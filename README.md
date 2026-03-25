@@ -1,217 +1,316 @@
-# Protenix: Protein + X
+# BindCraft v2: Inference-Time Optimization for Protein Binder Design
 
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
+[![arXiv](https://img.shields.io/badge/arXiv-coming%20soon-green.svg)]()
 
-> 📣📣📣 **We're hiring!** \
-> Positions in **_Beijing_** 🇨🇳 and **_Seattle_** 🇺🇸 \
-> Interested in machine learning, computational chemistry/biology, structural biology, or drug discovery?  Join us to build cutting-edge AI for biology!
-\
-> 👉 [**Join us »**](#join-us)
+**BindCraft v2** is a protein binder design framework built upon [Protenix](https://github.com/bytedance/Protenix), introducing a hybrid **1st-order + 0th-order** optimization pipeline for hallucinating target-binding protein sequences. By treating Protenix as a frozen differentiable critic, BindCraft v2 enables gradient-based sequence optimization without any fine-tuning of the base model.
 
+---
 
+## Table of Contents
 
-<div align="center" style="margin: 20px 0;">
-  <span style="margin: 0 10px;">⚡ <a href="https://protenix-server.com">Protenix Web Server</a></span>
-  &bull; <span style="margin: 0 10px;">📄 <a href="docs/PTX_V1_Technical_Report_202602042356.pdf">Technical Report</a></span>
-</div>
+- [Background & Motivation](#background--motivation)
+- [Core Idea: Frozen Critic + Inference-Time Optimization](#core-idea-frozen-critic--inference-time-optimization)
+- [Architecture: Three-Module Pipeline](#architecture-three-module-pipeline)
+  - [Module A — STE Bridge (Input Discretization Bridge)](#module-a--ste-bridge-input-discretization-bridge)
+  - [Module B — One-Step Diffusion Extrapolation (Output Truncation)](#module-b--one-step-diffusion-extrapolation-output-truncation)
+  - [Module C — Physical Constraint Losses (Frozen Critic)](#module-c--physical-constraint-losses-frozen-critic)
+- [Hybrid Search: 1st-Order Proposal + 0th-Order Verification](#hybrid-search-1st-order-proposal--0th-order-verification)
+- [Timestep Scheduling: Coarse-to-Fine Annealing](#timestep-scheduling-coarse-to-fine-annealing)
+- [Project Structure](#project-structure)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Algorithm Documents](#algorithm-documents)
+- [Citing](#citing)
+- [License](#license)
 
-<div align="center">
+---
 
-[![Twitter](https://img.shields.io/badge/Twitter-Follow-blue?logo=x)](https://x.com/ai4s_protenix)
-[![Slack](https://img.shields.io/badge/Slack-Join-yellow?logo=slack)](https://join.slack.com/t/protenixworkspace/shared_invite/zt-3drypwagk-zRnDF2VtOQhpWJqMrIveMw)
-[![Wechat](https://img.shields.io/badge/Wechat-Join-brightgreen?logo=wechat)](https://github.com/bytedance/Protenix/issues/52)
-[![Email](https://img.shields.io/badge/Email-Contact-lightgrey?logo=gmail)](#contact-us)
-</div>
+## Background & Motivation
 
-We’re excited to introduce **Protenix** — Toward High-Accuracy Open-Source Biomolecular Structure Prediction.
+Designing a protein that binds to a specific target (e.g., an antigen, enzyme pocket, or signaling interface) is a central challenge in therapeutic protein engineering. Traditional methods rely on library screening or physics-based docking — both expensive and slow.
 
-Protenix is built for high-accuracy structure prediction. It serves as an initial step in our journey toward advancing accessible and extensible research tools for the computational biology community.
+The key insight of **network-inversion design** is: **treat the forward structure-prediction network as a differentiable black box**. Freeze the model weights, treat the amino-acid sequence as a continuous optimizable variable, and backpropagate physical design objectives (binding distance, steric clash, structural confidence) directly through the network to update the input sequence.
 
-<img src="assets/protenix_predictions.gif" style="width: 100%; height: auto;" alt="Protenix predictions">
+This paradigm works naturally with AlphaFold 2 (AF2), which uses a residue-level representation with fixed atom counts. However, when upgrading to **AlphaFold 3 / Protenix** (AF3), two fundamental deadlocks emerge:
 
-## 🌟 Related Projects
-- **[PXDesign](https://protenix.github.io/pxdesign/)** is a model suite for de novo protein-binder design built on the Protenix foundation model. PXDesign achieves 20–73% experimental success rates across multiple targets — 2–6× higher than prior SOTA methods such as AlphaProteo and RFdiffusion. The framework is freely accessible via the Protenix Server.
+| | AF2 | AF3 / Protenix |
+|---|---|---|
+| **Input representation** | Fixed-residue slots (one ID per residue, constant atom count) | Dynamic atom lists — glycine has 4 atoms, tryptophan has 14. Total atom count is a *scalar that varies with amino-acid composition*. |
+| **Output generation** | Geometry拼接 (angles → coordinates) | Diffusion-based (Gaussian noise → all-atom coordinates). |
 
-- **[PXMeter](https://github.com/bytedance/PXMeter/)** is an open-source toolkit designed for reproducible evaluation of structure prediction models, released with high-quality benchmark dataset that has been manually reviewed to remove experimental artifacts and non-biological interactions. The associated study presents an in-depth comparative analysis of state-of-the-art models, drawing insights from extensive metric data and detailed case studies. The evaluation of Protenix is based on PXMeter.
+These changes **break the gradient path** from 3D coordinates back to 1D sequence:
+1. **Input deadlock**: You cannot naively backprop through a variable-size atom table.
+2. **Output deadlock**: Running 50+ diffusion ODE steps in a full computation graph causes OOM and gradient degradation.
 
-- **[Protenix-Dock](https://github.com/bytedance/Protenix-Dock)**: Our implementation of a classical protein-ligand docking framework that leverages empirical scoring functions. Without using deep neural networks, Protenix-Dock delivers competitive performance in rigid docking tasks.
+BindCraft v2 resolves both deadlocks architecturally.
 
-## 🎉 Latest Updates
-- **2026-02-05: Protenix-v1 Released** 💪 [[Technical Report](docs/PTX_V1_Technical_Report_202602042356.pdf)]
-  - Supported Template/RNA MSA features and improved training dynamics, along with further Inference-time model performance enhancements.
-- **2025-11-05: Protenix-v0.7.0 Released** 🚀
-  - Introduced advanced diffusion inference optimizations: Shared variable caching, efficient kernel fusion, and TF32 acceleration. See our [performance analysis](./assets/inference_time_vs_ntoken.png).
-- **2025-07-17: Protenix-Mini & Constraint Features**
-  - Released lightweight model variants ([Protenix-Mini](https://arxiv.org/abs/2507.11839)) that drastically reduce inference costs with minimal accuracy loss.
-  - Added support for [atom-level contact and pocket constraints](docs/infer_json_format.md#constraint), enhancing prediction accuracy through physical priors.
-- **2025-01-16: Pipeline Enhancements**
-  - Open-sourced the full [training data pipeline](./docs/prepare_training_data.md) and [MSA pipeline](./docs/msa_template_pipeline.md).
-  - Integrated local [ColabFold-compatible search](./docs/colabfold_compatible_msa.md) for streamlined MSA generation.
+---
 
+## Core Idea: Frozen Critic + Inference-Time Optimization
 
-## 🚀 Getting Started
+BindCraft v2 inherits the **"generate → score → revise"** loop from score-distillation / SDS methods (DreamFusion, ICLR 2023), adapted for the AF3 physics model:
 
-### 🛠 Quick Installation
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Current Binder Sequence (logits Θ)                                  │
+│       ↓                                                               │
+│  ┌─────────────┐   hard sample    ┌──────────────────────────┐       │
+│  │  STE Bridge  │ ───────────────→ │  Protenix Pairformer     │       │
+│  │  (Module A) │  soft features   │  (48-layer, frozen)      │       │
+│  └─────────────┘ ←───────────────  └──────────────────────────┘       │
+│                                              ↓                         │
+│                                    ┌──────────────────────┐            │
+│                                    │  One-Step Diffusion   │            │
+│                                    │  Extrapolation        │            │
+│                                    │  (Module B, τ = 0.1)   │            │
+│                                    └──────────────────────┘            │
+│                                              ↓                         │
+│                               ┌───────────────────────────┐           │
+│                               │  Physical Constraint Loss  │           │
+│                               │  Distance + Clash + iPTM   │           │
+│                               │  (Module C — frozen critic)│           │
+│                               └───────────────────────────┘           │
+│                                              ↓                         │
+│                                  ┌────────────────────┐                │
+│                                  │  backward(∂L/∂Θ)   │                │
+│                                  │  Adam update Θ     │                │
+│                                  └────────────────────┘                │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+The frozen Protenix model acts as a **single-step differentiable physics critic**. One forward + backward pass yields a tangent gradient that, in expectation, is mathematically equivalent to the steepest-descent direction for the 1D sequence.
+
+---
+
+## Architecture: Three-Module Pipeline
+
+### Module A — STE Bridge (Input Discretization Bridge)
+
+*(Maps CV: PEZ algorithm, ICLR 2023 — "soft features forward, hard tokens validated")*
+
+**Problem**: AF3's `InputEmbedder` performs a discrete lookup that produces a variable-length atom list. Any continuous gradient is cut off here.
+
+**Solution — Straight-Through Estimator (STE) with soft-reweighted monomer features**:
+
+1. Define a continuous logits variable $\mathbf{\Theta} \in \mathbb{R}^{L_{binder} \times 20}$ (requires_grad=True), where 20 is the number of amino-acid types.
+
+2. Convert to a soft probability matrix with temperature $\tau_{temp}$:
+   $$\mathbf{P} = \text{Softmax}\left(\mathbf{\Theta} / \tau_{temp}\right) \in \mathbb{R}^{L_{binder} \times 20}$$
+
+3. **Hard pass** (forward validation): `argmax(P)` gives a discrete amino-acid sequence $\mathbf{a}_{hard}$. Pass it through the official `InputEmbedder` to obtain a legitimate system atom count $N_{atom}$ and hard monomer features $\mathbf{s}^{init}_{hard}$. No gradient flows here.
+
+4. **Soft pass** (gradient highway): Pre-compute an offline feature dictionary $\mathbf{W}_{AAE} \in \mathbb{R}^{20 \times c_s}$ (atom-attention-encoded monomer features for all 20 amino acids). Build a smooth feature:
+   $$\mathbf{s}^{init}_{soft} = \mathbf{P} \cdot \mathbf{W}_{AAE}$$
+
+5. **STE fusion** — forward uses hard features (legit shape/size), backward routes gradient through soft features:
+   $$\tilde{\mathbf{s}}^{init} = \mathbf{s}^{init}_{hard}.\text{detach()} + \mathbf{s}^{init}_{soft} - \mathbf{s}^{init}_{soft}.\text{detach()}$$
+
+The fused binder features are concatenated with the target features (total length $N_{token}$) and fed into the Pairformer.
+
+---
+
+### Module B — One-Step Diffusion Extrapolation (Output Truncation)
+
+*(Maps CV: Universal Guidance, ICCV 2023 — "truncate ODE, extrapolate clean structure from noise")*
+
+**Problem**: Running 50+ diffusion ODE steps inside a full computation graph causes OOM and gradient shattering.
+
+**Solution — Single-step $\hat{\mathbf{x}}_0$ extrapolation**:
+
+At a chosen small noise timestep $\tau$ (e.g., $\tau = 0.1$), take the corresponding noisy 3D backbone $\mathbf{x}_\tau$ (obtainable via a cheap no-grad forward ODE solve). Execute **exactly one** forward diffusion pass to predict the denoising velocity:
+
+$$\mathbf{v}_{pred} = \text{Diffusion}\left(\mathbf{x}_\tau, \tau, \mathbf{s}, \mathbf{z}\right) \in \mathbb{R}^{N_{atom} \times 3}$$
+
+Per flow-matching ODE geometry, algebraically extrapolate back to the clean all-atom structure:
+
+$$\hat{\mathbf{x}}_0 = \mathbf{x}_\tau - \tau \cdot \mathbf{v}_{pred} \in \mathbb{R}^{N_{atom} \times 3}$$
+
+This $\hat{\mathbf{x}}_0$ is **fully differentiable** and avoids the multi-step ODE loop entirely. The gradient is routed through $\tau$ (scaling) and $\mathbf{v}_{pred}$ back into the Pairformer.
+
+**Why this works**: Inverse optimization needs a *direction derivative*, not a perfect sample. A single-step tangent gradient — uncontaminated by thousands of network layers — provides the highest signal-to-noise update signal.
+
+---
+
+### Module C — Physical Constraint Losses (Frozen Critic)
+
+*(Maps CV: SDS / DreamFusion — "frozen model as differentiable critic")*
+
+On the extrapolated all-atom structure $\hat{\mathbf{x}}_0$, we directly impose structural design objectives:
+
+$$\mathcal{L}_{total} = \lambda_1 \underbrace{\text{Distance}\left(\hat{\mathbf{x}}_0^{(binder)}, \mathbf{x}_{target}\right)}_{\text{Binder-to-hotspot distance}} + \lambda_2 \underbrace{\text{Clash}\left(\hat{\mathbf{x}}_0\right)}_{\text{Steric clash penalty}} - \lambda_3 \underbrace{\text{iPTM}\left(\hat{\mathbf{x}}_0, \mathbf{s}, \mathbf{z}\right)}_{\text{Complex confidence (maximize)}}$$
+
+This makes the frozen Protenix model behave as a **single-step differentiable 3D physics oracle**.
+
+---
+
+## Hybrid Search: 1st-Order Proposal + 0th-Order Verification
+
+Pure 1st-order optimization in a discrete sequence space ($20^{L_{binder}}$ scale) has two failure modes:
+1. **Gradient truncation error**: Single-step extrapolation is approximate.
+2. **STE gap**: Continuous-space descent may not be preserved after `argmax` projection.
+
+BindCraft v2 resolves this with a **1st + 0th hybrid framework**:
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│  1st-Order Proposal                                          │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  Backprop → get ∇_Θ L                                    │  │
+│  │  Use Taylor approx to rank (position, AA) mutations     │  │
+│  │  Generate B candidate sequences (e.g., B = 8–16)       │  │
+│  └─────────────────────────────────────────────────────────┘  │
+│                          ↓                                     │
+│  0th-Order Verification (no grad)                             │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  Full AF3 forward for each candidate (parallel)         │  │
+│  │  Evaluate exact physical loss on generated structures    │  │
+│  │  Sort by real loss → keep top B                          │  │
+│  └─────────────────────────────────────────────────────────┘  │
+│                          ↓                                     │
+│  State Update (Greedy or Metropolis-Hastings SA)            │
+└───────────────────────────────────────────────────────────────┘
+```
+
+- **1st-order**: fast gradient-based proposal of promising mutations.
+- **0th-order**: exact AF3 evaluation as oracle for rigorous screening.
+- **Beam search**: maintains B parallel branches for implicit backtracking.
+
+---
+
+## Timestep Scheduling: Coarse-to-Fine Annealing
+
+Different noise levels carry different physical frequency information:
+
+| Phase | Epoch Range | τ Range | Focus |
+|-------|-------------|---------|-------|
+| 1 — Global topology | 0–30% | [0.6, 0.9] | Macroscopic shape, binder orientation |
+| 2 — Interface shaping | 30–70% | [0.2, 0.6] | Contact surface, iPTM |
+| 3 — Atomic refinement | 70–100% | [0.01, 0.2] | Clash, H-bonds, side-chain packing |
+
+**Timestep jittering**: within each phase, sample multiple τ values and fuse their gradients to reduce bias.
+
+**Simulated annealing**: Metropolis-Hastings acceptance at temperature $T$ enables controlled escape from local minima in early epochs.
+
+---
+
+## Project Structure
+
+```
+BindCraft/
+├── bindcraft/                  # Core binder design algorithms
+│   ├── hallucination/          # Optimization pipeline
+│   │   ├── pipeline.py         # 3-stage design pipeline
+│   │   ├── ste_bridge.py      # STE input discretization bridge
+│   │   ├── diffusion_one_step.py  # One-step x̂₀ extrapolation
+│   │   ├── zeroth_order.py     # 0th-order refinement
+│   │   ├── mutation_proposer.py # Gradient-guided mutation proposer
+│   │   └── scheduler.py        # Timestep & parameter scheduler
+│   └── losses/                 # Physical constraint losses
+│       ├── geometry.py         # Distance, clash, H-bond
+│       ├── confidence.py       # iPTM, pLDDT
+│       └── total_loss.py       # Weighted total loss
+│
+├── protenix/                   # Protenix foundation model
+│   ├── model/                 # Model architecture
+│   │   ├── protenix.py        # Full model
+│   │   ├── modules/           # Transformer / Pairformer
+│   │   └── layer_norm/        # Custom CUDA LayerNorm
+│   ├── data/                  # Data pipeline
+│   │   ├── inference/         # JSON input parser
+│   │   └── msa/               # MSA processing
+│   └── metrics/               # Evaluation metrics
+│
+├── runner/                     # Training & inference entry points
+│   ├── train.py               # Training / fine-tuning
+│   └── inference.py           # Single-structure inference
+│
+├── scripts/                    # Design & evaluation scripts
+│   ├── run_hallucination.py   # Main binder design script
+│   └── run_full_eval.py       # Full evaluation pipeline
+│
+├── configs/                    # Configuration files
+│   ├── configs_model_type.py  # Model selection
+│   └── configs_inference.py   # Inference config
+│
+├── examples/                   # Example input JSON files
+├── docs/bindcraft/            # Algorithm documentation (Chinese)
+│   ├── BindcraftV2算法结构.md  # Full algorithm architecture
+│   └── Bindcraft v2零阶更新.md  # 0th-order optimization details
+│
+├── inference_demo.sh           # Inference demo
+├── finetune_demo.sh           # Fine-tuning demo
+└── train_demo.sh              # Training demo
+```
+
+---
+
+## Quick Start
+
+### 1. Installation
 
 ```bash
 pip install protenix
 ```
 
-### 🧬 Quick Prediction
+### 2. Run Protein Binder Design
 
 ```bash
-# Predict structure using a JSON input
-protenix pred -i examples/input.json -o ./output -n protenix_base_default_v1.0.0
+# Fine-tune (optional, recommended for specific targets)
+bash finetune_demo.sh
+
+# Design a binder
+bash inference_demo.sh
 ```
 
-#### Key Model Descriptions
-| Model Name | MSA | RNA MSA | Template | Params | Training Data Cutoff | Model Release Date |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| `protenix_base_default_v1.0.0` | ✅ | ✅ | ✅ | 368 M | 2021-09-30 | 2026-02-05 |
-| `protenix_base_20250630_v1.0.0` | ✅ | ✅ | ✅ | 368 M | 2025-06-30 | 2026-02-05 |
-| `protenix_base_default_v0.5.0` | ✅ | ❌ | ❌ | 368 M | 2021-09-30 | 2025-05-30 |
+### 3. Configuration
 
-- **protenix_base_default_v1.0.0**: Default model, trained with a data cutoff aligned with AlphaFold3 (2021-09-30).
-  > 💡
-  > This is the **highly recommended** model for conducting fair, rigorous public benchmarks and comparative studies against other state-of-the-art methods.
-- **protenix_base_20250630_v1.0.0**: Applied model, trained with an updated data cutoff (2025-06-30) for better practical performance. This model can be used for practical application scenarios.
-- **protenix_base_default_v0.5.0**: Previous version of the model, maintained primarily for backward compatibility with users who developed based on v0.5.0.
+Key parameters in `configs/configs_inference.py` and `runner/train.py`:
 
-For a complete list of supported models, please refer to [Supported Models](docs/supported_models.md).
+| Parameter | Description | Recommended |
+|-----------|-------------|-------------|
+| `tau` | Diffusion noise timestep for extrapolation | 0.05–0.2 |
+| `design_steps` | Number of optimization iterations | 200–500 |
+| `lambda_distance` | Weight for target-binding distance loss | 1.0–5.0 |
+| `lambda_clash` | Weight for steric clash penalty | 0.5–2.0 |
+| `lambda_iptm` | Weight for complex confidence (negative = maximize) | −0.5–−2.0 |
+| `temperature` | Softmax temperature for STE | 0.1–0.5 |
+| `n_candidates` | Number of 0th-order candidates per iteration | 8–16 |
+| `beam_width` | Number of parallel beam branches | 4–8 |
 
-For detailed instructions on installation, data preprocessing, inference, and training, please refer to the [Training and Inference Instructions](docs/training_inference_instructions.md). We recommend users refer to [inference_demo.sh](inference_demo.sh) for detailed inference methods and input explanations.
+---
 
+## Algorithm Documents
 
-### 📊 Benchmark
+Detailed algorithm documentation (in Chinese):
 
-**Protenix-v1 (refers to the `protenix_base_default_v1.0.0` model)**, the first fully open-source model that outperforms AlphaFold3 across diverse benchmark sets while adhering to the same training data cutoff, model scale, and inference budget as AlphaFold3. For challenging targets, such as antigen-antibody complexes, the prediction accuracy of Protenix-v1 can be further enhanced through inference-time scaling – increasing the sampling budget from several to hundreds of candidates leads to consistent log-linear gains.
+- **[BindcraftV2算法结构.md](docs/bindcraft/BindcraftV2%E7%AE%97%E6%B3%95%E7%BB%93%E6%9E%84.md)** — Full algorithm architecture, Jacobian chain derivation, AF2 vs AF3 comparison table.
+- **[Bindcraft v2零阶更新.md](docs/bindcraft/Bindcraft%20v2%E9%9B%B6%E9%98%B6%E6%9B%B4%E6%96%B0.md)** — 0th-order refinement, beam search, simulated annealing, phase annealing scheduler.
 
-<img src="./assets/protenix_base_default_v1.0.0_metrics.png" style="width: 100%; height: auto;" alt="protenix-v1 model Metrics">
+---
 
-<img src="./assets/protenix_base_default_v1.0.0_metrics2.png" style="width: 100%; height: auto;" alt="protenix-v1 model Metrics 2">
+## Citing
 
-For detailed benchmark metrics on each dataset, please refer to [docs/model_1.0.0_benchmark.md](docs/model_1.0.0_benchmark.md).
-
-## Citing Protenix
-
-If you use Protenix in your research, please cite the following:
+If you use BindCraft v2 in your research, please cite both BindCraft v2 and the underlying Protenix model:
 
 ```
-@article {Zhang2026.02.05.703733,
-	author = {Zhang, Yuxuan and Gong, Chengyue and Zhang, Hanyu and Ma, Wenzhi and Liu, Zhenyu and Chen, Xinshi and Guan, Jiaqi and Wang, Lan and Yang, Yanping and Xia, Yu and Xiao, Wenzhi},
-	title = {Protenix-v1: Toward High-Accuracy Open-Source Biomolecular Structure Prediction},
-	elocation-id = {2026.02.05.703733},
-	year = {2026},
-	doi = {10.64898/2026.02.05.703733},
-	publisher = {Cold Spring Harbor Laboratory},
-	URL = {https://www.biorxiv.org/content/early/2026/02/22/2026.02.05.703733.1},
-	eprint = {https://www.biorxiv.org/content/early/2026/02/22/2026.02.05.703733.1.full.pdf},
-	journal = {bioRxiv}
+@article{bindcraftv2,
+  title  = {BindCraft v2: Hybrid 1st-Order + 0th-Order Optimization for Protein Binder Design},
+  author = {Your Name and Co-Authors},
+  year   = {2026}
+}
+
+@article{zhang2026protenix,
+  author = {Zhang, Yuxuan and Gong, Chengyue and Zhang, Hanyu and Ma, Wenzhi and Liu, Zhenyu and others},
+  title  = {Protenix-v1: Toward High-Accuracy Open-Source Biomolecular Structure Prediction},
+  journal = {bioRxiv},
+  year   = {2026},
+  doi    = {10.64898/2026.02.05.703733}
 }
 ```
 
-### 📚 Citing Related Work
-Protenix is built upon and inspired by several influential projects. If you use Protenix in your research, we also encourage citing the following foundational works where appropriate:
-```
-@article{abramson2024accurate,
-  title={Accurate structure prediction of biomolecular interactions with AlphaFold 3},
-  author={Abramson, Josh and Adler, Jonas and Dunger, Jack and Evans, Richard and Green, Tim and Pritzel, Alexander and Ronneberger, Olaf and Willmore, Lindsay and Ballard, Andrew J and Bambrick, Joshua and others},
-  journal={Nature},
-  volume={630},
-  number={8016},
-  pages={493--500},
-  year={2024},
-  publisher={Nature Publishing Group UK London}
-}
-@article{ahdritz2024openfold,
-  title={OpenFold: Retraining AlphaFold2 yields new insights into its learning mechanisms and capacity for generalization},
-  author={Ahdritz, Gustaf and Bouatta, Nazim and Floristean, Christina and Kadyan, Sachin and Xia, Qinghui and Gerecke, William and O’Donnell, Timothy J and Berenberg, Daniel and Fisk, Ian and Zanichelli, Niccol{\`o} and others},
-  journal={Nature Methods},
-  volume={21},
-  number={8},
-  pages={1514--1524},
-  year={2024},
-  publisher={Nature Publishing Group US New York}
-}
-@article{mirdita2022colabfold,
-  title={ColabFold: making protein folding accessible to all},
-  author={Mirdita, Milot and Sch{\"u}tze, Konstantin and Moriwaki, Yoshitaka and Heo, Lim and Ovchinnikov, Sergey and Steinegger, Martin},
-  journal={Nature methods},
-  volume={19},
-  number={6},
-  pages={679--682},
-  year={2022},
-  publisher={Nature Publishing Group US New York}
-}
-```
-
-## Contributing to Protenix
-
-We welcome contributions from the community to help improve Protenix!
-
-📄 Check out the [Contributing Guide](CONTRIBUTING.md) to get started.
-
-✅ Code Quality: 
-We use `pre-commit` hooks to ensure consistency and code quality. Please install them before making commits:
-
-```bash
-pip install pre-commit
-pre-commit install
-```
-
-🐞 Found a bug or have a feature request? [Open an issue](https://github.com/bytedance/Protenix/issues).
-
-
-
-## Acknowledgements
-
-
-The implementation of LayerNorm operators refers to both [OneFlow](https://github.com/Oneflow-Inc/oneflow) and [FastFold](https://github.com/hpcaitech/FastFold).
-We also adopted several [module](protenix/openfold_local/) implementations from [OpenFold](https://github.com/aqlaboratory/openfold), except for [`LayerNorm`](protenix/model/layer_norm/), which is implemented independently.
-
-
-## Code of Conduct
-
-We are committed to fostering a welcoming and inclusive environment.
-Please review our [Code of Conduct](CODE_OF_CONDUCT.md) for guidelines on how to participate respectfully.
-
-
-## Security
-
-If you discover a potential security issue in this project, or think you may
-have discovered a security issue, we ask that you notify Bytedance Security via our [security center](https://security.bytedance.com/src) or [vulnerability reporting email](sec@bytedance.com).
-
-Please do **not** create a public GitHub issue.
+---
 
 ## License
 
-The Protenix project including both code and model parameters is released under the [Apache 2.0 License](./LICENSE). It is free for both academic research and commercial use.
-
-## Contact Us
-
-We welcome inquiries and collaboration opportunities for advanced applications of our model, such as developing new features, fine-tuning for specific use cases, and more. Please feel free to contact us at ai4s-bio@bytedance.com.
-
-## Join Us
-
-We're expanding the **Protenix team** at ByteDance Seed-AI for Science! We’re looking for talented individuals in machine learning and computational biology/chemistry (*“Computational Biology/Chemistry” covers structural biology, computational biology, computational chemistry, drug discovery, and more*). Opportunities are available in both **Beijing** and **Seattle**, across internships, new grad roles, and experienced full-time positions. 
-
-Outstanding applicants will be considered for **ByteDance’s Top Seed Talent Program** — with enhanced support.
-
-
-### 📍 Beijing, China
-| Type       | Expertise                          | Apply Link |
-|------------|------------------------------------|------------|
-| Full-Time  | Protein Design Scientist       | [Experienced](https://jobs.bytedance.com/society/position/detail/7550992796392982792) |
-| Full-Time  | Computational Biology / Chemistry       | [Experienced](https://jobs.bytedance.com/society/position/detail/7505998274429421842), [New Grad](https://job.toutiao.com/s/HGwWBs1UGR4) |
-| Full-Time  | Machine Learning                   | [Experienced](https://jobs.bytedance.com/society/position/detail/7505999453133015314), [New Grad](https://job.toutiao.com/s/upy82CljXlY) |
-| Internship | Computational Biology / Chemistry       | [Internship](https://job.toutiao.com/s/Wr3yig1Wet4) |
-| Internship | Machine Learning                   | [Internship](https://job.toutiao.com/s/w2GQQDfQUkc) |
-
-
-### 📍 Seattle, US
-
-| Type       | Expertise                          | Apply Link |
-|------------|------------------------------------|------------|
-| Full-Time  | Computational Biology / Chemistry       | [Experienced](https://jobs.bytedance.com/en/position/7270666468370614585/detail), [New Grad](https://job.toutiao.com/s/iH00nSEvrFo) |
-| Full-Time  | Machine Learning                   | [Experienced](https://jobs.bytedance.com/en/position/7270665658072926521/detail), [New Grad](https://job.toutiao.com/s/dmU_fbEHGOw) |
-| Internship | Computational Biology / Chemistry       | [Internship](https://job.toutiao.com/s/aiCZz0kJexs) |
-| Internship | Machine Learning                   | [Internship](https://job.toutiao.com/s/DiGnn5l1QpQ) |
+BindCraft v2 is released under the [Apache 2.0 License](./LICENSE). Both code and model parameters are freely available for academic research and commercial use.

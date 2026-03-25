@@ -1,205 +1,315 @@
-# Protenix: Protein + X
+# BindCraft v2: 蛋白质 Binder 设计推理时优化框架
 
-> 📣📣📣 **我们正在招聘！** \
-> 岗位位于 **_北京_** 🇨🇳 和 **_西雅图_** 🇺🇸 \
-> 对机器学习、计算化学/生物学、结构生物学或药物发现感兴趣？加入我们，共同构建生物领域的前沿 AI！
-> 👉 [**加入我们 »**](#join-us)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
+[![arXiv](https://img.shields.io/badge/arXiv-coming%20soon-green.svg)]()
 
-<div align="center" style="margin: 20px 0;">
-  <span style="margin: 0 10px;">⚡ <a href="https://protenix-server.com">Protenix 在线服务器</a></span>
-  &bull; <span style="margin: 0 10px;">📄 <a href="docs/PTX_V1_Technical_Report_202602042356.pdf">技术报告</a></span>
-</div>
+**BindCraft v2** 是基于 [Protenix](https://github.com/bytedance/Protenix) 构建的蛋白质 binder（结合蛋白）设计框架，引入了**混合一阶 + 零阶优化**流水线，通过将 Protenix 视为冻结的可微分评判器（Differentiable Critic），在不微调基座模型的情况下实现基于梯度的序列优化。
 
-<div align="center">
+---
 
-[![Twitter](https://img.shields.io/badge/Twitter-Follow-blue?logo=x)](https://x.com/ai4s_protenix)
-[![Slack](https://img.shields.io/badge/Slack-Join-yellow?logo=slack)](https://join.slack.com/t/protenixworkspace/shared_invite/zt-3drypwagk-zRnDF2VtOQhpWJqMrIveMw)
-[![Wechat](https://img.shields.io/badge/Wechat-Join-brightgreen?logo=wechat)](https://github.com/bytedance/Protenix/issues/52)
-[![Email](https://img.shields.io/badge/Email-Contact-lightgrey?logo=gmail)](#contact-us)
-</div>
+## 目录
 
-我们很高兴向您介绍 **Protenix** —— 面向高精度开源生物分子结构预测。
+- [背景与动机](#背景与动机)
+- [核心思想：冻结评判器 + 推理时优化](#核心思想冻结评判器--推理时优化)
+- [架构：三模块流水线](#架构三模块流水线)
+  - [模块 A — STE 桥接（输入离散化桥）](#模块-a--ste-桥接输入离散化桥)
+  - [模块 B — 单步扩散外推（输出截断）](#模块-b--单步扩散外推输出截断)
+  - [模块 C — 物理约束损失（冻结评判器）](#模块-c--物理约束损失冻结评判器)
+- [混合搜索：一阶提议 + 零阶验证](#混合搜索一阶提议--零阶验证)
+- [时间步调度：粗到细退火](#时间步调度粗到细退火)
+- [项目结构](#项目结构)
+- [快速开始](#快速开始)
+- [配置说明](#配置说明)
+- [算法文档](#算法文档)
+- [引用](#引用)
+- [许可证](#许可证)
 
-Protenix 专注于高精度结构预测，是我们为计算生物学社区提供可及、可扩展研究工具的重要一步。
+---
 
-<img src="assets/protenix_predictions.gif" style="width: 100%; height: auto;" alt="Protenix 预测效果">
+## 背景与动机
 
-## 🌟 相关项目
+设计能够特异性结合特定靶点（如抗原表位、酶口袋或信号接口）的蛋白质，是治疗性蛋白质工程的核心挑战。传统方法依赖库筛选或基于物理的对接——成本高且速度慢。
 
-- **[PXDesign](https://protenix.github.io/pxdesign/)** 是基于 Protenix 基础模型的从头蛋白质-配体设计模型套件。PXDesign 在多个靶点上达到 20–73% 的实验成功率，比 AlphaProteo、RFdiffusion 等先前 SOTA 方法高出 2–6 倍。该框架可通过 Protenix 服务器免费使用。
+**网络求逆设计**的核心洞察是：**将前向结构预测网络视为可微分黑箱**。冻结模型权重，将氨基酸序列设为连续可优化变量，通过网络反向传播物理设计目标（结合距离、空间位阻、结构置信度），直接更新输入序列。
 
-- **[PXMeter](https://github.com/bytedance/PXMeter/)** 是面向结构预测模型可重复评估的开源工具包，附带经人工审核去除实验伪影和非生物相互作用的高质量基准数据集。相关研究对 SOTA 模型进行了深入对比分析，从大量指标数据和案例研究中提炼洞察。Protenix 的评估基于 PXMeter。
+该范式在 AlphaFold 2（AF2）中天然可行——AF2 使用固定残基槽位（每个残基一个 ID，原子数量恒定）。然而，升级至 **AlphaFold 3 / Protenix（AF3）** 后，两座根本性的"物理死锁"出现了：
 
-- **[Protenix-Dock](https://github.com/bytedance/Protenix-Dock)**：我们实现的经典蛋白质-配体对接框架，采用经验打分函数。在不使用深度神经网络的情况下，Protenix-Dock 在刚性对接任务中表现优异。
+| | AF2 | AF3 / Protenix |
+|---|---|---|
+| **输入表示** | 固定残基槽位（每个残基 ID 恒定，原子数固定） | 动态原子列表 — 甘氨酸仅 4 个原子，色氨酸有 14 个。**总原子数是随氨基酸种类动态变化的标量**。 |
+| **输出生成** | 几何拼接（角度 → 坐标） | 扩散生成（高斯噪声 → 全原子坐标）。 |
 
-## 🎉 最新更新
+这些变化**切断了从 3D 坐标回到 1D 序列的梯度路径**：
+1. **输入端死锁**：无法对动态变长原子表做朴素反向传播。
+2. **输出端死锁**：在完整计算图中运行 50+ 步扩散 ODE 导致 OOM 和梯度粉碎。
 
-- **2026-02-05: Protenix-v1 发布** 💪 [[技术报告](docs/PTX_V1_Technical_Report_202602042356.pdf)]
-  - 支持模板/RNA MSA 特征，改进训练动态，并进一步优化推理时模型性能。
-- **2025-11-05: Protenix-v0.7.0 发布** 🚀
-  - 引入扩散推理优化：共享变量缓存、高效内核融合、TF32 加速。参见 [性能分析](./assets/inference_time_vs_ntoken.png)。
-- **2025-07-17: Protenix-Mini 与约束特征**
-  - 发布轻量级模型变体 [Protenix-Mini](https://arxiv.org/abs/2507.11839)，在几乎不损失精度的前提下大幅降低推理成本。
-  - 新增 [原子级接触与口袋约束](docs/infer_json_format.md#constraint) 支持，通过物理先验提升预测精度。
-- **2025-01-16: 流程增强**
-  - 开源完整 [训练数据流程](./docs/prepare_training_data.md) 和 [MSA 流程](./docs/msa_template_pipeline.md)。
-  - 集成本地 [ColabFold 兼容搜索](./docs/colabfold_compatible_msa.md)，简化 MSA 生成。
+BindCraft v2 从架构层面同时解决这两个死锁。
 
-## 🚀 快速开始
+---
 
-### 🛠 快速安装
+## 核心思想：冻结评判器 + 推理时优化
+
+BindCraft v2 借鉴了 **Score Distillation / SDS** 方法（DreamFusion, ICLR 2023）的"生成 → 评分 → 修订"循环，针对 AF3 物理模型进行适配：
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  当前 Binder 序列 (logits Θ)                                          │
+│       ↓                                                               │
+│  ┌─────────────┐   硬采样    ┌──────────────────────────┐            │
+│  │  STE 桥接   │ ─────────→  │  Protenix Pairformer     │            │
+│  │  (模块 A)   │  软特征     │  (48 层，冻结权重)        │            │
+│  └─────────────┘ ←─────────  └──────────────────────────┘             │
+│                                              ↓                         │
+│                                    ┌──────────────────────┐            │
+│                                    │  单步扩散外推         │            │
+│                                    │  (模块 B, τ = 0.1)   │            │
+│                                    └──────────────────────┘            │
+│                                              ↓                         │
+│                               ┌───────────────────────────┐           │
+│                               │  物理约束损失              │            │
+│                               │  距离 + 碰撞 + iPTM        │            │
+│                               │  (模块 C — 冻结评判器)     │            │
+│                               └───────────────────────────┘            │
+│                                              ↓                         │
+│                                  ┌────────────────────┐               │
+│                                  │  backward(∂L/∂Θ)   │               │
+│                                  │  Adam 更新 Θ        │               │
+│                                  └────────────────────┘                │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+冻结的 Protenix 模型充当**单步可微分物理评判器**。一次前向 + 反向传播即可产生切线梯度，在数学期望上等效于驱动一维序列演化的最速下降方向。
+
+---
+
+## 架构：三模块流水线
+
+### 模块 A — STE 桥接（输入离散化桥）
+
+*(映射 CV 领域：PEZ 算法，ICLR 2023 — "软特征前向，硬 token 验证")*
+
+**问题**：AF3 的 `InputEmbedder` 执行离散查表，产生变长原子列表。任何连续梯度在此处被彻底截断。
+
+**解决方案 — 直通估计器（STE）+ 软加权单体特征**：
+
+1. 定义连续 logits 变量 $\mathbf{\Theta} \in \mathbb{R}^{L_{binder} \times 20}$（requires_grad=True），其中 20 为氨基酸种类数。
+
+2. 用温度参数 $\tau_{temp}$ 转换为软概率矩阵：
+   $$\mathbf{P} = \text{Softmax}\left(\mathbf{\Theta} / \tau_{temp}\right) \in \mathbb{R}^{L_{binder} \times 20}$$
+
+3. **硬采样**（前向验证）：对 $\mathbf{P}$ 取 `argmax` 得到离散序列 $\mathbf{a}_{hard}$，通过官方 `InputEmbedder` 获取合法的系统原子总数 $N_{atom}$ 和硬编码单体特征 $\mathbf{s}^{init}_{hard}$。此步无梯度流过。
+
+4. **软特征构建**（梯度高速公路）：离线预计算特征字典 $\mathbf{W}_{AAE} \in \mathbb{R}^{20 \times c_s}$（20 种氨基酸的 AtomAttentionEncoder 编码特征），构建平滑特征：
+   $$\mathbf{s}^{init}_{soft} = \mathbf{P} \cdot \mathbf{W}_{AAE}$$
+
+5. **STE 融合** — 前向使用硬特征（合法形状/尺寸），反向将梯度路由至软特征分支：
+   $$\tilde{\mathbf{s}}^{init} = \mathbf{s}^{init}_{hard}.\text{detach()} + \mathbf{s}^{init}_{soft} - \mathbf{s}^{init}_{soft}.\text{detach()}$$
+
+融合后的 binder 特征与 target 特征拼接（总长度恢复为 $N_{token}$），送入 Pairformer。
+
+---
+
+### 模块 B — 单步扩散外推（输出截断）
+
+*(映射 CV 领域：Universal Guidance，ICCV 2023 — "截断 ODE，从噪声外推清晰结构")*
+
+**问题**：在完整计算图中运行 50+ 步扩散 ODE 会导致 OOM 和梯度粉碎。
+
+**解决方案 — 单步 $\hat{\mathbf{x}}_0$ 外推**：
+
+在选定的微小噪声时间步 $\tau$（如 $\tau = 0.1$），取对应带噪 3D 骨架 $\mathbf{x}_\tau$（可通过无梯度前向 ODE 求解低成本获得）。执行**唯一一次**前向扩散，预测去噪速度场：
+
+$$\mathbf{v}_{pred} = \text{Diffusion}\left(\mathbf{x}_\tau, \tau, \mathbf{s}, \mathbf{z}\right) \in \mathbb{R}^{N_{atom} \times 3}$$
+
+根据流匹配（Flow Matching）常微分方程的几何切线原理，代数外推回干净的全原子坐标：
+
+$$\hat{\mathbf{x}}_0 = \mathbf{x}_\tau - \tau \cdot \mathbf{v}_{pred} \in \mathbb{R}^{N_{atom} \times 3}$$
+
+此 $\hat{\mathbf{x}}_0$ **全链路可导**，且完全规避了多步 ODE 循环。梯度通过 $\tau$（标量缩放）和 $\mathbf{v}_{pred}$ 流回 Pairformer。
+
+**为什么有效**：逆向优化需要的是"方向导数"而非"完美的生成样本"。单步切线梯度——未经成千上万层网络污染——能为优化器提供信噪比最高的更新信号。
+
+---
+
+### 模块 C — 物理约束损失（冻结评判器）
+
+*(映射 CV 领域：SDS / DreamFusion — "冻结模型作为可微分评判器")*
+
+在单步外推的全原子结构 $\hat{\mathbf{x}}_0$ 上，直接施加结构学设计目标：
+
+$$\mathcal{L}_{total} = \lambda_1 \underbrace{\text{Distance}\left(\hat{\mathbf{x}}_0^{(binder)}, \mathbf{x}_{target}\right)}_{\text{Binder 与靶点热点的距离}} + \lambda_2 \underbrace{\text{Clash}\left(\hat{\mathbf{x}}_0\right)}_{\text{空间位阻惩罚}} - \lambda_3 \underbrace{\text{iPTM}\left(\hat{\mathbf{x}}_0, \mathbf{s}, \mathbf{z}\right)}_{\text{复合物置信度（最大化）}}$$
+
+这使冻结的 Protenix 模型成为**单步可微分 3D 物理评判器**。
+
+---
+
+## 混合搜索：一阶提议 + 零阶验证
+
+在离散序列空间（规模约 $20^{L_{binder}}$）中进行纯一阶优化，存在两大风险：
+1. **梯度截断误差**：单步外推的近似误差使连续空间更新偏离真实物理可行集合。
+2. **STE 间隙**：连续概率空间的下降趋势，在 `argmax` 投影回离散序列后不一定保持一致。
+
+BindCraft v2 通过**一阶 + 零阶混合框架**解决：
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│  一阶提议 (1st-Order Proposal)                                │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  反向传播 → 得到 ∇_Θ L                                     │  │
+│  │  用泰勒近似对 (位置, 氨基酸) 突变排序                         │  │
+│  │  生成 B 条候选序列（如 B = 8–16）                           │  │
+│  └─────────────────────────────────────────────────────────┘  │
+│                          ↓                                     │
+│  零阶验证 (0th-Order Verification, 无梯度)                      │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  对每条候选序列执行完整 AF3 前向（并行，无梯度）             │  │
+│  │  在生成结构上计算精确物理损失                                │  │
+│  │  按真实损失排序 → 保留 top B                                │  │
+│  └─────────────────────────────────────────────────────────┘  │
+│                          ↓                                     │
+│  状态更新（贪心或 Metropolis-Hastings 模拟退火）                │
+└───────────────────────────────────────────────────────────────┘
+```
+
+- **一阶**：快速梯度提议有潜力的突变方向。
+- **零阶**：以精确 AF3 评估为 Oracle 做严格筛选。
+- **集束搜索**：维护 B 条并行分支，实现隐式回退。
+
+---
+
+## 时间步调度：粗到细退火
+
+不同噪声水平携带不同的物理频域信息：
+
+| 阶段 | 训练进度 | τ 范围 | 优化重点 |
+|------|---------|--------|---------|
+| 1 — 全局拓扑探索 | 0–30% | [0.6, 0.9] | 宏观形状、Binder 取向 |
+| 2 — 界面塑造 | 30–70% | [0.2, 0.6] | 接触面、iPTM |
+| 3 — 原子级细化 | 70–100% | [0.01, 0.2] | 碰撞、氢键、侧链堆积 |
+
+**时间步抖动**：在每阶段内采样多个 τ 值并融合梯度，以减少偏差。
+
+**模拟退火**：Metropolis-Hastings 接受准则使系统在早期以受控概率接受略差候选，增强跳出局部最优的能力。
+
+---
+
+## 项目结构
+
+```
+BindCraft/
+├── bindcraft/                  # 核心 Binder 设计算法
+│   ├── hallucination/          # 优化流水线
+│   │   ├── pipeline.py         # 三阶段设计流程
+│   │   ├── ste_bridge.py      # STE 输入离散化桥接
+│   │   ├── diffusion_one_step.py  # 单步 x̂₀ 外推
+│   │   ├── zeroth_order.py     # 零阶优化
+│   │   ├── mutation_proposer.py # 梯度引导突变提议器
+│   │   └── scheduler.py        # 时间步与参数调度器
+│   └── losses/                 # 物理约束损失
+│       ├── geometry.py         # 距离、碰撞、氢键
+│       ├── confidence.py       # iPTM、pLDDT
+│       └── total_loss.py       # 加权总损失
+│
+├── protenix/                   # Protenix 基座模型
+│   ├── model/                  # 模型架构
+│   │   ├── protenix.py        # 完整模型
+│   │   ├── modules/           # Transformer / Pairformer
+│   │   └── layer_norm/        # 自定义 CUDA LayerNorm
+│   ├── data/                  # 数据处理
+│   │   ├── inference/         # JSON 输入解析
+│   │   └── msa/              # MSA 处理
+│   └── metrics/               # 评估指标
+│
+├── runner/                     # 训练与推理入口
+│   ├── train.py               # 训练 / 微调
+│   └── inference.py           # 单结构推理
+│
+├── scripts/                    # 设计与评估脚本
+│   ├── run_hallucination.py  # 主体 Binder 设计脚本
+│   └── run_full_eval.py       # 完整评估流程
+│
+├── configs/                    # 配置文件
+│   ├── configs_model_type.py  # 模型选择
+│   └── configs_inference.py   # 推理配置
+│
+├── examples/                   # 示例 JSON 输入文件
+├── docs/bindcraft/            # 算法文档
+│   ├── BindcraftV2算法结构.md  # 完整算法架构
+│   └── Bindcraft v2零阶更新.md  # 零阶优化详解
+│
+├── inference_demo.sh          # 推理演示
+├── finetune_demo.sh           # 微调演示
+└── train_demo.sh              # 训练演示
+```
+
+---
+
+## 快速开始
+
+### 1. 安装
 
 ```bash
 pip install protenix
 ```
 
-### 🧬 快速预测
+### 2. 运行蛋白质 Binder 设计
 
 ```bash
-# 使用 JSON 输入进行结构预测
-protenix pred -i examples/input.json -o ./output -n protenix_base_default_v1.0.0
+# 微调（可选，针对特定靶点推荐使用）
+bash finetune_demo.sh
+
+# 设计 Binder
+bash inference_demo.sh
 ```
 
-#### 主要模型说明
+### 3. 配置说明
 
-| 模型名称 | MSA | RNA MSA | 模板 | 参数量 | 训练数据截止日期 | 模型发布日期 |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| `protenix_base_default_v1.0.0` | ✅ | ✅ | ✅ | 368 M | 2021-09-30 | 2026-02-05 |
-| `protenix_base_20250630_v1.0.0` | ✅ | ✅ | ✅ | 368 M | 2025-06-30 | 2026-02-05 |
-| `protenix_base_default_v0.5.0` | ✅ | ❌ | ❌ | 368 M | 2021-09-30 | 2025-05-30 |
+`configs/configs_inference.py` 和 `runner/train.py` 中的关键参数：
 
-- **protenix_base_default_v1.0.0**：默认模型，训练数据截止日期与 AlphaFold3 对齐（2021-09-30）。
-  > 💡 这是进行公平、严谨的公开基准测试及与其他 SOTA 方法对比研究的**强烈推荐**模型。
-- **protenix_base_20250630_v1.0.0**：应用型模型，采用更新数据截止日期（2025-06-30）以获得更好的实际性能，适用于实际应用场景。
-- **protenix_base_default_v0.5.0**：旧版模型，主要为基于 v0.5.0 开发的用户保持向后兼容。
+| 参数 | 描述 | 推荐值 |
+|------|------|--------|
+| `tau` | 扩散外推的噪声时间步 | 0.05–0.2 |
+| `design_steps` | 优化迭代步数 | 200–500 |
+| `lambda_distance` | 靶点结合距离损失权重 | 1.0–5.0 |
+| `lambda_clash` | 空间位阻惩罚权重 | 0.5–2.0 |
+| `lambda_iptm` | 复合物置信度权重（负值 = 最大化） | −0.5–−2.0 |
+| `temperature` | STE 的 Softmax 温度 | 0.1–0.5 |
+| `n_candidates` | 每轮迭代零阶候选数量 | 8–16 |
+| `beam_width` | 并行集束分支数量 | 4–8 |
 
-完整支持的模型列表请参阅 [支持的模型](docs/supported_models.md)。
+---
 
-安装、数据预处理、推理和训练的详细说明请参阅 [训练与推理说明](docs/training_inference_instructions.md)。建议用户参考 [inference_demo.sh](inference_demo.sh) 了解详细推理方法和输入说明。
+## 算法文档
 
-### 📊 基准测试
+详细算法文档（中文）：
 
-**Protenix-v1**（即 `protenix_base_default_v1.0.0` 模型）是首个在多种基准集上超越 AlphaFold3 的全开源模型，同时保持与 AlphaFold3 相同的训练数据截止日期、模型规模和推理预算。对于抗原-抗体复合物等困难靶点，Protenix-v1 的预测精度可通过推理时扩展进一步提升——将采样候选数从数个增至数百个，可获得一致的对数线性增益。
+- **[BindcraftV2算法结构.md](docs/bindcraft/BindcraftV2%E7%AE%97%E6%B3%95%E7%BB%93%E6%9E%84.md)** — 完整算法架构、雅可比链推导、AF2 vs AF3 对照表。
+- **[Bindcraft v2零阶更新.md](docs/bindcraft/Bindcraft%20v2%E9%9B%B6%E9%98%B6%E6%9B%B4%E6%96%B0.md)** — 零阶优化、集束搜索、模拟退火、阶段退火调度器详解。
 
-<img src="./assets/protenix_base_default_v1.0.0_metrics.png" style="width: 100%; height: auto;" alt="protenix-v1 模型指标">
+---
 
-<img src="./assets/protenix_base_default_v1.0.0_metrics2.png" style="width: 100%; height: auto;" alt="protenix-v1 模型指标 2">
+## 引用
 
-各数据集的详细基准指标请参阅 [docs/model_1.0.0_benchmark.md](docs/model_1.0.0_benchmark.md)。
+如果您在研究中使用了 BindCraft v2，请同时引用 BindCraft v2 和底层 Protenix 模型：
 
-## 引用 Protenix
+```bibtex
+@article{bindcraftv2,
+  title  = {BindCraft v2: Hybrid 1st-Order + 0th-Order Optimization for Protein Binder Design},
+  author = {Your Name and Co-Authors},
+  year   = {2026}
+}
 
-若您在研究中使用 Protenix，请引用以下文献：
-
-```
-@article {Zhang2026.02.05.703733,
-	author = {Zhang, Yuxuan and Gong, Chengyue and Zhang, Hanyu and Ma, Wenzhi and Liu, Zhenyu and Chen, Xinshi and Guan, Jiaqi and Wang, Lan and Yang, Yanping and Xia, Yu and Xiao, Wenzhi},
-	title = {Protenix-v1: Toward High-Accuracy Open-Source Biomolecular Structure Prediction},
-	elocation-id = {2026.02.05.703733},
-	year = {2026},
-	doi = {10.64898/2026.02.05.703733},
-	publisher = {Cold Spring Harbor Laboratory},
-	URL = {https://www.biorxiv.org/content/early/2026/02/22/2026.02.05.703733.1},
-	eprint = {https://www.biorxiv.org/content/early/2026/02/22/2026.02.05.703733.1.full.pdf},
-	journal = {bioRxiv}
+@article{zhang2026protenix,
+  author = {Zhang, Yuxuan and Gong, Chengyue and Zhang, Hanyu and Ma, Wenzhi and Liu, Zhenyu and others},
+  title  = {Protenix-v1: Toward High-Accuracy Open-Source Biomolecular Structure Prediction},
+  journal = {bioRxiv},
+  year   = {2026},
+  doi    = {10.64898/2026.02.05.703733}
 }
 ```
 
-### 📚 引用相关工作
-
-Protenix 基于并受多项重要工作启发。若您使用 Protenix，我们也鼓励在适当处引用以下基础工作：
-
-```
-@article{abramson2024accurate,
-  title={Accurate structure prediction of biomolecular interactions with AlphaFold 3},
-  author={Abramson, Josh and Adler, Jonas and Dunger, Jack and Evans, Richard and Green, Tim and Pritzel, Alexander and Ronneberger, Olaf and Willmore, Lindsay and Ballard, Andrew J and Bambrick, Joshua and others},
-  journal={Nature},
-  volume={630},
-  number={8016},
-  pages={493--500},
-  year={2024},
-  publisher={Nature Publishing Group UK London}
-}
-@article{ahdritz2024openfold,
-  title={OpenFold: Retraining AlphaFold2 yields new insights into its learning mechanisms and capacity for generalization},
-  author={Ahdritz, Gustaf and Bouatta, Nazim and Floristean, Christina and Kadyan, Sachin and Xia, Qinghui and Gerecke, William and O'Donnell, Timothy J and Berenberg, Daniel and Fisk, Ian and Zanichelli, Niccol{\`o} and others},
-  journal={Nature Methods},
-  volume={21},
-  number={8},
-  pages={1514--1524},
-  year={2024},
-  publisher={Nature Publishing Group US New York}
-}
-@article{mirdita2022colabfold,
-  title={ColabFold: making protein folding accessible to all},
-  author={Mirdita, Milot and Sch{\"u}tze, Konstantin and Moriwaki, Yoshitaka and Heo, Lim and Ovchinnikov, Sergey and Steinegger, Martin},
-  journal={Nature methods},
-  volume={19},
-  number={6},
-  pages={679--682},
-  year={2022},
-  publisher={Nature Publishing Group US New York}
-}
-```
-
-## 参与贡献
-
-我们欢迎社区贡献以帮助改进 Protenix！
-
-📄 查看 [贡献指南](CONTRIBUTING.md) 开始参与。
-
-✅ 代码质量：我们使用 `pre-commit` 钩子确保一致性与代码质量。提交前请安装：
-
-```bash
-pip install pre-commit
-pre-commit install
-```
-
-🐞 发现 bug 或有功能建议？[提交 Issue](https://github.com/bytedance/Protenix/issues)。
-
-## 致谢
-
-LayerNorm 算子的实现参考了 [OneFlow](https://github.com/Oneflow-Inc/oneflow) 和 [FastFold](https://github.com/hpcaitech/FastFold)。我们还采用了 [OpenFold](https://github.com/aqlaboratory/openfold) 的若干[模块](protenix/openfold_local/)实现，但 [`LayerNorm`](protenix/model/layer_norm/) 为独立实现。
-
-## 行为准则
-
-我们致力于营造友好、包容的环境。请查阅 [行为准则](CODE_OF_CONDUCT.md) 了解如何以尊重的方式参与。
-
-## 安全
-
-若您发现本项目的潜在安全问题，或认为可能发现安全问题，请通过 [安全中心](https://security.bytedance.com/src) 或 [漏洞报告邮箱](sec@bytedance.com) 联系字节跳动安全团队。
-
-请**不要**在 GitHub 上公开提交相关 Issue。
+---
 
 ## 许可证
 
-Protenix 项目（包括代码和模型参数）采用 [Apache 2.0 许可证](./LICENSE) 发布，学术研究和商业使用均免费。
-
-## 联系我们
-
-我们欢迎关于模型高级应用的咨询与合作，如开发新功能、针对特定场景微调等。欢迎发送邮件至 ai4s-bio@bytedance.com。
-
-## 加入我们
-
-字节跳动 Seed-AI for Science 的 **Protenix 团队**正在扩招！我们寻找机器学习与计算生物学/化学领域的人才（*“计算生物学/化学”涵盖结构生物学、计算生物学、计算化学、药物发现等*）。岗位分布于 **北京** 和 **西雅图**，包括实习、应届生和全职。
-
-优秀候选人将有机会入选 **字节跳动 Top Seed 人才计划**，获得更多支持。
-
-### 📍 北京，中国
-
-| 类型 | 方向 | 申请链接 |
-|------------|------------------------------------|------------|
-| 全职 | 蛋白质设计科学家 | [社招](https://jobs.bytedance.com/society/position/detail/7550992796392982792) |
-| 全职 | 计算生物学/化学 | [社招](https://jobs.bytedance.com/society/position/detail/7505998274429421842)、[校招](https://job.toutiao.com/s/HGwWBs1UGR4) |
-| 全职 | 机器学习 | [社招](https://jobs.bytedance.com/society/position/detail/7505999453133015314)、[校招](https://job.toutiao.com/s/upy82CljXlY) |
-| 实习 | 计算生物学/化学 | [实习](https://job.toutiao.com/s/Wr3yig1Wet4) |
-| 实习 | 机器学习 | [实习](https://job.toutiao.com/s/w2GQQDfQUkc) |
-
-### 📍 西雅图，美国
-
-| 类型 | 方向 | 申请链接 |
-|------------|------------------------------------|------------|
-| 全职 | 计算生物学/化学 | [Experienced](https://jobs.bytedance.com/en/position/7270666468370614585/detail)、[New Grad](https://job.toutiao.com/s/iH00nSEvrFo) |
-| 全职 | 机器学习 | [Experienced](https://jobs.bytedance.com/en/position/7270665658072926521/detail)、[New Grad](https://job.toutiao.com/s/dmU_fbEHGOw) |
-| 实习 | 计算生物学/化学 | [Internship](https://job.toutiao.com/s/aiCZz0kJexs) |
-| 实习 | 机器学习 | [Internship](https://job.toutiao.com/s/DiGnn5l1QpQ) |
+BindCraft v2 采用 [Apache 2.0 许可证](./LICENSE) 发布。代码和模型参数均可免费用于学术研究和商业用途。
