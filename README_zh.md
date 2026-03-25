@@ -254,28 +254,82 @@ pip install protenix
 
 ### 2. 运行蛋白质 Binder 设计
 
-```bash
-# 微调（可选，针对特定靶点推荐使用）
-bash finetune_demo.sh
+Binder 设计入口为 `scripts/run_hallucination.py`，支持两种模式：
 
-# 设计 Binder
-bash inference_demo.sh
+#### 模式 A — 纯一阶幻觉优化（STE + 单步扩散）
+
+```bash
+python scripts/run_hallucination.py \
+    --target GIVEQCCTSICSLYQLENYCN \
+    --binder_length 40 \
+    --n_steps 200 \
+    --learning_rate 0.05 \
+    --tau_noise 4.0 \
+    --lambda_dist 2.0 \
+    --lambda_clash 1.0 \
+    --lambda_iptm -1.0 \
+    --lambda_plddt -0.5
 ```
 
-### 3. 配置说明
+#### 模式 B — 混合 1st + 0th 优化（推荐）
 
-`configs/configs_inference.py` 和 `runner/train.py` 中的关键参数：
+在一阶梯度提议的基础上，叠加零阶全链路验证 + 集束搜索：
 
-| 参数 | 描述 | 推荐值 |
+```bash
+python scripts/run_hallucination.py \
+    --target GIVEQCCTSICSLYQLENYCN \
+    --binder_length 40 \
+    --mode hybrid \
+    --n_steps 100 \
+    --learning_rate 0.05 \
+    --tau_noise 4.0 \
+    --k_top 10 \
+    --b_candidates 8 \
+    --max_mutations_per_seq 3 \
+    --use_annealing true \
+    --t_init 1.0 \
+    --t_min 0.01 \
+    --use_tau_scheduling true \
+    --tau_jitter true \
+    --lambda_dist 2.0 \
+    --lambda_clash 1.0 \
+    --lambda_iptm -1.0 \
+    --lambda_plddt -0.5
+```
+
+#### 可选：针对特定靶点微调模型
+
+```bash
+bash finetune_demo.sh
+```
+
+### 3. 关键参数说明
+
+完整参数列表可运行 `python scripts/run_hallucination.py --help`：
+
+| 参数 | 描述 | 默认值 |
 |------|------|--------|
-| `tau` | 扩散外推的噪声时间步 | 0.05–0.2 |
-| `design_steps` | 优化迭代步数 | 200–500 |
-| `lambda_distance` | 靶点结合距离损失权重 | 1.0–5.0 |
-| `lambda_clash` | 空间位阻惩罚权重 | 0.5–2.0 |
-| `lambda_iptm` | 复合物置信度权重（负值 = 最大化） | −0.5–−2.0 |
-| `temperature` | STE 的 Softmax 温度 | 0.1–0.5 |
-| `n_candidates` | 每轮迭代零阶候选数量 | 8–16 |
-| `beam_width` | 并行集束分支数量 | 4–8 |
+| `--target` | 靶点抗原序列（单字母氨基酸代码） | **必填** |
+| `--mode` | 优化模式：`first_order` 或 `hybrid` | `first_order` |
+| `--binder_length` | Binder 序列长度 | `40` |
+| `--n_steps` | 优化迭代步数 | `200` |
+| `--learning_rate` | Adam 学习率（更新 logits） | `0.05` |
+| `--tau_noise` | 单步外推的扩散噪声时间步 | `4.0` |
+| `--k_top` | 每分支采样的 Top-K (位置, 氨基酸) 候选（仅 hybrid） | `10` |
+| `--b_candidates` | 零阶验证候选序列数量（仅 hybrid） | `8` |
+| `--t_sample` | 突变选择采样温度（仅 hybrid） | `1.0` |
+| `--max_mutations_per_seq` | 每条候选序列的最大突变数（仅 hybrid） | `3` |
+| `--use_annealing` | 是否启用模拟退火（仅 hybrid） | `true` |
+| `--t_init` / `--t_min` | 退火初始/最低温度 | `1.0` / `0.01` |
+| `--use_tau_scheduling` | 是否启用粗到细时间步退火调度 | `true` |
+| `--tau_jitter` | 是否启用时间步抖动 | `true` |
+| `--lambda_dist` | Binder 与靶点热点距离损失权重 | `2.0` |
+| `--lambda_clash` | 空间位阻惩罚权重 | `1.0` |
+| `--lambda_iptm` | iPTM 复合物置信度权重（负值 = 最大化） | `-1.0` |
+| `--lambda_plddt` | pLDDT 单体置信度权重（负值 = 最大化） | `-0.5` |
+| `--model_name` | Protenix 模型变体 | `protenix_base_default_v1.0.0` |
+| `--device` | 计算设备 | `cuda` |
+| `--output_dir` | 输出目录 | `./outputs` |
 
 ---
 

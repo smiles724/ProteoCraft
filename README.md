@@ -253,30 +253,84 @@ BindCraft/
 pip install protenix
 ```
 
-### 2. Run Protein Binder Design
+### 2. Design a Protein Binder
+
+The binder design entry point is `scripts/run_hallucination.py`. It supports two modes:
+
+#### Mode A — Pure 1st-Order Hallucination (STE + One-Step Diffusion)
 
 ```bash
-# Fine-tune (optional, recommended for specific targets)
-bash finetune_demo.sh
-
-# Design a binder
-bash inference_demo.sh
+python scripts/run_hallucination.py \
+    --target GIVEQCCTSICSLYQLENYCN \
+    --binder_length 40 \
+    --n_steps 200 \
+    --learning_rate 0.05 \
+    --tau_noise 4.0 \
+    --lambda_dist 2.0 \
+    --lambda_clash 1.0 \
+    --lambda_iptm -1.0 \
+    --lambda_plddt -0.5
 ```
 
-### 3. Configuration
+#### Mode B — Hybrid 1st + 0th Order (Recommended)
 
-Key parameters in `configs/configs_inference.py` and `runner/train.py`:
+Adds 0th-order verification + beam search on top of the 1st-order gradient proposals:
 
-| Parameter | Description | Recommended |
-|-----------|-------------|-------------|
-| `tau` | Diffusion noise timestep for extrapolation | 0.05–0.2 |
-| `design_steps` | Number of optimization iterations | 200–500 |
-| `lambda_distance` | Weight for target-binding distance loss | 1.0–5.0 |
-| `lambda_clash` | Weight for steric clash penalty | 0.5–2.0 |
-| `lambda_iptm` | Weight for complex confidence (negative = maximize) | −0.5–−2.0 |
-| `temperature` | Softmax temperature for STE | 0.1–0.5 |
-| `n_candidates` | Number of 0th-order candidates per iteration | 8–16 |
-| `beam_width` | Number of parallel beam branches | 4–8 |
+```bash
+python scripts/run_hallucination.py \
+    --target GIVEQCCTSICSLYQLENYCN \
+    --binder_length 40 \
+    --mode hybrid \
+    --n_steps 100 \
+    --learning_rate 0.05 \
+    --tau_noise 4.0 \
+    --k_top 10 \
+    --b_candidates 8 \
+    --max_mutations_per_seq 3 \
+    --use_annealing true \
+    --t_init 1.0 \
+    --t_min 0.01 \
+    --use_tau_scheduling true \
+    --tau_jitter true \
+    --lambda_dist 2.0 \
+    --lambda_clash 1.0 \
+    --lambda_iptm -1.0 \
+    --lambda_plddt -0.5
+```
+
+#### Optional: Fine-Tune for Your Target
+
+```bash
+bash finetune_demo.sh
+```
+
+### 3. Key Parameters
+
+Full parameter list (`python scripts/run_hallucination.py --help`):
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--target` | Target antigen sequence (single-letter AA code) | **required** |
+| `--mode` | `first_order` or `hybrid` | `first_order` |
+| `--binder_length` | Length of binder to design | `40` |
+| `--n_steps` | Number of optimization iterations | `200` |
+| `--learning_rate` | Adam learning rate for logits update | `0.05` |
+| `--tau_noise` | Diffusion noise timestep for one-step extrapolation | `4.0` |
+| `--k_top` | Top-K (position, AA) mutations to sample per branch (hybrid only) | `10` |
+| `--b_candidates` | Number of 0th-order candidate sequences (hybrid only) | `8` |
+| `--t_sample` | Sampling temperature for mutation selection (hybrid only) | `1.0` |
+| `--max_mutations_per_seq` | Max mutations per candidate sequence (hybrid only) | `3` |
+| `--use_annealing` | Enable simulated annealing (hybrid only) | `true` |
+| `--t_init` / `--t_min` | Annealing initial / minimum temperature | `1.0` / `0.01` |
+| `--use_tau_scheduling` | Enable coarse-to-fine timestep annealing | `true` |
+| `--tau_jitter` | Enable timestep jittering within each phase | `true` |
+| `--lambda_dist` | Binder-to-hotspot distance weight | `2.0` |
+| `--lambda_clash` | Steric clash penalty weight | `1.0` |
+| `--lambda_iptm` | iPTM complex confidence weight (negative = maximize) | `-1.0` |
+| `--lambda_plddt` | pLDDT monomer confidence weight (negative = maximize) | `-0.5` |
+| `--model_name` | Protenix model variant | `protenix_base_default_v1.0.0` |
+| `--device` | Compute device | `cuda` |
+| `--output_dir` | Output directory | `./outputs` |
 
 ---
 
