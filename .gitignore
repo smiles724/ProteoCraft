@@ -136,3 +136,15 @@ cython_debug/
 wandb/
 output/
 release_data/
+
+# BindCraft v2: local runs, SLURM logs, and evaluation artifacts (do not push)
+logs/
+outputs/
+test_outputs/
+evaluation/outputs/
+
+# Generated attention cache (if present)
+protenix/model/tri_attention/TriAttentionCache/
+
+# ESM embeddings (large pre-computed features, do not push)
+esm_embeddings/

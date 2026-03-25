@@ -1,0 +1,76 @@
+"""
+BindCraft v2 - 几何 Loss 函数
+
+对标原版 BindCraft 的 Rg loss 和 Helix loss。
+Rg 使用动态目标值 2.38 * N^0.365 + elu 惩罚。
+Helix 使用 distogram 计算 i-(i+3) 接触概率。
+"""
+
+import torch
+import torch.nn.functional as F
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def compute_rg_loss(
+    binder_coords: torch.Tensor,
+    binder_len: int,
+) -> torch.Tensor:
+    """
+    Radius of gyration loss（对标原版 BindCraft add_rg_loss）。
+
+    rg_th = 2.38 * N^0.365（理论紧凑球蛋白的 Rg）
+    loss = elu(rg - rg_th)
+
+    Args:
+        binder_coords: Binder 原子坐标 [N_binder_atoms, 3]
+        binder_len: Binder 残基数（用于计算理论 Rg）
+    """
+    centroid = binder_coords.mean(dim=0, keepdim=True)
+    rg = torch.sqrt(((binder_coords - centroid) ** 2).sum(dim=-1).mean() + 1e-8)
+    rg_th = 2.38 * (binder_len ** 0.365)
+    return F.elu(rg - rg_th)
+
+
+def compute_helix_loss(
+    distogram_logits: torch.Tensor,
+    binder_token_mask: torch.Tensor,
+    distogram_params: dict,
+    cutoff: float = 6.0,
+) -> torch.Tensor:
+    """
+    Helix loss（对标原版 BindCraft add_helix_loss）。
+
+    计算 binder 区域内 i-(i+3) 残基对的接触概率。
+    接触概率越高说明越倾向于形成 alpha-helix。
+    返回值越小表示越多螺旋（loss = 1 - contact_prob）。
+
+    Args:
+        distogram_logits: [N_token, N_token, no_bins]
+        binder_token_mask: [N_token] bool, True for binder tokens
+        distogram_params: dict with min_bin, max_bin, no_bins
+        cutoff: 接触距离阈值 (Angstrom)
+    """
+    prob = F.softmax(distogram_logits, dim=-1)
+    min_bin = distogram_params["min_bin"]
+    max_bin = distogram_params["max_bin"]
+    no_bins = distogram_params["no_bins"]
+    bin_width = (max_bin - min_bin) / no_bins
+    boundaries = torch.linspace(min_bin, max_bin - bin_width, no_bins,
+                                device=prob.device)
+    bin_centers = boundaries + 0.5 * bin_width
+    thres_idx = int((bin_centers < cutoff).sum().item())
+    bins = (bin_centers < cutoff).to(distogram_logits.dtype)
+    # 对齐 ColabDesign _get_con_loss(binary=True): -log(sum_{d<cutoff} p(d))
+    helix_pair_loss = -torch.log((prob * bins).sum(dim=-1) + 1e-8)  # [N_token, N_token]
+
+    N = binder_token_mask.sum().item()
+    if N < 4:
+        return torch.tensor(0.0, device=prob.device, requires_grad=True)
+
+    binder_idx = binder_token_mask.nonzero(as_tuple=True)[0]
+    i_idx = binder_idx[:-3]
+    j_idx = binder_idx[3:]
+    helix_vals = helix_pair_loss[i_idx, j_idx]
+    return helix_vals.mean()

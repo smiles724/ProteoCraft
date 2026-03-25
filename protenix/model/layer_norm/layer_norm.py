@@ -69,7 +69,8 @@ class FusedLayerNormAffineFunction(torch.autograd.Function):
 
         ctx.normalized_shape = normalized_shape
         ctx.eps = eps
-        input_ = input.contiguous()
+        # clone() 确保 saved tensor 是独立副本，避免后续 inplace 操作污染计算图
+        input_ = input.contiguous().clone()
 
         if weight is None:
             if bias is None:
