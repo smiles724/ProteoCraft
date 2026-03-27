@@ -158,15 +158,19 @@ def main():
     parser.add_argument("--tau_jitter", type=lambda x: x.lower() == "true", default=True,
                        help="是否启用时间步抖动（默认：true）")
 
-    # === 损失函数权重 ===
-    parser.add_argument("--lambda_dist", type=float, default=2.0,
-                       help="Binder 与靶点热点距离损失权重（默认：2.0）")
-    parser.add_argument("--lambda_clash", type=float, default=1.0,
-                       help="空间位阻（Clash）惩罚权重（默认：1.0）")
-    parser.add_argument("--lambda_iptm", type=float, default=-1.0,
-                       help="iPTM 复合物置信度权重，负值 = 最大化（默认：-1.0）")
-    parser.add_argument("--lambda_plddt", type=float, default=-0.5,
-                       help="pLDDT 单体置信度权重，负值 = 最大化（默认：-0.5）")
+    # === 损失函数权重（key 必须与 DEFAULT_LOSS_WEIGHTS 一致） ===
+    parser.add_argument("--w_plddt", type=float, default=None, help="pLDDT 权重")
+    parser.add_argument("--w_pae", type=float, default=None, help="pAE (intra) 权重")
+    parser.add_argument("--w_i_pae", type=float, default=None, help="i_pAE (inter) 权重")
+    parser.add_argument("--w_con", type=float, default=None, help="con (intra contact) 权重")
+    parser.add_argument("--w_i_con", type=float, default=None, help="i_con (inter contact) 权重")
+    parser.add_argument("--w_iptm", type=float, default=None, help="iPTM 权重")
+    parser.add_argument("--w_rg", type=float, default=None, help="Rg 权重")
+    parser.add_argument("--w_helix", type=float, default=None, help="Helix 权重")
+    parser.add_argument("--w_clash", type=float, default=None, help="clash (intra) 权重")
+    parser.add_argument("--w_i_clash", type=float, default=None, help="i_clash (inter) 权重")
+    parser.add_argument("--w_pde", type=float, default=None, help="PDE (intra) 权重")
+    parser.add_argument("--w_i_pde", type=float, default=None, help="i_PDE (inter) 权重")
 
     args = parser.parse_args()
 
@@ -175,12 +179,18 @@ def main():
 
     model, configs = load_protenix_model(args.model_name, args.device)
 
-    loss_weights = {
-        "lambda_dist": args.lambda_dist,
-        "lambda_clash": args.lambda_clash,
-        "lambda_iptm": args.lambda_iptm,
-        "lambda_plddt": args.lambda_plddt,
+    # 组装 loss_weights: 仅覆盖 CLI 显式指定的项，其余保持 DEFAULT_LOSS_WEIGHTS
+    loss_weights = {}
+    weight_arg_map = {
+        "plddt": args.w_plddt, "pae": args.w_pae, "i_pae": args.w_i_pae,
+        "con": args.w_con, "i_con": args.w_i_con, "iptm": args.w_iptm,
+        "rg": args.w_rg, "helix": args.w_helix,
+        "clash": args.w_clash, "i_clash": args.w_i_clash,
+        "pde": args.w_pde, "i_pde": args.w_i_pde,
     }
+    for key, val in weight_arg_map.items():
+        if val is not None:
+            loss_weights[key] = val
 
     if args.mode == "first_order":
         best_seq, final_seq, losses_history = run_hallucination(
