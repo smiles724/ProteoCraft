@@ -118,16 +118,22 @@ class TauScheduler:
             "plddt": 0.02, "pae": 0.1, "i_pae": 0.02,
             "con": 1.5, "i_con": 1.5, "iptm": 0.01,
             "rg": 0.5, "helix": -0.3,
+            "clash": 0.2, "i_clash": 0.2,
+            "pde": 0.05, "i_pde": 0.02,
         },
         1: {
             "plddt": 0.1, "pae": 0.4, "i_pae": 0.1,
             "con": 1.0, "i_con": 1.0, "iptm": 0.05,
             "rg": 0.3, "helix": -0.3,
+            "clash": 0.5, "i_clash": 0.5,
+            "pde": 0.1, "i_pde": 0.05,
         },
         2: {
             "plddt": 0.2, "pae": 0.5, "i_pae": 0.2,
             "con": 0.8, "i_con": 0.8, "iptm": 0.1,
             "rg": 0.2, "helix": -0.3,
+            "clash": 1.0, "i_clash": 1.0,
+            "pde": 0.15, "i_pde": 0.1,
         },
     }
 

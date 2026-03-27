@@ -30,6 +30,7 @@ from bindcraft.utils import (
     NUM_AMINO_ACIDS,
     DEFAULT_LOSS_WEIGHTS,
     DEFAULT_CONTACT_PARAMS,
+    DEFAULT_CLASH_PARAMS,
 )
 from bindcraft.hallucination.diffusion_one_step import diffusion_one_step
 from bindcraft.hallucination.mutation_proposer import propose_mutations
@@ -121,6 +122,7 @@ def run_hallucination(
     plddt_params = sample_confidence.get_bin_params(model.configs.loss.plddt)
     pae_params = sample_confidence.get_bin_params(model.configs.loss.pae)
     distogram_params = sample_confidence.get_bin_params(model.configs.loss.distogram)
+    pde_params = sample_confidence.get_bin_params(model.configs.loss.pde)
 
     # ── 优化循环 ──────────────────────────────────────────────────────────
     best_loss = float('inf')
@@ -178,13 +180,16 @@ def run_hallucination(
             x0_flat=x0_flat,
             plddt_logits=heads["plddt_logits"],
             pae_logits=heads["pae_logits"],
+            pde_logits=heads["pde_logits"],
             distogram_logits=heads["distogram_logits"],
             input_feature_dict=input_feature_dict,
             L_binder=L_binder,
             weights=weights,
             contact_params=contact_params,
+            clash_params=dict(DEFAULT_CLASH_PARAMS),
             plddt_params=plddt_params,
             pae_params=pae_params,
+            pde_params=pde_params,
             distogram_params=distogram_params,
         )
 
@@ -363,6 +368,7 @@ def run_hybrid_hallucination(
     plddt_params = sample_confidence.get_bin_params(model.configs.loss.plddt)
     pae_params = sample_confidence.get_bin_params(model.configs.loss.pae)
     distogram_params = sample_confidence.get_bin_params(model.configs.loss.distogram)
+    pde_params = sample_confidence.get_bin_params(model.configs.loss.pde)
 
     # ── 状态变量 ──────────────────────────────────────────────────────────
     best_zeroth_loss = float("inf")
@@ -421,12 +427,15 @@ def run_hybrid_hallucination(
             x0_flat=x0_flat,
             plddt_logits=heads["plddt_logits"],
             pae_logits=heads["pae_logits"],
+            pde_logits=heads["pde_logits"],
             distogram_logits=heads["distogram_logits"],
             input_feature_dict=input_feature_dict,
             L_binder=L_binder, weights=step_weights,
             contact_params=contact_params,
+            clash_params=dict(DEFAULT_CLASH_PARAMS),
             plddt_params=plddt_params,
             pae_params=pae_params,
+            pde_params=pde_params,
             distogram_params=distogram_params,
         )
 
