@@ -265,8 +265,8 @@ DEFAULT_LOSS_WEIGHTS = {
     "helix":  -0.3,
     "clash":   0.5,
     "i_clash": 0.5,
-    "pde":     0.1,
-    "i_pde":   0.05,
+    "pde":     0.02,
+    "i_pde":   0.01,
 }
 
 DEFAULT_CONTACT_PARAMS = {
