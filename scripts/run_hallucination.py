@@ -71,7 +71,7 @@ def load_protenix_model(model_name: str = "protenix_base_default_v1.0.0", device
 
     logging.info(f"加载模型: {model_name}")
 
-    checkpoint_path = f"/hpc2hdd/home/bduan436/checkpoint/{model_name}.pt"
+    checkpoint_path = f"/mnt/shared-storage-gpfs2/liyanchao2/model/checkpoint/{model_name}.pt"
 
     def deep_update(d, u):
         for k, v in u.items():
@@ -89,7 +89,7 @@ def load_protenix_model(model_name: str = "protenix_base_default_v1.0.0", device
         f"--model_name {model_name} "
         f"--use_msa false "
         f"--dtype fp32 "
-        f"--load_checkpoint_dir /hpc2hdd/home/bduan436/checkpoint "
+        f"--load_checkpoint_dir /mnt/shared-storage-gpfs2/liyanchao2/model/checkpoint "
         f"--dump_dir /tmp/bindcraft_hallucination "
     )
     configs = parse_configs(
