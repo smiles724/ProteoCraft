@@ -31,7 +31,6 @@ from bindcraft.utils import (
     prepare_input_features,
     DEFAULT_LOSS_WEIGHTS,
     DEFAULT_CONTACT_PARAMS,
-    DEFAULT_CLASH_PARAMS,
 )
 from bindcraft.losses.total_loss import compute_all_losses
 
@@ -43,10 +42,12 @@ class ZerothOrderResult:
     """零阶推断的结构化返回值"""
 
     binder_seq: str
+    target_seq: str
     total_loss: float
     loss_dict: Dict[str, float]
     summary_confidence: dict
     coordinate: Optional[torch.Tensor] = field(default=None, repr=False)
+    plddt_logits: Optional[torch.Tensor] = field(default=None, repr=False)  # [1, N_atom, bins]
 
 
 def _run_full_forward(
@@ -204,7 +205,6 @@ def zeroth_order_eval(
     plddt_params = sample_confidence.get_bin_params(model.configs.loss.plddt)
     pae_params = sample_confidence.get_bin_params(model.configs.loss.pae)
     distogram_params = sample_confidence.get_bin_params(model.configs.loss.distogram)
-    pde_params = sample_confidence.get_bin_params(model.configs.loss.pde)
 
     with torch.no_grad():
         # ── 构建特征 ─────────────────────────────────────────────────────
@@ -230,22 +230,17 @@ def zeroth_order_eval(
         plddt_for_loss = plddt_logits[0:1]  # [1, N_atom, bins]，保留 N_sample 维
         pae_for_loss = pae_logits[0:1]      # [1, N_token, N_token, bins]
 
-        pde_for_loss = pde_logits[0:1]
-
         total_loss, losses = compute_all_losses(
             x0_flat=x0_flat,
             plddt_logits=plddt_for_loss,
             pae_logits=pae_for_loss,
-            pde_logits=pde_for_loss,
             distogram_logits=distogram_logits,
             input_feature_dict=input_feature_dict,
             L_binder=L_binder,
             weights=weights,
             contact_params=c_params,
-            clash_params=dict(DEFAULT_CLASH_PARAMS),
             plddt_params=plddt_params,
             pae_params=pae_params,
-            pde_params=pde_params,
             distogram_params=distogram_params,
         )
 
@@ -286,8 +281,10 @@ def zeroth_order_eval(
 
     return ZerothOrderResult(
         binder_seq=binder_seq,
+        target_seq=target_seq,
         total_loss=total_loss.item(),
         loss_dict=loss_dict,
         summary_confidence=sc_flat,
         coordinate=coordinate.cpu(),
+        plddt_logits=plddt_logits[0:1].cpu(),  # [1, N_atom, bins]
     )
