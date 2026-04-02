@@ -242,7 +242,7 @@ def run_confidence_heads(
     一次调用 confidence head，返回所有 logits，供各 loss 函数复用。
 
     Returns:
-        dict with keys: plddt_logits, pae_logits, distogram_logits
+        dict with keys: plddt_logits, pae_logits, pde_logits, distogram_logits
     """
     from protenix.model import sample_confidence
 
@@ -268,5 +268,54 @@ def run_confidence_heads(
     return {
         "plddt_logits": plddt,
         "pae_logits": pae,
+        "pde_logits": pde,
         "distogram_logits": distogram_logits,
     }
+
+
+# ── PDE Loss (intra / inter) ────────────────────────────────────────────────
+
+def compute_pde_loss(
+    pde_logits: torch.Tensor,
+    asym_id: torch.Tensor,
+    pde_params: dict,
+    mode: str = "intra",
+    contact_probs: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    PDE loss (Predicted Distance Error).
+
+    mode="intra": binder 内部 pair 的 raw mean（与 PAE intra 模式一致）。
+    mode="inter": contact-weighted gPDE（AF3 rank_metric 方式）。
+        用 contact_probs 加权，只聚焦有接触的 binder-target pair，
+        避免被大量非界面 pair 稀释。
+
+    Args:
+        pde_logits: [N_sample, N_token, N_token, pde_bins]
+        asym_id: [N_token] chain ID
+        pde_params: dict with min_bin, max_bin, no_bins
+        mode: "intra" or "inter"
+        contact_probs: [N_token, N_token] contact probability (inter only)
+    """
+    from protenix.model.sample_confidence import logits_to_score
+    pde_score = logits_to_score(pde_logits, **pde_params)
+    pde_score = pde_score / pde_params["max_bin"]
+    pde_score = 0.5 * (pde_score + pde_score.transpose(-1, -2))
+
+    binder_id = asym_id[0]
+
+    if mode == "intra":
+        mask = (asym_id == binder_id).unsqueeze(0) & (asym_id == binder_id).unsqueeze(1)
+        n = mask.sum()
+        if n == 0:
+            return torch.tensor(0.0, device=pde_score.device, requires_grad=True)
+        return (pde_score * mask.unsqueeze(0).float()).sum() / (n * pde_score.shape[0])
+    else:
+        # contact-weighted gPDE: sum(PDE * contact_probs) / sum(contact_probs)
+        assert contact_probs is not None, "inter mode requires contact_probs"
+        mask_inter = (asym_id == binder_id).unsqueeze(0) != (asym_id == binder_id).unsqueeze(1)
+        weighted_mask = contact_probs * mask_inter.float()
+        denom = weighted_mask.sum()
+        if denom < 1e-8:
+            return torch.tensor(0.0, device=pde_score.device, requires_grad=True)
+        return (pde_score * weighted_mask.unsqueeze(0)).sum() / (denom * pde_score.shape[0])

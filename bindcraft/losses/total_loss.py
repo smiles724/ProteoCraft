@@ -1,9 +1,11 @@
 """
 BindCraft v2 - 统一 Loss 计算
 
-将 8 项 loss（pLDDT / pAE / i_pAE / con / i_con / iPTM / Rg / Helix）的
-计算逻辑集中到一个函数中，供一阶优化（pipeline.py）和零阶验证（zeroth_order.py）
-共同调用，避免两处逻辑不一致。
+将 12 项 loss 的计算逻辑集中到一个函数中，供一阶优化（pipeline.py）
+和零阶验证（zeroth_order.py）共同调用，避免两处逻辑不一致。
+
+原有 8 项: pLDDT / pAE / i_pAE / con / i_con / iPTM / Rg / Helix
+新增 4 项: clash / i_clash / pde / i_pde
 """
 
 import torch
@@ -15,10 +17,12 @@ from bindcraft.losses.confidence import (
     compute_plddt_loss,
     compute_pae_loss,
     compute_contact_loss,
+    compute_pde_loss,
 )
 from bindcraft.losses.geometry import (
     compute_rg_loss,
     compute_helix_loss,
+    compute_soft_clash_loss,
 )
 
 
@@ -34,9 +38,12 @@ def compute_all_losses(
     plddt_params: dict,
     pae_params: dict,
     distogram_params: dict,
+    pde_logits: torch.Tensor = None,
+    pde_params: dict = None,
+    clash_params: Dict[str, float] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    在给定的全原子坐标和 confidence logits 上计算全部 8 项 loss。
+    在给定的全原子坐标和 confidence logits 上计算全部 12 项 loss。
 
     Args:
         x0_flat:           全原子坐标 [N_atoms, 3]（squeeze 后，无 batch 维）
@@ -50,6 +57,9 @@ def compute_all_losses(
         plddt_params:      pLDDT 的 bin 参数 (min_bin, max_bin, no_bins)
         pae_params:        PAE 的 bin 参数
         distogram_params:  Distogram 的 bin 参数
+        pde_logits:        PDE logits [N_sample, N_token, N_token, pde_bins] (None to skip)
+        pde_params:        PDE 的 bin 参数 (None to skip)
+        clash_params:      碰撞 loss 参数 (r_clash, bond_sep) (None to skip)
 
     Returns:
         total_loss: 加权总 loss（标量 tensor）
@@ -65,6 +75,7 @@ def compute_all_losses(
     target_token_mask = ~binder_token_mask
 
     binder_atom_mask = binder_token_mask[atom_to_token]
+    target_atom_mask = target_token_mask[atom_to_token]
 
     rep_atom_mask = input_feature_dict.get("distogram_rep_atom_mask", None)
     if rep_atom_mask is not None:
@@ -160,6 +171,54 @@ def compute_all_losses(
         )
         losses["helix"] = l_helix
         total_loss = total_loss + weights["helix"] * l_helix
+
+    # ── 新增: Clash ──────────────────────────────────────────────────────
+
+    _clash_params = clash_params or {}
+
+    # clash (intra)
+    if weights.get("clash", 0) != 0:
+        l_clash = compute_soft_clash_loss(
+            x0_flat, binder_atom_mask, target_atom_mask,
+            atom_to_token, input_feature_dict.get("residue_index", asym_id),
+            mode="intra",
+            r_clash=_clash_params.get("r_clash", 2.0),
+            bond_sep=_clash_params.get("bond_sep", 1),
+        )
+        losses["clash"] = l_clash
+        total_loss = total_loss + weights["clash"] * l_clash
+
+    # i_clash (inter)
+    if weights.get("i_clash", 0) != 0:
+        l_iclash = compute_soft_clash_loss(
+            x0_flat, binder_atom_mask, target_atom_mask,
+            atom_to_token, input_feature_dict.get("residue_index", asym_id),
+            mode="inter",
+            r_clash=_clash_params.get("r_clash", 2.0),
+            bond_sep=_clash_params.get("bond_sep", 1),
+        )
+        losses["i_clash"] = l_iclash
+        total_loss = total_loss + weights["i_clash"] * l_iclash
+
+    # ── 新增: PDE ────────────────────────────────────────────────────────
+
+    # pde (intra)
+    if weights.get("pde", 0) != 0 and pde_logits is not None and pde_params is not None:
+        l_pde = compute_pde_loss(pde_logits, asym_id, pde_params, mode="intra")
+        losses["pde"] = l_pde
+        total_loss = total_loss + weights["pde"] * l_pde
+
+    # i_pde (inter, contact-weighted gPDE)
+    if weights.get("i_pde", 0) != 0 and pde_logits is not None and pde_params is not None:
+        contact_probs = sample_confidence.compute_contact_prob(
+            distogram_logits=distogram_logits, **distogram_params,
+        )
+        l_ipde = compute_pde_loss(
+            pde_logits, asym_id, pde_params, mode="inter",
+            contact_probs=contact_probs,
+        )
+        losses["i_pde"] = l_ipde
+        total_loss = total_loss + weights["i_pde"] * l_ipde
 
     losses["total"] = total_loss
     return total_loss, losses

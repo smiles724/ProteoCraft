@@ -31,6 +31,7 @@ from bindcraft.utils import (
     prepare_input_features,
     DEFAULT_LOSS_WEIGHTS,
     DEFAULT_CONTACT_PARAMS,
+    DEFAULT_CLASH_PARAMS,
 )
 from bindcraft.losses.total_loss import compute_all_losses
 
@@ -205,6 +206,7 @@ def zeroth_order_eval(
     plddt_params = sample_confidence.get_bin_params(model.configs.loss.plddt)
     pae_params = sample_confidence.get_bin_params(model.configs.loss.pae)
     distogram_params = sample_confidence.get_bin_params(model.configs.loss.distogram)
+    pde_params = sample_confidence.get_bin_params(model.configs.loss.pde)
 
     with torch.no_grad():
         # ── 构建特征 ─────────────────────────────────────────────────────
@@ -220,7 +222,7 @@ def zeroth_order_eval(
             distogram_logits, contact_probs,
         ) = _run_full_forward(model, input_feature_dict, device, N_cycle)
 
-        # ── 计算 8 项 loss ───────────────────────────────────────────────
+        # ── 计算 12 项 loss ──────────────────────────────────────────────
         # coordinate 形状: [N_sample, N_atom, 3]
         # compute_all_losses 期望 x0_flat: [N_atom, 3]
         # plddt_logits: [N_sample, N_atom, bins]
@@ -229,6 +231,7 @@ def zeroth_order_eval(
         x0_flat = coordinate[0]  # [N_atom, 3]
         plddt_for_loss = plddt_logits[0:1]  # [1, N_atom, bins]，保留 N_sample 维
         pae_for_loss = pae_logits[0:1]      # [1, N_token, N_token, bins]
+        pde_for_loss = pde_logits[0:1]      # [1, N_token, N_token, bins]
 
         total_loss, losses = compute_all_losses(
             x0_flat=x0_flat,
@@ -242,6 +245,9 @@ def zeroth_order_eval(
             plddt_params=plddt_params,
             pae_params=pae_params,
             distogram_params=distogram_params,
+            pde_logits=pde_for_loss,
+            pde_params=pde_params,
+            clash_params=dict(DEFAULT_CLASH_PARAMS),
         )
 
         # ── Summary Confidence（Protenix 原生指标）────────────────────────

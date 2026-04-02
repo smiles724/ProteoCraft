@@ -263,6 +263,10 @@ DEFAULT_LOSS_WEIGHTS = {
     "iptm":    0.05,
     "rg":      0.3,
     "helix":  -0.3,
+    "clash":   0.5,
+    "i_clash": 0.5,
+    "pde":     0.02,
+    "i_pde":   0.01,
 }
 
 DEFAULT_CONTACT_PARAMS = {
@@ -271,4 +275,9 @@ DEFAULT_CONTACT_PARAMS = {
     "intra_num":     2,
     "inter_num":     2,
     "seqsep":        9,
+}
+
+DEFAULT_CLASH_PARAMS = {
+    "r_clash":   2.0,
+    "bond_sep":  1,
 }

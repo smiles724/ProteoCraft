@@ -295,6 +295,8 @@ def diffusion_one_step_fused(
     tau_fine: float = 0.05,
     alpha: float = 0.5,
     device: torch.device = None,
+    pde_params=None,
+    clash_params=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     多频段 τ 融合：在同一优化步中，分别用粗粒度 tau 和细粒度 tau 各执行一次
@@ -358,6 +360,7 @@ def diffusion_one_step_fused(
         x0_coarse.squeeze(0), heads_coarse, input_feature_dict,
         L_binder, step_weights, contact_params,
         plddt_params, pae_params, distogram_params,
+        pde_params=pde_params, clash_params=clash_params,
     )
     loss_coarse.backward(retain_graph=True)
     G_coarse = theta.grad.clone()
@@ -396,6 +399,7 @@ def diffusion_one_step_fused(
         x0_fine.squeeze(0), heads_fine, input_feature_dict,
         L_binder, step_weights, contact_params,
         plddt_params, pae_params, distogram_params,
+        pde_params=pde_params, clash_params=clash_params,
     )
     loss_fine.backward()
     G_fine = theta.grad.clone()
@@ -425,7 +429,8 @@ def _run_confidence_heads(model, input_feature_dict, s_inputs, s_trunk, z_trunk,
 
 
 def _compute_loss(x0_flat, heads, input_feature_dict, L_binder, weights,
-                   contact_params, plddt_params, pae_params, distogram_params):
+                   contact_params, plddt_params, pae_params, distogram_params,
+                   pde_params=None, clash_params=None):
     from bindcraft.losses.total_loss import compute_all_losses
     return compute_all_losses(
         x0_flat=x0_flat,
@@ -436,4 +441,6 @@ def _compute_loss(x0_flat, heads, input_feature_dict, L_binder, weights,
         L_binder=L_binder, weights=weights,
         contact_params=contact_params,
         plddt_params=plddt_params, pae_params=pae_params, distogram_params=distogram_params,
+        pde_logits=heads.get("pde_logits"),
+        pde_params=pde_params, clash_params=clash_params,
     )

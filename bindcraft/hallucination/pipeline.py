@@ -31,6 +31,7 @@ from bindcraft.utils import (
     NUM_AMINO_ACIDS,
     DEFAULT_LOSS_WEIGHTS,
     DEFAULT_CONTACT_PARAMS,
+    DEFAULT_CLASH_PARAMS,
 )
 from bindcraft.hallucination.diffusion_one_step import (
     diffusion_one_step,
@@ -125,6 +126,7 @@ def run_hallucination(
     plddt_params = sample_confidence.get_bin_params(model.configs.loss.plddt)
     pae_params = sample_confidence.get_bin_params(model.configs.loss.pae)
     distogram_params = sample_confidence.get_bin_params(model.configs.loss.distogram)
+    pde_params = sample_confidence.get_bin_params(model.configs.loss.pde)
 
     # ── 优化循环 ──────────────────────────────────────────────────────────
     best_loss = float('inf')
@@ -190,6 +192,9 @@ def run_hallucination(
             plddt_params=plddt_params,
             pae_params=pae_params,
             distogram_params=distogram_params,
+            pde_logits=heads["pde_logits"],
+            pde_params=pde_params,
+            clash_params=dict(DEFAULT_CLASH_PARAMS),
         )
 
         # ── 反向传播 ─────────────────────────────────────────────────────
@@ -440,6 +445,7 @@ def run_hybrid_hallucination(
     plddt_params = sample_confidence.get_bin_params(model.configs.loss.plddt)
     pae_params = sample_confidence.get_bin_params(model.configs.loss.pae)
     distogram_params = sample_confidence.get_bin_params(model.configs.loss.distogram)
+    pde_params = sample_confidence.get_bin_params(model.configs.loss.pde)
 
     # ── Step 0: 零阶全链路初始化（与算法指导文档 5.1 节对齐）───────────────
     logger.info("=" * 70)
@@ -549,6 +555,8 @@ def run_hybrid_hallucination(
                     tau_fine=tau_fine,
                     alpha=alpha,
                     device=device,
+                    pde_params=pde_params,
+                    clash_params=dict(DEFAULT_CLASH_PARAMS),
                 )
                 torch.nn.utils.clip_grad_norm_([thetas[b]], 1.0)
                 optimizers[b].step()
@@ -583,6 +591,9 @@ def run_hybrid_hallucination(
                     plddt_params=plddt_params,
                     pae_params=pae_params,
                     distogram_params=distogram_params,
+                    pde_logits=heads["pde_logits"],
+                    pde_params=pde_params,
+                    clash_params=dict(DEFAULT_CLASH_PARAMS),
                 )
 
                 first_order_loss.backward()

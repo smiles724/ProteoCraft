@@ -74,3 +74,60 @@ def compute_helix_loss(
     j_idx = binder_idx[3:]
     helix_vals = helix_pair_loss[i_idx, j_idx]
     return helix_vals.mean()
+
+
+def compute_soft_clash_loss(
+    x0_flat: torch.Tensor,
+    binder_atom_mask: torch.Tensor,
+    target_atom_mask: torch.Tensor,
+    atom_to_token_idx: torch.Tensor,
+    residue_index: torch.Tensor,
+    mode: str = "intra",
+    r_clash: float = 2.0,
+    bond_sep: int = 1,
+) -> torch.Tensor:
+    """
+    Soft clash penalty: quadratic repulsion for atom pairs closer than r_clash.
+
+    Intra: penalizes binder internal clashes (excludes bonded atoms via
+        residue_index separation <= bond_sep to avoid penalizing peptide bonds).
+    Inter: penalizes binder-target clashes, normalized by N_binder_atoms
+        (target-size invariant).
+
+    Args:
+        x0_flat: [N_atoms, 3] all-atom coordinates
+        binder_atom_mask: [N_atoms] bool
+        target_atom_mask: [N_atoms] bool
+        atom_to_token_idx: [N_atoms] token index per atom
+        residue_index: [N_tokens] residue index per token
+        mode: "intra" or "inter"
+        r_clash: clash distance threshold (Angstrom)
+        bond_sep: minimum residue separation to consider (intra only)
+    """
+    if mode == "inter":
+        coords_a = x0_flat[binder_atom_mask]
+        coords_b = x0_flat[target_atom_mask]
+        n_binder = coords_a.shape[0]
+        if n_binder == 0:
+            return torch.tensor(0.0, device=x0_flat.device, requires_grad=True)
+        dist = torch.cdist(coords_a, coords_b)
+        clash = torch.clamp(r_clash - dist, min=0) ** 2
+        return clash.sum() / n_binder
+    else:
+        coords = x0_flat[binder_atom_mask]
+        if coords.shape[0] < 2:
+            return torch.tensor(0.0, device=x0_flat.device, requires_grad=True)
+        dist = torch.cdist(coords, coords)
+
+        token_idx = atom_to_token_idx[binder_atom_mask]
+        res_idx = residue_index[token_idx]
+        sep = (res_idx.unsqueeze(1) - res_idx.unsqueeze(0)).abs()
+        bonded = sep <= bond_sep
+
+        mask_valid = ~bonded
+        mask_valid.fill_diagonal_(False)
+
+        clash = torch.clamp(r_clash - dist, min=0) ** 2
+        clash = clash * mask_valid.float()
+        n_pairs = mask_valid.sum().clamp(min=1)
+        return clash.sum() / n_pairs
