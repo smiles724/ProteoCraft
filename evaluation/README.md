@@ -32,30 +32,29 @@ datasets/PXM-22to25-Ab-Ag/retrodiction_list.csv  (450 条)
 
 ### 核心原则：同一把尺子
 
-三组序列全部通过 `zeroth_order_eval()` 做完整 AF3 推断，用同一套指标（iPTM / pLDDT / total_loss）打分，实现完全公平的对比。
+四组序列全部通过 `zeroth_order_eval()` 做完整 AF3 推断，用同一套指标（iPTM / pLDDT / total_loss）打分，实现完全公平的对比。
 
 | 组别 | 序列来源 | 序列长度 | 评估方式 |
 |------|----------|----------|----------|
-| **designed** | BindCraft v2 设计 | 40aa | AF3 完整推断 |
-| **random** | 等长随机氨基酸 | 40aa | AF3 完整推断 |
-| **real** | 真实抗体重链 | ~120aa | AF3 完整推断 |
+| **designed** | BindCraft v2 设计的 80aa binder | 80aa | AF3 完整推断 |
+| **random** | 等长随机氨基酸 | 80aa | AF3 完整推断 |
+| **real_vh** | 仅重链（~115aa） | ~115aa | AF3 完整推断 |
+| **real_full** | 完整 H+L 链（~430aa） | ~430aa | AF3 完整推断 |
 
-### real 组使用完整重链
+### real_vh vs real_full 的设计意图
 
-- 真实抗体的完整 Fab 为 H+L 链（120-430aa），但重链（VH + CH1）中位数仅 120aa
-- 79 个案例的 target + heavy <= 300aa，A40 46GB 完全跑得动
-- real 组直接使用 `binder_sequence_heavy`，不截断
-- target + heavy 超过 400aa 的案例自动跳过 real 组推断
+- **real_vh**：仅重链（~115aa），与 designed/random 长度最接近，做公平长度对比
+- **real_full**：完整 H+L 链（~430aa），与 ab-raw.csv DockQ 参考条件一致
 
 ### DockQ 参考
 
-`ab-raw.csv` 中 Protenix-v1 在完整真实序列上预测结构与实验 PDB 结构对比得出的 DockQ，附在 real 行的 `dockq_ref` 列作为额外参考。这不是评估指标，而是该案例的"结构预测质量上界"。
+`ab-raw.csv` 中 Protenix-v1 在完整真实序列上预测结构与实验 PDB 结构对比得出的 DockQ，附在 `real_full` 行的 `dockq_ref` 列作为额外参考。这不是评估指标，而是该案例的"结构预测质量上界"。
 
 ### 预期结果
 
 - **real > designed > random**: 真实抗体重链的 AF3 置信度应最高，设计序列居中，随机序列最低
 - designed vs random 的差距量化了优化的有效性
-- designed vs real 的差距量化了设计质量离真实抗体还有多远
+- designed vs real_vh 的差距量化了设计质量离真实抗体还有多远
 
 ## Pipeline 使用方法
 
@@ -67,17 +66,17 @@ datasets/PXM-22to25-Ab-Ag/retrodiction_list.csv  (450 条)
 python evaluation/select_cases.py --top_n 10
 ```
 
-从 450 条中筛选 target 长度在 [80, 400] 之间、真实抗体 DockQ 最高的 10 条。
+从 450 条中筛选 target 长度在 [80, 570] 之间、真实抗体 DockQ 最高的 10 条。
 
 ### Step 2: 批量设计 binder
 
 ```bash
 CUDA_VISIBLE_DEVICES=3 python evaluation/run_design.py \
     --cases evaluation/outputs/selected_cases.csv \
-    --n_steps 50 --b_candidates 4
+    --n_steps 50 --b_candidates 2 --l_binder 80
 ```
 
-对每个 target 运行 `run_hybrid_hallucination()`，同时生成随机基线。
+对每个 target 运行 `run_hybrid_hallucination()`，同时生成随机基线。支持 `--num_beams 1`（单路径）或 `--num_beams 2`（Beam Search，显存压力大）。
 
 ### Step 3: 三组统一评估
 
@@ -85,7 +84,7 @@ CUDA_VISIBLE_DEVICES=3 python evaluation/run_design.py \
 CUDA_VISIBLE_DEVICES=3 python evaluation/run_eval.py
 ```
 
-三组序列（designed / random / real）全部通过 AF3 推断打分。
+四组序列（designed / random / real_vh / real_full）全部通过 AF3 推断打分。
 
 ### Step 4: 生成对比报告
 
@@ -93,21 +92,21 @@ CUDA_VISIBLE_DEVICES=3 python evaluation/run_eval.py
 python evaluation/analyze_results.py
 ```
 
-生成对比表、汇总统计、配对比较、DockQ 参考。
+生成对比表、汇总统计、配对比较（designed vs random, designed vs real_vh）、DockQ 参考。
 
 ## 评估指标说明
 
 | 指标 | 来源 | 含义 | 方向 | 适用 |
 |------|------|------|------|------|
-| total_loss | BindCraft loss | 8 项加权和 | 越低越好 | 三组 |
-| mean_pLDDT | summary_confidence | 平均 per-residue 置信度 (0-100) | 越高越好 | 三组 |
-| iPTM | summary_confidence | 界面 pTM 置信度 (0-1) | 越高越好 | 三组 |
-| pTM | summary_confidence | 全局 pTM 置信度 (0-1) | 越高越好 | 三组 |
-| DockQ_ref | ab-raw.csv | 预测结构 vs 实验 PDB 对接质量 (0-1) | 越高越好 | 仅 real 参考 |
+| total_loss | BindCraft loss | 8 项加权和 | 越低越好 | 全部 |
+| mean_pLDDT | summary_confidence | 平均 per-residue 置信度 (0-100) | 越高越好 | 全部 |
+| iPTM | summary_confidence | 界面 pTM 置信度 (0-1) | 越高越好 | 全部 |
+| pTM | summary_confidence | 全局 pTM 置信度 (0-1) | 越高越好 | 全部 |
+| DockQ_ref | ab-raw.csv | 预测结构 vs 实验 PDB 对接质量 (0-1) | 越高越好 | 仅 real_full 参考 |
 
 ## 已知局限
 
-1. **长度不对称**: 设计 binder (40aa) 与真实重链 (~120aa) 长度不同，AF3 对长序列可能有天然的置信度偏好
-2. **计算成本**: 零阶推断 ~8-10s/条（40aa），~15-25s/条（120aa）；设计阶段 ~40s/step
+1. **长度不对称**: designed/random (80aa) vs real_vh (~115aa) vs real_full (~430aa)，长度不同对 AF3 置信度可能有天然偏好
+2. **计算成本**: 零阶推断 ~8-10s/条（80aa），~15-25s/条（115aa）；设计阶段 ~40s/step
 3. **模型偏差**: AF3/Protenix 的置信度指标不等同于实验结合亲和力
-4. **序列形式**: mini-binder (40aa) 与天然抗体重链的功能空间不同
+4. **序列形式**: mini-binder (80aa) 与天然抗体重链的功能空间不同

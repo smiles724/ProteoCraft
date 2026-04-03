@@ -3,9 +3,9 @@
 Retrodiction 评估 Pipeline - Step 4: 结果分析
 
 读取 eval_results.csv，生成：
-1. 每个 entry_id 三组序列的指标对比表（统一 AF3 指标 + DockQ 参考）
-2. 汇总统计（三组用同一把尺子：iPTM / pLDDT / total_loss）
-3. 配对比较：designed vs random, designed vs real
+1. 每个 entry_id 四组序列的指标对比表（统一 AF3 指标 + DockQ 参考）
+2. 汇总统计（四组用同一把尺子：iPTM / pLDDT / total_loss）
+3. 配对比较：designed vs random, designed vs real_vh
 4. evaluation_report.md
 
 用法:
@@ -89,7 +89,7 @@ def generate_report(csv_path: str, out_path: str):
     lines.append("# Retrodiction 评估报告\n")
     lines.append(f"数据: {csv_path}\n")
     lines.append(f"Entry 数: {len(grouped)}\n")
-    lines.append("三组序列全部通过 AF3 完整推断，用同一把尺子（iPTM / pLDDT / total_loss）打分。\n")
+    lines.append("四组序列全部通过 AF3 完整推断，用同一把尺子（iPTM / pLDDT / total_loss）打分。\n")
 
     # ── 逐 entry 对比表 ─────────────────────────────────────────────────
     lines.append("\n## 逐案例对比\n")
@@ -102,7 +102,7 @@ def generate_report(csv_path: str, out_path: str):
         "-----------|------|-----|-----------|"
     )
     for eid in sorted(grouped):
-        for st in ["designed", "random", "real"]:
+        for st in ["designed", "random", "real_vh", "real_full"]:
             r = grouped[eid].get(st)
             if r is None:
                 continue
@@ -115,8 +115,8 @@ def generate_report(csv_path: str, out_path: str):
                 f"{fmt(r['dockq_ref'])} |"
             )
 
-    # ── 汇总统计（三组统一指标）────────────────────────────────────────────
-    lines.append("\n## 汇总统计（三组统一 AF3 指标）\n")
+    # ── 汇总统计（四组统一指标）────────────────────────────────────────────
+    lines.append("\n## 汇总统计（四组统一 AF3 指标）\n")
 
     type_metrics = defaultdict(lambda: defaultdict(list))
     for r in rows:
@@ -130,7 +130,7 @@ def generate_report(csv_path: str, out_path: str):
     lines.append(
         "|----------|---|------------|-----------|------|-----|"
     )
-    for st in ["designed", "random", "real"]:
+    for st in ["designed", "random", "real_vh", "real_full"]:
         m = type_metrics.get(st)
         if not m:
             continue
@@ -188,16 +188,16 @@ def generate_report(csv_path: str, out_path: str):
     else:
         lines.append("无可配对数据。\n")
 
-    # ── 配对比较 (designed vs real) ──────────────────────────────────────
-    lines.append("\n## 配对比较: designed vs real\n")
+    # ── 配对比较 (designed vs real_vh) ────────────────────────────────────
+    # real_vh 使用仅重链（~115aa），与 designed/random 长度最接近，可做长度接近的公平对比
 
     paired_dreal = [
         eid for eid in grouped
-        if "designed" in grouped[eid] and "real" in grouped[eid]
+        if "designed" in grouped[eid] and "real_vh" in grouped[eid]
     ]
     if paired_dreal:
         lines.append(
-            "三组均通过 AF3 推断，指标完全可比。real 使用完整重链序列（~120aa）。\n"
+            "三组均通过 AF3 推断，指标完全可比。real_vh 使用仅重链序列（~115aa）。\n"
         )
 
         wins_real = {"total_loss": 0, "iptm_conf": 0, "mean_plddt_conf": 0}
@@ -205,15 +205,15 @@ def generate_report(csv_path: str, out_path: str):
 
         lines.append(
             "| entry_id | designed_iPTM | designed_pLDDT | "
-            "real_iPTM | real_pLDDT | DockQ_ref |"
+            "real_vh_iPTM | real_vh_pLDDT | DockQ_ref |"
         )
         lines.append(
             "|----------|--------------|----------------|"
-            "----------|------------|-----------|"
+            "--------------|----------------|-----------|"
         )
         for eid in sorted(paired_dreal):
             d = grouped[eid]["designed"]
-            r = grouped[eid]["real"]
+            r = grouped[eid]["real_vh"]
             lines.append(
                 f"| {eid} | {fmt(d['iptm_conf'])} | {fmt(d['mean_plddt_conf'], 1)} | "
                 f"{fmt(r['iptm_conf'])} | {fmt(r['mean_plddt_conf'], 1)} | "
@@ -240,13 +240,13 @@ def generate_report(csv_path: str, out_path: str):
 
         mean_diff_iptm_r, _, _ = compute_stats(diffs_iptm_real)
         mean_diff_plddt_r, _, _ = compute_stats(diffs_plddt_real)
-        lines.append(f"\n平均 iPTM 差异 (designed - real): {fmt(mean_diff_iptm_r, 4)}")
-        lines.append(f"平均 pLDDT 差异 (designed - real): {fmt(mean_diff_plddt_r, 1)}")
+        lines.append(f"\n平均 iPTM 差异 (designed - real_vh): {fmt(mean_diff_iptm_r, 4)}")
+        lines.append(f"平均 pLDDT 差异 (designed - real_vh): {fmt(mean_diff_plddt_r, 1)}")
     else:
         lines.append("无可配对数据。\n")
 
-    # ── DockQ 参考信息 ───────────────────────────────────────────────────
-    real_with_dockq = [r for r in rows if r["seq_type"] == "real" and r["dockq_ref"] is not None]
+    # ── DockQ 参考信息（附在 real_full 组，ab-raw.csv 中 DockQ 是在完整 H+L+Antigen 条件下计算的）─
+    real_with_dockq = [r for r in rows if r["seq_type"] == "real_full" and r["dockq_ref"] is not None]
     if real_with_dockq:
         lines.append("\n## DockQ 参考（ab-raw.csv，Protenix-v1 vs 实验 PDB）\n")
         dockq_vals = [r["dockq_ref"] for r in real_with_dockq]

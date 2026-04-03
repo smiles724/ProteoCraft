@@ -5,8 +5,8 @@ Retrodiction 评估 Pipeline - Step 3: 零阶全链路评估
 四组序列（designed / random / real_vh / real_full）全部通过 zeroth_order_eval() AF3 推断，
 用同一把尺子（iPTM / pLDDT / total_loss）打分。
 
-  - designed / random: BindCraft v2 设计的 40aa binder 及等长随机对照
-  - real_vh: 仅重链（~115aa），与 designed/random 长度最接近，可做长度接近的公平对比
+  - designed / random: BindCraft v2 设计的 80aa binder 及等长随机对照
+  - real_vh: 仅重链（~115aa），与 designed/random 长度最接近，做公平长度对比
   - real_full: 完整 H+L 链（~430aa），与 ab-raw.csv DockQ 参考条件一致
 
 DockQ 参考列仅附加到 real_full 组（因为 ab-raw.csv 中的 DockQ 是在完整 H+L+Antigen 复合物上计算的）。
