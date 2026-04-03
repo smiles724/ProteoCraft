@@ -184,10 +184,16 @@ def download_pdb(pdb_id: str, out_dir: Path = STRUCTURES_DIR) -> Path:
 
     url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
     logging.info(f"Downloading {url} ...")
+    import subprocess
     try:
-        urllib.request.urlretrieve(url, out_path)
-    except Exception as e:
+        result = subprocess.run(
+            ["curl", "-sL", url, "--noproxy", "*", "-o", str(out_path)],
+            check=True, timeout=60
+        )
+    except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Failed to download {pdb_id} from RCSB: {e}")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Timeout downloading {pdb_id} from RCSB")
 
     logging.info(f"Saved to {out_path}")
     return out_path
