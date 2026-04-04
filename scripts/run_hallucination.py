@@ -61,6 +61,7 @@ def setup_logging(log_file: str = None):
 
 
 def load_protenix_model(model_name: str = "protenix_base_default_v1.0.0", device: str = "cuda"):
+    import os as _os
     from collections.abc import Mapping
     from protenix.config.config import parse_configs
     from configs.configs_base import configs as configs_base
@@ -71,7 +72,13 @@ def load_protenix_model(model_name: str = "protenix_base_default_v1.0.0", device
 
     logging.info(f"加载模型: {model_name}")
 
-    checkpoint_path = f"/mnt/shared-storage-gpfs2/liyanchao2/model/checkpoint/{model_name}.pt"
+    # 本地 checkpoint 目录
+    _script_dir = _os.path.dirname(_os.path.abspath(__file__))           # scripts/
+    _project_dir = _os.path.dirname(_script_dir)                         # Bindcraftv2/
+    _ckpt_dir = _os.path.join(_project_dir, "checkpoint")                # Bindcraftv2/checkpoint/
+    _os.makedirs(_ckpt_dir, exist_ok=True)
+    checkpoint_path = _os.path.join(_ckpt_dir, f"{model_name}.pt")
+    logging.info(f"Checkpoint: {checkpoint_path}")
 
     def deep_update(d, u):
         for k, v in u.items():
@@ -89,7 +96,7 @@ def load_protenix_model(model_name: str = "protenix_base_default_v1.0.0", device
         f"--model_name {model_name} "
         f"--use_msa false "
         f"--dtype fp32 "
-        f"--load_checkpoint_dir /mnt/shared-storage-gpfs2/liyanchao2/model/checkpoint "
+        f"--load_checkpoint_dir {_ckpt_dir} "
         f"--dump_dir /tmp/bindcraft_hallucination "
     )
     configs = parse_configs(

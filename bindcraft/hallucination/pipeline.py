@@ -290,7 +290,7 @@ def run_hybrid_hallucination(
     tau_coarse: float = 0.8,
     tau_fine: float = 0.05,
     alpha: float = 0.5,
-    use_macro_breathing: bool = True,
+    use_macro_breathing: bool = False,
     breath_patience: int = 8,
     breath_tau_recovery: float = 0.9,
     breath_con_factor: float = 0.3,
@@ -697,7 +697,7 @@ def run_hybrid_hallucination(
                 optimizers[0].state.clear()
                 optimizers[0] = torch.optim.Adam([thetas[0]], lr=learning_rate)
 
-            losses_history.append(round_best_loss)
+            losses_history.append(round_best_loss if accepted else beam_losses[0])
             fo_val = step_fo_losses[0]
             logger.info(
                 f"Step {step:3d}/{N_steps} | phase={phase_name} | tau={step_tau:.3f} | T={anneal_T:.4f} | "
@@ -763,7 +763,7 @@ def run_hybrid_hallucination(
                     optimizers[src_beam].state.clear()
                     optimizers[src_beam] = torch.optim.Adam([thetas[src_beam]], lr=learning_rate)
 
-            losses_history.append(best_zeroth_loss)
+            losses_history.append(min(beam_losses))
             valid_fo = [v for v in step_fo_losses if v is not None]
             fo_val_str = "N/A(τ-fusion)" if not valid_fo else f"{min(valid_fo):.4f}"
             beam_loss_str = " | ".join(

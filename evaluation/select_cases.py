@@ -87,7 +87,8 @@ def select_cases(top_n: int = SELECT_TOP_N):
     out_path = os.path.join(OUTPUT_DIR, "selected_cases.csv")
     fieldnames = [
         "entry_id", "target_sequence", "binder_sequence_heavy",
-        "binder_sequence", "target_length", "binder_length", "best_dockq",
+        "binder_sequence_light", "binder_sequence", "target_length",
+        "binder_length", "best_dockq",
     ]
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")

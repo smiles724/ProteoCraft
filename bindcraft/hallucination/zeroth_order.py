@@ -56,12 +56,18 @@ def _run_full_forward(
     input_feature_dict: Dict,
     device: torch.device,
     N_cycle: int = 4,
+    chunk_size: int = None,
 ) -> tuple:
     """
     手动分步执行 Protenix 完整推断流程。
 
     与 _main_inference_loop 等价，但保留对 z_trunk 的引用，
     以便后续直接计算 distogram_logits。
+
+    Args:
+        chunk_size: Attention 分块大小（None 表示不分块）。
+                   当 complex 较大（如 114+ aa binder）时建议设为 256，
+                   避免 OOM。
 
     Returns:
         coordinate:       [N_sample, N_atom, 3]
@@ -178,6 +184,7 @@ def zeroth_order_eval(
     loss_weights: Dict[str, float] = None,
     contact_params: Dict[str, float] = None,
     N_cycle: int = 4,
+    chunk_size: int = None,
 ) -> ZerothOrderResult:
     """
     对一条离散候选序列执行完整 AF3 推断，并在最终结构上计算全部 8 项 loss。
@@ -190,6 +197,8 @@ def zeroth_order_eval(
         loss_weights:   各项 loss 权重（默认使用 DEFAULT_LOSS_WEIGHTS）
         contact_params: 接触 loss 参数（默认使用 DEFAULT_CONTACT_PARAMS）
         N_cycle:        Pairformer 循环次数
+        chunk_size:     Attention 分块大小。当 complex 较大（如 114+ aa）
+                       时建议设为 256，避免 OOM。默认为 None（不分块）。
 
     Returns:
         ZerothOrderResult: 包含 total_loss / loss_dict / summary_confidence / coordinate
@@ -220,7 +229,7 @@ def zeroth_order_eval(
             coordinate, s_inputs, s_trunk, z_trunk,
             plddt_logits, pae_logits, pde_logits,
             distogram_logits, contact_probs,
-        ) = _run_full_forward(model, input_feature_dict, device, N_cycle)
+        ) = _run_full_forward(model, input_feature_dict, device, N_cycle, chunk_size=None)
 
         # ── 计算 12 项 loss ──────────────────────────────────────────────
         # coordinate 形状: [N_sample, N_atom, 3]

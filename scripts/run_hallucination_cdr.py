@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""
+BindCraft v2 - CDR-Aware Hallucination CLI
+
+支持三种使用模式（自动检测，互斥）：
+
+  Mode A — 一键自动（推荐）:
+    python scripts/run_hallucination_cdr.py \
+        --pdb_id 8PIH \
+        --mode hybrid \
+        --n_steps 200 \
+        --learning_rate 0.05
+
+    自动完成：下载 PDB → ANARCI CDR 识别 → 优化
+
+  Mode B — 手动 JSON:
+    python scripts/run_hallucination_cdr.py \
+        --cdr_json outputs/8PIH_cdr.json \
+        --mode hybrid --n_steps 200
+
+  Mode C — 传统纯序列（与原 run_hallucination.py 等效）:
+    python scripts/run_hallucination_cdr.py \
+        --target GIVEQCCTSICSLYQLENYCN \
+        --binder_length 40 \
+        --mode hybrid --n_steps 200
+
+三种模式的优先级：Mode A > Mode B > Mode C
+（即同时指定 pdb_id 和 cdr_json 时，优先 Mode A）
+"""
+
+import os
+import sys
+import argparse
+import logging
+import torch
+
+# 确保 HMMER 工具链（ANARCI 依赖 hmmscan/hmmpress 等）在 PATH 中
+_HMMER_BIN = "/mnt/data/conda_envs/prot_und/bin"
+if _HMMER_BIN not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + _HMMER_BIN
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
+
+from bindcraft.hallucination.pipeline import run_hallucination
+from bindcraft.hallucination.pipeline_cdr import run_hybrid_hallucination_cdr
+
+
+def setup_logging(log_file: str = None):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    if log_file:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        )
+        logging.getLogger().addHandler(file_handler)
+
+
+def load_protenix_model(
+    model_name: str = "protenix_base_default_v1.0.0",
+    device: str = "cuda"
+):
+    import os as _os
+    from collections.abc import Mapping
+    from protenix.config.config import parse_configs
+    from configs.configs_base import configs as configs_base
+    from configs.configs_data import data_configs
+    from configs.configs_inference import inference_configs
+    from configs.configs_model_type import model_configs
+    from protenix.model.protenix import Protenix
+
+    logging.info(f"加载模型: {model_name}")
+
+    _script_dir = _os.path.dirname(_os.path.abspath(__file__))
+    _project_dir = _os.path.dirname(_script_dir)
+    _ckpt_dir = _os.path.join(_project_dir, "checkpoint")
+    _os.makedirs(_ckpt_dir, exist_ok=True)
+    checkpoint_path = _os.path.join(_ckpt_dir, f"{model_name}.pt")
+    logging.info(f"Checkpoint: {checkpoint_path}")
+
+    def deep_update(d, u):
+        for k, v in u.items():
+            if isinstance(v, Mapping) and k in d and isinstance(d[k], Mapping):
+                deep_update(d[k], v)
+            else:
+                d[k] = v
+        return d
+
+    base_configs = {**configs_base, **{"data": data_configs}, **inference_configs}
+    model_specific = model_configs[model_name]
+    deep_update(base_configs, model_specific)
+
+    arg_str = (
+        f"--model_name {model_name} "
+        f"--use_msa false "
+        f"--dtype fp32 "
+        f"--load_checkpoint_dir {_ckpt_dir} "
+        f"--dump_dir /tmp/bindcraft_hallucination "
+    )
+    configs = parse_configs(
+        configs=base_configs, arg_str=arg_str, fill_required_with_null=True,
+    )
+
+    device_obj = torch.device(device)
+    model = Protenix(configs).to(device_obj)
+
+    checkpoint = torch.load(checkpoint_path, map_location=device_obj, weights_only=False)
+    state_dict = checkpoint["model"]
+    if list(state_dict.keys())[0].startswith("module."):
+        state_dict = {k[len("module."):]: v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict, strict=False)
+    model.eval()
+
+    logging.info(f"模型加载完成")
+    return model, configs
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="BindCraft v2 — CDR-Aware Hallucination Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+
+    # ── 基础参数 ──────────────────────────────────────────────────────────────
+    parser.add_argument("--mode", type=str, default="hybrid",
+                       choices=["first_order", "hybrid"],
+                       help="优化模式（仅 Mode C 影响行为）")
+    parser.add_argument("--device", type=str, default="cuda",
+                       help="计算设备（默认：cuda）")
+    parser.add_argument("--model_name", type=str, default="protenix_base_default_v1.0.0",
+                       help="模型名称")
+    parser.add_argument("--output_dir", type=str, default="outputs",
+                       help="输出目录（默认：./outputs）")
+    parser.add_argument("--log_file", type=str, default=None,
+                       help="日志文件路径")
+    parser.add_argument("--checkpoint_dir", type=str, default=None,
+                       help="每个 step 保存 checkpoint 的根目录。不指定时默认自动推导；设为 '' 禁用。")
+
+    # ── CDR Mode A：一键 PDB ─────────────────────────────────────────────────
+    g = parser.add_argument_group("Mode A: 一键 PDB（自动识别 CDR）")
+    g.add_argument("--pdb_id", default=None,
+                   help="PDB ID（e.g. 8PIH）或 PDB 文件路径。"
+                        "提供此参数后自动完成 CDR 识别，无需手动运行 identify_cdr.py。")
+    g.add_argument("--binder_chain", default=None,
+                   help="Binder chain ID（默认：第一条 heavy chain）")
+    g.add_argument("--scheme", default="chothia",
+                   choices=["chothia", "kabat", "imgt"],
+                   help="ANARCI numbering scheme (default: chothia)")
+
+    # ── CDR Mode B：手动 JSON ─────────────────────────────────────────────────
+    g2 = parser.add_argument_group("Mode B: 手动 CDR JSON")
+    g2.add_argument("--cdr_json", default=None,
+                    help="预生成的 CDR JSON 路径（由 scripts/identify_cdr.py 生成）")
+
+    # ── Fallback Mode C：纯序列 ────────────────────────────────────────────────
+    g3 = parser.add_argument_group("Mode C: 纯序列（与原 run_hallucination.py 等效）")
+    g3.add_argument("--target", type=str, default=None,
+                    help="抗原序列（Mode C 必需，Mode A/B 可省略）")
+    g3.add_argument("--binder_length", type=int, default=40,
+                    help="Binder 长度（Mode C 使用）")
+    g3.add_argument("--binder_sequence", default=None,
+                    help="Binder 全长序列（Mode B 可选，用于长度推断）")
+
+    # ── 优化参数 ──────────────────────────────────────────────────────────────
+    g4 = parser.add_argument_group("优化参数（所有模式）")
+    g4.add_argument("--n_steps", type=int, default=200,
+                    help="优化步数（默认：200）")
+    g4.add_argument("--learning_rate", type=float, default=0.05,
+                    help="Adam 学习率（默认：0.05）")
+    g4.add_argument("--tau_noise", type=float, default=4.0,
+                    help="扩散噪声时间步（默认：4.0）")
+    g4.add_argument("--k_top", type=int, default=10,
+                    help="Top-K 突变候选数（默认：10）")
+    g4.add_argument("--b_candidates", type=int, default=8,
+                    help="零阶验证候选序列数（默认：8）")
+    g4.add_argument("--t_sample", type=float, default=1.0,
+                    help="突变采样温度（默认：1.0）")
+    g4.add_argument("--max_mutations_per_seq", type=int, default=3,
+                    help="每条序列的最大突变数（默认：3）")
+    g4.add_argument("--use_annealing", type=lambda x: x.lower() == "true", default=True,
+                    help="是否启用模拟退火（默认：true）")
+    g4.add_argument("--t_init", type=float, default=1.0,
+                    help="退火初始温度（默认：1.0）")
+    g4.add_argument("--t_min", type=float, default=0.01,
+                    help="退火最低温度（默认：0.01）")
+    g4.add_argument("--use_tau_scheduling", type=lambda x: x.lower() == "true", default=True,
+                    help="是否启用时间步退火调度（默认：true）")
+    g4.add_argument("--tau_jitter", type=lambda x: x.lower() == "true", default=True,
+                    help="是否启用时间步抖动（默认：true）")
+    g4.add_argument("--use_prior", type=lambda x: x.lower() == "true", default=True,
+                    help="启用 BLOSUM62 先验约束（默认：true）")
+    g4.add_argument("--prior_strength", type=float, default=0.1,
+                    help="先验权重系数（默认：0.1）")
+    g4.add_argument("--chunk_size", type=int, default=None,
+                    help="Attention 分块大小。当 binder>100 aa 时建议设为 256 避免 OOM（默认：None）")
+
+    # ── 损失函数权重 ──────────────────────────────────────────────────────────
+    g5 = parser.add_argument_group("损失函数权重")
+    g5.add_argument("--w_plddt", type=float, default=None, help="pLDDT 权重")
+    g5.add_argument("--w_pae", type=float, default=None, help="pAE (intra) 权重")
+    g5.add_argument("--w_i_pae", type=float, default=None, help="i_pAE (inter) 权重")
+    g5.add_argument("--w_con", type=float, default=None, help="con (intra contact) 权重")
+    g5.add_argument("--w_i_con", type=float, default=None, help="i_con (inter contact) 权重")
+    g5.add_argument("--w_iptm", type=float, default=None, help="iPTM 权重")
+    g5.add_argument("--w_rg", type=float, default=None, help="Rg 权重")
+    g5.add_argument("--w_helix", type=float, default=None, help="Helix 权重")
+    g5.add_argument("--w_clash", type=float, default=None, help="clash (intra) 权重")
+    g5.add_argument("--w_i_clash", type=float, default=None, help="i_clash (inter) 权重")
+    g5.add_argument("--w_pde", type=float, default=None, help="PDE (intra) 权重")
+    g5.add_argument("--w_i_pde", type=float, default=None, help="i_PDE (inter) 权重")
+
+    args = parser.parse_args()
+
+    setup_logging(args.log_file)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    model, configs = load_protenix_model(args.model_name, args.device)
+
+    # 组装 loss_weights
+    loss_weights = {}
+    weight_arg_map = {
+        "plddt": args.w_plddt, "pae": args.w_pae, "i_pae": args.w_i_pae,
+        "con": args.w_con, "i_con": args.w_i_con, "iptm": args.w_iptm,
+        "rg": args.w_rg, "helix": args.w_helix,
+        "clash": args.w_clash, "i_clash": args.w_i_clash,
+        "pde": args.w_pde, "i_pde": args.w_i_pde,
+    }
+    for key, val in weight_arg_map.items():
+        if val is not None:
+            loss_weights[key] = val
+
+    # checkpoint_dir：None → 自动推导；"" → 禁用；显式路径 → 使用显式路径
+    _ckpt_override = args.checkpoint_dir  # None / "" / str
+
+    # ── 模式分支 ──────────────────────────────────────────────────────────────
+    if args.pdb_id is not None:
+        # Mode A：一键自动
+        ckpt_dir = _ckpt_override if _ckpt_override is not None \
+            else os.path.join(args.output_dir, f"{args.pdb_id}_cdr_checkpoints")
+        _ckpt = ckpt_dir if ckpt_dir != "" else None
+        logging.info(f"[CDR-Aware] Mode A — pdb_id={args.pdb_id} | checkpoint_dir={ckpt_dir}")
+        best_seq, final_seq, losses_history = run_hybrid_hallucination_cdr(
+            model=model,
+            pdb_id=args.pdb_id,
+            binder_chain=args.binder_chain,
+            scheme=args.scheme,
+            N_steps=args.n_steps,
+            learning_rate=args.learning_rate,
+            tau_noise=args.tau_noise,
+            loss_weights=loss_weights,
+            K_top=args.k_top,
+            B_candidates=args.b_candidates,
+            T_sample=args.t_sample,
+            max_mutations_per_seq=args.max_mutations_per_seq,
+            use_annealing=args.use_annealing,
+            T_init=args.t_init,
+            T_min=args.t_min,
+            use_tau_scheduling=args.use_tau_scheduling,
+            tau_jitter=args.tau_jitter,
+            use_prior=args.use_prior,
+            prior_strength=args.prior_strength,
+            checkpoint_dir=_ckpt,
+            chunk_size=args.chunk_size,
+        )
+        run_label = f"ModeA_{args.pdb_id}"
+
+    elif args.cdr_json is not None:
+        # Mode B：CDR JSON
+        import json
+        with open(args.cdr_json) as f:
+            cdr_data = json.load(f)
+
+        binder_seq = args.binder_sequence or cdr_data.get("binder_sequence")
+        cdr_mask = cdr_data.get("binder_cdr_mask")
+        target_from_json = cdr_data.get("target_sequence", "")
+        target_seq = args.target or target_from_json
+
+        json_basename = os.path.basename(args.cdr_json).replace('.json', '')
+        ckpt_dir = _ckpt_override if _ckpt_override is not None \
+            else os.path.join(args.output_dir, f"{json_basename}_checkpoints")
+        _ckpt = ckpt_dir if ckpt_dir != "" else None
+        logging.info(f"[CDR-Aware] Mode B — cdr_json={args.cdr_json} | checkpoint_dir={ckpt_dir}")
+        if binder_seq is None:
+            logging.error("--binder_sequence is required in Mode B when JSON lacks it")
+            sys.exit(1)
+        if cdr_mask is None:
+            logging.error("CDR JSON missing 'binder_cdr_mask' field")
+            sys.exit(1)
+
+        best_seq, final_seq, losses_history = run_hybrid_hallucination_cdr(
+            model=model,
+            binder_sequence=binder_seq,
+            cdr_mask=cdr_mask,
+            target_seq=target_seq,
+            N_steps=args.n_steps,
+            learning_rate=args.learning_rate,
+            tau_noise=args.tau_noise,
+            loss_weights=loss_weights,
+            K_top=args.k_top,
+            B_candidates=args.b_candidates,
+            T_sample=args.t_sample,
+            max_mutations_per_seq=args.max_mutations_per_seq,
+            use_annealing=args.use_annealing,
+            T_init=args.t_init,
+            T_min=args.t_min,
+            use_tau_scheduling=args.use_tau_scheduling,
+            tau_jitter=args.tau_jitter,
+            use_prior=args.use_prior,
+            prior_strength=args.prior_strength,
+            checkpoint_dir=_ckpt,
+            chunk_size=args.chunk_size,
+        )
+        run_label = f"ModeB_{json_basename}"
+
+    else:
+        # Mode C：传统纯序列
+        if args.target is None:
+            parser.error("--pdb_id or --target is required (Mode C needs --target)")
+        ckpt_dir = _ckpt_override if _ckpt_override is not None \
+            else os.path.join(args.output_dir, "ModeC_hybrid_checkpoints")
+        _ckpt = ckpt_dir if ckpt_dir != "" else None
+        if args.mode == "first_order":
+            logging.info(f"[CDR-Aware] Mode C — first_order (纯一阶)")
+            best_seq, final_seq, losses_history = run_hallucination(
+                model=model,
+                target_seq=args.target,
+                L_binder=args.binder_length,
+                N_steps=args.n_steps,
+                learning_rate=args.learning_rate,
+                tau_noise=args.tau_noise,
+                device=torch.device(args.device),
+                loss_weights=loss_weights,
+            )
+        else:
+            logging.info(f"[CDR-Aware] Mode C — hybrid (无 CDR mask)")
+            best_seq, final_seq, losses_history = run_hybrid_hallucination_cdr(
+                model=model,
+                target_seq=args.target,
+                L_binder=args.binder_length,
+                N_steps=args.n_steps,
+                learning_rate=args.learning_rate,
+                tau_noise=args.tau_noise,
+                loss_weights=loss_weights,
+                K_top=args.k_top,
+                B_candidates=args.b_candidates,
+                T_sample=args.t_sample,
+                max_mutations_per_seq=args.max_mutations_per_seq,
+                use_annealing=args.use_annealing,
+                T_init=args.t_init,
+                T_min=args.t_min,
+                use_tau_scheduling=args.use_tau_scheduling,
+                tau_jitter=args.tau_jitter,
+                use_prior=args.use_prior,
+                prior_strength=args.prior_strength,
+                checkpoint_dir=_ckpt,
+                chunk_size=args.chunk_size,
+            )
+        run_label = f"ModeC_{args.mode}"
+
+    # ── 保存结果 ──────────────────────────────────────────────────────────────
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = os.path.join(args.output_dir, f"result_{run_label}_{timestamp}.txt")
+    with open(output_file, "w") as f:
+        f.write(f"Run Label: {run_label}\n")
+        f.write(f"Mode: {args.mode}\n")
+        if args.pdb_id:
+            f.write(f"PDB ID: {args.pdb_id}\n")
+        if args.cdr_json:
+            f.write(f"CDR JSON: {args.cdr_json}\n")
+        if args.target:
+            f.write(f"Target: {args.target}\n")
+        f.write(f"Binder Length: {args.binder_length}\n")
+        f.write(f"Optimization Steps: {args.n_steps}\n")
+        f.write(f"Learning Rate: {args.learning_rate}\n")
+        f.write(f"Tau Noise: {args.tau_noise}\n")
+        f.write(f"\n")
+        f.write(f"Best Sequence: {best_seq}\n")
+        f.write(f"Final Sequence: {final_seq}\n")
+        f.write(f"\n")
+        f.write(f"Loss History:\n")
+        for i, loss in enumerate(losses_history):
+            f.write(f"Step {i}: {loss:.6f}\n")
+
+    logging.info(f"结果已保存到: {output_file}")
+
+    print("\n" + "=" * 70)
+    print(" CDR-Aware Hallucination 完成！")
+    print(f" 最佳序列: {best_seq}")
+    print(f" 结果文件: {output_file}")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()

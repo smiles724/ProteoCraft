@@ -31,6 +31,7 @@ def _msa_module_forward_no_ckpt(
     input_feature_dict: Dict,
     z: torch.Tensor,
     s_inputs: torch.Tensor,
+    chunk_size: int = None,
 ) -> torch.Tensor:
     """
     手动执行 MSAModule 前向，绕过内部的 checkpoint_blocks。
@@ -98,7 +99,7 @@ def _msa_module_forward_no_ckpt(
             triangle_multiplicative="torch",
             triangle_attention="torch",
             inplace_safe=False,
-            chunk_size=None,
+            chunk_size=chunk_size,
         )
 
     return z
@@ -109,6 +110,7 @@ def pairformer_forward_no_ckpt(
     input_feature_dict: Dict,
     s_init_override: Optional[torch.Tensor] = None,
     N_cycle: int = 4,
+    chunk_size: int = None,
 ) -> tuple:
     """
     无 Gradient Checkpoint 的完整 Pairformer 前向。
@@ -124,6 +126,7 @@ def pairformer_forward_no_ckpt(
                          作为 s_inputs（即 STE 桥接后的 s̃_init 拼接 s_target）。
                          shape: [N_token, c_s]
         N_cycle: 循环次数，默认 4
+        chunk_size: Attention 分块大小。114+ aa 建议 256，避免 OOM。
 
     Returns:
         s_inputs: 原始 input_embedder 输出（或 s_init_override），[N_token, c_s]
@@ -167,7 +170,7 @@ def pairformer_forward_no_ckpt(
                     triangle_multiplicative="torch",
                     triangle_attention="torch",
                     inplace_safe=False,
-                    chunk_size=None,
+                    chunk_size=chunk_size,
                 )
 
             # MSA Module：手动逐块调用，绕过 checkpoint_blocks（blocks_per_ckpt 默认 1）
@@ -176,6 +179,7 @@ def pairformer_forward_no_ckpt(
                 input_feature_dict=input_feature_dict,
                 z=z,
                 s_inputs=s_inputs,
+                chunk_size=chunk_size,
             )
 
             # 单体特征更新（recycling）
@@ -190,7 +194,7 @@ def pairformer_forward_no_ckpt(
                     triangle_multiplicative="torch",
                     triangle_attention="torch",
                     inplace_safe=False,  # 关键：禁止 inplace
-                    chunk_size=None,
+                    chunk_size=chunk_size,
                 )
 
     return s_inputs, s, z

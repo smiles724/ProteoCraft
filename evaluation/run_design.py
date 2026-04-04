@@ -35,7 +35,7 @@ from evaluation.configs import (
     DESIGN_L_BINDER, DESIGN_N_STEPS, DESIGN_LEARNING_RATE,
     DESIGN_K_TOP, DESIGN_B_CANDIDATES, DESIGN_T_SAMPLE,
     DESIGN_MAX_MUTATIONS, DESIGN_USE_ANNEALING, DESIGN_USE_TAU_SCHEDULING,
-    DESIGN_NUM_BEAMS,
+    DESIGN_NUM_BEAMS, CHECKPOINT_DIR,
 )
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -59,7 +59,7 @@ def generate_random_seq(length: int) -> str:
     return "".join(random.choices(AA_ALPHABET, k=length))
 
 
-def run_design_batch(cases_csv: str, n_steps: int, b_candidates: int, device_str: str, entry_ids: list = None, num_beams: int = 1, L_binder_override: int = None):
+def run_design_batch(cases_csv: str, n_steps: int, b_candidates: int, device_str: str, entry_ids: list = None, num_beams: int = 1, L_binder_override: int = None, checkpoint_dir: str = None):
     from scripts.run_hallucination import load_protenix_model
     from bindcraft.hallucination.pipeline import run_hybrid_hallucination
 
@@ -78,8 +78,24 @@ def run_design_batch(cases_csv: str, n_steps: int, b_candidates: int, device_str
     for i, case in enumerate(cases):
         entry_id = case["entry_id"]
         target_seq = case["target_sequence"]
-        real_binder = case.get("binder_sequence", "")
-        real_heavy = case.get("binder_sequence_heavy", "")
+
+        # real_binder_seq: 完整抗体（所有 chain 拼接），用于 real_full 对照
+        ab_chains_raw = case.get("antibody_chains", "")
+        if ab_chains_raw:
+            ab_chains = json.loads(ab_chains_raw) if isinstance(ab_chains_raw, str) else ab_chains_raw
+            real_binder_seq = "".join(v["sequence"] for v in ab_chains.values())
+        else:
+            real_binder_seq = case.get("binder_sequence", "")
+
+        # real_binder_heavy: 仅 heavy chain，用于 real_vh 对照
+        real_binder_heavy = case.get("binder_sequence_heavy", "")
+        if not real_binder_heavy and ab_chains_raw:
+            ab_chains = json.loads(ab_chains_raw) if isinstance(ab_chains_raw, str) else ab_chains_raw
+            # 按 chain_id 找到 heavy chain（type=H）
+            for v in ab_chains.values():
+                if v.get("chain_type") == "H":
+                    real_binder_heavy = v["sequence"]
+                    break
 
         L_binder = L_binder_override if L_binder_override is not None else DESIGN_L_BINDER
         out_path = os.path.join(DESIGNS_DIR, f"{entry_id}.json")
@@ -120,6 +136,7 @@ def run_design_batch(cases_csv: str, n_steps: int, b_candidates: int, device_str
                 use_annealing=DESIGN_USE_ANNEALING,
                 use_tau_scheduling=DESIGN_USE_TAU_SCHEDULING,
                 num_beams=num_beams,
+                checkpoint_dir=checkpoint_dir,
             )
             elapsed = time.time() - t0
 
@@ -134,8 +151,8 @@ def run_design_batch(cases_csv: str, n_steps: int, b_candidates: int, device_str
                 "designed_seq": best_seq,
                 "designed_final_seq": final_seq,
                 "random_seq": random_seq,
-                "real_binder_seq": real_binder,
-                "real_binder_heavy": real_heavy,
+                "real_binder_seq": real_binder_seq,
+                "real_binder_heavy": real_binder_heavy,
                 "design_loss_history": [float(l) for l in losses_history],
                 "best_loss": best_loss,
                 "best_step": best_step,
@@ -190,13 +207,22 @@ def main():
         help="Binder 长度（aa）。不指定时使用 configs.py 中的 DESIGN_L_BINDER（默认 80aa）。"
         "用于跑不同长度的对照实验，如 '--l_binder 114'。"
     )
+    parser.add_argument(
+        "--checkpoint_dir", type=str, default=None,
+        help="每个 step 保存 checkpoint 的根目录。不指定时使用 evaluation/outputs/checkpoints/。"
+        "设为 ''（空字符串）可禁用 checkpoint 保存。"
+    )
     args = parser.parse_args()
 
     entry_ids = None
     if args.entry_ids:
         entry_ids = [e.strip() for e in args.entry_ids.split(",") if e.strip()]
     L_override = args.l_binder if args.l_binder is not None else DESIGN_L_BINDER
-    run_design_batch(args.cases, args.n_steps, args.b_candidates, args.device, entry_ids, args.num_beams, L_binder_override=L_override)
+    # None → 使用默认目录；空字符串 → 禁用 checkpoint
+    ckpt_dir = CHECKPOINT_DIR if args.checkpoint_dir is None else args.checkpoint_dir
+    if ckpt_dir == "":
+        ckpt_dir = None
+    run_design_batch(args.cases, args.n_steps, args.b_candidates, args.device, entry_ids, args.num_beams, L_binder_override=L_override, checkpoint_dir=ckpt_dir)
 
 
 if __name__ == "__main__":

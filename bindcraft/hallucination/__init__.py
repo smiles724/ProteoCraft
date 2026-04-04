@@ -20,6 +20,7 @@ from .diffusion_one_step import (
 )
 
 from .pipeline import run_hallucination, run_hybrid_hallucination
+from .pipeline_cdr import run_hybrid_hallucination_cdr
 from .mutation_proposer import propose_mutations
 from .scheduler import AnnealingScheduler, TauScheduler, MacroBreathTracker
 
@@ -38,6 +39,7 @@ __all__ = [
     # Pipeline
     "run_hallucination",
     "run_hybrid_hallucination",
+    "run_hybrid_hallucination_cdr",
     # Mutation Proposer
     "propose_mutations",
     # Schedulers

@@ -210,7 +210,8 @@ def diffusion_one_step(
     x_coarse: Optional[torch.Tensor] = None,
     X_clean: Optional[torch.Tensor] = None,
     tau: float = 4.0,
-    device: torch.device = None
+    device: torch.device = None,
+    chunk_size: int = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     完整的单步外推流程（模块 B）
@@ -231,6 +232,7 @@ def diffusion_one_step(
         X_clean: 零阶全链路骨架，[1, N_atom, 3]（由 Step 0 或 Step 3 获得）
         tau: 噪声时间步
         device: 计算设备
+        chunk_size: Attention 分块大小。114+ aa 建议 256，避免 OOM。
 
     Returns:
         x0_hat: 外推的无噪声结构，[1, N_atoms, 3]
@@ -250,6 +252,7 @@ def diffusion_one_step(
         input_feature_dict=input_feature_dict,
         s_init_override=s_inputs_ste,
         N_cycle=4,
+        chunk_size=chunk_size,
     )
 
     # 步骤 3：获取 x_coarse（优先用 X_clean，回退到随机初始化）
@@ -297,6 +300,7 @@ def diffusion_one_step_fused(
     device: torch.device = None,
     pde_params=None,
     clash_params=None,
+    chunk_size: int = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     多频段 τ 融合：在同一优化步中，分别用粗粒度 tau 和细粒度 tau 各执行一次
@@ -345,7 +349,7 @@ def diffusion_one_step_fused(
     theta.grad.zero_()
     _, s_trunk_coarse, z_trunk_coarse = pairformer_forward_no_ckpt(
         model=model, input_feature_dict=input_feature_dict,
-        s_init_override=s_inputs_ste, N_cycle=4,
+        s_init_override=s_inputs_ste, N_cycle=4, chunk_size=chunk_size,
     )
     x0_coarse = one_step_denoise(
         model=model, x_coarse=x_coarse, s_inputs=s_inputs_ste,
@@ -355,6 +359,7 @@ def diffusion_one_step_fused(
 
     heads_coarse = _run_confidence_heads(
         model, input_feature_dict, s_inputs_ste, s_trunk_coarse, z_trunk_coarse, x0_coarse,
+        chunk_size=chunk_size,
     )
     loss_coarse, _ = _compute_loss(
         x0_coarse.squeeze(0), heads_coarse, input_feature_dict,
@@ -394,6 +399,7 @@ def diffusion_one_step_fused(
     )
     heads_fine = _run_confidence_heads(
         model, input_feature_dict, s_inputs_ste, s_trunk_coarse, z_trunk_coarse, x0_fine,
+        chunk_size=chunk_size,
     )
     loss_fine, _ = _compute_loss(
         x0_fine.squeeze(0), heads_fine, input_feature_dict,
@@ -419,12 +425,12 @@ def diffusion_one_step_fused(
 
 # ── 内部辅助函数（避免在 fusion 函数中重复大段代码）───────────────────────
 
-def _run_confidence_heads(model, input_feature_dict, s_inputs, s_trunk, z_trunk, x0_hat):
+def _run_confidence_heads(model, input_feature_dict, s_inputs, s_trunk, z_trunk, x0_hat, chunk_size=None):
     from bindcraft.losses.confidence import run_confidence_heads
     return run_confidence_heads(
         model=model, input_feature_dict=input_feature_dict,
         s_inputs=s_inputs, s_trunk=s_trunk, z_trunk=z_trunk,
-        x0_hat=x0_hat, inplace_safe=False, chunk_size=None,
+        x0_hat=x0_hat, inplace_safe=False, chunk_size=chunk_size,
     )
 
 

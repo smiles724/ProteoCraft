@@ -467,7 +467,10 @@ Examples:
     for chain_id, seq in antigen_chains.items():
         ag_results[chain_id] = {"sequence": seq, "length": len(seq)}
 
-    target_sequence = "".join(antigen_chains.values())
+    # For crystallographic ASU with duplicated chains (e.g. 8YAF has 6 identical copies),
+    # deduplicate identical antigen sequences so the target isn't artificially inflated
+    unique_antigen_seqs = list(dict.fromkeys(antigen_chains.values()))
+    target_sequence = "".join(unique_antigen_seqs)
 
     binder_info = ab_results[binder_chain_id]
     result = {
