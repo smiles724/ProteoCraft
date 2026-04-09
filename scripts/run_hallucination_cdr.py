@@ -188,8 +188,8 @@ def main():
                     help="退火初始温度（默认：1.0）")
     g4.add_argument("--t_min", type=float, default=0.01,
                     help="退火最低温度（默认：0.01）")
-    g4.add_argument("--use_tau_scheduling", type=lambda x: x.lower() == "true", default=True,
-                    help="是否启用时间步退火调度（默认：true）")
+    g4.add_argument("--use_tau_scheduling", type=lambda x: x.lower() == "true", default=False,
+                    help="是否启用时间步退火调度（默认：false，改用固定 tau=4.0）")
     g4.add_argument("--tau_jitter", type=lambda x: x.lower() == "true", default=True,
                     help="是否启用时间步抖动（默认：true）")
     g4.add_argument("--use_prior", type=lambda x: x.lower() == "true", default=True,

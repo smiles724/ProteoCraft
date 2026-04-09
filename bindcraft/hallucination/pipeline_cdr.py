@@ -346,7 +346,7 @@ def run_hybrid_hallucination_cdr(
     use_annealing: bool = True,
     T_init: float = 1.0,
     T_min: float = 0.01,
-    use_tau_scheduling: bool = True,
+    use_tau_scheduling: bool = False,
     tau_jitter: bool = True,
     num_beams: int = 1,
     use_prior: bool = True,
