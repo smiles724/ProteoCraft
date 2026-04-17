@@ -15,7 +15,7 @@ BindCraft v2 - Hallucination 主循环
 
 import torch
 import numpy as np
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Union
 import logging
 
 from bindcraft.hallucination.ste_bridge import (
@@ -31,15 +31,74 @@ from bindcraft.utils import (
     DEFAULT_LOSS_WEIGHTS,
     DEFAULT_CONTACT_PARAMS,
     DEFAULT_CLASH_PARAMS,
+    _normalize_chain_sequences,
 )
 from bindcraft.hallucination.diffusion_one_step import diffusion_one_step
-from bindcraft.hallucination.mutation_proposer import propose_mutations
+from bindcraft.hallucination.mutation_proposer import AA_1_TO_IDX, propose_mutations
 from bindcraft.hallucination.zeroth_order import zeroth_order_eval
 from bindcraft.losses.confidence import run_confidence_heads
 from bindcraft.losses.total_loss import compute_all_losses
 from protenix.model import sample_confidence
 
 logger = logging.getLogger(__name__)
+VALID_BINDER_AAS = "ACDEFGHIKLMNPQRSTVWY"
+
+
+def _normalize_init_binder_seq(init_binder_seq: str, L_binder: int) -> str:
+    """
+    校验并标准化用户提供的初始 Binder 序列。
+
+    Args:
+        init_binder_seq: 用户提供的单字母序列
+        L_binder: 期望的 Binder 长度
+
+    Returns:
+        规范化后的大写单字母序列
+    """
+    seq = init_binder_seq.strip().upper()
+    if len(seq) != L_binder:
+        raise ValueError(
+            f"初始 Binder 序列长度 {len(seq)} 与 binder_length={L_binder} 不一致"
+        )
+
+    invalid = sorted(set(seq) - set(VALID_BINDER_AAS))
+    if invalid:
+        raise ValueError(
+            "初始 Binder 序列包含非法氨基酸字符: "
+            + ",".join(invalid)
+            + f"；仅支持 {VALID_BINDER_AAS}"
+        )
+    return seq
+
+
+def _sample_random_binder_seq(L_binder: int) -> str:
+    """
+    生成随机初始 Binder 序列。
+    """
+    return "".join(np.random.choice(list(VALID_BINDER_AAS)) for _ in range(L_binder))
+
+
+def _initialize_theta(
+    L_binder: int,
+    device: torch.device,
+    init_binder_seq: str = None,
+    logit_scale: float = 5.0,
+) -> Tuple[torch.Tensor, str]:
+    """
+    根据初始 Binder 序列初始化 theta，使 argmax(theta) 与起始序列一致。
+    """
+    init_binder = (
+        _sample_random_binder_seq(L_binder)
+        if init_binder_seq is None
+        else _normalize_init_binder_seq(init_binder_seq, L_binder)
+    )
+
+    theta = torch.randn(L_binder, NUM_AMINO_ACIDS, device=device) * 0.01
+    with torch.no_grad():
+        for i, aa in enumerate(init_binder):
+            theta[i, AA_1_TO_IDX[aa]] += logit_scale
+    theta.requires_grad_(True)
+    return theta, init_binder
 
 
 # ============================================================
@@ -48,13 +107,14 @@ logger = logging.getLogger(__name__)
 
 def run_hallucination(
     model,
-    target_seq: str,
+    target_seq: Union[str, List[str]],
     L_binder: int = 40,
     N_steps: int = 200,
     learning_rate: float = 0.05,
     tau_noise: float = 4.0,
     device: torch.device = None,
     loss_weights: Dict[str, float] = None,
+    init_binder_seq: str = None,
 ) -> Tuple[str, str, List[float]]:
     """
     运行 Hallucination 优化循环
@@ -68,6 +128,7 @@ def run_hallucination(
         tau_noise: 噪声时间步
         device: 计算设备
         loss_weights: Loss 权重字典
+        init_binder_seq: 可选的初始 Binder 单字母序列
 
     Returns:
         best_seq: 最佳序列
@@ -81,10 +142,15 @@ def run_hallucination(
     if loss_weights is not None:
         weights.update(loss_weights)
     contact_params = dict(DEFAULT_CONTACT_PARAMS)
+    target_sequences = _normalize_chain_sequences(target_seq)
+    target_total_len = sum(len(seq) for seq in target_sequences)
+    target_len_str = "+".join(str(len(seq)) for seq in target_sequences)
 
     logger.info("=" * 70)
     logger.info("开始 Hallucination 优化")
-    logger.info(f"Target: {target_seq} ({len(target_seq)} aa)")
+    logger.info(
+        f"Target chains: {len(target_sequences)} | lengths={target_len_str} | total={target_total_len} aa"
+    )
     logger.info(f"Binder 长度: {L_binder} aa")
     logger.info(f"优化步数: {N_steps}")
     logger.info(f"Loss 权重: {weights}")
@@ -99,8 +165,11 @@ def run_hallucination(
     # ── 初始化 Theta ──────────────────────────────────────────────────────
     torch.manual_seed(42)
     np.random.seed(42)
-    theta = torch.randn(L_binder, NUM_AMINO_ACIDS, device=device) * 0.01
-    theta.requires_grad_(True)
+    theta, init_binder = _initialize_theta(
+        L_binder=L_binder,
+        device=device,
+        init_binder_seq=init_binder_seq,
+    )
 
     optimizer = torch.optim.Adam([theta], lr=learning_rate)
 
@@ -113,10 +182,8 @@ def run_hallucination(
         s_target = s_target.clone()
     logger.info(f"s_target shape: {s_target.shape}")
 
-    init_binder = "".join(
-        np.random.choice(list("ACDEFGHIKLMNPQRSTVWY")) for _ in range(L_binder)
-    )
-    logger.info(f"初始 Binder 序列（随机）: {init_binder}")
+    init_source = "指定" if init_binder_seq is not None else "随机"
+    logger.info(f"初始 Binder 序列（{init_source}）: {init_binder}")
 
     # ── 获取 bin 参数（从 model configs 读取） ────────────────────────────
     plddt_params = sample_confidence.get_bin_params(model.configs.loss.plddt)
@@ -263,7 +330,7 @@ def _sync_theta_to_seq(
 
 def run_hybrid_hallucination(
     model,
-    target_seq: str,
+    target_seq: Union[str, List[str]],
     L_binder: int = 40,
     N_steps: int = 100,
     learning_rate: float = 0.05,
@@ -279,6 +346,7 @@ def run_hybrid_hallucination(
     T_min: float = 0.01,
     use_tau_scheduling: bool = True,
     tau_jitter: bool = True,
+    init_binder_seq: str = None,
 ) -> Tuple[str, str, List[float]]:
     """
     混合优化循环：一阶梯度引导离散候选 + 零阶全链路验证 + 接受准则。
@@ -307,6 +375,7 @@ def run_hybrid_hallucination(
         T_min:         退火最低温度
         use_tau_scheduling: 启用 Coarse-to-Fine tau 动态调度
         tau_jitter:    启用 tau 抖动
+        init_binder_seq: 可选的初始 Binder 单字母序列
 
     Returns:
         best_seq:        零阶验证下的最优序列
@@ -322,13 +391,18 @@ def run_hybrid_hallucination(
     if loss_weights is not None:
         base_weights.update(loss_weights)
     contact_params = dict(DEFAULT_CONTACT_PARAMS)
+    target_sequences = _normalize_chain_sequences(target_seq)
+    target_total_len = sum(len(seq) for seq in target_sequences)
+    target_len_str = "+".join(str(len(seq)) for seq in target_sequences)
 
     annealer = AnnealingScheduler(T_init=T_init, T_min=T_min) if use_annealing else None
     tau_sched = TauScheduler(jitter=tau_jitter) if use_tau_scheduling else None
 
     logger.info("=" * 70)
     logger.info("开始混合优化循环 (Hybrid: 1st-Order Proposal + 0th-Order Verification)")
-    logger.info(f"Target: {target_seq} ({len(target_seq)} aa)")
+    logger.info(
+        f"Target chains: {len(target_sequences)} | lengths={target_len_str} | total={target_total_len} aa"
+    )
     logger.info(f"Binder 长度: {L_binder} aa")
     logger.info(f"总轮数: {N_steps} | K_top={K_top} B={B_candidates} T_sample={T_sample}")
     logger.info(f"Annealing: {use_annealing} (T_init={T_init}, T_min={T_min})")
@@ -345,8 +419,11 @@ def run_hybrid_hallucination(
     # ── 初始化 Theta ──────────────────────────────────────────────────────
     torch.manual_seed(42)
     np.random.seed(42)
-    theta = torch.randn(L_binder, NUM_AMINO_ACIDS, device=device) * 0.01
-    theta.requires_grad_(True)
+    theta, init_binder = _initialize_theta(
+        L_binder=L_binder,
+        device=device,
+        init_binder_seq=init_binder_seq,
+    )
 
     optimizer = torch.optim.Adam([theta], lr=learning_rate)
 
@@ -359,10 +436,8 @@ def run_hybrid_hallucination(
         s_target = s_target.clone()
     logger.info(f"s_target shape: {s_target.shape}")
 
-    init_binder = "".join(
-        np.random.choice(list("ACDEFGHIKLMNPQRSTVWY")) for _ in range(L_binder)
-    )
-    logger.info(f"初始 Binder 序列（随机）: {init_binder}")
+    init_source = "指定" if init_binder_seq is not None else "随机"
+    logger.info(f"初始 Binder 序列（{init_source}）: {init_binder}")
 
     # ── 获取 bin 参数 ─────────────────────────────────────────────────────
     plddt_params = sample_confidence.get_bin_params(model.configs.loss.plddt)

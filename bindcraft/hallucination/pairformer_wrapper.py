@@ -1,42 +1,49 @@
 """
-BindCraft v2 - 无 Gradient Checkpoint 的 Pairformer 前向（阶段 3）
+BindCraft v2 - Pairformer 前向包装（阶段 3）
 
-问题背景：
-  Protenix 的 PairformerStack.forward() 和 MSAModule.forward() 均调用 checkpoint_blocks()。
-  - PairformerStack：blocks_per_ckpt 默认 None，但若配置文件设置了非 None 值则触发 checkpointing。
-  - MSAModule：blocks_per_ckpt 默认 1，只要 grad 启用就必然触发 checkpointing。
-  Gradient checkpointing 要求前向中不能有 inplace 操作，否则反向传播时
-  重新计算会读到被修改后的张量，导致 RuntimeError。
+保留历史接口名 ``pairformer_forward_no_ckpt``，但内部已恢复使用
+Protenix 自带的 ``checkpoint_blocks()`` 以降低一阶优化的显存占用。
 
-解决方案：
-  直接复用 Protenix 模型中已加载的权重（不重新初始化），
-  但手动逐块调用 PairformerBlock 和 MSABlock，完全跳过 checkpoint_blocks。
-  这样梯度可以安全地穿过 48 层 Pairformer，同时不触发任何 inplace 问题。
-
-算法指导对应：
-  s, z = Pairformer(s̃_init, z_init | Φ_pair)
-  梯度链中的 ∂s/∂s̃_init 层。
+关键约束：
+  - 继续保持 inplace_safe=False，避免 checkpoint 重算阶段遇到 inplace 冲突。
+  - 暂时保留现有 "torch" triangle kernel，不在此文件中切换 kernel 配置。
 """
 
 import torch
 import torch.nn.functional as F
+from functools import partial
 from typing import Dict, Optional, Any
 import logging
+
+from protenix.model.utils import (
+    checkpoint_blocks,
+    sample_msa_feature_dict_random_without_replacement,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _msa_module_forward_no_ckpt(
+def _run_checkpointed_blocks(
+    blocks,
+    args,
+    blocks_per_ckpt: Optional[int],
+):
+    """在 grad 开启时使用 activation checkpoint，其余情况保持直跑。"""
+    return checkpoint_blocks(
+        blocks=blocks,
+        args=args,
+        blocks_per_ckpt=blocks_per_ckpt,
+    )
+
+
+def _msa_module_forward_ckpt_safe(
     msa_module,
     input_feature_dict: Dict,
     z: torch.Tensor,
     s_inputs: torch.Tensor,
 ) -> torch.Tensor:
     """
-    手动执行 MSAModule 前向，绕过内部的 checkpoint_blocks。
-
-    MSAModule.forward() 中 blocks_per_ckpt 默认为 1，只要 grad 启用就触发 checkpointing。
-    这里复制其前向逻辑，但将 checkpoint_blocks 替换为直接逐块调用。
+    手动执行 MSAModule 前向，同时保留 checkpoint_blocks。
 
     Args:
         msa_module: model.msa_module
@@ -53,8 +60,6 @@ def _msa_module_forward_no_ckpt(
         return z
     if input_feature_dict["msa"].dim() < 2:
         return z
-
-    from protenix.model.utils import sample_msa_feature_dict_random_without_replacement
 
     msa_feat = sample_msa_feature_dict_random_without_replacement(
         feat_dict=input_feature_dict,
@@ -89,17 +94,23 @@ def _msa_module_forward_no_ckpt(
     msa_sample = msa_module.linear_no_bias_m(msa_sample)
     msa_sample = msa_sample + msa_module.linear_no_bias_s(s_inputs)
 
-    # 手动逐块调用，绕过 checkpoint_blocks
-    for block in msa_module.blocks:
-        msa_sample, z = block(
-            m=msa_sample,
-            z=z,
+    blocks = [
+        partial(
+            block,
             pair_mask=None,
             triangle_multiplicative="torch",
             triangle_attention="torch",
             inplace_safe=False,
             chunk_size=None,
         )
+        for block in msa_module.blocks
+    ]
+
+    msa_sample, z = _run_checkpointed_blocks(
+        blocks=blocks,
+        args=(msa_sample, z),
+        blocks_per_ckpt=msa_module.blocks_per_ckpt,
+    )
 
     return z
 
@@ -111,11 +122,10 @@ def pairformer_forward_no_ckpt(
     N_cycle: int = 4,
 ) -> tuple:
     """
-    无 Gradient Checkpoint 的完整 Pairformer 前向。
+    Pairformer 完整前向。
 
-    直接复用 model 中已加载的权重（linear_no_bias_sinit、pairformer_stack 等），
-    但手动逐块调用，绕过 PairformerStack 和 MSAModule 中的 checkpoint_blocks，
-    保证梯度正常反传。
+    保留历史函数名以兼容现有调用，但内部已恢复使用 checkpoint_blocks，
+    同时继续保持 inplace_safe=False，保证梯度正常反传。
 
     Args:
         model: 已加载权重的 Protenix 模型（权重已冻结）
@@ -170,27 +180,34 @@ def pairformer_forward_no_ckpt(
                     chunk_size=None,
                 )
 
-            # MSA Module：手动逐块调用，绕过 checkpoint_blocks（blocks_per_ckpt 默认 1）
-            z = _msa_module_forward_no_ckpt(
-                msa_module=model.msa_module,
-                input_feature_dict=input_feature_dict,
-                z=z,
-                s_inputs=s_inputs,
-            )
+            # 对 use_msa=False 的模型，直接跳过 MSA 路径。
+            if getattr(model.configs, "use_msa", True):
+                z = _msa_module_forward_ckpt_safe(
+                    msa_module=model.msa_module,
+                    input_feature_dict=input_feature_dict,
+                    z=z,
+                    s_inputs=s_inputs,
+                )
 
             # 单体特征更新（recycling）
             s = s_init + model.linear_no_bias_s(model.layernorm_s(s))
 
-            # ── 5. PairformerStack：手动逐块调用，绕过 checkpoint_blocks ──────
-            for block in model.pairformer_stack.blocks:
-                s, z = block(
-                    s=s,
-                    z=z,
+            # PairformerStack：恢复 checkpoint_blocks，但继续禁止 inplace。
+            blocks = [
+                partial(
+                    block,
                     pair_mask=None,
                     triangle_multiplicative="torch",
                     triangle_attention="torch",
-                    inplace_safe=False,  # 关键：禁止 inplace
+                    inplace_safe=False,
                     chunk_size=None,
                 )
+                for block in model.pairformer_stack.blocks
+            ]
+            s, z = _run_checkpointed_blocks(
+                blocks=blocks,
+                args=(s, z),
+                blocks_per_ckpt=model.pairformer_stack.blocks_per_ckpt,
+            )
 
     return s_inputs, s, z
