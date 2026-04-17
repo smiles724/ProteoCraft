@@ -21,12 +21,18 @@ for _pkg in [
     "protenix",
     "protenix.model",
     "protenix.model.sample_confidence",
+    "protenix.data",
+    "protenix.data.constants",
 ]:
     if _pkg not in sys.modules:
         _make_stub(_pkg)
 
 # Provide the specific symbol that protenix/model/sample_confidence.py imports
 sys.modules["ml_collections.config_dict"].ConfigDict = dict
+
+# Provide constants that checkpoint.py imports
+sys.modules["protenix.data.constants"].ATOM14 = []
+sys.modules["protenix.data.constants"].ATOM37_ORDER = {}
 
 # Provide logits_to_score used by confidence loss functions
 import torch
@@ -50,3 +56,17 @@ def _logits_to_score(logits, min_bin, max_bin, no_bins, return_prob=False):
 
 
 sys.modules["protenix.model.sample_confidence"].logits_to_score = _logits_to_score
+
+
+def _compute_contact_prob(distogram_logits, min_bin, max_bin, no_bins, thres=8.0):
+    prob = _F.softmax(distogram_logits, dim=-1)
+    bin_width = (max_bin - min_bin) / no_bins
+    centers = torch.linspace(
+        min_bin + 0.5 * bin_width, max_bin - 0.5 * bin_width, no_bins,
+        device=distogram_logits.device, dtype=distogram_logits.dtype,
+    )
+    thres_idx = int((centers < thres).sum().item())
+    return prob[..., :thres_idx].sum(-1)
+
+
+sys.modules["protenix.model.sample_confidence"].compute_contact_prob = _compute_contact_prob

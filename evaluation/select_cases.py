@@ -3,7 +3,7 @@
 Retrodiction 评估 Pipeline - Step 1: 案例筛选
 
 从 retrodiction_list.csv（450 条）中筛选适合评估的子集：
-  - target 长度在 [80, 180] 之间（上限 180 保证 target + H+L 链 <= 650aa 安全边界）
+  - target 长度在 [80, 570] 之间（上限保证 target + 80aa binder ≤ 650aa 安全边界）
   - 以 ab-raw.csv 中 Protenix-v1.0.0 的 best DockQ 排序，优先选界面清晰的案例
 
 输出: evaluation/outputs/selected_cases.csv
@@ -87,7 +87,8 @@ def select_cases(top_n: int = SELECT_TOP_N):
     out_path = os.path.join(OUTPUT_DIR, "selected_cases.csv")
     fieldnames = [
         "entry_id", "target_sequence", "binder_sequence_heavy",
-        "binder_sequence", "target_length", "binder_length", "best_dockq",
+        "binder_sequence_light", "binder_sequence", "target_length",
+        "binder_length", "best_dockq",
     ]
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
