@@ -146,6 +146,12 @@ A6_TCR/input/
 A6_TCR/results/
 A6_TCR/protenix_runtime/
 
+# Benchmark runner artifacts (do not push)
+benchmark/log/
+benchmark/results/
+benchmark/input/
+benchmark/protenix_runtime/
+
 # Generated attention cache (if present)
 protenix/model/tri_attention/TriAttentionCache/
 

@@ -74,7 +74,7 @@ def _dense_index_to_atom37_atomname(
 
 def _rebuild_atom_array(
     binder_seq: str,
-    target_seq: str,
+    target_seq: Any,
 ) -> "biotite.AtomArray":            # type hint forward-ref
     """
     通过 SampleDict → SampleDictToFeatures 路径重建 atom_array。
@@ -85,11 +85,41 @@ def _rebuild_atom_array(
     from protenix.data.inference.infer_dataloader import InferenceTemplateFeaturizer
     from protenix.data.utils import make_dummy_feature
 
+    def _normalize_seq(seq: Any) -> str:
+        # Some upstream callers may pass ["ACDE..."] instead of "ACDE...".
+        # Protenix expects a single string of 1-letter residue codes.
+        if isinstance(seq, str):
+            return seq
+        if isinstance(seq, (list, tuple)):
+            if len(seq) == 1 and isinstance(seq[0], str):
+                return seq[0]
+            if all(isinstance(x, str) and len(x) == 1 for x in seq):
+                return "".join(seq)
+        raise TypeError(f"sequence must be str (or list/tuple convertible to str), got {type(seq)}")
+
+    def _normalize_chain_seqs(seq: Any) -> List[str]:
+        # Accept either a single chain "ACDE..." or multi-chain ["...","..."].
+        if isinstance(seq, str):
+            return [seq]
+        if isinstance(seq, (list, tuple)):
+            if len(seq) == 0:
+                raise TypeError("target sequence list cannot be empty")
+            # ["ACDE..."] or ["ACDE...","FGH..."]
+            if all(isinstance(x, str) and len(x) >= 1 for x in seq):
+                # If it's actually a list of single-letter chars, merge.
+                if all(len(x) == 1 for x in seq):
+                    return ["".join(seq)]
+                return list(seq)
+        raise TypeError(f"target_seq must be str or list/tuple[str], got {type(seq)}")
+
+    binder_seq = _normalize_seq(binder_seq)
+    target_chain_seqs = _normalize_chain_seqs(target_seq)
+
     sample_dict = {
-        "sequences": [
-            {"proteinChain": {"sequence": binder_seq, "count": 1}},
-            {"proteinChain": {"sequence": target_seq, "count": 1}},
-        ],
+        "sequences": (
+            [{"proteinChain": {"sequence": binder_seq, "count": 1}}]
+            + [{"proteinChain": {"sequence": s, "count": 1}} for s in target_chain_seqs]
+        ),
         "name": "checkpoint_complex",
     }
 
@@ -209,7 +239,7 @@ def write_metadata_json(
     step: int,
     beam_id: int,
     binder_seq: str,
-    target_seq: str,
+    target_seq: Any,
     total_loss: float,
     loss_dict: Dict[str, float],
     summary_confidence: Dict[str, Any],
@@ -223,6 +253,14 @@ def write_metadata_json(
     """
     写入 step 级别的元数据 JSON。
     """
+    if isinstance(target_seq, str):
+        n_target_res = len(target_seq)
+    elif isinstance(target_seq, (list, tuple)) and all(isinstance(x, str) for x in target_seq):
+        n_target_res = sum(len(x) for x in target_seq)
+    else:
+        # Best-effort fallback; keep metadata writing robust.
+        n_target_res = None
+
     payload = {
         "step": step,
         "beam_id": beam_id,
@@ -238,7 +276,7 @@ def write_metadata_json(
         "plddt_file": plddt_filename,
         "coordinate_shape": list(coordinate_shape),
         "n_binder_res": len(binder_seq),
-        "n_target_res": len(target_seq),
+        "n_target_res": n_target_res,
     }
     if extra is not None:
         payload["extra"] = extra
@@ -304,7 +342,7 @@ def compute_atom_plddt(
 
 def get_chain_boundaries(
     binder_seq: str,
-    target_seq: str,
+    target_seq: Any,
     atom_array,
 ) -> Dict[str, Tuple[int, int]]:
     """
