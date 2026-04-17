@@ -142,6 +142,9 @@ logs/
 outputs/
 test_outputs/
 evaluation/outputs/
+A6_TCR/input/
+A6_TCR/results/
+A6_TCR/protenix_runtime/
 
 # Generated attention cache (if present)
 protenix/model/tri_attention/TriAttentionCache/

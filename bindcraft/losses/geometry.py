@@ -89,21 +89,29 @@ def compute_soft_clash_loss(
     """
     Soft clash penalty: quadratic repulsion for atom pairs closer than r_clash.
 
-    Intra: penalizes binder internal clashes (excludes bonded atoms).
-    Inter: penalizes binder-target clashes (no exclusion needed).
+    Intra: penalizes binder internal clashes (excludes bonded atoms via
+        residue_index separation <= bond_sep to avoid penalizing peptide bonds).
+    Inter: penalizes binder-target clashes, normalized by N_binder_atoms
+        (target-size invariant).
 
-    Normalization:
-      intra: sum(penalty) / N_valid_pairs
-      inter: sum(penalty) / N_binder_atoms  (target-size invariant)
+    Args:
+        x0_flat: [N_atoms, 3] all-atom coordinates
+        binder_atom_mask: [N_atoms] bool
+        target_atom_mask: [N_atoms] bool
+        atom_to_token_idx: [N_atoms] token index per atom
+        residue_index: [N_tokens] residue index per token
+        mode: "intra" or "inter"
+        r_clash: clash distance threshold (Angstrom)
+        bond_sep: minimum residue separation to consider (intra only)
     """
     if mode == "inter":
         coords_a = x0_flat[binder_atom_mask]
         coords_b = x0_flat[target_atom_mask]
-        dist = torch.cdist(coords_a, coords_b)
-        clash = torch.clamp(r_clash - dist, min=0) ** 2
         n_binder = coords_a.shape[0]
         if n_binder == 0:
             return torch.tensor(0.0, device=x0_flat.device, requires_grad=True)
+        dist = torch.cdist(coords_a, coords_b)
+        clash = torch.clamp(r_clash - dist, min=0) ** 2
         return clash.sum() / n_binder
     else:
         coords = x0_flat[binder_atom_mask]

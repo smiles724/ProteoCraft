@@ -16,6 +16,7 @@ BindCraft v2 - 梯度引导的离散候选生成器
 
 import torch
 import torch.nn.functional as F
+import numpy as np
 from typing import List, Tuple
 import logging
 
@@ -28,6 +29,38 @@ from bindcraft.utils import (
 logger = logging.getLogger(__name__)
 
 AA_1_TO_IDX = {AA_1LETTER[name]: idx for idx, name in enumerate(PROTEIN_RESIDUE_NAMES)}
+
+# ── BLOSUM62 替换矩阵（20×20，对应 PROTEIN_RESIDUE_NAMES 顺序）─────────────
+# 行 = 目标氨基酸 (to)，列 = 源氨基酸 (from)
+# 正值：演化上保守的替换（高分）；负值：罕见替换（低分）
+# 矩阵来源：NCBI BLAST BLOSUM62，对角线为最大正值，非对角线反映替换频率
+# 顺序：ALA, ARG, ASN, ASP, CYS, GLN, GLU, GLY, HIS, ILE, LEU, LYS, MET, PHE, PRO, SER, THR, TRP, TYR, VAL
+_BLOSUM62_ROWS = [
+    # A    R    N    D    C    Q    E    G    H    I    L    K    M    F    P    S    T    W    Y    V
+    [ 4,  -1,  -2,  -2,   0,  -1,  -1,   0,  -2,  -1,  -1,  -1,  -1,  -2,  -1,   1,   0,  -3,  -2,   0],  # A
+    [-1,   5,   0,  -2,  -3,   1,   0,  -2,   0,  -3,  -2,   2,  -1,  -3,  -2,  -1,  -1,  -3,  -2,  -3],  # R
+    [-2,   0,   6,   1,  -3,   0,   0,   0,   1,  -3,  -3,   0,  -2,  -3,  -2,   1,   0,  -4,  -2,  -3],  # N
+    [-2,  -2,   1,   6,  -3,   0,   2,  -1,  -1,  -3,  -4,  -1,  -3,  -3,  -1,   0,  -1,  -4,  -3,  -3],  # D
+    [ 0,  -3,  -3,  -3,   9,  -3,  -4,  -3,  -3,  -1,  -1,  -3,  -1,  -2,  -3,  -1,  -1,  -2,  -2,  -1],  # C
+    [-1,   1,   0,   0,  -3,   5,   2,  -2,   0,  -3,  -2,   1,   0,  -3,  -1,   0,  -1,  -2,  -1,  -2],  # Q
+    [-1,   0,   0,   2,  -4,   2,   5,  -2,   0,  -3,  -3,   1,  -2,  -3,  -1,   0,  -1,  -3,  -2,  -2],  # E
+    [ 0,  -2,   0,  -1,  -3,  -2,  -2,   6,  -2,  -4,  -4,  -2,  -3,  -3,  -2,   0,  -2,  -2,  -3,  -3],  # G
+    [-2,   0,   1,  -1,  -3,   0,   0,  -2,   8,  -3,  -3,  -1,  -2,  -1,  -2,  -1,  -2,  -2,   2,  -3],  # H
+    [-1,  -3,  -3,  -3,  -1,  -3,  -3,  -4,  -3,   4,   2,  -3,   1,   0,  -3,  -2,  -1,  -3,  -1,   3],  # I
+    [-1,  -2,  -3,  -4,  -1,  -2,  -3,  -4,  -3,   2,   4,  -2,   2,   0,  -3,  -2,  -1,  -2,  -1,   1],  # L
+    [-1,   2,   0,  -1,  -3,   1,   1,  -2,  -1,  -3,  -2,   5,  -1,  -3,  -1,   0,  -1,  -3,  -2,  -2],  # K
+    [-1,  -1,  -2,  -3,  -1,   0,  -2,  -3,  -2,   1,   2,  -1,   5,   0,  -2,  -1,  -1,  -1,  -1,   1],  # M
+    [-2,  -3,  -3,  -3,  -2,  -3,  -3,  -3,  -1,   0,   0,  -3,   0,   6,  -4,  -2,  -2,   1,   3,  -1],  # F
+    [-1,  -2,  -2,  -1,  -3,  -1,  -1,  -2,  -2,  -3,  -3,  -1,  -2,  -4,   7,  -1,  -1,  -4,  -3,  -2],  # P
+    [ 1,  -1,   1,   0,  -1,   0,   0,   0,  -1,  -2,  -2,   0,  -1,  -2,  -1,   4,   1,  -3,  -2,  -2],  # S
+    [ 0,  -1,   0,  -1,  -1,  -1,  -1,  -2,  -2,  -1,  -1,  -1,  -1,  -2,  -1,   1,   5,  -2,  -2,   0],  # T
+    [-3,  -3,  -4,  -4,  -2,  -2,  -3,  -2,  -2,  -3,  -2,  -3,  -1,   1,  -4,  -3,  -2,  11,   2,  -3],  # W
+    [-2,  -2,  -2,  -3,  -2,  -1,  -2,  -3,   2,  -1,  -1,  -2,  -1,   3,  -3,  -2,  -2,   2,   7,  -1],  # Y
+    [ 0,  -3,  -3,  -3,  -1,  -2,  -2,  -3,  -3,   3,   1,  -2,   1,  -1,  -2,  -2,   0,  -3,  -1,   4],  # V
+]
+# to_idx = row (目标氨基酸 to), from_idx = col (源氨基酸 from)
+# BLOSUM62[a, c] = 从 c 替换为 a 的得分（c→a）
+BLOSUM62: np.ndarray = np.array(_BLOSUM62_ROWS, dtype=np.float32)
 
 
 def _seq_to_indices(seq: str) -> List[int]:
@@ -43,17 +76,27 @@ def _indices_to_seq(indices: List[int]) -> str:
 def compute_mutation_benefit(
     grad_matrix: torch.Tensor,
     current_indices: List[int],
+    use_prior: bool = True,
+    prior_strength: float = 0.1,
 ) -> torch.Tensor:
     """
-    计算突变收益矩阵 Delta_L。
+    计算突变收益矩阵 Delta_L，并可选地引入 BLOSUM62 生物物理先验。
 
     Delta_L[i, a] = G[i, a] - G[i, c_i]
     其中 c_i 是位置 i 当前的氨基酸索引。
     负值表示突变为 a 可降低 loss（有利突变）。
 
+    当 use_prior=True 时，在梯度收益上叠加 BLOSUM62 替换得分：
+      adjusted[i, a] = delta_L[i, a] + prior_strength * BLOSUM62[a, c_i]
+    BLOSUM62[a, c] 为从 c 替换为 a 的演化保守性得分（正值=保守）。
+    这会使演化上合理的突变（高 BLOSUM62 分）更容易被选中，
+    而不合理的突变（低分或负分）被抑制。
+
     Args:
-        grad_matrix: [L_binder, 20] 梯度矩阵
-        current_indices: 长度 L_binder 的当前氨基酸索引列表
+        grad_matrix:      [L_binder, 20] 梯度矩阵
+        current_indices:  长度 L_binder 的当前氨基酸索引列表
+        use_prior:        是否应用 BLOSUM62 先验约束掩码
+        prior_strength:   先验权重系数（推荐 0.05~0.2，太大则梯度信息被淹没）
 
     Returns:
         delta_L: [L_binder, 20] 突变收益矩阵
@@ -61,6 +104,15 @@ def compute_mutation_benefit(
     L = grad_matrix.shape[0]
     current_grad = grad_matrix[torch.arange(L), current_indices]  # [L]
     delta_L = grad_matrix - current_grad.unsqueeze(1)  # [L, 20]
+
+    if use_prior:
+        # BLOSUM62[current_a, current_c] — 从 c_i 替换为 a 的保守性得分
+        current_indices_arr = np.array(current_indices, dtype=np.int64)  # [L]
+        # 从 BLOSUM62 中按行（to）和列（from）索引
+        prior_scores = BLOSUM62[:, current_indices_arr]  # [20, L]
+        prior_scores = prior_scores.T  # [L, 20]
+        delta_L = delta_L + prior_strength * torch.from_numpy(prior_scores).to(delta_L)
+
     return delta_L
 
 
@@ -176,22 +228,27 @@ def propose_mutations(
     B_candidates: int = 8,
     T_sample: float = 1.0,
     max_mutations_per_seq: int = 3,
+    use_prior: bool = True,
+    prior_strength: float = 0.1,
 ) -> List[str]:
     """
-    梯度引导的离散候选序列生成。
+    梯度引导的离散候选序列生成（含可选 BLOSUM62 先验约束）。
 
     完整流程：
     1. 将梯度矩阵转换为突变收益矩阵 Delta_L
-    2. 选取 Top-K 候选突变
-    3. 按收益分布采样组合，生成 B 条离散候选序列
+    2. （可选）叠加 BLOSUM62 先验约束掩码 M_prior
+    3. 选取 Top-K 候选突变
+    4. 按收益分布采样组合，生成 B 条离散候选序列
 
     Args:
-        grad_matrix:  [L_binder, 20] 梯度矩阵 G = nabla_Theta L
-        current_seq:  当前离散序列（单字母 str）
-        K_top:        选取 Top-K 候选突变数
-        B_candidates: 生成 B 条候选序列
-        T_sample:     采样温度（越小越确定性，越大越随机）
+        grad_matrix:          [L_binder, 20] 梯度矩阵 G = nabla_Theta L
+        current_seq:         当前离散序列（单字母 str）
+        K_top:              选取 Top-K 候选突变数
+        B_candidates:       生成 B 条候选序列
+        T_sample:           采样温度（越小越确定性，越大越随机）
         max_mutations_per_seq: 每条候选的最大突变数
+        use_prior:          是否启用 BLOSUM62 先验约束掩码（M_prior）
+        prior_strength:     先验权重系数（推荐 0.05~0.2）
 
     Returns:
         B 条离散候选序列（单字母 str 列表）
@@ -200,7 +257,10 @@ def propose_mutations(
 
     grad_cpu = grad_matrix.detach().cpu()
 
-    delta_L = compute_mutation_benefit(grad_cpu, current_indices)
+    delta_L = compute_mutation_benefit(
+        grad_cpu, current_indices,
+        use_prior=use_prior, prior_strength=prior_strength,
+    )
 
     positions, new_aas, benefits = select_top_k_mutations(
         delta_L, current_indices, K_top

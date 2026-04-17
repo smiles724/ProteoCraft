@@ -6,7 +6,7 @@ BindCraft v2 - 基础工具函数
 
 import torch
 import numpy as np
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Union
 
 
 # ============================================================
@@ -28,6 +28,7 @@ AA_1LETTER = {
 }
 
 NUM_AMINO_ACIDS = 20
+TargetSeqInput = Union[str, List[str]]
 
 
 # ============================================================
@@ -65,30 +66,46 @@ def one_letter_to_sequence(seq_1letter: str) -> List[str]:
 # 特征构建函数（调用 Protenix）
 # ============================================================
 
-def build_single_chain_features(seq: str, device: torch.device) -> Tuple[Dict, int, int]:
+def _normalize_chain_sequences(seq_input: TargetSeqInput) -> List[str]:
     """
-    构建单链蛋白质的输入特征（用于 W_AAE 预计算和 s_target 提取）
+    将单链或多链输入统一规范化为序列列表。
 
-    与 build_complex_features 的区别：只有一条链，无 context 污染。
+    支持:
+    - 单条序列字符串
+    - 逗号分隔的多条序列字符串
+    - 序列列表
+    """
+    if isinstance(seq_input, str):
+        parts = [part.strip().upper() for part in seq_input.split(",")]
+        seqs = [part for part in parts if part]
+    else:
+        seqs = [str(seq).strip().upper() for seq in seq_input if str(seq).strip()]
 
-    Args:
-        seq: 单字母蛋白质序列
-        device: 计算设备
+    if not seqs:
+        raise ValueError("至少需要提供一条蛋白质序列")
 
-    Returns:
-        input_feature_dict: 输入特征字典
-        N_token: Token 总数（= len(seq)）
-        N_atom: 原子总数
+    return seqs
+
+
+def _build_features_from_sequences(
+    seq_input: TargetSeqInput,
+    device: torch.device,
+    name: str,
+) -> Tuple[Dict, int, int]:
+    """
+    基于一条或多条蛋白链序列构建 Protenix 输入特征。
     """
     from protenix.data.inference.json_to_feature import SampleDictToFeatures
     from protenix.data.inference.infer_dataloader import InferenceTemplateFeaturizer
     from protenix.data.utils import data_type_transform, make_dummy_feature
 
+    seqs = _normalize_chain_sequences(seq_input)
     sample_dict = {
         "sequences": [
-            {"proteinChain": {"sequence": seq, "count": 1}},
+            {"proteinChain": {"sequence": seq, "count": 1}}
+            for seq in seqs
         ],
-        "name": "single_chain"
+        "name": name,
     }
 
     sample2feat = SampleDictToFeatures(sample_dict)
@@ -124,13 +141,36 @@ def build_single_chain_features(seq: str, device: torch.device) -> Tuple[Dict, i
     return input_feature_dict, N_token, N_atom
 
 
-def build_complex_features(binder_seq: str, target_seq: str, device: torch.device) -> Tuple[Dict, int, int]:
+def build_single_chain_features(seq: TargetSeqInput, device: torch.device) -> Tuple[Dict, int, int]:
     """
-    构建 Binder-Target 复合物的输入特征
+    构建蛋白质目标的输入特征（支持单链或多链）。
+
+    当输入为单链时，可用于 W_AAE 预计算。
+    当输入为多链时，可用于提取多链 target-only 特征。
+
+    Args:
+        seq: 单字母蛋白质序列，或多条序列组成的列表/逗号分隔字符串
+        device: 计算设备
+
+    Returns:
+        input_feature_dict: 输入特征字典
+        N_token: Token 总数
+        N_atom: 原子总数
+    """
+    return _build_features_from_sequences(seq, device, name="target_only")
+
+
+def build_complex_features(
+    binder_seq: str,
+    target_seq: TargetSeqInput,
+    device: torch.device,
+) -> Tuple[Dict, int, int]:
+    """
+    构建 Binder-Target 复合物的输入特征，支持单链或多链 target。
     
     Args:
         binder_seq: Binder 单字母序列
-        target_seq: Target 单字母序列
+        target_seq: Target 单字母序列，或多条 target 链组成的列表/逗号分隔字符串
         device: 计算设备
         
     Returns:
@@ -138,55 +178,9 @@ def build_complex_features(binder_seq: str, target_seq: str, device: torch.devic
         N_token: Token 总数
         N_atom: 原子总数
     """
-    from protenix.data.inference.json_to_feature import SampleDictToFeatures
-    from protenix.data.inference.infer_dataloader import InferenceTemplateFeaturizer
-    from protenix.data.utils import data_type_transform, make_dummy_feature
-    
-    # 构建 sample_dict
-    sample_dict = {
-        "sequences": [
-            {"proteinChain": {"sequence": binder_seq, "count": 1}},
-            {"proteinChain": {"sequence": target_seq, "count": 1}},
-        ],
-        "name": "binder_target_complex"
-    }
-    
-    # 转换为特征
-    sample2feat = SampleDictToFeatures(sample_dict)
-    features_dict, atom_array, token_array = sample2feat.get_feature_dict()
-    features_dict["distogram_rep_atom_mask"] = torch.Tensor(
-        atom_array.distogram_rep_atom_mask
-    ).long()
-    
-    # 添加 template 特征（空）
-    template_features = InferenceTemplateFeaturizer.make_template_feature(
-        bioassembly=sample_dict["sequences"],
-        atom_array=atom_array,
-        use_template=False,
-        online_template_featurizer=None,
-    )
-    
-    # 添加 dummy MSA 和 template
-    dummy_feats = ["msa"]
-    if len(template_features) == 0:
-        dummy_feats.append("template")
-    features_dict = make_dummy_feature(features_dict=features_dict, dummy_feats=dummy_feats)
-    
-    # 类型转换
-    feat = data_type_transform(feat_or_label_dict=features_dict)
-    
-    # 移动到设备
-    input_feature_dict = {}
-    for k, v in feat.items():
-        if isinstance(v, torch.Tensor):
-            input_feature_dict[k] = v.to(device)
-        else:
-            input_feature_dict[k] = v
-    
-    N_token = feat["token_index"].shape[0]
-    N_atom = feat["atom_to_token_idx"].shape[0]
-    
-    return input_feature_dict, N_token, N_atom
+    target_seqs = _normalize_chain_sequences(target_seq)
+    seqs = [binder_seq] + target_seqs
+    return _build_features_from_sequences(seqs, device, name="binder_target_complex")
 
 
 def prepare_input_features(model, input_feature_dict: Dict) -> Dict:
@@ -278,6 +272,6 @@ DEFAULT_CONTACT_PARAMS = {
 }
 
 DEFAULT_CLASH_PARAMS = {
-    "r_clash":     2.0,
-    "bond_sep":    1,
+    "r_clash":   2.0,
+    "bond_sep":  1,
 }

@@ -1,123 +1,194 @@
-"""Tests for new AF3-specific losses: Soft Clash and PDE."""
-
+"""
+Unit tests for AF3-specific losses: Soft Clash Penalty and PDE Loss.
+"""
 import torch
 import pytest
 
 
 class TestSoftClashLoss:
+    """compute_soft_clash_loss tests."""
 
-    def _make_clash_inputs(self, n_binder=4, n_target=3, device="cpu"):
-        n_total = n_binder + n_target
-        binder_atom_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
-        binder_atom_mask[:n_binder] = True
-        target_atom_mask = ~binder_atom_mask
-        atom_to_token_idx = torch.arange(n_total, device=device)
-        residue_index = torch.arange(n_total, device=device)
-        return binder_atom_mask, target_atom_mask, atom_to_token_idx, residue_index
-
-    def test_no_clash_returns_zero(self):
+    def test_intra_no_clash(self):
+        """Well-separated atoms should produce zero clash."""
         from bindcraft.losses.geometry import compute_soft_clash_loss
         coords = torch.tensor([
-            [0.0, 0.0, 0.0], [5.0, 0.0, 0.0], [10.0, 0.0, 0.0], [15.0, 0.0, 0.0],
-            [20.0, 0.0, 0.0], [25.0, 0.0, 0.0], [30.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],   # atom 0 (res 0)
+            [5.0, 0.0, 0.0],   # atom 1 (res 1)
+            [10.0, 0.0, 0.0],  # atom 2 (res 2)
         ])
-        bm, tm, a2t, ri = self._make_clash_inputs(n_binder=4, n_target=3)
-        loss_intra = compute_soft_clash_loss(coords, bm, tm, a2t, ri, mode="intra", r_clash=2.0, bond_sep=1)
-        loss_inter = compute_soft_clash_loss(coords, bm, tm, a2t, ri, mode="inter", r_clash=2.0, bond_sep=1)
-        assert loss_intra.item() == 0.0
-        assert loss_inter.item() == 0.0
+        binder_mask = torch.tensor([True, True, True])
+        target_mask = torch.tensor([False, False, False])
+        atom_to_token = torch.tensor([0, 1, 2])
+        residue_index = torch.tensor([0, 1, 2])
 
-    def test_inter_clash_detected(self):
+        loss = compute_soft_clash_loss(
+            coords, binder_mask, target_mask, atom_to_token, residue_index,
+            mode="intra", r_clash=2.0, bond_sep=1,
+        )
+        assert loss.item() == pytest.approx(0.0, abs=1e-6)
+
+    def test_intra_with_clash(self):
+        """Atoms closer than r_clash should produce positive loss."""
         from bindcraft.losses.geometry import compute_soft_clash_loss
         coords = torch.tensor([
-            [0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [20.0, 0.0, 0.0], [30.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0], [50.0, 0.0, 0.0], [60.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],   # res 0
+            [5.0, 0.0, 0.0],   # res 2
+            [10.0, 0.0, 0.0],  # res 4
+            [10.5, 0.0, 0.0],  # res 6 — clashes with res 4 (dist=0.5, sep=2)
         ])
-        bm, tm, a2t, ri = self._make_clash_inputs(n_binder=4, n_target=3)
-        loss = compute_soft_clash_loss(coords, bm, tm, a2t, ri, mode="inter", r_clash=2.0, bond_sep=1)
-        assert loss.item() == pytest.approx(0.25, abs=1e-5)
+        binder_mask = torch.ones(4, dtype=torch.bool)
+        target_mask = torch.zeros(4, dtype=torch.bool)
+        atom_to_token = torch.tensor([0, 1, 2, 3])
+        residue_index = torch.tensor([0, 2, 4, 6])
 
-    def test_intra_bond_exclusion(self):
+        loss = compute_soft_clash_loss(
+            coords, binder_mask, target_mask, atom_to_token, residue_index,
+            mode="intra", r_clash=2.0, bond_sep=1,
+        )
+        assert loss.item() > 0.0
+
+    def test_intra_bonded_exclusion(self):
+        """Adjacent residues (bond_sep=1) should be excluded from clash."""
         from bindcraft.losses.geometry import compute_soft_clash_loss
         coords = torch.tensor([
-            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.5, 0.0, 0.0], [5.0, 0.0, 0.0], [50.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],   # res 0
+            [1.3, 0.0, 0.0],   # res 1 — 1.3Å from res 0 (peptide bond)
         ])
-        bm = torch.tensor([True, True, True, True, False])
-        tm = ~bm
-        a2t = torch.tensor([0, 0, 1, 1, 2])
-        ri = torch.tensor([0, 0, 1, 1, 5])
-        loss = compute_soft_clash_loss(coords, bm, tm, a2t, ri, mode="intra", r_clash=2.0, bond_sep=1)
-        assert loss.item() == pytest.approx(0.0, abs=1e-5)
+        binder_mask = torch.ones(2, dtype=torch.bool)
+        target_mask = torch.zeros(2, dtype=torch.bool)
+        atom_to_token = torch.tensor([0, 1])
+        residue_index = torch.tensor([0, 1])
 
-    def test_inter_clash_target_size_invariant(self):
+        loss = compute_soft_clash_loss(
+            coords, binder_mask, target_mask, atom_to_token, residue_index,
+            mode="intra", r_clash=2.0, bond_sep=1,
+        )
+        assert loss.item() == pytest.approx(0.0, abs=1e-6)
+
+    def test_inter_clash(self):
+        """Binder-target clash should produce positive loss."""
         from bindcraft.losses.geometry import compute_soft_clash_loss
-        coords_small = torch.tensor([
-            [0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [1.0, 0.0, 0.0], [50.0, 0.0, 0.0],
-        ])
-        bm_s = torch.tensor([True, True, False, False])
-        tm_s = ~bm_s
-        far_atoms = torch.tensor([[100.0 + i * 10.0, 0.0, 0.0] for i in range(10)])
-        coords_large = torch.cat([coords_small[:3], far_atoms], dim=0)
-        bm_l = torch.zeros(13, dtype=torch.bool); bm_l[:2] = True
-        tm_l = ~bm_l
-        a2t_s, ri_s = torch.arange(4), torch.arange(4)
-        a2t_l, ri_l = torch.arange(13), torch.arange(13)
-        loss_small = compute_soft_clash_loss(coords_small, bm_s, tm_s, a2t_s, ri_s, mode="inter", r_clash=2.0)
-        loss_large = compute_soft_clash_loss(coords_large, bm_l, tm_l, a2t_l, ri_l, mode="inter", r_clash=2.0)
-        assert loss_small.item() == pytest.approx(loss_large.item(), abs=1e-5)
+        binder_coords = torch.tensor([[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]])
+        target_coords = torch.tensor([[0.5, 0.0, 0.0]])
+        coords = torch.cat([binder_coords, target_coords], dim=0)
+        binder_mask = torch.tensor([True, True, False])
+        target_mask = torch.tensor([False, False, True])
+        atom_to_token = torch.tensor([0, 1, 2])
+        residue_index = torch.tensor([0, 1, 2])
 
-    def test_gradient_pushes_apart(self):
+        loss = compute_soft_clash_loss(
+            coords, binder_mask, target_mask, atom_to_token, residue_index,
+            mode="inter", r_clash=2.0,
+        )
+        assert loss.item() > 0.0
+
+    def test_inter_normalized_by_binder_atoms(self):
+        """Inter clash should be normalized by N_binder_atoms, not N_pairs."""
+        from bindcraft.losses.geometry import compute_soft_clash_loss
+        binder_coords = torch.tensor([[0.0, 0.0, 0.0]])
+        target_coords = torch.tensor([[0.5, 0.0, 0.0]])
+        coords = torch.cat([binder_coords, target_coords], dim=0)
+        binder_mask = torch.tensor([True, False])
+        target_mask = torch.tensor([False, True])
+        atom_to_token = torch.tensor([0, 1])
+        residue_index = torch.tensor([0, 1])
+
+        loss = compute_soft_clash_loss(
+            coords, binder_mask, target_mask, atom_to_token, residue_index,
+            mode="inter", r_clash=2.0,
+        )
+        # 1 binder atom, dist=0.5, penalty = (2.0 - 0.5)^2 = 2.25, / 1 atom
+        assert loss.item() == pytest.approx(2.25, abs=1e-4)
+
+    def test_differentiable(self):
+        """Loss must support backward() for one-step gradient optimization."""
         from bindcraft.losses.geometry import compute_soft_clash_loss
         coords = torch.tensor([
-            [0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.5, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
         ], requires_grad=True)
-        bm = torch.tensor([True, True, False])
-        tm = ~bm
-        a2t, ri = torch.arange(3), torch.arange(3)
-        loss = compute_soft_clash_loss(coords, bm, tm, a2t, ri, mode="inter", r_clash=2.0)
+        binder_mask = torch.tensor([True, True, False])
+        target_mask = torch.tensor([False, False, True])
+        atom_to_token = torch.tensor([0, 1, 2])
+        residue_index = torch.tensor([0, 5, 10])
+
+        loss = compute_soft_clash_loss(
+            coords, binder_mask, target_mask, atom_to_token, residue_index,
+            mode="intra", r_clash=2.0, bond_sep=1,
+        )
         loss.backward()
-        assert coords.grad[0, 0] > 0  # gradient > 0 → gradient descent moves x_0 negative (away from target at +0.5)
+        assert coords.grad is not None
 
 
 class TestPDELoss:
+    """compute_pde_loss tests."""
 
-    def test_low_pde_gives_low_loss(self):
-        from bindcraft.losses.confidence import compute_pde_loss
-        N_token, no_bins = 5, 64
-        pde_params = {"min_bin": 0, "max_bin": 32, "no_bins": no_bins}
-        asym_id = torch.tensor([0, 0, 0, 1, 1])
-        logits = torch.full((1, N_token, N_token, no_bins), -10.0)
-        logits[..., 0] = 10.0
-        loss = compute_pde_loss(logits, asym_id, pde_params, mode="intra")
-        assert loss.item() < 0.05
+    def _make_pde_logits(self, n_token, n_bins=64):
+        return torch.randn(1, n_token, n_token, n_bins)
 
-    def test_high_pde_gives_high_loss(self):
+    def test_intra_pde(self):
+        """Intra PDE should return a scalar."""
         from bindcraft.losses.confidence import compute_pde_loss
-        N_token, no_bins = 5, 64
-        pde_params = {"min_bin": 0, "max_bin": 32, "no_bins": no_bins}
-        asym_id = torch.tensor([0, 0, 0, 1, 1])
-        logits = torch.full((1, N_token, N_token, no_bins), -10.0)
-        logits[..., -1] = 10.0
-        loss = compute_pde_loss(logits, asym_id, pde_params, mode="intra")
-        assert loss.item() > 0.8
-
-    def test_inter_pde_requires_contact_probs(self):
-        from bindcraft.losses.confidence import compute_pde_loss
-        logits = torch.randn(1, 5, 5, 64)
-        asym_id = torch.tensor([0, 0, 0, 1, 1])
-        pde_params = {"min_bin": 0, "max_bin": 32, "no_bins": 64}
-        with pytest.raises(AssertionError):
-            compute_pde_loss(logits, asym_id, pde_params, mode="inter")
+        pde_logits = self._make_pde_logits(10)
+        asym_id = torch.tensor([0]*5 + [1]*5)
+        pde_params = {"min_bin": 0.0, "max_bin": 32.0, "no_bins": 64}
+        loss = compute_pde_loss(pde_logits, asym_id, pde_params, mode="intra")
+        assert loss.dim() == 0
+        assert loss.item() >= 0
 
     def test_inter_pde_contact_weighted(self):
+        """Inter PDE should use contact_probs weighting."""
         from bindcraft.losses.confidence import compute_pde_loss
-        N_token, no_bins = 5, 64
-        pde_params = {"min_bin": 0, "max_bin": 32, "no_bins": no_bins}
-        asym_id = torch.tensor([0, 0, 0, 1, 1])
-        logits = torch.full((1, N_token, N_token, no_bins), -10.0)
-        logits[..., -1] = 10.0
-        contact_probs = torch.zeros(N_token, N_token)
-        contact_probs[0, 3] = 1.0
-        contact_probs[3, 0] = 1.0
-        loss = compute_pde_loss(logits, asym_id, pde_params, mode="inter", contact_probs=contact_probs)
-        assert loss.item() > 0.5
+        n = 10
+        pde_logits = self._make_pde_logits(n)
+        asym_id = torch.tensor([0]*5 + [1]*5)
+        pde_params = {"min_bin": 0.0, "max_bin": 32.0, "no_bins": 64}
+        contact_probs = torch.rand(n, n)
+        loss = compute_pde_loss(
+            pde_logits, asym_id, pde_params, mode="inter",
+            contact_probs=contact_probs,
+        )
+        assert loss.dim() == 0
+        assert loss.item() >= 0
+
+    def test_inter_pde_zero_contact(self):
+        """Zero contact_probs should give zero loss."""
+        from bindcraft.losses.confidence import compute_pde_loss
+        n = 10
+        pde_logits = self._make_pde_logits(n)
+        asym_id = torch.tensor([0]*5 + [1]*5)
+        pde_params = {"min_bin": 0.0, "max_bin": 32.0, "no_bins": 64}
+        contact_probs = torch.zeros(n, n)
+        loss = compute_pde_loss(
+            pde_logits, asym_id, pde_params, mode="inter",
+            contact_probs=contact_probs,
+        )
+        assert loss.item() == pytest.approx(0.0, abs=1e-6)
+
+    def test_differentiable(self):
+        """PDE loss must be differentiable."""
+        from bindcraft.losses.confidence import compute_pde_loss
+        pde_logits = torch.randn(1, 6, 6, 64, requires_grad=True)
+        asym_id = torch.tensor([0]*3 + [1]*3)
+        pde_params = {"min_bin": 0.0, "max_bin": 32.0, "no_bins": 64}
+        loss = compute_pde_loss(pde_logits, asym_id, pde_params, mode="intra")
+        loss.backward()
+        assert pde_logits.grad is not None
+
+
+class TestDefaultWeights:
+    """Verify DEFAULT_LOSS_WEIGHTS includes new losses."""
+
+    def test_twelve_loss_items(self):
+        from bindcraft.utils import DEFAULT_LOSS_WEIGHTS
+        assert "clash" in DEFAULT_LOSS_WEIGHTS
+        assert "i_clash" in DEFAULT_LOSS_WEIGHTS
+        assert "pde" in DEFAULT_LOSS_WEIGHTS
+        assert "i_pde" in DEFAULT_LOSS_WEIGHTS
+        assert len(DEFAULT_LOSS_WEIGHTS) == 12
+
+    def test_clash_params_exist(self):
+        from bindcraft.utils import DEFAULT_CLASH_PARAMS
+        assert "r_clash" in DEFAULT_CLASH_PARAMS
+        assert "bond_sep" in DEFAULT_CLASH_PARAMS

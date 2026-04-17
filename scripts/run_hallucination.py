@@ -60,7 +60,37 @@ def setup_logging(log_file: str = None):
         logging.getLogger().addHandler(file_handler)
 
 
-def load_protenix_model(model_name: str = "protenix_base_default_v1.0.0", device: str = "cuda"):
+def resolve_checkpoint_dir(checkpoint_dir: str = None) -> str:
+    """
+    解析 checkpoint 目录优先级:
+    1. CLI 显式传入
+    2. 环境变量 PROTENIX_CHECKPOINT_DIR
+    3. 项目根目录下的 checkpoint/（若存在）
+    4. 环境变量 PROTENIX_ROOT_DIR/checkpoint
+    """
+    if checkpoint_dir:
+        return checkpoint_dir
+
+    env_checkpoint_dir = os.environ.get("PROTENIX_CHECKPOINT_DIR")
+    if env_checkpoint_dir:
+        return env_checkpoint_dir
+
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _project_dir = os.path.dirname(_script_dir)
+    _local_ckpt = os.path.join(_project_dir, "checkpoint")
+    if os.path.isdir(_local_ckpt):
+        return _local_ckpt
+
+    protenix_root = os.environ.get("PROTENIX_ROOT_DIR", os.path.expanduser("~"))
+    return os.path.join(protenix_root, "checkpoint")
+
+
+def load_protenix_model(
+    model_name: str = "protenix_base_default_v1.0.0",
+    device: str = "cuda",
+    checkpoint_dir: str = None,
+    model_dtype: str = "bf16",
+):
     from collections.abc import Mapping
     from protenix.config.config import parse_configs
     from configs.configs_base import configs as configs_base
@@ -69,9 +99,17 @@ def load_protenix_model(model_name: str = "protenix_base_default_v1.0.0", device
     from configs.configs_model_type import model_configs
     from protenix.model.protenix import Protenix
 
-    logging.info(f"加载模型: {model_name}")
+    logging.info(f"加载模型: {model_name} | dtype={model_dtype}")
 
-    checkpoint_path = f"/hpc2hdd/home/bduan436/checkpoint/{model_name}.pt"
+    checkpoint_dir = resolve_checkpoint_dir(checkpoint_dir)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, f"{model_name}.pt")
+    logging.info(f"Checkpoint: {checkpoint_path}")
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(
+            f"未找到模型权重: {checkpoint_path}。"
+            f"请检查 --model_name 或通过 --checkpoint_dir / PROTENIX_CHECKPOINT_DIR 指定正确目录。"
+        )
 
     def deep_update(d, u):
         for k, v in u.items():
@@ -88,8 +126,8 @@ def load_protenix_model(model_name: str = "protenix_base_default_v1.0.0", device
     arg_str = (
         f"--model_name {model_name} "
         f"--use_msa false "
-        f"--dtype fp32 "
-        f"--load_checkpoint_dir /hpc2hdd/home/bduan436/checkpoint "
+        f"--dtype {model_dtype} "
+        f"--load_checkpoint_dir {checkpoint_dir} "
         f"--dump_dir /tmp/bindcraft_hallucination "
     )
     configs = parse_configs(
@@ -133,10 +171,17 @@ def main():
                        help="计算设备（默认：cuda）")
     parser.add_argument("--model_name", type=str, default="protenix_base_default_v1.0.0",
                        help="模型名称")
+    parser.add_argument("--checkpoint_dir", type=str, default=None,
+                       help="Checkpoint 目录；默认依次读取 --checkpoint_dir、PROTENIX_CHECKPOINT_DIR、PROTENIX_ROOT_DIR/checkpoint")
+    parser.add_argument("--dtype", type=str, default="bf16",
+                       choices=["bf16", "fp32"],
+                       help="模型计算精度（默认：bf16）")
     parser.add_argument("--output_dir", type=str, default="outputs",
                        help="输出目录（默认：./outputs）")
     parser.add_argument("--log_file", type=str, default=None,
                        help="日志文件路径")
+    parser.add_argument("--init_binder_seq", type=str, default=None,
+                       help="可选的初始 Binder 单字母序列；长度必须与 --binder_length 一致")
 
     # === 混合模式专用参数 ===
     parser.add_argument("--k_top", type=int, default=10,
@@ -153,8 +198,8 @@ def main():
                        help="退火初始温度（默认：1.0）")
     parser.add_argument("--t_min", type=float, default=0.01,
                        help="退火最低温度（默认：0.01）")
-    parser.add_argument("--use_tau_scheduling", type=lambda x: x.lower() == "true", default=True,
-                       help="是否启用时间步退火调度（默认：true）")
+    parser.add_argument("--use_tau_scheduling", type=lambda x: x.lower() == "true", default=False,
+                       help="是否启用时间步退火调度（默认：false，改用固定 tau=4.0）")
     parser.add_argument("--tau_jitter", type=lambda x: x.lower() == "true", default=True,
                        help="是否启用时间步抖动（默认：true）")
 
@@ -174,10 +219,30 @@ def main():
 
     args = parser.parse_args()
 
+    if args.init_binder_seq is not None:
+        args.init_binder_seq = args.init_binder_seq.strip().upper()
+        valid_aas = set("ACDEFGHIKLMNPQRSTVWY")
+        invalid = sorted(set(args.init_binder_seq) - valid_aas)
+        if len(args.init_binder_seq) != args.binder_length:
+            parser.error(
+                f"--init_binder_seq 长度为 {len(args.init_binder_seq)}，"
+                f"但 --binder_length 为 {args.binder_length}。"
+            )
+        if invalid:
+            parser.error(
+                "--init_binder_seq 只能包含 20 种标准氨基酸单字母代码；"
+                f"检测到非法字符: {','.join(invalid)}"
+            )
+
     setup_logging(args.log_file)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    model, configs = load_protenix_model(args.model_name, args.device)
+    model, configs = load_protenix_model(
+        args.model_name,
+        args.device,
+        checkpoint_dir=args.checkpoint_dir,
+        model_dtype=args.dtype,
+    )
 
     # 组装 loss_weights: 仅覆盖 CLI 显式指定的项，其余保持 DEFAULT_LOSS_WEIGHTS
     loss_weights = {}
@@ -202,6 +267,7 @@ def main():
             tau_noise=args.tau_noise,
             device=torch.device(args.device),
             loss_weights=loss_weights,
+            init_binder_seq=args.init_binder_seq,
         )
     else:
         best_seq, final_seq, losses_history = run_hybrid_hallucination(
@@ -222,6 +288,7 @@ def main():
             T_min=args.t_min,
             use_tau_scheduling=args.use_tau_scheduling,
             tau_jitter=args.tau_jitter,
+            init_binder_seq=args.init_binder_seq,
         )
 
     output_file = os.path.join(args.output_dir, "hallucination_result.txt")
@@ -232,6 +299,8 @@ def main():
         f.write(f"Optimization Steps: {args.n_steps}\n")
         f.write(f"Learning Rate: {args.learning_rate}\n")
         f.write(f"Tau Noise: {args.tau_noise}\n")
+        f.write(f"Checkpoint Dir: {resolve_checkpoint_dir(args.checkpoint_dir)}\n")
+        f.write(f"Initial Binder Sequence: {args.init_binder_seq or 'RANDOM'}\n")
         f.write(f"\n")
         f.write(f"Best Sequence: {best_seq}\n")
         f.write(f"Final Sequence: {final_seq}\n")
