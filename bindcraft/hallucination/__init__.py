@@ -16,11 +16,13 @@ from .diffusion_one_step import (
     get_coarse_structure,
     one_step_denoise,
     diffusion_one_step,
+    diffusion_one_step_fused,
 )
 
 from .pipeline import run_hallucination, run_hybrid_hallucination
+from .pipeline_cdr import run_hybrid_hallucination_cdr
 from .mutation_proposer import propose_mutations
-from .scheduler import AnnealingScheduler, TauScheduler
+from .scheduler import AnnealingScheduler, TauScheduler, MacroBreathTracker
 
 __all__ = [
     # STE Bridge
@@ -33,12 +35,15 @@ __all__ = [
     "get_coarse_structure",
     "one_step_denoise",
     "diffusion_one_step",
+    "diffusion_one_step_fused",
     # Pipeline
     "run_hallucination",
     "run_hybrid_hallucination",
+    "run_hybrid_hallucination_cdr",
     # Mutation Proposer
     "propose_mutations",
     # Schedulers
     "AnnealingScheduler",
     "TauScheduler",
+    "MacroBreathTracker",
 ]

@@ -65,7 +65,8 @@ def resolve_checkpoint_dir(checkpoint_dir: str = None) -> str:
     解析 checkpoint 目录优先级:
     1. CLI 显式传入
     2. 环境变量 PROTENIX_CHECKPOINT_DIR
-    3. 环境变量 PROTENIX_ROOT_DIR/checkpoint
+    3. 项目根目录下的 checkpoint/（若存在）
+    4. 环境变量 PROTENIX_ROOT_DIR/checkpoint
     """
     if checkpoint_dir:
         return checkpoint_dir
@@ -73,6 +74,12 @@ def resolve_checkpoint_dir(checkpoint_dir: str = None) -> str:
     env_checkpoint_dir = os.environ.get("PROTENIX_CHECKPOINT_DIR")
     if env_checkpoint_dir:
         return env_checkpoint_dir
+
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _project_dir = os.path.dirname(_script_dir)
+    _local_ckpt = os.path.join(_project_dir, "checkpoint")
+    if os.path.isdir(_local_ckpt):
+        return _local_ckpt
 
     protenix_root = os.environ.get("PROTENIX_ROOT_DIR", os.path.expanduser("~"))
     return os.path.join(protenix_root, "checkpoint")
@@ -95,7 +102,9 @@ def load_protenix_model(
     logging.info(f"加载模型: {model_name} | dtype={model_dtype}")
 
     checkpoint_dir = resolve_checkpoint_dir(checkpoint_dir)
+    os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, f"{model_name}.pt")
+    logging.info(f"Checkpoint: {checkpoint_path}")
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(
             f"未找到模型权重: {checkpoint_path}。"
@@ -189,8 +198,8 @@ def main():
                        help="退火初始温度（默认：1.0）")
     parser.add_argument("--t_min", type=float, default=0.01,
                        help="退火最低温度（默认：0.01）")
-    parser.add_argument("--use_tau_scheduling", type=lambda x: x.lower() == "true", default=True,
-                       help="是否启用时间步退火调度（默认：true）")
+    parser.add_argument("--use_tau_scheduling", type=lambda x: x.lower() == "true", default=False,
+                       help="是否启用时间步退火调度（默认：false，改用固定 tau=4.0）")
     parser.add_argument("--tau_jitter", type=lambda x: x.lower() == "true", default=True,
                        help="是否启用时间步抖动（默认：true）")
 

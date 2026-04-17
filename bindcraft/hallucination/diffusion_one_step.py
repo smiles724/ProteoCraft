@@ -34,35 +34,50 @@ def get_coarse_structure(
     model,
     input_feature_dict: Dict,
     s_inputs: torch.Tensor,
-    device: torch.device
+    device: torch.device,
+    X_clean: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    通过简单的随机初始化获取粗结构
-    
-    这个粗结构用作后续单步外推的起点
-    
+    获取粗结构 x_coarse，用作后续单步外推的起点。
+
+    优先级：
+    1. 若传入了 X_clean（Step 0/Step 3 得到的全链路零阶物理骨架），直接使用
+       - X_clean 的形状为 [1, N_atom, 3]（经 ODESolve 完整去噪后的真实物理结构）
+       - 这避免了每次从随机起点出发，让一阶前向的起点更有物理意义
+    2. 否则从 ref_pos + 随机噪声初始化
+
     Args:
         model: Protenix 模型
         input_feature_dict: 输入特征字典
         s_inputs: 输入的单体特征，[N_token, c_s]
         device: 计算设备
-        
+        X_clean: 可选，零阶全链路骨架，[1, N_atom, 3]
+
     Returns:
         x_coarse: 粗结构坐标，[1, N_atoms, 3]
     """
-    logger.info("初始化粗结构（随机初始化）...")
-    
-    # 获取原子数量
-    N_atoms = input_feature_dict["ref_pos"].shape[0]
-    
-    # 使用 ref_pos 作为初始粗结构（加上小的随机扰动）
-    with torch.no_grad():
-        x_coarse = input_feature_dict["ref_pos"].clone().unsqueeze(0)  # [1, N_atoms, 3]
-        # 添加小的随机扰动
+    N_atoms_dict = input_feature_dict["ref_pos"].shape[0]
+
+    if X_clean is not None:
+        # 分支1：使用零阶物理骨架（优先路径）
+        # 验证原子数匹配（序列不变时原子数相同）
+        if X_clean.shape[0] == 1 and X_clean.shape[1] == N_atoms_dict:
+            x_coarse = X_clean.clone().to(device)
+            logger.info(f"[骨架] 使用零阶骨架，shape={x_coarse.shape}")
+        else:
+            # 原子数不匹配（序列变化导致原子数变化），回退到随机初始化
+            logger.info(
+                f"[骨架] X_clean 原子数不匹配（{X_clean.shape[1]} vs {N_atoms_dict}），回退随机初始化"
+            )
+            x_coarse = None
+
+    if X_clean is None or x_coarse is None:
+        # 分支2：随机初始化（首次或序列变化后）
+        logger.info("[骨架] 随机初始化（ref_pos + 小随机扰动）")
+        x_coarse = input_feature_dict["ref_pos"].clone().unsqueeze(0).to(device)  # [1, N_atoms, 3]
         x_coarse = x_coarse + torch.randn_like(x_coarse) * 0.1
-    
-    logger.info(f"粗结构初始化完成，shape: {x_coarse.shape}")
-    
+
+    logger.debug(f"粗结构 shape: {x_coarse.shape}")
     return x_coarse
 
 
@@ -193,8 +208,10 @@ def diffusion_one_step(
     s_target: torch.Tensor,
     input_feature_dict: Dict,
     x_coarse: Optional[torch.Tensor] = None,
+    X_clean: Optional[torch.Tensor] = None,
     tau: float = 4.0,
-    device: torch.device = None
+    device: torch.device = None,
+    chunk_size: int = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     完整的单步外推流程（模块 B）
@@ -203,16 +220,19 @@ def diffusion_one_step(
     1. 拼接 Binder（STE 软特征）和 Target 特征 → s_inputs_ste
     2. 通过无 checkpoint 的 Pairformer 获取 s_trunk 和 z_trunk
        （梯度可从 s_trunk/z_trunk 反传至 s_binder → Theta）
-    3. 单步外推预测 x0_hat
+    3. 获取 x_coarse（优先用 X_clean 零阶骨架，回退到随机初始化）
+    4. 单步外推预测 x0_hat
 
     Args:
         model: Protenix 模型（权重已冻结）
         s_binder: Binder 特征（来自 STE，含梯度），[L_binder, c_s]
         s_target: Target 特征（冻结），[L_target, c_s]
         input_feature_dict: 输入特征字典
-        x_coarse: 粗结构（如果为 None 则初始化），[1, N_atoms, 3]
+        x_coarse: 粗结构（内部使用，优先由 X_clean 决定；若为 None 则从 X_clean 初始化）
+        X_clean: 零阶全链路骨架，[1, N_atom, 3]（由 Step 0 或 Step 3 获得）
         tau: 噪声时间步
         device: 计算设备
+        chunk_size: Attention 分块大小。114+ aa 建议 256，避免 OOM。
 
     Returns:
         x0_hat: 外推的无噪声结构，[1, N_atoms, 3]
@@ -232,11 +252,14 @@ def diffusion_one_step(
         input_feature_dict=input_feature_dict,
         s_init_override=s_inputs_ste,
         N_cycle=4,
+        chunk_size=chunk_size,
     )
 
-    # 步骤 3：初始化 x_coarse（如果需要）
+    # 步骤 3：获取 x_coarse（优先用 X_clean，回退到随机初始化）
     if x_coarse is None:
-        x_coarse = get_coarse_structure(model, input_feature_dict, s_inputs_ste, device)
+        x_coarse = get_coarse_structure(
+            model, input_feature_dict, s_inputs_ste, device, X_clean=X_clean
+        )
 
     # 步骤 4：单步外推
     x0_hat = one_step_denoise(
@@ -251,3 +274,179 @@ def diffusion_one_step(
     )
 
     return x0_hat, s_trunk, z_trunk
+
+
+# ============================================================
+# 多频段 τ 融合（Multi-Frequency τ Fusion）
+# ============================================================
+
+def diffusion_one_step_fused(
+    model,
+    s_binder: torch.Tensor,
+    s_target: torch.Tensor,
+    input_feature_dict: Dict,
+    x_coarse: Optional[torch.Tensor],
+    X_clean: Optional[torch.Tensor],
+    theta: torch.Tensor,
+    step_weights: Dict,
+    contact_params: Dict,
+    plddt_params,
+    pae_params,
+    distogram_params,
+    L_binder: int,
+    tau_coarse: float = 0.8,
+    tau_fine: float = 0.05,
+    alpha: float = 0.5,
+    device: torch.device = None,
+    pde_params=None,
+    clash_params=None,
+    chunk_size: int = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    多频段 τ 融合：在同一优化步中，分别用粗粒度 tau 和细粒度 tau 各执行一次
+    一阶前向，融合两次梯度后再更新 theta。
+
+    公式：
+      G_coarse = nabla_Theta L(tau=tau_coarse)
+      G_fine   = nabla_Theta L(tau=tau_fine)
+      G_fused  = alpha * G_coarse + (1 - alpha) * G_fine
+
+    其中 alpha 越大越偏向宏观探索（粗粒度），越小越偏向局部精修（细粒度）。
+
+    注意：该函数假设 optimizer.zero_grad() 已在外层调用，
+    caller 负责在返回值后执行 optimizer.step()。
+
+    Args:
+        model, s_binder, s_target, input_feature_dict, x_coarse:
+            与 diffusion_one_step 相同
+        X_clean: 零阶全链路骨架，[1, N_atom, 3]
+        theta:           [L_binder, 20] 可学习 Logits（需要就地清零梯度）
+        step_weights:   loss 权重字典
+        contact_params:  contact loss 参数
+        plddt_params / pae_params / distogram_params: bin 参数
+        L_binder:        binder 长度
+        tau_coarse:      粗粒度时间步（建议 0.6~0.9）
+        tau_fine:        细粒度时间步（建议 0.01~0.2）
+        alpha:           融合系数（粗粒度权重，0~1）
+        device:          计算设备
+
+    Returns:
+        grad_fused: [L_binder, 20] 融合后的梯度
+        x0_fine:    [1, N_atom, 3] 细粒度预测的结构（用于后续候选生成参考）
+    """
+    if device is None:
+        device = s_binder.device
+
+    s_inputs_ste = torch.cat([s_binder, s_target], dim=0)
+
+    # ── 获取 x_coarse（优先用 X_clean，回退到随机初始化）────────────────────
+    if x_coarse is None:
+        x_coarse = get_coarse_structure(
+            model, input_feature_dict, s_inputs_ste, device, X_clean=X_clean
+        )
+
+    # ── 粗粒度前向（tau_coarse）───────────────────────────────────────────
+    theta.grad.zero_()
+    _, s_trunk_coarse, z_trunk_coarse = pairformer_forward_no_ckpt(
+        model=model, input_feature_dict=input_feature_dict,
+        s_init_override=s_inputs_ste, N_cycle=4, chunk_size=chunk_size,
+    )
+    x0_coarse = one_step_denoise(
+        model=model, x_coarse=x_coarse, s_inputs=s_inputs_ste,
+        s_trunk=s_trunk_coarse, z_trunk=z_trunk_coarse,
+        input_feature_dict=input_feature_dict, tau=tau_coarse, device=device,
+    )
+
+    heads_coarse = _run_confidence_heads(
+        model, input_feature_dict, s_inputs_ste, s_trunk_coarse, z_trunk_coarse, x0_coarse,
+        chunk_size=chunk_size,
+    )
+    loss_coarse, _ = _compute_loss(
+        x0_coarse.squeeze(0), heads_coarse, input_feature_dict,
+        L_binder, step_weights, contact_params,
+        plddt_params, pae_params, distogram_params,
+        pde_params=pde_params, clash_params=clash_params,
+    )
+    loss_coarse.backward(retain_graph=True)
+    G_coarse = theta.grad.clone()
+    theta.grad.zero_()
+
+    # ── 细粒度前向（tau_fine）─────────────────────────────────────────────
+    # Pairformer 结果可复用（不依赖 tau，只依赖序列特征）
+    # 重新构建原子级 cache（pair_z 依赖 z_trunk，但粗细粒度用的是同一个 z_trunk）
+    pair_z = model.diffusion_module.diffusion_conditioning.prepare_cache(
+        input_feature_dict["relp"], z_trunk_coarse
+    )
+    p_lm, c_l = model.diffusion_module.atom_attention_encoder.prepare_cache(
+        ref_pos=input_feature_dict["ref_pos"],
+        ref_charge=input_feature_dict["ref_charge"],
+        ref_mask=input_feature_dict["ref_mask"],
+        ref_element=input_feature_dict["ref_element"],
+        ref_atom_name_chars=input_feature_dict["ref_atom_name_chars"],
+        atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+        d_lm=input_feature_dict["d_lm"],
+        v_lm=input_feature_dict["v_lm"],
+        pad_info=input_feature_dict["pad_info"],
+        r_l=True, z=pair_z, inplace_safe=False,
+    )
+    t_hat_fine = torch.tensor([tau_fine], device=device)
+    x_noisy_fine = x_coarse.detach() + tau_fine * torch.randn_like(x_coarse)
+    x0_fine = model.diffusion_module(
+        x_noisy=x_noisy_fine, t_hat_noise_level=t_hat_fine,
+        input_feature_dict=input_feature_dict,
+        s_inputs=s_inputs_ste, s_trunk=s_trunk_coarse, z_trunk=z_trunk_coarse,
+        pair_z=pair_z, p_lm=p_lm, c_l=c_l, inplace_safe=False,
+    )
+    heads_fine = _run_confidence_heads(
+        model, input_feature_dict, s_inputs_ste, s_trunk_coarse, z_trunk_coarse, x0_fine,
+        chunk_size=chunk_size,
+    )
+    loss_fine, _ = _compute_loss(
+        x0_fine.squeeze(0), heads_fine, input_feature_dict,
+        L_binder, step_weights, contact_params,
+        plddt_params, pae_params, distogram_params,
+        pde_params=pde_params, clash_params=clash_params,
+    )
+    loss_fine.backward()
+    G_fine = theta.grad.clone()
+
+    # ── 梯度融合 ──────────────────────────────────────────────────────────
+    grad_fused = alpha * G_coarse + (1.0 - alpha) * G_fine
+    theta.grad.copy_(grad_fused)
+
+    logger.debug(
+        f"  τ-fusion: coarse_loss={loss_coarse.item():.4f} fine_loss={loss_fine.item():.4f} "
+        f"α={alpha} G_coarse_norm={G_coarse.norm().item():.4f} "
+        f"G_fine_norm={G_fine.norm().item():.4f} G_fused_norm={grad_fused.norm().item():.4f}"
+    )
+
+    return grad_fused, x0_fine
+
+
+# ── 内部辅助函数（避免在 fusion 函数中重复大段代码）───────────────────────
+
+def _run_confidence_heads(model, input_feature_dict, s_inputs, s_trunk, z_trunk, x0_hat, chunk_size=None):
+    from bindcraft.losses.confidence import run_confidence_heads
+    return run_confidence_heads(
+        model=model, input_feature_dict=input_feature_dict,
+        s_inputs=s_inputs, s_trunk=s_trunk, z_trunk=z_trunk,
+        x0_hat=x0_hat, inplace_safe=False, chunk_size=chunk_size,
+    )
+
+
+def _compute_loss(x0_flat, heads, input_feature_dict, L_binder, weights,
+                   contact_params, plddt_params, pae_params, distogram_params,
+                   pde_params=None, clash_params=None):
+    from bindcraft.losses.total_loss import compute_all_losses
+    return compute_all_losses(
+        x0_flat=x0_flat,
+        plddt_logits=heads["plddt_logits"],
+        pae_logits=heads["pae_logits"],
+        distogram_logits=heads["distogram_logits"],
+        input_feature_dict=input_feature_dict,
+        L_binder=L_binder, weights=weights,
+        contact_params=contact_params,
+        plddt_params=plddt_params, pae_params=pae_params, distogram_params=distogram_params,
+        pde_logits=heads.get("pde_logits"),
+        pde_params=pde_params, clash_params=clash_params,
+    )

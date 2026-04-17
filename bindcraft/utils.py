@@ -272,6 +272,6 @@ DEFAULT_CONTACT_PARAMS = {
 }
 
 DEFAULT_CLASH_PARAMS = {
-    "r_clash":     2.0,
-    "bond_sep":    1,
+    "r_clash":   2.0,
+    "bond_sep":  1,
 }

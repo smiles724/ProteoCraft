@@ -41,6 +41,7 @@ def _msa_module_forward_ckpt_safe(
     input_feature_dict: Dict,
     z: torch.Tensor,
     s_inputs: torch.Tensor,
+    chunk_size: int = None,
 ) -> torch.Tensor:
     """
     手动执行 MSAModule 前向，同时保留 checkpoint_blocks。
@@ -101,7 +102,7 @@ def _msa_module_forward_ckpt_safe(
             triangle_multiplicative="torch",
             triangle_attention="torch",
             inplace_safe=False,
-            chunk_size=None,
+            chunk_size=chunk_size,
         )
         for block in msa_module.blocks
     ]
@@ -120,6 +121,7 @@ def pairformer_forward_no_ckpt(
     input_feature_dict: Dict,
     s_init_override: Optional[torch.Tensor] = None,
     N_cycle: int = 4,
+    chunk_size: int = None,
 ) -> tuple:
     """
     Pairformer 完整前向。
@@ -134,6 +136,7 @@ def pairformer_forward_no_ckpt(
                          作为 s_inputs（即 STE 桥接后的 s̃_init 拼接 s_target）。
                          shape: [N_token, c_s]
         N_cycle: 循环次数，默认 4
+        chunk_size: Attention 分块大小。114+ aa 建议 256，避免 OOM。
 
     Returns:
         s_inputs: 原始 input_embedder 输出（或 s_init_override），[N_token, c_s]
@@ -177,7 +180,7 @@ def pairformer_forward_no_ckpt(
                     triangle_multiplicative="torch",
                     triangle_attention="torch",
                     inplace_safe=False,
-                    chunk_size=None,
+                    chunk_size=chunk_size,
                 )
 
             # 对 use_msa=False 的模型，直接跳过 MSA 路径。
@@ -187,6 +190,7 @@ def pairformer_forward_no_ckpt(
                     input_feature_dict=input_feature_dict,
                     z=z,
                     s_inputs=s_inputs,
+                    chunk_size=chunk_size,
                 )
 
             # 单体特征更新（recycling）
@@ -200,7 +204,7 @@ def pairformer_forward_no_ckpt(
                     triangle_multiplicative="torch",
                     triangle_attention="torch",
                     inplace_safe=False,
-                    chunk_size=None,
+                    chunk_size=chunk_size,
                 )
                 for block in model.pairformer_stack.blocks
             ]

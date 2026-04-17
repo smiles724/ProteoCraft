@@ -285,9 +285,10 @@ def compute_pde_loss(
     """
     PDE loss (Predicted Distance Error).
 
-    mode="intra": raw mean over binder-internal pairs (same pattern as PAE).
-    mode="inter": contact-weighted mean over binder-target pairs (gPDE style).
-        Requires contact_probs [N_token, N_token] from distogram.
+    mode="intra": binder 内部 pair 的 raw mean（与 PAE intra 模式一致）。
+    mode="inter": contact-weighted gPDE（AF3 rank_metric 方式）。
+        用 contact_probs 加权，只聚焦有接触的 binder-target pair，
+        避免被大量非界面 pair 稀释。
 
     Args:
         pde_logits: [N_sample, N_token, N_token, pde_bins]
@@ -310,6 +311,7 @@ def compute_pde_loss(
             return torch.tensor(0.0, device=pde_score.device, requires_grad=True)
         return (pde_score * mask.unsqueeze(0).float()).sum() / (n * pde_score.shape[0])
     else:
+        # contact-weighted gPDE: sum(PDE * contact_probs) / sum(contact_probs)
         assert contact_probs is not None, "inter mode requires contact_probs"
         mask_inter = (asym_id == binder_id).unsqueeze(0) != (asym_id == binder_id).unsqueeze(1)
         weighted_mask = contact_probs * mask_inter.float()

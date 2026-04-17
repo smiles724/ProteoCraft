@@ -43,10 +43,12 @@ class ZerothOrderResult:
     """零阶推断的结构化返回值"""
 
     binder_seq: str
+    target_seq: str
     total_loss: float
     loss_dict: Dict[str, float]
     summary_confidence: dict
     coordinate: Optional[torch.Tensor] = field(default=None, repr=False)
+    plddt_logits: Optional[torch.Tensor] = field(default=None, repr=False)  # [1, N_atom, bins]
 
 
 def _run_full_forward(
@@ -54,12 +56,18 @@ def _run_full_forward(
     input_feature_dict: Dict,
     device: torch.device,
     N_cycle: int = 4,
+    chunk_size: int = None,
 ) -> tuple:
     """
     手动分步执行 Protenix 完整推断流程。
 
     与 _main_inference_loop 等价，但保留对 z_trunk 的引用，
     以便后续直接计算 distogram_logits。
+
+    Args:
+        chunk_size: Attention 分块大小（None 表示不分块）。
+                   当 complex 较大（如 114+ aa binder）时建议设为 256，
+                   避免 OOM。
 
     Returns:
         coordinate:       [N_sample, N_atom, 3]
@@ -176,6 +184,7 @@ def zeroth_order_eval(
     loss_weights: Dict[str, float] = None,
     contact_params: Dict[str, float] = None,
     N_cycle: int = 4,
+    chunk_size: int = None,
 ) -> ZerothOrderResult:
     """
     对一条离散候选序列执行完整 AF3 推断，并在最终结构上计算全部 8 项 loss。
@@ -188,6 +197,8 @@ def zeroth_order_eval(
         loss_weights:   各项 loss 权重（默认使用 DEFAULT_LOSS_WEIGHTS）
         contact_params: 接触 loss 参数（默认使用 DEFAULT_CONTACT_PARAMS）
         N_cycle:        Pairformer 循环次数
+        chunk_size:     Attention 分块大小。当 complex 较大（如 114+ aa）
+                       时建议设为 256，避免 OOM。默认为 None（不分块）。
 
     Returns:
         ZerothOrderResult: 包含 total_loss / loss_dict / summary_confidence / coordinate
@@ -218,9 +229,9 @@ def zeroth_order_eval(
             coordinate, s_inputs, s_trunk, z_trunk,
             plddt_logits, pae_logits, pde_logits,
             distogram_logits, contact_probs,
-        ) = _run_full_forward(model, input_feature_dict, device, N_cycle)
+        ) = _run_full_forward(model, input_feature_dict, device, N_cycle, chunk_size=None)
 
-        # ── 计算 8 项 loss ───────────────────────────────────────────────
+        # ── 计算 12 项 loss ──────────────────────────────────────────────
         # coordinate 形状: [N_sample, N_atom, 3]
         # compute_all_losses 期望 x0_flat: [N_atom, 3]
         # plddt_logits: [N_sample, N_atom, bins]
@@ -229,24 +240,23 @@ def zeroth_order_eval(
         x0_flat = coordinate[0]  # [N_atom, 3]
         plddt_for_loss = plddt_logits[0:1]  # [1, N_atom, bins]，保留 N_sample 维
         pae_for_loss = pae_logits[0:1]      # [1, N_token, N_token, bins]
-
-        pde_for_loss = pde_logits[0:1]
+        pde_for_loss = pde_logits[0:1]      # [1, N_token, N_token, bins]
 
         total_loss, losses = compute_all_losses(
             x0_flat=x0_flat,
             plddt_logits=plddt_for_loss,
             pae_logits=pae_for_loss,
-            pde_logits=pde_for_loss,
             distogram_logits=distogram_logits,
             input_feature_dict=input_feature_dict,
             L_binder=L_binder,
             weights=weights,
             contact_params=c_params,
-            clash_params=dict(DEFAULT_CLASH_PARAMS),
             plddt_params=plddt_params,
             pae_params=pae_params,
-            pde_params=pde_params,
             distogram_params=distogram_params,
+            pde_logits=pde_for_loss,
+            pde_params=pde_params,
+            clash_params=dict(DEFAULT_CLASH_PARAMS),
         )
 
         # ── Summary Confidence（Protenix 原生指标）────────────────────────
@@ -286,8 +296,10 @@ def zeroth_order_eval(
 
     return ZerothOrderResult(
         binder_seq=binder_seq,
+        target_seq=target_seq,
         total_loss=total_loss.item(),
         loss_dict=loss_dict,
         summary_confidence=sc_flat,
         coordinate=coordinate.cpu(),
+        plddt_logits=plddt_logits[0:1].cpu(),  # [1, N_atom, bins]
     )

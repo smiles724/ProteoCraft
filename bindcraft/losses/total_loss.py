@@ -30,39 +30,39 @@ def compute_all_losses(
     x0_flat: torch.Tensor,
     plddt_logits: torch.Tensor,
     pae_logits: torch.Tensor,
-    pde_logits: torch.Tensor,
     distogram_logits: torch.Tensor,
     input_feature_dict: Dict,
     L_binder: int,
     weights: Dict[str, float],
     contact_params: Dict[str, float],
-    clash_params: Dict[str, float],
     plddt_params: dict,
     pae_params: dict,
-    pde_params: dict,
     distogram_params: dict,
+    pde_logits: torch.Tensor = None,
+    pde_params: dict = None,
+    clash_params: Dict[str, float] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     在给定的全原子坐标和 confidence logits 上计算全部 12 项 loss。
 
     Args:
-        x0_flat:           全原子坐标 [N_atoms, 3]
+        x0_flat:           全原子坐标 [N_atoms, 3]（squeeze 后，无 batch 维）
         plddt_logits:      pLDDT logits [N_sample, N_atom, plddt_bins]
         pae_logits:        PAE logits [N_sample, N_token, N_token, pae_bins]
-        pde_logits:        PDE logits [N_sample, N_token, N_token, pde_bins] (None to skip)
         distogram_logits:  Distogram logits [N_token, N_token, no_bins]
-        input_feature_dict: 输入特征字典
+        input_feature_dict: 输入特征字典（含 asym_id / atom_to_token_idx / has_frame 等）
         L_binder:          Binder 残基数
         weights:           各项 loss 权重
-        contact_params:    接触 loss 参数
-        clash_params:      碰撞 loss 参数 (r_clash, bond_sep)
-        plddt_params:      pLDDT bin 参数
-        pae_params:        PAE bin 参数
-        pde_params:        PDE bin 参数
-        distogram_params:  Distogram bin 参数
+        contact_params:    接触 loss 参数（cutoff / num / seqsep）
+        plddt_params:      pLDDT 的 bin 参数 (min_bin, max_bin, no_bins)
+        pae_params:        PAE 的 bin 参数
+        distogram_params:  Distogram 的 bin 参数
+        pde_logits:        PDE logits [N_sample, N_token, N_token, pde_bins] (None to skip)
+        pde_params:        PDE 的 bin 参数 (None to skip)
+        clash_params:      碰撞 loss 参数 (r_clash, bond_sep) (None to skip)
 
     Returns:
-        total_loss: 加权总 loss
+        total_loss: 加权总 loss（标量 tensor）
         losses:     各项分项 loss 的字典（含 "total" 键）
     """
     device = x0_flat.device
@@ -164,7 +164,7 @@ def compute_all_losses(
         losses["rg"] = l_rg
         total_loss = total_loss + weights["rg"] * l_rg
 
-    # Helix
+    # Helix（负权重 = 鼓励螺旋）
     if weights.get("helix", 0) != 0:
         l_helix = compute_helix_loss(
             distogram_logits, binder_token_mask, distogram_params
@@ -174,14 +174,16 @@ def compute_all_losses(
 
     # ── 新增: Clash ──────────────────────────────────────────────────────
 
+    _clash_params = clash_params or {}
+
     # clash (intra)
     if weights.get("clash", 0) != 0:
         l_clash = compute_soft_clash_loss(
             x0_flat, binder_atom_mask, target_atom_mask,
             atom_to_token, input_feature_dict.get("residue_index", asym_id),
             mode="intra",
-            r_clash=clash_params.get("r_clash", 2.0),
-            bond_sep=clash_params.get("bond_sep", 1),
+            r_clash=_clash_params.get("r_clash", 2.0),
+            bond_sep=_clash_params.get("bond_sep", 1),
         )
         losses["clash"] = l_clash
         total_loss = total_loss + weights["clash"] * l_clash
@@ -192,8 +194,8 @@ def compute_all_losses(
             x0_flat, binder_atom_mask, target_atom_mask,
             atom_to_token, input_feature_dict.get("residue_index", asym_id),
             mode="inter",
-            r_clash=clash_params.get("r_clash", 2.0),
-            bond_sep=clash_params.get("bond_sep", 1),
+            r_clash=_clash_params.get("r_clash", 2.0),
+            bond_sep=_clash_params.get("bond_sep", 1),
         )
         losses["i_clash"] = l_iclash
         total_loss = total_loss + weights["i_clash"] * l_iclash
@@ -201,13 +203,13 @@ def compute_all_losses(
     # ── 新增: PDE ────────────────────────────────────────────────────────
 
     # pde (intra)
-    if weights.get("pde", 0) != 0 and pde_logits is not None:
+    if weights.get("pde", 0) != 0 and pde_logits is not None and pde_params is not None:
         l_pde = compute_pde_loss(pde_logits, asym_id, pde_params, mode="intra")
         losses["pde"] = l_pde
         total_loss = total_loss + weights["pde"] * l_pde
 
-    # i_pde (inter, contact-weighted)
-    if weights.get("i_pde", 0) != 0 and pde_logits is not None:
+    # i_pde (inter, contact-weighted gPDE)
+    if weights.get("i_pde", 0) != 0 and pde_logits is not None and pde_params is not None:
         contact_probs = sample_confidence.compute_contact_prob(
             distogram_logits=distogram_logits, **distogram_params,
         )

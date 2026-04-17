@@ -12,8 +12,8 @@ from .confidence import (
     compute_pae_loss,
     compute_contact_loss,
     compute_iptm_loss,
-    run_confidence_heads,
     compute_pde_loss,
+    run_confidence_heads,
 )
 from .total_loss import compute_all_losses
 
@@ -25,7 +25,7 @@ __all__ = [
     "compute_pae_loss",
     "compute_contact_loss",
     "compute_iptm_loss",
-    "run_confidence_heads",
     "compute_pde_loss",
+    "run_confidence_heads",
     "compute_all_losses",
 ]
