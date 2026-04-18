@@ -150,6 +150,7 @@ A6_TCR/protenix_runtime/
 benchmark/log/
 benchmark/input/
 benchmark/protenix_runtime/
+benchmark/protenix_runtime_*/
 
 # Benchmark run outputs (large); keep analysis scripts + directory placeholders
 benchmark/results/*

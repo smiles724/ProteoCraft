@@ -264,16 +264,22 @@ class TauScheduler:
 
         return tau
 
-    def get_dynamic_weights(self, step: int, total_steps: int) -> Dict[str, float]:
+    def get_dynamic_weights(
+        self,
+        step: int,
+        total_steps: int,
+        base_weights: Dict[str, float] | None = None,
+    ) -> Dict[str, float]:
         """
-        返回静态默认 loss 权重。
+        返回当前步使用的 loss 权重。
 
-        NOTE: 动态 loss 权重暂不使用（2026-04-04）。
-        get_dynamic_weights 始终返回 DEFAULT_LOSS_WEIGHTS。
-        如将来需要启用动态权重，大 tau 阶段应强调 con/i_con/rg，
-        小 tau 阶段应强调 plddt/pae/iptm。
+        当前仍不启用分阶段动态调权，因此返回 base_weights；若未提供则退回 DEFAULT_LOSS_WEIGHTS。
+        这样可保留调用方运行时注入的额外权重（如 hotspot）。
         """
-        return dict(DEFAULT_LOSS_WEIGHTS)
+        weights = dict(DEFAULT_LOSS_WEIGHTS)
+        if base_weights is not None:
+            weights.update(base_weights)
+        return weights
 
     def get_phase_name(self, step: int, total_steps: int) -> str:
         names = ["macro_topology", "interface_shaping", "atomic_refinement"]

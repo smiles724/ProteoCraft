@@ -21,7 +21,7 @@ BindCraft v2 - 零阶全链路推断模块
 
 import torch
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 import logging
 
 from protenix.model import sample_confidence
@@ -185,6 +185,7 @@ def zeroth_order_eval(
     contact_params: Dict[str, float] = None,
     N_cycle: int = 4,
     chunk_size: int = None,
+    hotspot_params: Optional[Dict[str, Any]] = None,
 ) -> ZerothOrderResult:
     """
     对一条离散候选序列执行完整 AF3 推断，并在最终结构上计算全部 8 项 loss。
@@ -257,6 +258,7 @@ def zeroth_order_eval(
             pde_logits=pde_for_loss,
             pde_params=pde_params,
             clash_params=dict(DEFAULT_CLASH_PARAMS),
+            hotspot_params=hotspot_params,
         )
 
         # ── Summary Confidence（Protenix 原生指标）────────────────────────

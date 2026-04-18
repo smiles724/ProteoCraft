@@ -76,6 +76,49 @@ def compute_helix_loss(
     return helix_vals.mean()
 
 
+def compute_hotspot_distance_loss(
+    x0_flat: torch.Tensor,
+    binder_atom_mask: torch.Tensor,
+    hotspot_target_atom_mask: torch.Tensor,
+    cutoff: float = 8.0,
+    top_k: int = 3,
+) -> tuple[torch.Tensor, dict]:
+    """
+    hotspot 距离约束：鼓励 binder 靠近指定 target hotspot 残基。
+
+    对每个 hotspot representative atom 计算其到 binder representative atoms 的最小距离，
+    再对最靠近的 top-k 个 hotspot 距离取均值，最后用 relu(distance-cutoff) 作为惩罚。
+    """
+    binder_coords = x0_flat[binder_atom_mask]
+    hotspot_coords = x0_flat[hotspot_target_atom_mask]
+
+    if binder_coords.shape[0] == 0 or hotspot_coords.shape[0] == 0:
+        zero = torch.tensor(0.0, device=x0_flat.device, requires_grad=True)
+        return zero, {
+            "hotspot_min_distance": zero,
+            "hotspot_mean_min_distance": zero,
+        }
+
+    dist = torch.cdist(hotspot_coords, binder_coords)
+    min_dist_per_hotspot = dist.min(dim=1).values
+    hotspot_min_distance = min_dist_per_hotspot.min()
+
+    if top_k is None or top_k <= 0 or top_k >= min_dist_per_hotspot.shape[0]:
+        hotspot_mean_min_distance = min_dist_per_hotspot.mean()
+    else:
+        hotspot_mean_min_distance = torch.topk(
+            min_dist_per_hotspot,
+            k=top_k,
+            largest=False,
+        ).values.mean()
+
+    hotspot_loss = torch.relu(hotspot_mean_min_distance - cutoff)
+    return hotspot_loss, {
+        "hotspot_min_distance": hotspot_min_distance,
+        "hotspot_mean_min_distance": hotspot_mean_min_distance,
+    }
+
+
 def compute_soft_clash_loss(
     x0_flat: torch.Tensor,
     binder_atom_mask: torch.Tensor,

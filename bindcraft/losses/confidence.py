@@ -46,18 +46,21 @@ def compute_pae_loss(
     asym_id: torch.Tensor,
     pae_params: dict,
     mode: str = "intra",
+    hotspot_token_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     PAE loss: mean PAE score over intra-chain or inter-chain token pairs.
 
     mode="intra": binder 内部（同链）的 PAE -> 越低越好
     mode="inter": binder-target 界面（跨链）的 PAE -> 越低越好
+      若提供 hotspot_token_mask，则 inter 模式只计算 binder x hotspot 的 PAE（仿 v1）。
 
     Args:
         pae_logits: [N_sample, N_token, N_token, pae_bins]
         asym_id: [N_token] chain ID
         pae_params: dict with min_bin, max_bin, no_bins
         mode: "intra" or "inter"
+        hotspot_token_mask: [N_token] bool, optional hotspot target token mask
     """
     from protenix.model.sample_confidence import logits_to_score
     pae_score = logits_to_score(pae_logits, **pae_params)  # [N_sample, N_token, N_token]
@@ -67,15 +70,20 @@ def compute_pae_loss(
 
     # 以第一个 token 所在链作为 binder 链，避免 unique() 排序带来的链顺序歧义
     binder_id = asym_id[0]
+    binder_mask = asym_id == binder_id
 
     if mode == "intra":
-        mask = (asym_id == binder_id).unsqueeze(0) & (asym_id == binder_id).unsqueeze(1)
+        mask = binder_mask.unsqueeze(0) & binder_mask.unsqueeze(1)
         n = mask.sum()
         if n == 0:
             return torch.tensor(0.0, device=pae_score.device, requires_grad=True)
         return (pae_score * mask.unsqueeze(0).float()).sum() / (n * pae_score.shape[0])
     else:
-        mask_inter = (asym_id == binder_id).unsqueeze(0) != (asym_id == binder_id).unsqueeze(1)
+        if hotspot_token_mask is not None:
+            # v1 style: only compute PAE between binder tokens and hotspot target tokens
+            mask_inter = binder_mask.unsqueeze(1) & hotspot_token_mask.unsqueeze(0)
+        else:
+            mask_inter = binder_mask.unsqueeze(0) != binder_mask.unsqueeze(1)
         n = mask_inter.sum()
         if n == 0:
             return torch.tensor(0.0, device=pae_score.device, requires_grad=True)
@@ -96,6 +104,7 @@ def compute_contact_loss(
     seqsep: int = 9,
     binary: bool = False,
     residue_index: torch.Tensor = None,
+    hotspot_token_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Contact loss（对齐 ColabDesign get_con_loss / _get_con_loss）。
@@ -109,6 +118,8 @@ def compute_contact_loss(
         cutoff: contact distance threshold (Angstrom)
         num: target number of contacts per residue
         seqsep: minimum sequence separation for intra contacts
+        hotspot_token_mask: [N_token] bool, optional; when set in inter mode,
+            only contacts against hotspot target tokens are counted (v1 style)
     """
     def _min_k(x: torch.Tensor, k: int, mask: torch.Tensor = None) -> torch.Tensor:
         """沿最后一维取最小 k 个（忽略 mask=False 位置），并取均值。"""
@@ -159,14 +170,21 @@ def compute_contact_loss(
         mask_2d = binder_token_mask.unsqueeze(0) & binder_token_mask.unsqueeze(1)
         m = m & mask_2d
         mask_1d = binder_token_mask
+        effective_num_pos = num_pos
     else:
-        # binder-target（行上做 binder，列上做 target）
-        # 对齐 ColabDesign: m = logical_and(m, mask_1b)
-        m = m & target_token_mask.unsqueeze(0)
-        mask_1d = binder_token_mask
+        if hotspot_token_mask is not None:
+            # v1 style: 行 = hotspot 残基，列 = binder，num_pos = 全部 hotspot（等效 inf）
+            m = m & binder_token_mask.unsqueeze(0)
+            mask_1d = hotspot_token_mask
+            effective_num_pos = int(hotspot_token_mask.sum().item())
+        else:
+            # 默认: 行 = binder，列 = target
+            m = m & target_token_mask.unsqueeze(0)
+            mask_1d = binder_token_mask
+            effective_num_pos = num_pos
 
     per_pos = _min_k(pair_loss, k=num, mask=m)
-    return _min_k(per_pos, k=num_pos, mask=mask_1d)
+    return _min_k(per_pos, k=effective_num_pos, mask=mask_1d)
 
 
 # ── iPTM Loss ─────────────────────────────────────────────────────────────────

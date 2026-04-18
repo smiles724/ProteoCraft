@@ -300,6 +300,7 @@ def diffusion_one_step_fused(
     device: torch.device = None,
     pde_params=None,
     clash_params=None,
+    hotspot_params=None,
     chunk_size: int = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -366,6 +367,7 @@ def diffusion_one_step_fused(
         L_binder, step_weights, contact_params,
         plddt_params, pae_params, distogram_params,
         pde_params=pde_params, clash_params=clash_params,
+        hotspot_params=hotspot_params,
     )
     loss_coarse.backward(retain_graph=True)
     G_coarse = theta.grad.clone()
@@ -406,6 +408,7 @@ def diffusion_one_step_fused(
         L_binder, step_weights, contact_params,
         plddt_params, pae_params, distogram_params,
         pde_params=pde_params, clash_params=clash_params,
+        hotspot_params=hotspot_params,
     )
     loss_fine.backward()
     G_fine = theta.grad.clone()
@@ -436,7 +439,7 @@ def _run_confidence_heads(model, input_feature_dict, s_inputs, s_trunk, z_trunk,
 
 def _compute_loss(x0_flat, heads, input_feature_dict, L_binder, weights,
                    contact_params, plddt_params, pae_params, distogram_params,
-                   pde_params=None, clash_params=None):
+                   pde_params=None, clash_params=None, hotspot_params=None):
     from bindcraft.losses.total_loss import compute_all_losses
     return compute_all_losses(
         x0_flat=x0_flat,
@@ -449,4 +452,5 @@ def _compute_loss(x0_flat, heads, input_feature_dict, L_binder, weights,
         plddt_params=plddt_params, pae_params=pae_params, distogram_params=distogram_params,
         pde_logits=heads.get("pde_logits"),
         pde_params=pde_params, clash_params=clash_params,
+        hotspot_params=hotspot_params,
     )

@@ -253,7 +253,7 @@ DEFAULT_LOSS_WEIGHTS = {
     "pae":     0.4,
     "i_pae":   0.1,
     "con":     1.0,
-    "i_con":   1.0,
+    "i_con":   3.0,
     "iptm":    0.05,
     "rg":      0.3,
     "helix":  -0.3,
@@ -265,9 +265,10 @@ DEFAULT_LOSS_WEIGHTS = {
 
 DEFAULT_CONTACT_PARAMS = {
     "intra_cutoff":  14.0,
-    "inter_cutoff":  20.0,
+    "inter_cutoff":  21.6875,
     "intra_num":     2,
-    "inter_num":     2,
+    "inter_num":     1,
+    "inter_num_pos": 100000,  # v1: num_pos=inf，取所有位置
     "seqsep":        9,
 }
 

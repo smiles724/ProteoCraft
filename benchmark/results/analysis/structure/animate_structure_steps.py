@@ -19,7 +19,7 @@ def _extract_step_num(path):
         raise ValueError(f"Could not parse step number from {path}") from exc
 
 
-def discover_steps(run_dir, beam=0):
+def discover_steps(run_dir, beam=0, accepted_only=False):
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
     pattern = os.path.join(checkpoint_dir, "step_*", f"step_*_beam_{beam}_meta.json")
     meta_files = sorted(glob(pattern))
@@ -32,6 +32,9 @@ def discover_steps(run_dir, beam=0):
     for meta_path in meta_files:
         with open(meta_path) as f:
             meta = json.load(f)
+
+        if accepted_only and not meta.get("accepted", False):
+            continue
 
         step_dir = os.path.dirname(meta_path)
         step_num = meta.get("step", _extract_step_num(meta_path))
@@ -577,13 +580,15 @@ def parse_args():
     parser.add_argument("--stride", type=int, default=None, help="Keep every Nth step before rendering")
     parser.add_argument("--max_frames", type=int, default=None, help="Evenly sample down to at most this many frames")
     parser.add_argument("--fps", type=int, default=4, help="Default playback speed (default: 4)")
+    parser.add_argument("--accepted-only", action="store_true", default=True, help="Only include accepted steps (default: True)")
+    parser.add_argument("--all-steps", dest="accepted_only", action="store_false", help="Include all steps including rejected")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    steps = discover_steps(args.run_dir, beam=args.beam)
+    steps = discover_steps(args.run_dir, beam=args.beam, accepted_only=args.accepted_only)
     sampled_steps = sample_steps(steps, stride=args.stride, max_frames=args.max_frames)
     frames, static_target_pdb, binder_chain, target_chains = build_aligned_frames(sampled_steps)
 

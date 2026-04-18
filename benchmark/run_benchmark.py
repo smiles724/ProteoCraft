@@ -10,6 +10,7 @@
 """
 
 import os
+import re
 import sys
 import csv
 import json
@@ -17,7 +18,7 @@ import time
 import argparse
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 import yaml
@@ -62,6 +63,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "source_dir": "/data/huangyanjie/binder_design/AF3Score/input",
     "input_dir": str(Path(PROJECT_ROOT) / "benchmark" / "input" / "A6_TCR"),
     "results_dir": str(Path(PROJECT_ROOT) / "benchmark" / "results"),
+    "log_dir": None,
     "model_checkpoint_dir": "/data/huangyanjie/Alphaenzyme/LGOS/checkpoints",
     "components_cache_dir": "/data/huangyanjie/Alphaenzyme/LGOS/protenix/release_data/ccd_cache",
     "protenix_root_dir": str(Path(PROJECT_ROOT) / "benchmark" / "protenix_runtime"),
@@ -80,6 +82,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "t_min": 0.01,
     "use_tau_scheduling": True,
     "tau_jitter": True,
+    "target_hotspot_residues": None,
+    "w_plddt": None,
+    "w_pae": None,
+    "w_i_pae": None,
+    "w_con": None,
+    "w_i_con": None,
+    "w_iptm": None,
+    "w_rg": None,
+    "w_helix": None,
+    "w_clash": None,
+    "w_i_clash": None,
+    "w_pde": None,
+    "w_i_pde": None,
     "entry_ids": None,
     "skip_existing": False,
     "save_checkpoints": True,
@@ -166,8 +181,14 @@ def resolve_args(parsed_args: argparse.Namespace) -> argparse.Namespace:
     return argparse.Namespace(**config)
 
 
-def extract_chain_sequence(pdb_path: Path, chain_id: str) -> str:
-    residues = []
+HOTSPOT_TOKEN_PATTERN = re.compile(
+    r"^(?P<chain>[A-Za-z0-9_])(?P<start>-?\d+[A-Za-z]?)(?:-(?P<end>-?\d+[A-Za-z]?))?$"
+)
+RESIDUE_REF_PATTERN = re.compile(r"^(?P<number>-?\d+)(?P<icode>[A-Za-z]?)$")
+
+
+def extract_chain_residues(pdb_path: Path, chain_id: str) -> List[Dict[str, Any]]:
+    residues: List[Dict[str, Any]] = []
     seen = set()
 
     with pdb_path.open() as handle:
@@ -181,21 +202,126 @@ def extract_chain_sequence(pdb_path: Path, chain_id: str) -> str:
             if current_chain != chain_id:
                 continue
 
-            resid = (line[22:26].strip(), line[26].strip())
+            resid_number_str = line[22:26].strip()
+            insertion_code = line[26].strip().upper()
+            resid = (resid_number_str, insertion_code)
             if resid in seen:
                 continue
             seen.add(resid)
 
             resname = line[17:20].strip()
-            residues.append(AA3_TO_1.get(resname, "X"))
+            residues.append(
+                {
+                    "chain_id": chain_id,
+                    "residue_number": int(resid_number_str),
+                    "insertion_code": insertion_code,
+                    "seq_index": len(residues),
+                    "aa": AA3_TO_1.get(resname, "X"),
+                }
+            )
 
     if not residues:
         raise ValueError(f"{pdb_path} 中未找到链 {chain_id} 的蛋白质序列")
 
-    return "".join(residues)
+    return residues
 
 
-def collect_entries(source_dir: Path) -> tuple[List[Dict[str, Any]], List[str]]:
+def extract_chain_sequence(pdb_path: Path, chain_id: str) -> str:
+    return "".join(residue["aa"] for residue in extract_chain_residues(pdb_path, chain_id))
+
+
+def _parse_residue_ref(label: str) -> Tuple[int, str]:
+    match = RESIDUE_REF_PATTERN.fullmatch(label)
+    if match is None:
+        raise ValueError(f"非法残基编号: {label}")
+    return int(match.group("number")), match.group("icode").upper()
+
+
+def resolve_target_hotspots(
+    chain_residue_map: Dict[str, List[Dict[str, Any]]],
+    hotspot_spec: Optional[str],
+) -> Tuple[List[int], List[str]]:
+    if hotspot_spec is None:
+        return [], []
+
+    spec = str(hotspot_spec).strip()
+    if not spec:
+        return [], []
+
+    chain_offsets: Dict[str, int] = {}
+    running_offset = 0
+    for chain_id in ("B", "C"):
+        chain_offsets[chain_id] = running_offset
+        running_offset += len(chain_residue_map.get(chain_id, []))
+
+    resolved_indices: List[int] = []
+    resolved_labels: List[str] = []
+    seen_indices = set()
+
+    for raw_token in spec.split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+
+        match = HOTSPOT_TOKEN_PATTERN.fullmatch(token)
+        if match is None:
+            raise ValueError(
+                f"非法 hotspot 片段: {token}；当前必须使用带链名前缀的格式，如 B56 或 C12-15"
+            )
+
+        chain_id = match.group("chain")
+        if chain_id not in chain_residue_map:
+            raise ValueError(f"hotspot 指定了不存在的 target 链: {chain_id}")
+
+        residues = chain_residue_map[chain_id]
+        start_number, start_icode = _parse_residue_ref(match.group("start"))
+        end_label = match.group("end")
+
+        if end_label is None:
+            matched = [
+                residue
+                for residue in residues
+                if residue["residue_number"] == start_number
+                and residue["insertion_code"] == start_icode
+            ]
+            if not matched:
+                suffix = start_icode or ""
+                raise ValueError(f"未在链 {chain_id} 中找到 hotspot 残基 {chain_id}{start_number}{suffix}")
+        else:
+            end_number, end_icode = _parse_residue_ref(end_label)
+            if start_icode or end_icode:
+                raise ValueError(f"暂不支持带 insertion code 的区间 hotspot: {token}")
+            if end_number < start_number:
+                raise ValueError(f"hotspot 区间非法: {token}")
+            matched = [
+                residue
+                for residue in residues
+                if start_number <= residue["residue_number"] <= end_number
+            ]
+            if not matched:
+                raise ValueError(f"未在链 {chain_id} 中找到 hotspot 区间 {token}")
+
+        chain_offset = chain_offsets[chain_id]
+        for residue in matched:
+            concat_index = chain_offset + residue["seq_index"]
+            if concat_index in seen_indices:
+                continue
+            seen_indices.add(concat_index)
+            resolved_indices.append(concat_index)
+            resolved_labels.append(
+                f"{chain_id}{residue['residue_number']}{residue['insertion_code']}"
+            )
+
+    if not resolved_indices:
+        raise ValueError(f"未解析出任何有效 hotspot: {hotspot_spec}")
+
+    return resolved_indices, resolved_labels
+
+
+def collect_entries(
+    source_dir: Path,
+    target_hotspot_residues: Optional[str] = None,
+) -> tuple[List[Dict[str, Any]], List[str]]:
     pdb_files = sorted(source_dir.rglob("*.pdb"))
     if not pdb_files:
         raise FileNotFoundError(f"{source_dir} 下未找到 PDB 文件")
@@ -203,14 +329,30 @@ def collect_entries(source_dir: Path) -> tuple[List[Dict[str, Any]], List[str]]:
     entries: List[Dict[str, Any]] = []
     target_b_set = set()
     target_c_set = set()
+    reference_hotspot_indices: Optional[List[int]] = None
 
     for pdb_path in pdb_files:
-        binder_seq = extract_chain_sequence(pdb_path, "A")
-        target_b = extract_chain_sequence(pdb_path, "B")
-        target_c = extract_chain_sequence(pdb_path, "C")
+        binder_residues = extract_chain_residues(pdb_path, "A")
+        target_b_residues = extract_chain_residues(pdb_path, "B")
+        target_c_residues = extract_chain_residues(pdb_path, "C")
+
+        binder_seq = "".join(residue["aa"] for residue in binder_residues)
+        target_b = "".join(residue["aa"] for residue in target_b_residues)
+        target_c = "".join(residue["aa"] for residue in target_c_residues)
 
         target_b_set.add(target_b)
         target_c_set.add(target_c)
+
+        hotspot_concat_indices, hotspot_labels = resolve_target_hotspots(
+            {"B": target_b_residues, "C": target_c_residues},
+            target_hotspot_residues,
+        )
+        if reference_hotspot_indices is None:
+            reference_hotspot_indices = hotspot_concat_indices
+        elif hotspot_concat_indices != reference_hotspot_indices:
+            raise ValueError(
+                f"{pdb_path} 的 hotspot 映射与其他 source PDB 不一致，无法作为固定 target 批量优化"
+            )
 
         entries.append(
             {
@@ -221,6 +363,9 @@ def collect_entries(source_dir: Path) -> tuple[List[Dict[str, Any]], List[str]]:
                 "init_binder_seq": binder_seq,
                 "target_chain_b_seq": target_b,
                 "target_chain_c_seq": target_c,
+                "target_hotspot_residues": target_hotspot_residues,
+                "target_hotspot_concat_indices": hotspot_concat_indices,
+                "target_hotspot_labels": hotspot_labels,
             }
         )
 
@@ -244,11 +389,17 @@ def write_input_files(entries: List[Dict[str, Any]], target_sequences: List[str]
             "init_binder_seq",
             "target_chain_b_seq",
             "target_chain_c_seq",
+            "target_hotspot_residues",
+            "target_hotspot_concat_indices",
         ]
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for entry in entries:
-            writer.writerow(entry)
+            row = dict(entry)
+            row["target_hotspot_concat_indices"] = json.dumps(
+                entry.get("target_hotspot_concat_indices", []), ensure_ascii=False
+            )
+            writer.writerow(row)
 
     target_fasta = input_dir / "target_chains.fasta"
     with target_fasta.open("w", encoding="utf-8") as handle:
@@ -322,6 +473,29 @@ def parse_entry_ids(entry_ids: Any) -> Set[str]:
     raise TypeError("entry_ids 必须是 null、逗号分隔字符串或字符串列表")
 
 
+def resolve_loss_weights(args: argparse.Namespace) -> Optional[Dict[str, float]]:
+    weight_arg_map = {
+        "plddt": getattr(args, "w_plddt", None),
+        "pae": getattr(args, "w_pae", None),
+        "i_pae": getattr(args, "w_i_pae", None),
+        "con": getattr(args, "w_con", None),
+        "i_con": getattr(args, "w_i_con", None),
+        "iptm": getattr(args, "w_iptm", None),
+        "rg": getattr(args, "w_rg", None),
+        "helix": getattr(args, "w_helix", None),
+        "clash": getattr(args, "w_clash", None),
+        "i_clash": getattr(args, "w_i_clash", None),
+        "pde": getattr(args, "w_pde", None),
+        "i_pde": getattr(args, "w_i_pde", None),
+    }
+    loss_weights = {
+        key: float(value)
+        for key, value in weight_arg_map.items()
+        if value is not None
+    }
+    return loss_weights or None
+
+
 def run_one_entry(
     entry: Dict[str, Any],
     target_sequences: List[str],
@@ -343,12 +517,27 @@ def run_one_entry(
         optimization_checkpoint_dir = entry_results_dir / args.checkpoint_subdir_name
         optimization_checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    hotspot_params = None
+    hotspot_indices = entry.get("target_hotspot_concat_indices", [])
+    if hotspot_indices:
+        hotspot_params = {
+            "target_hotspot_concat_indices": hotspot_indices,
+        }
+        logger.info(
+            f"{entry['entry_id']} hotspot={entry.get('target_hotspot_labels', hotspot_indices)} "
+            f"concat_idx={hotspot_indices}"
+        )
+
     logger.info(
         f"开始 {entry['entry_id']} | binder_len={entry['binder_length']} | "
         f"target={len(target_sequences[0])}+{len(target_sequences[1])}"
     )
     if optimization_checkpoint_dir is not None:
         logger.info(f"{entry['entry_id']} checkpoint 输出目录: {optimization_checkpoint_dir}")
+
+    loss_weights = resolve_loss_weights(args)
+    if loss_weights is not None:
+        logger.info(f"{entry['entry_id']} loss_weights_override={loss_weights}")
 
     t0 = time.time()
     if args.mode == "first_order":
@@ -360,8 +549,9 @@ def run_one_entry(
             learning_rate=args.learning_rate,
             tau_noise=args.tau_noise,
             device=device,
-            loss_weights=None,
+            loss_weights=loss_weights,
             init_binder_seq=entry["init_binder_seq"],
+            hotspot_params=hotspot_params,
         )
     else:
         best_seq, final_seq, losses_history = run_hybrid_hallucination(
@@ -372,7 +562,7 @@ def run_one_entry(
             learning_rate=args.learning_rate,
             tau_noise=args.tau_noise,
             device=device,
-            loss_weights=None,
+            loss_weights=loss_weights,
             K_top=args.k_top,
             B_candidates=args.b_candidates,
             T_sample=args.t_sample,
@@ -384,6 +574,7 @@ def run_one_entry(
             tau_jitter=args.tau_jitter,
             init_binder_seq=entry["init_binder_seq"],
             checkpoint_dir=str(optimization_checkpoint_dir) if optimization_checkpoint_dir is not None else None,
+            hotspot_params=hotspot_params,
         )
 
     elapsed = time.time() - t0
@@ -398,6 +589,9 @@ def run_one_entry(
         "init_binder_seq": entry["init_binder_seq"],
         "target_chain_b_seq": target_sequences[0],
         "target_chain_c_seq": target_sequences[1],
+        "target_hotspot_residues": entry.get("target_hotspot_residues"),
+        "target_hotspot_labels": entry.get("target_hotspot_labels", []),
+        "target_hotspot_concat_indices": hotspot_indices,
         "mode": args.mode,
         "best_seq": best_seq,
         "final_seq": final_seq,
@@ -419,6 +613,8 @@ def run_one_entry(
             "t_min": args.t_min,
             "use_tau_scheduling": args.use_tau_scheduling,
             "tau_jitter": args.tau_jitter,
+            "target_hotspot_residues": args.target_hotspot_residues,
+            "loss_weights_override": loss_weights,
             "model_name": args.model_name,
             "save_checkpoints": args.save_checkpoints,
             "checkpoint_subdir_name": args.checkpoint_subdir_name,
@@ -451,6 +647,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-dir", type=str, default=argparse.SUPPRESS)
     parser.add_argument("--input-dir", type=str, default=argparse.SUPPRESS)
     parser.add_argument("--results-dir", type=str, default=argparse.SUPPRESS)
+    parser.add_argument("--log-dir", type=str, default=argparse.SUPPRESS)
     parser.add_argument(
         "--model-checkpoint-dir",
         "--checkpoint-dir",
@@ -481,6 +678,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--t-init", dest="t_init", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--t-min", dest="t_min", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--w-plddt", dest="w_plddt", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--w-pae", dest="w_pae", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--w-i-pae", dest="w_i_pae", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--w-con", dest="w_con", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--w-i-con", dest="w_i_con", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--w-iptm", dest="w_iptm", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--w-rg", dest="w_rg", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--w-helix", dest="w_helix", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--w-clash", dest="w_clash", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--w-i-clash", dest="w_i_clash", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--w-pde", dest="w_pde", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--w-i-pde", dest="w_i_pde", type=float, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--target-hotspot-residues",
+        dest="target_hotspot_residues",
+        type=str,
+        default=argparse.SUPPRESS,
+        help="指定 target hotspot，必须带链名前缀，如 B56,B57,C12-15",
+    )
     parser.add_argument("--entry-ids", dest="entry_ids", type=str, default=argparse.SUPPRESS)
     parser.add_argument(
         "--checkpoint-subdir-name",
@@ -516,7 +732,7 @@ def main() -> None:
     results_dir = base_results_dir / task_id
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    log_dir = Path(PROJECT_ROOT) / "benchmark" / "log"
+    log_dir = Path(args.log_dir) if args.log_dir else (Path(PROJECT_ROOT) / "benchmark" / "log")
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"worker_{args.worker_index}.log"
     logger = setup_logging(log_path)
@@ -537,11 +753,19 @@ def main() -> None:
     logger.info(f"PROTENIX_ROOT_DIR={runtime_root}")
 
     source_dir = Path(args.source_dir)
-    entries, target_sequences = collect_entries(source_dir)
+    entries, target_sequences = collect_entries(
+        source_dir,
+        target_hotspot_residues=args.target_hotspot_residues,
+    )
     logger.info(f"扫描到 {len(entries)} 个 source PDB 条目")
     logger.info(
         f"固定 target: chain_B={len(target_sequences[0])} aa, chain_C={len(target_sequences[1])} aa"
     )
+    if args.target_hotspot_residues:
+        logger.info(
+            f"已启用 hotspot: spec={args.target_hotspot_residues} | "
+            f"concat_idx={entries[0].get('target_hotspot_concat_indices', [])}"
+        )
 
     selected_entry_ids = parse_entry_ids(args.entry_ids)
     if selected_entry_ids:

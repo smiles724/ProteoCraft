@@ -15,7 +15,7 @@ BindCraft v2 - Hallucination 主循环
 
 import torch
 import numpy as np
-from typing import Dict, Tuple, List, Union
+from typing import Dict, Tuple, List, Union, Optional
 import logging
 
 from bindcraft.hallucination.ste_bridge import (
@@ -119,6 +119,7 @@ def run_hallucination(
     device: torch.device = None,
     loss_weights: Dict[str, float] = None,
     init_binder_seq: str = None,
+    hotspot_params: Optional[Dict] = None,
 ) -> Tuple[str, str, List[float]]:
     """
     运行 Hallucination 优化循环
@@ -262,6 +263,7 @@ def run_hallucination(
             pde_logits=heads["pde_logits"],
             pde_params=pde_params,
             clash_params=dict(DEFAULT_CLASH_PARAMS),
+            hotspot_params=hotspot_params,
         )
 
         # ── 反向传播 ─────────────────────────────────────────────────────
@@ -364,6 +366,7 @@ def run_hybrid_hallucination(
     breath_con_factor: float = 0.3,
     breath_recovery_steps: int = 3,
     checkpoint_dir: str = None,
+    hotspot_params: Optional[Dict] = None,
 ) -> Tuple[str, str, List[float]]:
     """
     混合优化循环：一阶梯度引导离散候选 + 零阶全链路验证 + 接受准则。
@@ -535,6 +538,7 @@ def run_hybrid_hallucination(
         device=device,
         loss_weights=base_weights,
         contact_params=contact_params,
+        hotspot_params=hotspot_params,
     )
     logger.info(
         f"  初始零阶 total_loss={init_zeroth.total_loss:.4f} | "
@@ -580,7 +584,7 @@ def run_hybrid_hallucination(
         # ================================================================
         if tau_sched is not None:
             step_tau = tau_sched.get_tau(step, N_steps)
-            step_weights = tau_sched.get_dynamic_weights(step, N_steps)
+            step_weights = tau_sched.get_dynamic_weights(step, N_steps, base_weights=base_weights)
             phase_name = tau_sched.get_phase_name(step, N_steps)
         else:
             step_tau = tau_noise
@@ -635,6 +639,7 @@ def run_hybrid_hallucination(
                     device=device,
                     pde_params=pde_params,
                     clash_params=dict(DEFAULT_CLASH_PARAMS),
+                    hotspot_params=hotspot_params,
                 )
                 torch.nn.utils.clip_grad_norm_([thetas[b]], 1.0)
                 optimizers[b].step()
@@ -672,6 +677,7 @@ def run_hybrid_hallucination(
                     pde_logits=heads["pde_logits"],
                     pde_params=pde_params,
                     clash_params=dict(DEFAULT_CLASH_PARAMS),
+                    hotspot_params=hotspot_params,
                 )
 
                 first_order_loss.backward()
@@ -727,6 +733,7 @@ def run_hybrid_hallucination(
                 device=device,
                 loss_weights=step_weights,
                 contact_params=contact_params,
+                hotspot_params=hotspot_params,
             )
             all_zeroth_results.append(result)
             beam_src = all_candidate_beams[idx]

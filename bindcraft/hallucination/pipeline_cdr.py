@@ -14,7 +14,7 @@ CDR mask 注入的两个位置：
 
 import torch
 import numpy as np
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 import logging
 from pathlib import Path
 
@@ -120,6 +120,7 @@ def run_hallucination(
     tau_noise: float = 4.0,
     device: torch.device = None,
     loss_weights: Dict[str, float] = None,
+    hotspot_params: Optional[Dict] = None,
 ) -> Tuple[str, str, List[float]]:
     """
     运行 Hallucination 优化循环
@@ -257,6 +258,7 @@ def run_hallucination(
             pde_logits=heads["pde_logits"],
             pde_params=pde_params,
             clash_params=dict(DEFAULT_CLASH_PARAMS),
+            hotspot_params=hotspot_params,
         )
 
         # ── 反向传播 ─────────────────────────────────────────────────────
@@ -361,6 +363,7 @@ def run_hybrid_hallucination_cdr(
     breath_con_factor: float = 0.3,
     breath_recovery_steps: int = 3,
     checkpoint_dir: str = None,
+    hotspot_params: Optional[Dict] = None,
     # ── Mode A 专属参数 ───────────────────────────────────────────
     binder_chain: str = None,
     scheme: str = "chothia",
@@ -574,6 +577,7 @@ def run_hybrid_hallucination_cdr(
         loss_weights=base_weights,
         contact_params=contact_params,
         chunk_size=None,
+        hotspot_params=hotspot_params,
     )
     logger.info(
         f"  初始零阶 total_loss={init_zeroth.total_loss:.4f} | "
@@ -590,7 +594,7 @@ def run_hybrid_hallucination_cdr(
     # 主循环 step=0 使用 tau_sched.get_dynamic_weights(step=0)，即 WEIGHT_PROFILES[0]（Phase 0 权重）。
     # 如果 tau_sched 未启用，则退回到 base_weights（与 step_weights 一致）。
     if tau_sched is not None:
-        phase0_weights = tau_sched.get_dynamic_weights(step=0, total_steps=N_steps)
+        phase0_weights = tau_sched.get_dynamic_weights(step=0, total_steps=N_steps, base_weights=base_weights)
     else:
         phase0_weights = base_weights
     logger.info(f"建立基准 (Phase 0 权重体系): {phase0_weights}")
@@ -602,6 +606,7 @@ def run_hybrid_hallucination_cdr(
         loss_weights=phase0_weights,
         contact_params=contact_params,
         chunk_size=None,
+        hotspot_params=hotspot_params,
     )
     logger.info(f"  基准 loss={baseline_for_best.total_loss:.4f} | pLDDT={baseline_for_best.summary_confidence.get('plddt', 'N/A')}")
     best_zeroth_loss = baseline_for_best.total_loss
@@ -634,7 +639,7 @@ def run_hybrid_hallucination_cdr(
         # ================================================================
         if tau_sched is not None:
             step_tau = tau_sched.get_tau(step, N_steps)
-            step_weights = tau_sched.get_dynamic_weights(step, N_steps)
+            step_weights = tau_sched.get_dynamic_weights(step, N_steps, base_weights=base_weights)
             phase_name = tau_sched.get_phase_name(step, N_steps)
         else:
             step_tau = tau_noise
@@ -692,6 +697,7 @@ def run_hybrid_hallucination_cdr(
                     device=device,
                     pde_params=pde_params,
                     clash_params=dict(DEFAULT_CLASH_PARAMS),
+                    hotspot_params=hotspot_params,
                     chunk_size=None,
                 )
                 torch.nn.utils.clip_grad_norm_([thetas[b]], 1.0)
@@ -730,6 +736,7 @@ def run_hybrid_hallucination_cdr(
                     pde_logits=heads["pde_logits"],
                     pde_params=pde_params,
                     clash_params=dict(DEFAULT_CLASH_PARAMS),
+                    hotspot_params=hotspot_params,
                 )
 
                 first_order_loss.backward()
@@ -807,6 +814,7 @@ def run_hybrid_hallucination_cdr(
                 loss_weights=step_weights,
                 contact_params=contact_params,
                 chunk_size=None,
+                hotspot_params=hotspot_params,
             )
             all_zeroth_results.append(result)
             logger.debug(

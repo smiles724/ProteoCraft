@@ -9,7 +9,7 @@ BindCraft v2 - 统一 Loss 计算
 """
 
 import torch
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Any
 
 from protenix.model import sample_confidence
 
@@ -41,6 +41,7 @@ def compute_all_losses(
     pde_logits: torch.Tensor = None,
     pde_params: dict = None,
     clash_params: Dict[str, float] = None,
+    hotspot_params: Dict[str, Any] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     在给定的全原子坐标和 confidence logits 上计算全部 12 项 loss。
@@ -86,6 +87,29 @@ def compute_all_losses(
     else:
         binder_rep_atom_mask = binder_atom_mask
 
+    hotspot_token_mask = None
+    _hotspot_params = hotspot_params or {}
+    hotspot_concat_indices = _hotspot_params.get("target_hotspot_concat_indices") or []
+    if hotspot_concat_indices:
+        target_token_indices = target_token_mask.nonzero(as_tuple=True)[0]
+        invalid_indices = [
+            int(index) for index in hotspot_concat_indices
+            if int(index) < 0 or int(index) >= target_token_indices.shape[0]
+        ]
+        if invalid_indices:
+            raise ValueError(
+                f"hotspot target concat indices 越界: {invalid_indices}; target_len={target_token_indices.shape[0]}"
+            )
+
+        hotspot_index_tensor = torch.as_tensor(
+            [int(index) for index in hotspot_concat_indices],
+            device=device,
+            dtype=torch.long,
+        )
+        hotspot_token_indices = target_token_indices[hotspot_index_tensor]
+        hotspot_token_mask = torch.zeros_like(target_token_mask, dtype=torch.bool)
+        hotspot_token_mask[hotspot_token_indices] = True
+
     # ── 逐项计算 loss ───────────────────────────────────────────────────
     losses: Dict[str, torch.Tensor] = {}
     total_loss = torch.tensor(0.0, device=device, requires_grad=True)
@@ -104,7 +128,8 @@ def compute_all_losses(
 
     # i_pAE (inter)
     if weights.get("i_pae", 0) != 0:
-        l_ipae = compute_pae_loss(pae_logits, asym_id, pae_params, mode="inter")
+        l_ipae = compute_pae_loss(pae_logits, asym_id, pae_params, mode="inter",
+                                  hotspot_token_mask=hotspot_token_mask)
         losses["i_pae"] = l_ipae
         total_loss = total_loss + weights["i_pae"] * l_ipae
 
@@ -130,9 +155,10 @@ def compute_all_losses(
             distogram_params, mode="inter",
             cutoff=contact_params["inter_cutoff"],
             num=contact_params["inter_num"],
-            num_pos=contact_params["inter_num"],
+            num_pos=contact_params.get("inter_num_pos", contact_params["inter_num"]),
             binary=False,
             residue_index=input_feature_dict.get("residue_index"),
+            hotspot_token_mask=hotspot_token_mask,
         )
         losses["i_con"] = l_icon
         total_loss = total_loss + weights["i_con"] * l_icon
