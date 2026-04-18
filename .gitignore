@@ -148,9 +148,16 @@ A6_TCR/protenix_runtime/
 
 # Benchmark runner artifacts (do not push)
 benchmark/log/
-benchmark/results/
 benchmark/input/
 benchmark/protenix_runtime/
+
+# Benchmark run outputs (large); keep analysis scripts + directory placeholders
+benchmark/results/*
+!benchmark/results/analysis/
+!benchmark/results/analysis/**
+benchmark/results/analysis/**/*.html
+benchmark/results/analysis/**/*.png
+benchmark/results/analysis/**/__pycache__/
 
 # Generated attention cache (if present)
 protenix/model/tri_attention/TriAttentionCache/
