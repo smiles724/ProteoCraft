@@ -43,21 +43,26 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, PROJECT_ROOT)
 
-from bindcraft.hallucination.pipeline import run_hallucination, run_hybrid_hallucination
+from bindcraft.hallucination.pipeline import (
+    run_hallucination,
+    run_hybrid_hallucination,
+    run_mcts_hallucination,
+)
 
 
-def setup_logging(log_file: str = None):
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
+def setup_logging(log_file: str = None, level: str = "INFO"):
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    handlers = [logging.StreamHandler(sys.stdout)]
     if log_file:
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-        )
-        logging.getLogger().addHandler(file_handler)
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(fmt)
+        fh.setLevel(lvl)
+        handlers.append(fh)
+    handlers[0].setFormatter(fmt)
+    handlers[0].setLevel(lvl)
+    # force=True：避免被其它模块抢先 basicConfig 后级别不生效
+    logging.basicConfig(level=lvl, handlers=handlers, force=True)
 
 
 def resolve_checkpoint_dir(checkpoint_dir: str = None) -> str:
@@ -155,8 +160,8 @@ def main():
     parser.add_argument("--target", type=str, required=True,
                        help="Target 序列（单字母氨基酸序列）")
     parser.add_argument("--mode", type=str, default="first_order",
-                       choices=["first_order", "hybrid"],
-                       help="优化模式: first_order (纯一阶) 或 hybrid (1st+0th 混合)")
+                       choices=["first_order", "hybrid", "mcts"],
+                       help="优化模式: first_order / hybrid (1st+0th) / mcts")
 
     # === Binder 与优化参数 ===
     parser.add_argument("--binder_length", type=int, default=40,
@@ -180,6 +185,9 @@ def main():
                        help="输出目录（默认：./outputs）")
     parser.add_argument("--log_file", type=str, default=None,
                        help="日志文件路径")
+    parser.add_argument("--log_level", type=str, default="INFO",
+                       choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                       help="日志级别（默认：INFO；排错可用 DEBUG）")
     parser.add_argument("--init_binder_seq", type=str, default=None,
                        help="可选的初始 Binder 单字母序列；长度必须与 --binder_length 一致")
 
@@ -202,6 +210,17 @@ def main():
                        help="是否启用时间步退火调度（默认：false，改用固定 tau=4.0）")
     parser.add_argument("--tau_jitter", type=lambda x: x.lower() == "true", default=True,
                        help="是否启用时间步抖动（默认：true）")
+
+    # === MCTS 模式参数 ===
+    parser.add_argument("--mcts_c", type=float, default=1.0, help="MCTS UCB 探索常数 C（默认：1.0）")
+    parser.add_argument("--mcts_max_nodes", type=int, default=5000, help="MCTS 树最大节点数（默认：5000）")
+    parser.add_argument("--mcts_tau_fixed", type=float, default=4.0, help="MCTS 固定扩散 tau（默认：4.0）")
+    parser.add_argument("--mcts_num_beams", type=int, default=8, help="MCTS Phase0 根节点数 / beam（默认：8）")
+    parser.add_argument("--chunk_size", type=int, default=None,
+                       help="Attention 分块（MCTS 一阶/零阶）；大复合物可设 256 避免 OOM（默认：None）")
+    parser.add_argument("--use_prior", type=lambda x: x.lower() == "true", default=True,
+                       help="MCTS：启用 BLOSUM62 先验（默认：true）")
+    parser.add_argument("--prior_strength", type=float, default=0.1, help="MCTS：先验强度（默认：0.1）")
 
     # === 损失函数权重（key 必须与 DEFAULT_LOSS_WEIGHTS 一致） ===
     parser.add_argument("--w_plddt", type=float, default=None, help="pLDDT 权重")
@@ -234,7 +253,7 @@ def main():
                 f"检测到非法字符: {','.join(invalid)}"
             )
 
-    setup_logging(args.log_file)
+    setup_logging(args.log_file, level=args.log_level)
     os.makedirs(args.output_dir, exist_ok=True)
 
     model, configs = load_protenix_model(
@@ -269,7 +288,7 @@ def main():
             loss_weights=loss_weights,
             init_binder_seq=args.init_binder_seq,
         )
-    else:
+    elif args.mode == "hybrid":
         best_seq, final_seq, losses_history = run_hybrid_hallucination(
             model=model,
             target_seq=args.target,
@@ -289,6 +308,33 @@ def main():
             use_tau_scheduling=args.use_tau_scheduling,
             tau_jitter=args.tau_jitter,
             init_binder_seq=args.init_binder_seq,
+        )
+    else:
+        best_seq, final_seq, losses_history = run_mcts_hallucination(
+            model=model,
+            target_seq=args.target,
+            L_binder=args.binder_length,
+            N_steps=args.n_steps,
+            learning_rate=args.learning_rate,
+            tau_noise=args.tau_noise,
+            device=torch.device(args.device),
+            loss_weights=loss_weights,
+            K_top=args.k_top,
+            B_candidates=args.b_candidates,
+            T_sample=args.t_sample,
+            max_mutations_per_seq=args.max_mutations_per_seq,
+            use_annealing=args.use_annealing,
+            T_init=args.t_init,
+            T_min=args.t_min,
+            num_beams=args.mcts_num_beams,
+            use_prior=args.use_prior,
+            prior_strength=args.prior_strength,
+            init_binder_seq=args.init_binder_seq,
+            hotspot_params=None,
+            chunk_size=args.chunk_size,
+            mcts_C=args.mcts_c,
+            mcts_max_nodes=args.mcts_max_nodes,
+            mcts_tau_fixed=args.mcts_tau_fixed,
         )
 
     output_file = os.path.join(args.output_dir, "hallucination_result.txt")
@@ -319,4 +365,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import faulthandler
+    import traceback
+
+    faulthandler.enable(all_threads=True, file=sys.stderr)
+
+    try:
+        main()
+    except BaseException:
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        raise
