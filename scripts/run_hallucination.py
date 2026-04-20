@@ -53,14 +53,17 @@ from bindcraft.hallucination.pipeline import (
 def setup_logging(log_file: str = None, level: str = "INFO"):
     lvl = getattr(logging, level.upper(), logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    handlers = [logging.StreamHandler(sys.stdout)]
+    handlers = []
     if log_file:
         fh = logging.FileHandler(log_file)
         fh.setFormatter(fmt)
         fh.setLevel(lvl)
         handlers.append(fh)
-    handlers[0].setFormatter(fmt)
-    handlers[0].setLevel(lvl)
+    else:
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        sh.setLevel(lvl)
+        handlers.append(sh)
     # force=True：避免被其它模块抢先 basicConfig 后级别不生效
     logging.basicConfig(level=lvl, handlers=handlers, force=True)
 
