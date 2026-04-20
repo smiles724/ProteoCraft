@@ -125,9 +125,15 @@ def one_step_denoise(
     """
     if device is None:
         device = x_coarse.device
-    
+
+    # 单步外推只需要 1 个 sample；上游可能传入 [N_sample, N_atom, 3]
+    # （如 zeroth_order_eval 缓存的 N_sample=5），先收缩到首个 sample，
+    # 否则会触发 protenix 的 t_hat.size(-1) == r_noisy.size(-3) 断言。
+    if x_coarse.dim() >= 3 and x_coarse.size(-3) > 1:
+        x_coarse = x_coarse.narrow(-3, 0, 1).contiguous()
+
     # 重要：检查 x_coarse 和 input_feature_dict 的原子数是否匹配
-    N_atoms_coarse = x_coarse.shape[1]
+    N_atoms_coarse = x_coarse.shape[-2]
     N_atoms_dict = input_feature_dict["ref_pos"].shape[0]
     
     # 如果原子数不匹配（例如跨步复用的 x_coarse 与当前序列原子数不同），
@@ -158,7 +164,9 @@ def one_step_denoise(
     # 两者等价：DiffusionModule.forward 返回的 x_denoised 就是 x̂_0。
     # 注意：不能用 x_noisy - tau * x_denoised，那是错误的二次外推。
     #
-    t_hat = torch.tensor([tau], device=device)
+    # 与 x_noisy 的 N_sample 维对齐，满足 protenix 的形状断言
+    n_sample = x_noisy.size(-3) if x_noisy.dim() >= 3 else 1
+    t_hat = torch.full((n_sample,), float(tau), device=device, dtype=x_noisy.dtype)
 
     # 准备 diffusion conditioning 参数（pair_z 含梯度，来自 z_trunk）
     pair_z = model.diffusion_module.diffusion_conditioning.prepare_cache(
@@ -391,8 +399,9 @@ def diffusion_one_step_fused(
         pad_info=input_feature_dict["pad_info"],
         r_l=True, z=pair_z, inplace_safe=False,
     )
-    t_hat_fine = torch.tensor([tau_fine], device=device)
     x_noisy_fine = x_coarse.detach() + tau_fine * torch.randn_like(x_coarse)
+    n_sample_fine = x_noisy_fine.size(-3) if x_noisy_fine.dim() >= 3 else 1
+    t_hat_fine = torch.full((n_sample_fine,), float(tau_fine), device=device, dtype=x_noisy_fine.dtype)
     x0_fine = model.diffusion_module(
         x_noisy=x_noisy_fine, t_hat_noise_level=t_hat_fine,
         input_feature_dict=input_feature_dict,

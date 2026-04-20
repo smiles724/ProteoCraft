@@ -232,16 +232,60 @@ def zeroth_order_eval(
             distogram_logits, contact_probs,
         ) = _run_full_forward(model, input_feature_dict, device, N_cycle, chunk_size=None)
 
+        # ── Summary Confidence（Protenix 原生指标）────────────────────────
+        summary_confidence_list, _ = sample_confidence.compute_full_data_and_summary(
+            configs=model.configs,
+            pae_logits=pae_logits,
+            plddt_logits=plddt_logits,
+            pde_logits=pde_logits,
+            contact_probs=contact_probs,
+            token_asym_id=input_feature_dict["asym_id"],
+            token_has_frame=input_feature_dict["has_frame"],
+            atom_coordinate=coordinate,
+            atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+            atom_is_polymer=1 - input_feature_dict["is_ligand"],
+            N_recycle=N_cycle,
+            return_full_data=False,
+        )
+
+        # 基于 Protenix ranking_score 在 N_sample 中选择最佳结构样本
+        # ranking_score 缺失时回退 0.0；summary 列表为空时回退 index 0（等价历史行为）
+        scores = []
+        for sc in summary_confidence_list:
+            score = sc.get("ranking_score", 0.0)
+            if isinstance(score, torch.Tensor):
+                score = float(score.flatten()[0].item())
+            else:
+                try:
+                    score = float(score)
+                except (TypeError, ValueError):
+                    score = 0.0
+            scores.append(score)
+
+        if scores:
+            best_idx = int(max(range(len(scores)), key=lambda i: scores[i]))
+            best_ranking = scores[best_idx]
+            summary_confidence = summary_confidence_list[best_idx]
+        else:
+            best_idx = 0
+            best_ranking = 0.0
+            summary_confidence = {}
+
+        logger.info(
+            "[zeroth] best_sample_idx=%d ranking_score=%.4f",
+            best_idx,
+            best_ranking,
+        )
+
         # ── 计算 12 项 loss ──────────────────────────────────────────────
         # coordinate 形状: [N_sample, N_atom, 3]
         # compute_all_losses 期望 x0_flat: [N_atom, 3]
         # plddt_logits: [N_sample, N_atom, bins]
         # pae_logits: [N_sample, N_token, N_token, bins]
-        # 取第一个 sample 用于 loss 计算（与 run_full_eval 一致）
-        x0_flat = coordinate[0]  # [N_atom, 3]
-        plddt_for_loss = plddt_logits[0:1]  # [1, N_atom, bins]，保留 N_sample 维
-        pae_for_loss = pae_logits[0:1]      # [1, N_token, N_token, bins]
-        pde_for_loss = pde_logits[0:1]      # [1, N_token, N_token, bins]
+        x0_flat = coordinate[best_idx]  # [N_atom, 3]
+        plddt_for_loss = plddt_logits[best_idx : best_idx + 1]  # [1, N_atom, bins]
+        pae_for_loss = pae_logits[best_idx : best_idx + 1]      # [1, N_token, N_token, bins]
+        pde_for_loss = pde_logits[best_idx : best_idx + 1]      # [1, N_token, N_token, bins]
 
         total_loss, losses = compute_all_losses(
             x0_flat=x0_flat,
@@ -260,23 +304,6 @@ def zeroth_order_eval(
             clash_params=dict(DEFAULT_CLASH_PARAMS),
             hotspot_params=hotspot_params,
         )
-
-        # ── Summary Confidence（Protenix 原生指标）────────────────────────
-        summary_confidence_list, _ = sample_confidence.compute_full_data_and_summary(
-            configs=model.configs,
-            pae_logits=pae_logits,
-            plddt_logits=plddt_logits,
-            pde_logits=pde_logits,
-            contact_probs=contact_probs,
-            token_asym_id=input_feature_dict["asym_id"],
-            token_has_frame=input_feature_dict["has_frame"],
-            atom_coordinate=coordinate,
-            atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
-            atom_is_polymer=1 - input_feature_dict["is_ligand"],
-            N_recycle=N_cycle,
-            return_full_data=False,
-        )
-        summary_confidence = summary_confidence_list[0] if summary_confidence_list else {}
 
     # ── 组装结果 ─────────────────────────────────────────────────────────
     loss_dict = {
@@ -302,6 +329,6 @@ def zeroth_order_eval(
         total_loss=total_loss.item(),
         loss_dict=loss_dict,
         summary_confidence=sc_flat,
-        coordinate=coordinate.cpu(),
-        plddt_logits=plddt_logits[0:1].cpu(),  # [1, N_atom, bins]
+        coordinate=coordinate[best_idx : best_idx + 1].cpu(),
+        plddt_logits=plddt_logits[best_idx : best_idx + 1].cpu(),  # [1, N_atom, bins]
     )

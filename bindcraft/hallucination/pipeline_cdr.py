@@ -14,7 +14,7 @@ CDR mask 注入的两个位置：
 
 import torch
 import numpy as np
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, List, Optional, Any
 import logging
 from pathlib import Path
 
@@ -32,6 +32,7 @@ from bindcraft.utils import (
     DEFAULT_LOSS_WEIGHTS,
     DEFAULT_CONTACT_PARAMS,
     DEFAULT_CLASH_PARAMS,
+    _normalize_chain_sequences,
 )
 from bindcraft.hallucination.diffusion_one_step import (
     diffusion_one_step,
@@ -964,6 +965,506 @@ def run_hybrid_hallucination_cdr(
     if num_beams > 1:
         for b in range(num_beams):
             logger.info(f"  Beam {b}: {beam_seqs[b]} (loss={beam_losses[b]:.4f})")
+    logger.info("=" * 70)
+
+    return best_zeroth_seq, best_zeroth_seq, losses_history
+
+
+# ============================================================
+# MCTS 模式：CDR-Aware 版本
+# ============================================================
+
+
+def _init_child_logits_for_mcts_cdr(
+    parent_node: Any,
+    child_seq: str,
+    cdr_mask: List[bool],
+    device: torch.device,
+) -> torch.Tensor:
+    """CDR-aware MCTS：子节点 Logits 初始化，框架区与全序列 one-hot 对齐。"""
+    if len(cdr_mask) != len(child_seq):
+        raise ValueError("cdr_mask length must match child_seq length")
+    child_logits = parent_node.logits.clone().to(device)
+    _sync_theta_to_seq(child_logits, child_seq)
+    return child_logits
+
+
+def _clip_seq_by_cdr_mask(
+    seq: str,
+    cdr_mask: List[bool],
+    reference_seq: str,
+) -> str:
+    """
+    CDR 安全网：将序列中非 CDR 区的位置强制还原为参考序列。
+    用于候选提议后和零阶验证前的双重保护。
+    """
+    if len(seq) != len(cdr_mask):
+        raise ValueError(f"seq len {len(seq)} != cdr_mask len {len(cdr_mask)}")
+    if len(seq) != len(reference_seq):
+        raise ValueError(f"seq len {len(seq)} != ref len {len(reference_seq)}")
+
+    seq_list = list(seq)
+    clipped = False
+    for i, is_cdr in enumerate(cdr_mask):
+        if not is_cdr and seq_list[i] != reference_seq[i]:
+            seq_list[i] = reference_seq[i]
+            clipped = True
+    if clipped:
+        logger.debug("CDR guard: clipped framework to reference")
+    return "".join(seq_list)
+
+
+def run_mcts_hallucination_cdr(
+    model,
+    pdb_id: str = None,
+    binder_sequence: str = None,
+    cdr_mask: List[bool] = None,
+    target_seq: str = None,
+    L_binder: int = None,
+    N_steps: int = 100,
+    learning_rate: float = 0.05,
+    tau_noise: float = 4.0,
+    device: torch.device = None,
+    loss_weights: Dict[str, float] = None,
+    K_top: int = 10,
+    B_candidates: int = 8,
+    T_sample: float = 1.0,
+    max_mutations_per_seq: int = 3,
+    use_annealing: bool = False,
+    T_init: float = 1.0,
+    T_min: float = 0.01,
+    num_beams: int = 8,
+    use_prior: bool = True,
+    prior_strength: float = 0.1,
+    checkpoint_dir: str = None,
+    hotspot_params: Optional[Dict] = None,
+    mcts_C: float = 1.0,
+    mcts_max_nodes: int = 5000,
+    mcts_tau_fixed: float = 4.0,
+    binder_chain: str = None,
+    scheme: str = "chothia",
+    chunk_size: int = None,
+) -> Tuple[str, str, List[float]]:
+    """
+    CDR-Aware MCTS：与 ``run_hybrid_hallucination_cdr`` 相同的 Mode A/B/C 检测，
+    Phase 0 与主循环中透传 ``hotspot_params`` / ``chunk_size``。
+    """
+    from bindcraft.hallucination.mcts_controller import MCTSTree
+    from bindcraft.hallucination.scheduler import AnnealingScheduler
+
+    if device is None:
+        device = next(model.parameters()).device
+
+    # ── CDR 自动推断（与 hybrid 对齐）─────────────────────────────────────
+    if pdb_id is not None:
+        cdr_info = _identify_cdr_from_pdb(pdb_id, binder_chain=binder_chain, scheme=scheme)
+        binder_sequence = cdr_info["binder_sequence"]
+        cdr_mask = cdr_info["binder_cdr_mask"]
+        inferred_target = cdr_info["target_sequence"]
+        if target_seq is None:
+            target_seq = inferred_target
+        elif target_seq != inferred_target:
+            logger.warning(
+                f"Target seq mismatch: CLI='{target_seq}' vs PDB antigen='{inferred_target}'"
+                f" — using CLI value."
+            )
+        L_binder = len(binder_sequence)
+        logger.info(
+            f"[CDR-auto] Mode A — PDB={pdb_id} | binder={cdr_info['binder_chain_id']}"
+            f" ({L_binder} aa) | CDR={sum(cdr_mask)}/{L_binder}"
+        )
+    elif cdr_mask is not None:
+        if binder_sequence is None and L_binder is None:
+            raise ValueError("Mode B requires --binder_sequence or --L_binder")
+        L_binder = L_binder or len(binder_sequence)
+        logger.info(
+            f"[CDR-auto] Mode B — CDR={sum(cdr_mask)}/{L_binder} residues mutable"
+        )
+    else:
+        L_binder = L_binder or 40
+        cdr_mask = [True] * L_binder
+        logger.info("[CDR-auto] Mode C — no CDR mask, full-length optimization")
+
+    assert len(cdr_mask) == L_binder, (
+        f"cdr_mask length {len(cdr_mask)} != L_binder {L_binder}"
+    )
+
+    base_weights = dict(DEFAULT_LOSS_WEIGHTS)
+    if loss_weights is not None:
+        base_weights.update(loss_weights)
+    contact_params = dict(DEFAULT_CONTACT_PARAMS)
+
+    framework_indices = [i for i, is_cdr in enumerate(cdr_mask) if not is_cdr]
+    has_cdr_protection = len(framework_indices) > 0 and any(not m for m in cdr_mask)
+
+    annealer = AnnealingScheduler(T_init=T_init, T_min=T_min) if use_annealing else None
+
+    ckpt_mgr = None
+    if checkpoint_dir is not None:
+        ckpt_mgr = CheckpointManager(
+            output_dir=checkpoint_dir,
+            binder_seq="PLACEHOLDER",
+            target_seq=target_seq,
+        )
+        logger.info(f"Checkpoint 保存已启用: {checkpoint_dir}")
+
+    tgt_seqs = _normalize_chain_sequences(target_seq)
+    tgt_len_str = "+".join(str(len(s)) for s in tgt_seqs)
+    tgt_total = sum(len(s) for s in tgt_seqs)
+
+    logger.info("=" * 70)
+    logger.info("CDR-Aware MCTS 混合优化 (Mode A/B/C auto-detected above)")
+    logger.info(
+        f"Target chains: {len(tgt_seqs)} | lengths={tgt_len_str} | total={tgt_total} aa"
+    )
+    logger.info(f"Binder 长度: {L_binder} aa | CDR residues: {sum(cdr_mask)}/{L_binder}")
+    logger.info(f"总轮数: {N_steps} | K_top={K_top} B={B_candidates} T_sample={T_sample}")
+    logger.info(f"MCTS: C={mcts_C}, max_nodes={mcts_max_nodes}, tau_fixed={mcts_tau_fixed}")
+    logger.info(f"Annealing: {use_annealing}")
+    logger.info(f"CDR protection: {len(framework_indices)} framework residues")
+    logger.info(f"M_prior (BLOSUM62): use_prior={use_prior}, prior_strength={prior_strength}")
+    logger.info(f"Base loss 权重: {base_weights}")
+    logger.info("=" * 70)
+
+    freeze_model(model)
+
+    logger.info("预计算 W_AAE...")
+    W_AAE = precompute_waa_embeddings(model, device)
+
+    logger.info("获取 Target 特征（target-only）...")
+    with torch.no_grad():
+        feat_target_only, _, _ = build_single_chain_features(target_seq, device)
+        feat_target_only = _prepare_input_features(model, feat_target_only)
+        s_target = model.input_embedder(feat_target_only, inplace_safe=False)
+        s_target = s_target.clone()
+    logger.info(f"s_target shape: {s_target.shape}")
+
+    plddt_params = sample_confidence.get_bin_params(model.configs.loss.plddt)
+    pae_params = sample_confidence.get_bin_params(model.configs.loss.pae)
+    distogram_params = sample_confidence.get_bin_params(model.configs.loss.distogram)
+    pde_params = sample_confidence.get_bin_params(model.configs.loss.pde)
+
+    mcts_tree = MCTSTree(C=mcts_C, max_nodes=mcts_max_nodes, mcts_tau=mcts_tau_fixed)
+    logger.info(f"MCTS 树已创建: C={mcts_C}, max_nodes={mcts_max_nodes}, tau_fixed={mcts_tau_fixed}")
+
+    logger.info("=" * 70)
+    logger.info("Phase 0: 全局冷启动 (Best-of-N)")
+
+    if binder_sequence is not None and not all(cdr_mask):
+        init_binder = binder_sequence
+        logger.info(f"初始 Binder（真实抗体）: {init_binder}")
+    else:
+        torch.manual_seed(42)
+        np.random.seed(42)
+        init_binder = "".join(
+            np.random.choice(list("ACDEFGHIKLMNPQRSTVWY")) for _ in range(L_binder)
+        )
+        logger.info(f"初始 Binder（随机）: {init_binder}")
+
+    torch.manual_seed(42)
+    np.random.seed(42)
+
+    if binder_sequence is not None and not all(cdr_mask):
+        phase0_candidates = [init_binder]
+        cdr_indices = [i for i, m in enumerate(cdr_mask) if m]
+        for _ in range(num_beams - 1):
+            cand_list = list(init_binder)
+            n_mut = min(len(cdr_indices), np.random.randint(1, 3))
+            for pos in np.random.choice(cdr_indices, n_mut, replace=False):
+                cand_list[pos] = np.random.choice(list("ACDEFGHIKLMNPQRSTVWY"))
+            phase0_candidates.append("".join(cand_list))
+    else:
+        phase0_candidates = []
+        for _ in range(num_beams):
+            seq = "".join(
+                np.random.choice(list("ACDEFGHIKLMNPQRSTVWY")) for _ in range(L_binder)
+            )
+            phase0_candidates.append(seq)
+
+    logger.info(f"Phase 0：对 {len(phase0_candidates)} 条候选执行 Step3 零阶验证...")
+    phase0_results = []
+    for idx, cand_seq in enumerate(phase0_candidates):
+        if has_cdr_protection:
+            cand_seq = _clip_seq_by_cdr_mask(cand_seq, cdr_mask, init_binder)
+
+        logger.info(f"  Phase0 [{idx+1}/{len(phase0_candidates)}]: {cand_seq[:20]}...")
+        result = zeroth_order_eval(
+            binder_seq=cand_seq,
+            target_seq=target_seq,
+            model=model,
+            device=device,
+            loss_weights=base_weights,
+            contact_params=contact_params,
+            chunk_size=chunk_size,
+            hotspot_params=hotspot_params,
+        )
+        phase0_results.append((cand_seq, result))
+        logger.info(
+            f"    L_real={result.total_loss:.4f} "
+            f"pLDDT={result.summary_confidence.get('plddt', 'N/A')} "
+            f"iPTM={result.summary_confidence.get('i_ptm', 'N/A')}"
+        )
+
+    phase0_results.sort(key=lambda x: x[1].total_loss)
+    top_beam = min(num_beams, len(phase0_results))
+
+    torch.manual_seed(42)
+    np.random.seed(42)
+    for i in range(top_beam):
+        seq, result = phase0_results[i]
+        theta_root = torch.zeros(L_binder, NUM_AMINO_ACIDS, device=device)
+        _sync_theta_to_seq(theta_root, seq)
+        theta_root.requires_grad_(True)
+
+        mcts_tree.add_root_node(
+            sequence=seq,
+            logits=theta_root,
+            L_real=result.total_loss,
+            coordinate=result.coordinate,
+        )
+        logger.info(f"  根节点 {i+1}: {seq[:20]}... L={result.total_loss:.4f}")
+
+    best_zeroth_loss = phase0_results[0][1].total_loss
+    best_zeroth_seq = phase0_results[0][0]
+    best_step = 0
+    losses_history = []
+
+    if ckpt_mgr is not None:
+        _, best_result = phase0_results[0]
+        ckpt_mgr.save(
+            step=0,
+            beam_id=0,
+            zeroth_result=best_result,
+            plddt_logits=best_result.plddt_logits,
+            accepted=True,
+            is_global_best=True,
+        )
+        logger.info("[Checkpoint] Phase 0 保存完毕")
+
+    logger.info(f"Phase 0 完成：{mcts_tree.total_nodes} 个根节点, best_L={best_zeroth_loss:.4f}")
+    logger.info("=" * 70)
+
+    logger.info("开始 CDR-Aware MCTS 主循环...")
+
+    for step in range(N_steps):
+        selected_node = mcts_tree.select()
+        selected_seq = selected_node.sequence
+        selected_logits = selected_node.logits.clone().to(device)
+
+        if has_cdr_protection:
+            selected_seq_clipped = _clip_seq_by_cdr_mask(selected_seq, cdr_mask, init_binder)
+            if selected_seq_clipped != selected_seq:
+                logger.debug(
+                    f"Step {step}: CDR guard clipped selected_seq framework, "
+                    f"id={selected_node.node_id}"
+                )
+                selected_seq = selected_seq_clipped
+                _sync_theta_to_seq(selected_logits, selected_seq)
+
+        with torch.no_grad():
+            feat_binder_only, _, _ = build_single_chain_features(selected_seq, device)
+            feat_binder_only = _prepare_input_features(model, feat_binder_only)
+            if selected_node.coordinate is not None:
+                x_coarse_cached = selected_node.coordinate.clone().to(device)
+                if x_coarse_cached.dim() >= 3 and x_coarse_cached.size(-3) > 1:
+                    x_coarse_cached = x_coarse_cached.narrow(-3, 0, 1).contiguous()
+            else:
+                ref_pos = feat_binder_only["ref_pos"]
+                x_coarse_cached = ref_pos.clone().unsqueeze(0).to(device)
+                x_coarse_cached = x_coarse_cached + torch.randn_like(x_coarse_cached) * 0.1
+
+        theta_step2 = selected_logits.detach().clone().requires_grad_(True)
+        optimizer_step2 = torch.optim.Adam([theta_step2], lr=learning_rate)
+
+        progress = step / max(N_steps - 1, 1)
+        tau_temp = 2.0 * (1.0 - progress) + 0.05 * progress
+
+        s_binder_step2, current_seq_step2, input_feature_dict_step2 = ste_bridge(
+            theta=theta_step2,
+            W_AAE=W_AAE,
+            model=model,
+            target_seq=target_seq,
+            device=device,
+            tau_temp=tau_temp,
+        )
+
+        x_coarse_step2 = x_coarse_cached
+        if x_coarse_step2 is None:
+            ref_step2 = input_feature_dict_step2["ref_pos"]
+            x_coarse_step2 = ref_step2.clone().unsqueeze(0).to(device)
+            x_coarse_step2 = x_coarse_step2 + torch.randn_like(x_coarse_step2) * 0.1
+
+        x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
+            model=model,
+            s_binder=s_binder_step2,
+            s_target=s_target,
+            input_feature_dict=input_feature_dict_step2,
+            x_coarse=x_coarse_step2,
+            X_clean=selected_node.coordinate,
+            tau=mcts_tau_fixed,
+            device=device,
+            chunk_size=chunk_size,
+        )
+
+        x0_flat = x0_hat_step2.squeeze(0)
+        s_inputs_full = torch.cat([s_binder_step2, s_target], dim=0)
+        heads = run_confidence_heads(
+            model=model,
+            input_feature_dict=input_feature_dict_step2,
+            s_inputs=s_inputs_full,
+            s_trunk=s_trunk_step2,
+            z_trunk=z_trunk_step2,
+            x0_hat=x0_hat_step2,
+            inplace_safe=False,
+            chunk_size=chunk_size,
+        )
+
+        first_order_loss, first_order_losses = compute_all_losses(
+            x0_flat=x0_flat,
+            plddt_logits=heads["plddt_logits"],
+            pae_logits=heads["pae_logits"],
+            distogram_logits=heads["distogram_logits"],
+            input_feature_dict=input_feature_dict_step2,
+            L_binder=L_binder,
+            weights=base_weights,
+            contact_params=contact_params,
+            plddt_params=plddt_params,
+            pae_params=pae_params,
+            distogram_params=distogram_params,
+            pde_logits=heads["pde_logits"],
+            pde_params=pde_params,
+            clash_params=dict(DEFAULT_CLASH_PARAMS),
+            hotspot_params=hotspot_params,
+        )
+
+        first_order_loss.backward()
+        grad_for_proposal = theta_step2.grad.clone() if theta_step2.grad is not None else None
+        torch.nn.utils.clip_grad_norm_([theta_step2], 1.0)
+        optimizer_step2.step()
+        fo_loss_val = first_order_loss.item()
+
+        if grad_for_proposal is None:
+            logger.warning(f"Step {step}: grad is None, skipping")
+            losses_history.append(best_zeroth_loss)
+            continue
+
+        grads_cpu = grad_for_proposal.detach().cpu()
+
+        if has_cdr_protection:
+            grad_masked = grads_cpu.clone()
+            grad_masked[framework_indices, :] = 0.0
+        else:
+            grad_masked = grads_cpu
+
+        candidates = propose_mutations(
+            grad_matrix=grad_masked,
+            current_seq=current_seq_step2,
+            K_top=K_top,
+            B_candidates=B_candidates,
+            T_sample=T_sample,
+            max_mutations_per_seq=max_mutations_per_seq,
+            use_prior=use_prior,
+            prior_strength=prior_strength,
+        )
+
+        if not candidates:
+            logger.warning(f"Step {step}: no candidates generated, skipping")
+            losses_history.append(best_zeroth_loss)
+            continue
+
+        all_zeroth_results = []
+        for cand_seq in candidates:
+            if has_cdr_protection:
+                cand_seq = _clip_seq_by_cdr_mask(cand_seq, cdr_mask, init_binder)
+
+            result = zeroth_order_eval(
+                binder_seq=cand_seq,
+                target_seq=target_seq,
+                model=model,
+                device=device,
+                loss_weights=base_weights,
+                contact_params=contact_params,
+                chunk_size=chunk_size,
+                hotspot_params=hotspot_params,
+            )
+            all_zeroth_results.append(result)
+
+        new_nodes = mcts_tree.expand(selected_node, all_zeroth_results)
+
+        for new_node in new_nodes:
+            new_node.logits = _init_child_logits_for_mcts_cdr(
+                selected_node, new_node.sequence, cdr_mask, device
+            )
+
+        losses_for_backprop = [r.total_loss for r in all_zeroth_results]
+        mcts_tree.backpropagate(selected_node, losses_for_backprop)
+
+        n_pruned = mcts_tree.prune()
+        if n_pruned > 0:
+            logger.debug(f"Step {step}: pruned {n_pruned} nodes")
+
+        round_best = min(all_zeroth_results, key=lambda r: r.total_loss)
+        round_best_loss = round_best.total_loss
+
+        accepted = False
+        prob_accept = False
+        if annealer is not None:
+            current_node_loss = selected_node.L_real
+            accepted = annealer.accept(current_node_loss, round_best_loss, step, N_steps)
+            if accepted and round_best_loss >= current_node_loss:
+                prob_accept = True
+        else:
+            accepted = round_best_loss <= best_zeroth_loss
+
+        if accepted and round_best_loss <= best_zeroth_loss:
+            best_zeroth_loss = round_best_loss
+            best_zeroth_seq = round_best.binder_seq
+            best_step = step
+
+        losses_history.append(round_best_loss)
+
+        stats = mcts_tree.get_node_stats()
+        logger.info(
+            f"Step {step:3d}/{N_steps} | "
+            f"sel_node={selected_node.node_id}(d={selected_node.depth}) "
+            f"L_real={selected_node.L_real:.4f} "
+            f"1st={fo_loss_val:.4f} | "
+            f"K={len(candidates)} "
+            f"round_best={round_best_loss:.4f} "
+            f"global_best={best_zeroth_loss:.4f}@{best_step} "
+            f"tree={stats['total_nodes']}nodes "
+            f"N_total={stats['N_total']} | "
+            f"CDR={sum(cdr_mask)}/{L_binder} | "
+            f"accepted={accepted}{'(prob)' if prob_accept else ''}"
+        )
+
+        if ckpt_mgr is not None:
+            ckpt_mgr.save(
+                step=step,
+                beam_id=0,
+                zeroth_result=round_best,
+                plddt_logits=round_best.plddt_logits,
+                accepted=accepted,
+                is_global_best=(round_best_loss == best_zeroth_loss),
+            )
+            best_info = ckpt_mgr.get_best_info()
+            logger.info(
+                f"  [Checkpoint] best={best_info['loss']:.4f} @ "
+                f"step={best_info['step']} beam={best_info['beam']}"
+            )
+
+    mcts_tree.log_tree_summary()
+
+    best_final = mcts_tree.get_global_best()
+    logger.info("=" * 70)
+    logger.info("CDR-Aware MCTS 混合优化完成！")
+    logger.info(f"全局最优序列: {best_zeroth_seq} (loss={best_zeroth_loss:.4f} @step {best_step})")
+    logger.info(f"CDR residues: {sum(cdr_mask)}/{L_binder} | Framework: {L_binder - sum(cdr_mask)}/{L_binder}")
+    logger.info(f"MCTS 树最终节点数: {mcts_tree.total_nodes}")
+    logger.info(
+        f"MCTS 全局最优节点: id={best_final.node_id} depth={best_final.depth} "
+        f"seq={best_final.sequence[:20]}... L={best_final.L_real:.4f}"
+    )
     logger.info("=" * 70)
 
     return best_zeroth_seq, best_zeroth_seq, losses_history

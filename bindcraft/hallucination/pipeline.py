@@ -15,7 +15,7 @@ BindCraft v2 - Hallucination 主循环
 
 import torch
 import numpy as np
-from typing import Dict, Tuple, List, Union, Optional
+from typing import Dict, Tuple, List, Union, Optional, Any
 import logging
 
 from bindcraft.hallucination.ste_bridge import (
@@ -888,6 +888,414 @@ def run_hybrid_hallucination(
     if num_beams > 1:
         for b in range(num_beams):
             logger.info(f"  Beam {b}: {beam_seqs[b]} (loss={beam_losses[b]:.4f})")
+    logger.info("=" * 70)
+
+    return best_zeroth_seq, best_zeroth_seq, losses_history
+
+
+# ============================================================
+# MCTS 模式：全局资源调度器
+# ============================================================
+
+
+def _make_phase0_seeds(
+    init_binder_seq: Optional[str],
+    num_beams: int,
+    L_binder: int,
+) -> List[str]:
+    """
+    Phase 0 冷启动序列列表。
+    - 若提供 init_binder_seq：第 1 条为规范化种子，其余为全序列上随机 1–2 位突变拷贝。
+    - 否则：与旧版一致，随机生成 num_beams 条全长序列。
+    """
+    rng = np.random.RandomState(42)
+    if init_binder_seq is not None:
+        seed = _normalize_init_binder_seq(init_binder_seq, L_binder)
+        seeds = [seed]
+        for _ in range(max(0, num_beams - 1)):
+            cand = list(seed)
+            n_mut = int(rng.randint(1, 3))  # 1 或 2
+            positions = rng.choice(L_binder, size=min(n_mut, L_binder), replace=False)
+            for pos in positions:
+                cand[pos] = str(rng.choice(list(VALID_BINDER_AAS)))
+            seeds.append("".join(cand))
+        return seeds
+    return [
+        "".join(str(rng.choice(list(VALID_BINDER_AAS))) for _ in range(L_binder))
+        for _ in range(num_beams)
+    ]
+
+
+def _init_child_logits_from_parent(
+    parent_node: Any,
+    child_seq: str,
+    device: torch.device,
+) -> torch.Tensor:
+    """子节点 Logits：克隆父 logits 后同步到子离散序列。"""
+    child_logits = parent_node.logits.clone().to(device)
+    _sync_theta_to_seq(child_logits, child_seq)
+    return child_logits
+
+
+def run_mcts_hallucination(
+    model,
+    target_seq: Union[str, List[str]],
+    L_binder: int = 40,
+    N_steps: int = 100,
+    learning_rate: float = 0.05,
+    tau_noise: float = 4.0,
+    device: torch.device = None,
+    loss_weights: Dict[str, float] = None,
+    K_top: int = 10,
+    B_candidates: int = 8,
+    T_sample: float = 1.0,
+    max_mutations_per_seq: int = 3,
+    use_annealing: bool = False,
+    T_init: float = 1.0,
+    T_min: float = 0.01,
+    num_beams: int = 8,
+    use_prior: bool = True,
+    prior_strength: float = 0.1,
+    checkpoint_dir: str = None,
+    init_binder_seq: Optional[str] = None,
+    hotspot_params: Optional[Dict] = None,
+    chunk_size: int = None,
+    mcts_C: float = 1.0,
+    mcts_max_nodes: int = 5000,
+    mcts_tau_fixed: float = 4.0,
+) -> Tuple[str, str, List[float]]:
+    """
+    MCTS 调度的混合优化：UCB 选点 + 一阶提议 + 零阶验证 + Expansion/Backprop/Prune。
+    Phase 0 使用 ``--init_binder_seq`` 单种子 + 随机突变扩展（与 hybrid 的 init 语义对齐）。
+    """
+    from bindcraft.hallucination.mcts_controller import MCTSTree
+    from bindcraft.hallucination.scheduler import AnnealingScheduler
+
+    if device is None:
+        device = next(model.parameters()).device
+
+    base_weights = dict(DEFAULT_LOSS_WEIGHTS)
+    if loss_weights is not None:
+        base_weights.update(loss_weights)
+    contact_params = dict(DEFAULT_CONTACT_PARAMS)
+
+    target_sequences = _normalize_chain_sequences(target_seq)
+    target_len_str = "+".join(str(len(s)) for s in target_sequences)
+    target_total_len = sum(len(s) for s in target_sequences)
+
+    annealer = AnnealingScheduler(T_init=T_init, T_min=T_min) if use_annealing else None
+
+    ckpt_mgr = None
+    if checkpoint_dir is not None:
+        ckpt_mgr = CheckpointManager(
+            output_dir=checkpoint_dir,
+            binder_seq="PLACEHOLDER",
+            target_seq=target_seq,
+        )
+        logger.info(f"Checkpoint 保存已启用: {checkpoint_dir}")
+
+    logger.info("=" * 70)
+    logger.info("MCTS 调度混合优化 (1st-Order Proposal + 0th-Order Verification)")
+    logger.info(
+        f"Target chains: {len(target_sequences)} | lengths={target_len_str} | total={target_total_len} aa"
+    )
+    logger.info(f"Binder 长度: {L_binder} aa")
+    logger.info(f"总轮数: {N_steps} | K_top={K_top} B={B_candidates} T_sample={T_sample}")
+    logger.info(f"MCTS: C={mcts_C}, max_nodes={mcts_max_nodes}, tau_fixed={mcts_tau_fixed}")
+    logger.info(f"Annealing: {use_annealing} (C={mcts_C} is primary exploration control)")
+    logger.info(f"M_prior (BLOSUM62): use_prior={use_prior}, prior_strength={prior_strength}")
+    logger.info(f"Base loss 权重: {base_weights}")
+    logger.info("=" * 70)
+
+    freeze_model(model)
+
+    logger.info("预计算 W_AAE...")
+    W_AAE = precompute_waa_embeddings(model, device)
+
+    logger.info("获取 Target 特征（target-only）...")
+    with torch.no_grad():
+        feat_target_only, _, _ = build_single_chain_features(target_seq, device)
+        feat_target_only = _prepare_input_features(model, feat_target_only)
+        s_target = model.input_embedder(feat_target_only, inplace_safe=False)
+        s_target = s_target.clone()
+    logger.info(f"s_target shape: {s_target.shape}")
+
+    plddt_params = sample_confidence.get_bin_params(model.configs.loss.plddt)
+    pae_params = sample_confidence.get_bin_params(model.configs.loss.pae)
+    distogram_params = sample_confidence.get_bin_params(model.configs.loss.distogram)
+    pde_params = sample_confidence.get_bin_params(model.configs.loss.pde)
+
+    mcts_tree = MCTSTree(C=mcts_C, max_nodes=mcts_max_nodes, mcts_tau=mcts_tau_fixed)
+    logger.info(f"MCTS 树已创建: C={mcts_C}, max_nodes={mcts_max_nodes}, tau_fixed={mcts_tau_fixed}")
+
+    # ── Phase 0：全局冷启动 ─────────────────────────────────────────────
+    logger.info("=" * 70)
+    logger.info("Phase 0: 全局冷启动 (Best-of-N)")
+    template_seqs = _make_phase0_seeds(init_binder_seq, num_beams, L_binder)
+    if init_binder_seq is not None:
+        logger.info(
+            f"使用 init_binder_seq 种子 + 突变扩展，共 {len(template_seqs)} 条 Phase0 候选"
+        )
+    else:
+        logger.info(f"无 init_binder_seq，随机生成 {len(template_seqs)} 条初始序列")
+
+    logger.info(f"对 {len(template_seqs)} 条模板执行 Step3 零阶验证...")
+    phase0_results = []
+    for idx, tseq in enumerate(template_seqs):
+        logger.info(f"  Phase0 [{idx+1}/{len(template_seqs)}]: {tseq[:20]}...")
+        result = zeroth_order_eval(
+            binder_seq=tseq,
+            target_seq=target_seq,
+            model=model,
+            device=device,
+            loss_weights=base_weights,
+            contact_params=contact_params,
+            chunk_size=chunk_size,
+            hotspot_params=hotspot_params,
+        )
+        phase0_results.append((tseq, result))
+        logger.info(
+            f"    L_real={result.total_loss:.4f} "
+            f"pLDDT={result.summary_confidence.get('plddt', 'N/A')} "
+            f"iPTM={result.summary_confidence.get('i_ptm', 'N/A')}"
+        )
+
+    phase0_results.sort(key=lambda x: x[1].total_loss)
+    top_beam = min(num_beams, len(phase0_results))
+
+    torch.manual_seed(42)
+    np.random.seed(42)
+    for i in range(top_beam):
+        seq, result = phase0_results[i]
+        theta_root = torch.zeros(L_binder, NUM_AMINO_ACIDS, device=device)
+        _sync_theta_to_seq(theta_root, seq)
+        theta_root.requires_grad_(True)
+
+        mcts_tree.add_root_node(
+            sequence=seq,
+            logits=theta_root,
+            L_real=result.total_loss,
+            coordinate=result.coordinate,
+        )
+        logger.info(f"  根节点 {i+1}: {seq[:20]}... L={result.total_loss:.4f}")
+
+    best_zeroth_loss = phase0_results[0][1].total_loss
+    best_zeroth_seq = phase0_results[0][0]
+    best_step = 0
+    losses_history = []
+
+    if ckpt_mgr is not None:
+        _, best_result = phase0_results[0]
+        ckpt_mgr.save(
+            step=0,
+            beam_id=0,
+            zeroth_result=best_result,
+            plddt_logits=best_result.plddt_logits,
+            accepted=True,
+            is_global_best=True,
+        )
+        logger.info("[Checkpoint] Phase 0 保存完毕")
+
+    logger.info(f"Phase 0 完成：{mcts_tree.total_nodes} 个根节点, best_L={best_zeroth_loss:.4f}")
+    logger.info("=" * 70)
+
+    logger.info("开始 MCTS 主循环...")
+
+    for step in range(N_steps):
+        selected_node = mcts_tree.select()
+        selected_seq = selected_node.sequence
+        selected_logits = selected_node.logits.clone().to(device)
+
+        with torch.no_grad():
+            feat_binder_only, _, _ = build_single_chain_features(selected_seq, device)
+            feat_binder_only = _prepare_input_features(model, feat_binder_only)
+            if selected_node.coordinate is not None:
+                x_coarse_cached = selected_node.coordinate.clone().to(device)
+                # zeroth_order 可能保存 [N_sample, N_atom, 3]（默认 N_sample>1），
+                # 单步外推只用首个 sample，避免 t_hat/r_noisy 形状不匹配
+                if x_coarse_cached.dim() >= 3 and x_coarse_cached.size(-3) > 1:
+                    x_coarse_cached = x_coarse_cached.narrow(-3, 0, 1).contiguous()
+            else:
+                ref_pos = feat_binder_only["ref_pos"]
+                x_coarse_cached = ref_pos.clone().unsqueeze(0).to(device)
+                x_coarse_cached = x_coarse_cached + torch.randn_like(x_coarse_cached) * 0.1
+
+        # detach：避免 clone(logits) 仍为非 leaf，Adam 报 can't optimize a non-leaf Tensor
+        theta_step2 = selected_logits.detach().clone().requires_grad_(True)
+        optimizer_step2 = torch.optim.Adam([theta_step2], lr=learning_rate)
+
+        progress = step / max(N_steps - 1, 1)
+        tau_temp = 2.0 * (1.0 - progress) + 0.05 * progress
+
+        s_binder_step2, current_seq_step2, input_feature_dict_step2 = ste_bridge(
+            theta=theta_step2,
+            W_AAE=W_AAE,
+            model=model,
+            target_seq=target_seq,
+            device=device,
+            tau_temp=tau_temp,
+        )
+
+        x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
+            model=model,
+            s_binder=s_binder_step2,
+            s_target=s_target,
+            input_feature_dict=input_feature_dict_step2,
+            x_coarse=x_coarse_cached,
+            X_clean=selected_node.coordinate,
+            tau=mcts_tau_fixed,
+            device=device,
+            chunk_size=chunk_size,
+        )
+
+        x0_flat = x0_hat_step2.squeeze(0)
+        s_inputs_full = torch.cat([s_binder_step2, s_target], dim=0)
+        heads = run_confidence_heads(
+            model=model,
+            input_feature_dict=input_feature_dict_step2,
+            s_inputs=s_inputs_full,
+            s_trunk=s_trunk_step2,
+            z_trunk=z_trunk_step2,
+            x0_hat=x0_hat_step2,
+            inplace_safe=False,
+            chunk_size=chunk_size,
+        )
+
+        first_order_loss, first_order_losses = compute_all_losses(
+            x0_flat=x0_flat,
+            plddt_logits=heads["plddt_logits"],
+            pae_logits=heads["pae_logits"],
+            distogram_logits=heads["distogram_logits"],
+            input_feature_dict=input_feature_dict_step2,
+            L_binder=L_binder,
+            weights=base_weights,
+            contact_params=contact_params,
+            plddt_params=plddt_params,
+            pae_params=pae_params,
+            distogram_params=distogram_params,
+            pde_logits=heads["pde_logits"],
+            pde_params=pde_params,
+            clash_params=dict(DEFAULT_CLASH_PARAMS),
+            hotspot_params=hotspot_params,
+        )
+
+        first_order_loss.backward()
+        grad_for_proposal = theta_step2.grad.clone() if theta_step2.grad is not None else None
+        torch.nn.utils.clip_grad_norm_([theta_step2], 1.0)
+        optimizer_step2.step()
+        fo_loss_val = first_order_loss.item()
+
+        if grad_for_proposal is None:
+            logger.warning(f"Step {step}: grad is None, skipping candidate generation")
+            losses_history.append(best_zeroth_loss)
+            continue
+
+        grads_cpu = grad_for_proposal.detach().cpu()
+        candidates = propose_mutations(
+            grad_matrix=grads_cpu,
+            current_seq=current_seq_step2,
+            K_top=K_top,
+            B_candidates=B_candidates,
+            T_sample=T_sample,
+            max_mutations_per_seq=max_mutations_per_seq,
+            use_prior=use_prior,
+            prior_strength=prior_strength,
+        )
+
+        if not candidates:
+            logger.warning(f"Step {step}: no candidates generated, skipping")
+            losses_history.append(best_zeroth_loss)
+            continue
+
+        all_zeroth_results = []
+        for cand_seq in candidates:
+            result = zeroth_order_eval(
+                binder_seq=cand_seq,
+                target_seq=target_seq,
+                model=model,
+                device=device,
+                loss_weights=base_weights,
+                contact_params=contact_params,
+                chunk_size=chunk_size,
+                hotspot_params=hotspot_params,
+            )
+            all_zeroth_results.append(result)
+
+        new_nodes = mcts_tree.expand(selected_node, all_zeroth_results)
+
+        for new_node in new_nodes:
+            new_node.logits = _init_child_logits_from_parent(
+                selected_node, new_node.sequence, device
+            )
+
+        losses_for_backprop = [r.total_loss for r in all_zeroth_results]
+        mcts_tree.backpropagate(selected_node, losses_for_backprop)
+
+        n_pruned = mcts_tree.prune()
+        if n_pruned > 0:
+            logger.debug(f"Step {step}: pruned {n_pruned} nodes")
+
+        round_best = min(all_zeroth_results, key=lambda r: r.total_loss)
+        round_best_loss = round_best.total_loss
+
+        accepted = False
+        prob_accept = False
+        if annealer is not None:
+            current_node_loss = selected_node.L_real
+            accepted = annealer.accept(current_node_loss, round_best_loss, step, N_steps)
+            if accepted and round_best_loss >= current_node_loss:
+                prob_accept = True
+        else:
+            accepted = round_best_loss <= best_zeroth_loss
+
+        if accepted and round_best_loss <= best_zeroth_loss:
+            best_zeroth_loss = round_best_loss
+            best_zeroth_seq = round_best.binder_seq
+            best_step = step
+
+        losses_history.append(round_best_loss)
+
+        stats = mcts_tree.get_node_stats()
+
+        logger.info(
+            f"Step {step:3d}/{N_steps} | "
+            f"sel_node={selected_node.node_id}(d={selected_node.depth}) "
+            f"L_real={selected_node.L_real:.4f} "
+            f"1st={fo_loss_val:.4f} | "
+            f"K={len(candidates)} "
+            f"round_best={round_best_loss:.4f} "
+            f"global_best={best_zeroth_loss:.4f}@{best_step} "
+            f"tree={stats['total_nodes']}nodes "
+            f"N_total={stats['N_total']} | "
+            f"accepted={accepted}{'(prob)' if prob_accept else ''}"
+        )
+
+        if ckpt_mgr is not None:
+            ckpt_mgr.save(
+                step=step,
+                beam_id=0,
+                zeroth_result=round_best,
+                plddt_logits=round_best.plddt_logits,
+                accepted=accepted,
+                is_global_best=(round_best_loss == best_zeroth_loss),
+            )
+            best_info = ckpt_mgr.get_best_info()
+            logger.info(
+                f"  [Checkpoint] best={best_info['loss']:.4f} @ "
+                f"step={best_info['step']} beam={best_info['beam']}"
+            )
+
+    mcts_tree.log_tree_summary()
+
+    best_final = mcts_tree.get_global_best()
+    logger.info("=" * 70)
+    logger.info("MCTS 混合优化完成！")
+    logger.info(f"全局最优序列: {best_zeroth_seq} (loss={best_zeroth_loss:.4f} @step {best_step})")
+    logger.info(f"MCTS 树最终节点数: {mcts_tree.total_nodes}")
+    logger.info(
+        f"MCTS 全局最优节点: id={best_final.node_id} depth={best_final.depth} "
+        f"seq={best_final.sequence[:20]}... L={best_final.L_real:.4f}"
+    )
     logger.info("=" * 70)
 
     return best_zeroth_seq, best_zeroth_seq, losses_history

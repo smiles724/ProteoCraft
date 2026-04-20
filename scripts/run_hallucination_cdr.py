@@ -43,7 +43,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from bindcraft.hallucination.pipeline import run_hallucination
-from bindcraft.hallucination.pipeline_cdr import run_hybrid_hallucination_cdr
+from bindcraft.hallucination.pipeline_cdr import (
+    run_hybrid_hallucination_cdr,
+    run_mcts_hallucination_cdr,
+)
 
 
 def setup_logging(log_file: str = None):
@@ -128,8 +131,8 @@ def main():
 
     # ── 基础参数 ──────────────────────────────────────────────────────────────
     parser.add_argument("--mode", type=str, default="hybrid",
-                       choices=["first_order", "hybrid"],
-                       help="优化模式（仅 Mode C 影响行为）")
+                       choices=["first_order", "hybrid", "mcts"],
+                       help="优化模式: first_order / hybrid / mcts（Mode A/B/C 均支持 hybrid 与 mcts）")
     parser.add_argument("--device", type=str, default="cuda",
                        help="计算设备（默认：cuda）")
     parser.add_argument("--model_name", type=str, default="protenix_base_default_v1.0.0",
@@ -198,6 +201,10 @@ def main():
                     help="先验权重系数（默认：0.1）")
     g4.add_argument("--chunk_size", type=int, default=None,
                     help="Attention 分块大小。当 binder>100 aa 时建议设为 256 避免 OOM（默认：None）")
+    g4.add_argument("--mcts_c", type=float, default=1.0, help="MCTS UCB 探索常数 C（默认：1.0）")
+    g4.add_argument("--mcts_max_nodes", type=int, default=5000, help="MCTS 树最大节点数（默认：5000）")
+    g4.add_argument("--mcts_tau_fixed", type=float, default=4.0, help="MCTS 固定扩散 tau（默认：4.0）")
+    g4.add_argument("--mcts_num_beams", type=int, default=8, help="MCTS Phase0 根节点数（默认：8）")
 
     # ── 损失函数权重 ──────────────────────────────────────────────────────────
     g5 = parser.add_argument_group("损失函数权重")
@@ -215,6 +222,9 @@ def main():
     g5.add_argument("--w_i_pde", type=float, default=None, help="i_PDE (inter) 权重")
 
     args = parser.parse_args()
+
+    if args.pdb_id is not None and args.mode == "first_order":
+        parser.error("Mode A (--pdb_id) does not support --mode first_order; use hybrid or mcts")
 
     setup_logging(args.log_file)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -244,29 +254,57 @@ def main():
             else os.path.join(args.output_dir, f"{args.pdb_id}_cdr_checkpoints")
         _ckpt = ckpt_dir if ckpt_dir != "" else None
         logging.info(f"[CDR-Aware] Mode A — pdb_id={args.pdb_id} | checkpoint_dir={ckpt_dir}")
-        best_seq, final_seq, losses_history = run_hybrid_hallucination_cdr(
-            model=model,
-            pdb_id=args.pdb_id,
-            binder_chain=args.binder_chain,
-            scheme=args.scheme,
-            N_steps=args.n_steps,
-            learning_rate=args.learning_rate,
-            tau_noise=args.tau_noise,
-            loss_weights=loss_weights,
-            K_top=args.k_top,
-            B_candidates=args.b_candidates,
-            T_sample=args.t_sample,
-            max_mutations_per_seq=args.max_mutations_per_seq,
-            use_annealing=args.use_annealing,
-            T_init=args.t_init,
-            T_min=args.t_min,
-            use_tau_scheduling=args.use_tau_scheduling,
-            tau_jitter=args.tau_jitter,
-            use_prior=args.use_prior,
-            prior_strength=args.prior_strength,
-            checkpoint_dir=_ckpt,
-            chunk_size=args.chunk_size,
-        )
+        if args.mode == "mcts":
+            best_seq, final_seq, losses_history = run_mcts_hallucination_cdr(
+                model=model,
+                pdb_id=args.pdb_id,
+                binder_chain=args.binder_chain,
+                scheme=args.scheme,
+                N_steps=args.n_steps,
+                learning_rate=args.learning_rate,
+                tau_noise=args.tau_noise,
+                loss_weights=loss_weights,
+                K_top=args.k_top,
+                B_candidates=args.b_candidates,
+                T_sample=args.t_sample,
+                max_mutations_per_seq=args.max_mutations_per_seq,
+                use_annealing=args.use_annealing,
+                T_init=args.t_init,
+                T_min=args.t_min,
+                num_beams=args.mcts_num_beams,
+                use_prior=args.use_prior,
+                prior_strength=args.prior_strength,
+                checkpoint_dir=_ckpt,
+                hotspot_params=None,
+                mcts_C=args.mcts_c,
+                mcts_max_nodes=args.mcts_max_nodes,
+                mcts_tau_fixed=args.mcts_tau_fixed,
+                chunk_size=args.chunk_size,
+            )
+        else:
+            best_seq, final_seq, losses_history = run_hybrid_hallucination_cdr(
+                model=model,
+                pdb_id=args.pdb_id,
+                binder_chain=args.binder_chain,
+                scheme=args.scheme,
+                N_steps=args.n_steps,
+                learning_rate=args.learning_rate,
+                tau_noise=args.tau_noise,
+                loss_weights=loss_weights,
+                K_top=args.k_top,
+                B_candidates=args.b_candidates,
+                T_sample=args.t_sample,
+                max_mutations_per_seq=args.max_mutations_per_seq,
+                use_annealing=args.use_annealing,
+                T_init=args.t_init,
+                T_min=args.t_min,
+                use_tau_scheduling=args.use_tau_scheduling,
+                tau_jitter=args.tau_jitter,
+                use_prior=args.use_prior,
+                prior_strength=args.prior_strength,
+                checkpoint_dir=_ckpt,
+                chunk_size=args.chunk_size,
+            )
         run_label = f"ModeA_{args.pdb_id}"
 
     elif args.cdr_json is not None:
@@ -292,29 +330,57 @@ def main():
             logging.error("CDR JSON missing 'binder_cdr_mask' field")
             sys.exit(1)
 
-        best_seq, final_seq, losses_history = run_hybrid_hallucination_cdr(
-            model=model,
-            binder_sequence=binder_seq,
-            cdr_mask=cdr_mask,
-            target_seq=target_seq,
-            N_steps=args.n_steps,
-            learning_rate=args.learning_rate,
-            tau_noise=args.tau_noise,
-            loss_weights=loss_weights,
-            K_top=args.k_top,
-            B_candidates=args.b_candidates,
-            T_sample=args.t_sample,
-            max_mutations_per_seq=args.max_mutations_per_seq,
-            use_annealing=args.use_annealing,
-            T_init=args.t_init,
-            T_min=args.t_min,
-            use_tau_scheduling=args.use_tau_scheduling,
-            tau_jitter=args.tau_jitter,
-            use_prior=args.use_prior,
-            prior_strength=args.prior_strength,
-            checkpoint_dir=_ckpt,
-            chunk_size=args.chunk_size,
-        )
+        if args.mode == "mcts":
+            best_seq, final_seq, losses_history = run_mcts_hallucination_cdr(
+                model=model,
+                binder_sequence=binder_seq,
+                cdr_mask=cdr_mask,
+                target_seq=target_seq,
+                N_steps=args.n_steps,
+                learning_rate=args.learning_rate,
+                tau_noise=args.tau_noise,
+                loss_weights=loss_weights,
+                K_top=args.k_top,
+                B_candidates=args.b_candidates,
+                T_sample=args.t_sample,
+                max_mutations_per_seq=args.max_mutations_per_seq,
+                use_annealing=args.use_annealing,
+                T_init=args.t_init,
+                T_min=args.t_min,
+                num_beams=args.mcts_num_beams,
+                use_prior=args.use_prior,
+                prior_strength=args.prior_strength,
+                checkpoint_dir=_ckpt,
+                hotspot_params=None,
+                mcts_C=args.mcts_c,
+                mcts_max_nodes=args.mcts_max_nodes,
+                mcts_tau_fixed=args.mcts_tau_fixed,
+                chunk_size=args.chunk_size,
+            )
+        else:
+            best_seq, final_seq, losses_history = run_hybrid_hallucination_cdr(
+                model=model,
+                binder_sequence=binder_seq,
+                cdr_mask=cdr_mask,
+                target_seq=target_seq,
+                N_steps=args.n_steps,
+                learning_rate=args.learning_rate,
+                tau_noise=args.tau_noise,
+                loss_weights=loss_weights,
+                K_top=args.k_top,
+                B_candidates=args.b_candidates,
+                T_sample=args.t_sample,
+                max_mutations_per_seq=args.max_mutations_per_seq,
+                use_annealing=args.use_annealing,
+                T_init=args.t_init,
+                T_min=args.t_min,
+                use_tau_scheduling=args.use_tau_scheduling,
+                tau_jitter=args.tau_jitter,
+                use_prior=args.use_prior,
+                prior_strength=args.prior_strength,
+                checkpoint_dir=_ckpt,
+                chunk_size=args.chunk_size,
+            )
         run_label = f"ModeB_{json_basename}"
 
     else:
@@ -335,6 +401,33 @@ def main():
                 tau_noise=args.tau_noise,
                 device=torch.device(args.device),
                 loss_weights=loss_weights,
+            )
+        elif args.mode == "mcts":
+            logging.info(f"[CDR-Aware] Mode C — mcts (无 CDR mask)")
+            best_seq, final_seq, losses_history = run_mcts_hallucination_cdr(
+                model=model,
+                target_seq=args.target,
+                L_binder=args.binder_length,
+                N_steps=args.n_steps,
+                learning_rate=args.learning_rate,
+                tau_noise=args.tau_noise,
+                loss_weights=loss_weights,
+                K_top=args.k_top,
+                B_candidates=args.b_candidates,
+                T_sample=args.t_sample,
+                max_mutations_per_seq=args.max_mutations_per_seq,
+                use_annealing=args.use_annealing,
+                T_init=args.t_init,
+                T_min=args.t_min,
+                num_beams=args.mcts_num_beams,
+                use_prior=args.use_prior,
+                prior_strength=args.prior_strength,
+                checkpoint_dir=_ckpt,
+                hotspot_params=None,
+                mcts_C=args.mcts_c,
+                mcts_max_nodes=args.mcts_max_nodes,
+                mcts_tau_fixed=args.mcts_tau_fixed,
+                chunk_size=args.chunk_size,
             )
         else:
             logging.info(f"[CDR-Aware] Mode C — hybrid (无 CDR mask)")

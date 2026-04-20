@@ -19,8 +19,9 @@ from .diffusion_one_step import (
     diffusion_one_step_fused,
 )
 
-from .pipeline import run_hallucination, run_hybrid_hallucination
-from .pipeline_cdr import run_hybrid_hallucination_cdr
+from .pipeline import run_hallucination, run_hybrid_hallucination, run_mcts_hallucination
+from .pipeline_cdr import run_hybrid_hallucination_cdr, run_mcts_hallucination_cdr
+from .mcts_controller import MCTSNode, MCTSTree
 from .mutation_proposer import propose_mutations
 from .scheduler import AnnealingScheduler, TauScheduler, MacroBreathTracker
 
@@ -39,7 +40,11 @@ __all__ = [
     # Pipeline
     "run_hallucination",
     "run_hybrid_hallucination",
+    "run_mcts_hallucination",
     "run_hybrid_hallucination_cdr",
+    "run_mcts_hallucination_cdr",
+    "MCTSNode",
+    "MCTSTree",
     # Mutation Proposer
     "propose_mutations",
     # Schedulers
