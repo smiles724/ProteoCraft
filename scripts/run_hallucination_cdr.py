@@ -50,17 +50,17 @@ from bindcraft.hallucination.pipeline_cdr import (
 
 
 def setup_logging(log_file: str = None):
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     if log_file:
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-        )
-        logging.getLogger().addHandler(file_handler)
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(fmt)
+        fh.setLevel(logging.INFO)
+        logging.basicConfig(level=logging.INFO, handlers=[fh], force=True)
+    else:
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        sh.setLevel(logging.INFO)
+        logging.basicConfig(level=logging.INFO, handlers=[sh], force=True)
 
 
 def load_protenix_model(

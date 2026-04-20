@@ -282,7 +282,9 @@ def zeroth_order_eval(
         # compute_all_losses 期望 x0_flat: [N_atom, 3]
         # plddt_logits: [N_sample, N_atom, bins]
         # pae_logits: [N_sample, N_token, N_token, bins]
-        x0_flat = coordinate[best_idx]  # [N_atom, 3]
+        # 避免 CUDA 上高级索引路径潜在卡死：改用 narrow + squeeze
+        coordinate_sel = coordinate.narrow(0, best_idx, 1).contiguous()
+        x0_flat = coordinate_sel.squeeze(0)  # [N_atom, 3]
         plddt_for_loss = plddt_logits[best_idx : best_idx + 1]  # [1, N_atom, bins]
         pae_for_loss = pae_logits[best_idx : best_idx + 1]      # [1, N_token, N_token, bins]
         pde_for_loss = pde_logits[best_idx : best_idx + 1]      # [1, N_token, N_token, bins]
@@ -323,12 +325,15 @@ def zeroth_order_eval(
         except (TypeError, ValueError):
             sc_flat[k] = v
 
+    coordinate_cpu = coordinate_sel.cpu()
+    plddt_logits_cpu = plddt_logits[best_idx : best_idx + 1].cpu()  # [1, N_atom, bins]
+
     return ZerothOrderResult(
         binder_seq=binder_seq,
         target_seq=target_seq,
         total_loss=total_loss.item(),
         loss_dict=loss_dict,
         summary_confidence=sc_flat,
-        coordinate=coordinate[best_idx : best_idx + 1].cpu(),
-        plddt_logits=plddt_logits[best_idx : best_idx + 1].cpu(),  # [1, N_atom, bins]
+        coordinate=coordinate_cpu,
+        plddt_logits=plddt_logits_cpu,
     )
