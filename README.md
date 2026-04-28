@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
 
-**BindCraft v2** is a protein binder design framework built on [Protenix](https://github.com/bytedance/Protenix). It freezes the structure-prediction model and directly backpropagates 3D physical objectives (binding distance, steric clash, complex confidence) through the network to optimize input amino-acid sequences — no fine-tuning of the base model required.
+**BindCraft v2** is a protein binder design framework built on [Protenix](https://github.com/bytedance/Protenix). It freezes the structure-prediction model and directly backpropagates 3D physical objectives (interface contact, steric clash, complex confidence) through the network to optimize input amino-acid sequences — no fine-tuning of the base model required.
 
 ---
 
@@ -43,10 +43,7 @@ python scripts/run_hallucination.py \
     --n_steps 200 \
     --learning_rate 0.05 \
     --tau_noise 4.0 \
-    --lambda_dist 2.0 \
-    --lambda_clash 1.0 \
-    --lambda_iptm -1.0 \
-    --lambda_plddt -0.5
+    --w_i_con 3.0
 ```
 
 **Mode B — Hybrid 1st + 0th (Recommended)**
@@ -69,10 +66,8 @@ python scripts/run_hallucination.py \
     --t_min 0.01 \
     --use_tau_scheduling true \
     --tau_jitter true \
-    --lambda_dist 2.0 \
-    --lambda_clash 1.0 \
-    --lambda_iptm -1.0 \
-    --lambda_plddt -0.5
+    --w_i_pae 0.1 \
+    --w_i_con 3.0
 ```
 
 **Optional: Fine-tune for a specific target**
@@ -93,10 +88,11 @@ Full list: `python scripts/run_hallucination.py --help`
 | `--n_steps` | Optimization iterations | `200` |
 | `--learning_rate` | Adam learning rate | `0.05` |
 | `--tau_noise` | Diffusion noise timestep | `4.0` |
-| `--lambda_dist` | Binder-to-hotspot distance weight | `2.0` |
-| `--lambda_clash` | Steric clash penalty weight | `1.0` |
-| `--lambda_iptm` | iPTM weight (negative = maximize) | `-1.0` |
-| `--lambda_plddt` | pLDDT weight (negative = maximize) | `-0.5` |
+| `--w_i_pae` | Inter-chain PAE weight; with hotspot enabled, scores binder-hotspot pairs only | `0.1` |
+| `--w_i_con` | Inter-chain contact weight; with hotspot enabled, scores binder-hotspot contacts only | `3.0` |
+| `--w_clash` | Intra-binder clash penalty weight | `0.5` |
+| `--w_iptm` | iPTM weight | `0.05` |
+| `--w_plddt` | pLDDT weight | `0.1` |
 | `--k_top` | Top-K mutations per branch (hybrid only) | `10` |
 | `--b_candidates` | 0th-order candidates (hybrid only) | `8` |
 | `--use_tau_scheduling` | Coarse-to-fine τ annealing | `true` |
@@ -115,7 +111,7 @@ bindcraft/
 │   ├── mutation_proposer.py   # Gradient-guided mutation proposer
 │   └── scheduler.py           # Timestep & parameter scheduler
 └── losses/                    # Physical constraint losses
-    ├── geometry.py            # Distance, clash, H-bond
+    ├── geometry.py            # Rg, helix, clash
     ├── confidence.py          # iPTM, pLDDT
     └── total_loss.py          # Weighted total loss
 

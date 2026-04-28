@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
 
-**BindCraft v2** 是基于 [Protenix](https://github.com/bytedance/Protenix) 构建的蛋白质 binder 设计框架。核心思想：冻结结构预测模型，将 3D 物理目标（结合距离、空间位阻、复合物置信度）直接反向传播过网络来优化输入氨基酸序列，无需对基座模型做任何微调。
+**BindCraft v2** 是基于 [Protenix](https://github.com/bytedance/Protenix) 构建的蛋白质 binder 设计框架。核心思想：冻结结构预测模型，将 3D 物理目标（界面接触、空间位阻、复合物置信度）直接反向传播过网络来优化输入氨基酸序列，无需对基座模型做任何微调。
 
 ---
 
@@ -43,10 +43,7 @@ python scripts/run_hallucination.py \
     --n_steps 200 \
     --learning_rate 0.05 \
     --tau_noise 4.0 \
-    --lambda_dist 2.0 \
-    --lambda_clash 1.0 \
-    --lambda_iptm -1.0 \
-    --lambda_plddt -0.5
+    --w_i_con 3.0
 ```
 
 **模式 B — 混合 1st + 0th（推荐）**
@@ -67,10 +64,8 @@ python scripts/run_hallucination.py \
     --use_annealing true \
     --use_tau_scheduling true \
     --tau_jitter true \
-    --lambda_dist 2.0 \
-    --lambda_clash 1.0 \
-    --lambda_iptm -1.0 \
-    --lambda_plddt -0.5
+    --w_i_pae 0.1 \
+    --w_i_con 3.0
 ```
 
 **可选：针对特定靶点微调模型**
@@ -91,10 +86,11 @@ bash finetune_demo.sh
 | `--n_steps` | 优化迭代步数 | `200` |
 | `--learning_rate` | Adam 学习率 | `0.05` |
 | `--tau_noise` | 扩散噪声时间步 | `4.0` |
-| `--lambda_dist` | 距离损失权重 | `2.0` |
-| `--lambda_clash` | 位阻惩罚权重 | `1.0` |
-| `--lambda_iptm` | iPTM 权重（负值 = 最大化） | `-1.0` |
-| `--lambda_plddt` | pLDDT 权重（负值 = 最大化） | `-0.5` |
+| `--w_i_pae` | 链间 PAE 权重；启用 hotspot 后仅统计 binder-hotspot 对 | `0.1` |
+| `--w_i_con` | 链间接触权重；启用 hotspot 后仅统计 binder-hotspot 接触 | `3.0` |
+| `--w_clash` | binder 内部位阻惩罚权重 | `0.5` |
+| `--w_iptm` | iPTM 权重 | `0.05` |
+| `--w_plddt` | pLDDT 权重 | `0.1` |
 | `--k_top` | 每分支 Top-K 突变候选（仅 hybrid） | `10` |
 | `--b_candidates` | 零阶验证候选数（仅 hybrid） | `8` |
 | `--use_tau_scheduling` | 粗到细 τ 退火调度 | `true` |
@@ -113,7 +109,7 @@ bindcraft/
 │   ├── mutation_proposer.py  # 梯度引导突变提议器
 │   └── scheduler.py          # 时间步与参数调度器
 └── losses/                   # 物理约束损失
-    ├── geometry.py           # 距离、碰撞、氢键
+    ├── geometry.py           # Rg、螺旋、碰撞
     ├── confidence.py         # iPTM、pLDDT
     └── total_loss.py         # 加权总损失
 

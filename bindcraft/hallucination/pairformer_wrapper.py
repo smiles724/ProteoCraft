@@ -174,7 +174,7 @@ def pairformer_forward_no_ckpt(
 
             # Template Embedder（若有 template block）
             if model.template_embedder.n_blocks > 0:
-                z = z + model.template_embedder(
+                template_update = model.template_embedder(
                     input_feature_dict,
                     z,
                     triangle_multiplicative="torch",
@@ -182,6 +182,7 @@ def pairformer_forward_no_ckpt(
                     inplace_safe=False,
                     chunk_size=chunk_size,
                 )
+                z = z + template_update.detach()
 
             # 对 use_msa=False 的模型，直接跳过 MSA 路径。
             if getattr(model.configs, "use_msa", True):

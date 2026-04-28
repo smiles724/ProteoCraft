@@ -246,7 +246,7 @@ class Protenix(nn.Module):
                     z = z_init + self.linear_no_bias_z_cycle(self.layernorm_z_cycle(z))
                 if inplace_safe:
                     if self.template_embedder.n_blocks > 0:
-                        z += self.template_embedder(
+                        template_update = self.template_embedder(
                             input_feature_dict,
                             z,
                             triangle_multiplicative=self.configs.triangle_multiplicative,
@@ -254,6 +254,7 @@ class Protenix(nn.Module):
                             inplace_safe=inplace_safe,
                             chunk_size=chunk_size,
                         )
+                        z += template_update.detach()
                     z = self.msa_module(
                         input_feature_dict,
                         z,
@@ -266,7 +267,7 @@ class Protenix(nn.Module):
                     )
                 else:
                     if self.template_embedder.n_blocks > 0:
-                        z = z + self.template_embedder(
+                        template_update = self.template_embedder(
                             input_feature_dict,
                             z,
                             triangle_multiplicative=self.configs.triangle_multiplicative,
@@ -274,6 +275,7 @@ class Protenix(nn.Module):
                             inplace_safe=inplace_safe,
                             chunk_size=chunk_size,
                         )
+                        z = z + template_update.detach()
                     z = self.msa_module(
                         input_feature_dict,
                         z,

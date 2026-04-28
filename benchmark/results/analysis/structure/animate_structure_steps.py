@@ -107,8 +107,8 @@ def _parse_atom_line(line):
         return None
 
     parts = line.split()
-    atom_name = parts[2] if len(parts) >= 3 else ""
-    chain_id = parts[4] if len(parts) >= 5 else ""
+    atom_name = line[12:16].strip() or (parts[2] if len(parts) >= 3 else "")
+    chain_id = line[21].strip() or (parts[4] if len(parts) >= 5 else "")
 
     try:
         x = float(line[30:38])

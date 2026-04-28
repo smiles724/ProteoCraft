@@ -8,7 +8,8 @@ BindCraft v2 - 入口脚本
         --binder_length 40 \
         --n_steps 200 \
         --learning_rate 0.05 \
-        --tau_noise 4.0
+        --tau_noise 4.0 \
+        --w_i_con 3.0
 
 使用方法（混合 1st+0th 模式）:
     python scripts/run_hallucination.py \
@@ -27,10 +28,8 @@ BindCraft v2 - 入口脚本
         --t_min 0.01 \
         --use_tau_scheduling true \
         --tau_jitter true \
-        --lambda_dist 2.0 \
-        --lambda_clash 1.0 \
-        --lambda_iptm -1.0 \
-        --lambda_plddt -0.5
+        --w_i_pae 0.1 \
+        --w_i_con 3.0
 """
 
 import os
@@ -193,6 +192,8 @@ def main():
                        help="日志级别（默认：INFO；排错可用 DEBUG）")
     parser.add_argument("--init_binder_seq", type=str, default=None,
                        help="可选的初始 Binder 单字母序列；长度必须与 --binder_length 一致")
+    parser.add_argument("--target_template_path", type=str, default=None,
+                       help="可选 target template 结构文件（.cif/.mmcif/.pdb），只作用于 target 链")
 
     # === 混合模式专用参数 ===
     parser.add_argument("--k_top", type=int, default=10,
@@ -290,6 +291,7 @@ def main():
             device=torch.device(args.device),
             loss_weights=loss_weights,
             init_binder_seq=args.init_binder_seq,
+            target_template_path=args.target_template_path,
         )
     elif args.mode == "hybrid":
         best_seq, final_seq, losses_history = run_hybrid_hallucination(
@@ -311,6 +313,7 @@ def main():
             use_tau_scheduling=args.use_tau_scheduling,
             tau_jitter=args.tau_jitter,
             init_binder_seq=args.init_binder_seq,
+            target_template_path=args.target_template_path,
         )
     else:
         best_seq, final_seq, losses_history = run_mcts_hallucination(
@@ -338,6 +341,7 @@ def main():
             mcts_C=args.mcts_c,
             mcts_max_nodes=args.mcts_max_nodes,
             mcts_tau_fixed=args.mcts_tau_fixed,
+            target_template_path=args.target_template_path,
         )
 
     output_file = os.path.join(args.output_dir, "hallucination_result.txt")
@@ -350,6 +354,7 @@ def main():
         f.write(f"Tau Noise: {args.tau_noise}\n")
         f.write(f"Checkpoint Dir: {resolve_checkpoint_dir(args.checkpoint_dir)}\n")
         f.write(f"Initial Binder Sequence: {args.init_binder_seq or 'RANDOM'}\n")
+        f.write(f"Target Template Path: {args.target_template_path or 'None'}\n")
         f.write(f"\n")
         f.write(f"Best Sequence: {best_seq}\n")
         f.write(f"Final Sequence: {final_seq}\n")
@@ -375,7 +380,7 @@ if __name__ == "__main__":
 
     try:
         main()
-    except BaseException:
+    except Exception:
         traceback.print_exc()
         sys.stdout.flush()
         sys.stderr.flush()

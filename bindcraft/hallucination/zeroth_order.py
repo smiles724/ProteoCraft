@@ -186,6 +186,7 @@ def zeroth_order_eval(
     N_cycle: int = 4,
     chunk_size: int = None,
     hotspot_params: Optional[Dict[str, Any]] = None,
+    target_template_path: Optional[str] = None,
 ) -> ZerothOrderResult:
     """
     对一条离散候选序列执行完整 AF3 推断，并在最终结构上计算全部 8 项 loss。
@@ -200,6 +201,7 @@ def zeroth_order_eval(
         N_cycle:        Pairformer 循环次数
         chunk_size:     Attention 分块大小。当 complex 较大（如 114+ aa）
                        时建议设为 256，避免 OOM。默认为 None（不分块）。
+        target_template_path: 可选 target template 结构文件
 
     Returns:
         ZerothOrderResult: 包含 total_loss / loss_dict / summary_confidence / coordinate
@@ -221,7 +223,7 @@ def zeroth_order_eval(
     with torch.no_grad():
         # ── 构建特征 ─────────────────────────────────────────────────────
         input_feature_dict, N_token, N_atom = build_complex_features(
-            binder_seq, target_seq, device
+            binder_seq, target_seq, device, target_template_path=target_template_path
         )
         input_feature_dict = prepare_input_features(model, input_feature_dict)
 

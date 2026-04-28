@@ -17,6 +17,7 @@ import json
 import time
 import argparse
 import logging
+import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -31,6 +32,7 @@ from scripts.run_hallucination import load_protenix_model  # noqa: E402
 from bindcraft.hallucination.pipeline import (  # noqa: E402
     run_hallucination,
     run_hybrid_hallucination,
+    run_mcts_hallucination,
 )
 
 
@@ -61,6 +63,12 @@ AA3_TO_1 = {
 DEFAULT_CONFIG_PATH = Path(PROJECT_ROOT) / "benchmark" / "yaml" / "default.yaml"
 DEFAULT_CONFIG: Dict[str, Any] = {
     "source_dir": "/data/huangyanjie/binder_design/AF3Score/input",
+    "target_fasta_dir": None,
+    "target_fasta_residue_start": None,
+    "random_binder_length": 100,
+    "random_binder_lengths": None,
+    "init_binder_fasta_dir": None,
+    "random_seed": 42,
     "input_dir": str(Path(PROJECT_ROOT) / "benchmark" / "input" / "A6_TCR"),
     "results_dir": str(Path(PROJECT_ROOT) / "benchmark" / "results"),
     "log_dir": None,
@@ -82,7 +90,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "t_min": 0.01,
     "use_tau_scheduling": True,
     "tau_jitter": True,
+    "mcts_c": 1.0,
+    "mcts_max_nodes": 5000,
+    "mcts_tau_fixed": 4.0,
+    "mcts_num_beams": 8,
+    "chunk_size": None,
+    "use_prior": True,
+    "prior_strength": 0.1,
     "target_hotspot_residues": None,
+    "target_template_path": None,
+    "target_template_dir": None,
     "w_plddt": None,
     "w_pae": None,
     "w_i_pae": None,
@@ -318,6 +335,117 @@ def resolve_target_hotspots(
     return resolved_indices, resolved_labels
 
 
+
+def read_fasta_sequence(fasta_path: Path) -> str:
+    sequence_parts: List[str] = []
+    with fasta_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith(">"):
+                continue
+            sequence_parts.append(line)
+    sequence = "".join(sequence_parts).upper()
+    invalid = sorted(set(sequence) - set("ACDEFGHIKLMNPQRSTVWY"))
+    if not sequence:
+        raise ValueError(f"{fasta_path} 中没有 FASTA 序列")
+    if invalid:
+        raise ValueError(f"{fasta_path} 包含非标准氨基酸: {','.join(invalid)}")
+    return sequence
+
+
+def make_random_binder_sequence(length: int, rng: random.Random) -> str:
+    if length <= 0:
+        raise ValueError(f"random_binder_length={length} 必须大于 0")
+    alphabet = "ACDEFGHIKLMNPQRSTVWY"
+    return "".join(rng.choice(alphabet) for _ in range(length))
+
+
+def make_fasta_target_residues(
+    sequence: str,
+    chain_id: str = "B",
+    residue_start: int = 1,
+) -> List[Dict[str, Any]]:
+    return [
+        {
+            "chain_id": chain_id,
+            "residue_number": residue_start + seq_index,
+            "insertion_code": "",
+            "seq_index": seq_index,
+            "aa": aa,
+        }
+        for seq_index, aa in enumerate(sequence)
+    ]
+
+
+def collect_fasta_random_entries(
+    target_fasta_dir: Path,
+    random_binder_length: int,
+    random_seed: int,
+    random_binder_lengths: Optional[Dict[str, int]] = None,
+    init_binder_fasta_dir: Optional[Path] = None,
+    target_hotspot_residues: Optional[str] = None,
+    target_fasta_residue_start: Optional[int] = None,
+    selected_entry_ids: Optional[Set[str]] = None,
+) -> tuple[List[Dict[str, Any]], List[str]]:
+    fasta_files = sorted(
+        list(target_fasta_dir.glob("*.fa"))
+        + list(target_fasta_dir.glob("*.faa"))
+        + list(target_fasta_dir.glob("*.fasta"))
+    )
+    if not fasta_files:
+        raise FileNotFoundError(f"{target_fasta_dir} 下未找到 FASTA 文件")
+
+    rng = random.Random(random_seed)
+    per_case_lengths = random_binder_lengths or {}
+    entries: List[Dict[str, Any]] = []
+    for fasta_path in fasta_files:
+        entry_id = fasta_path.stem
+
+        target_seq = read_fasta_sequence(fasta_path)
+        init_binder_path = init_binder_fasta_dir / f"{entry_id}.fasta" if init_binder_fasta_dir else None
+        if init_binder_path is not None and init_binder_path.exists():
+            binder_seq = read_fasta_sequence(init_binder_path)
+            binder_source = str(init_binder_path)
+        else:
+            binder_length = int(per_case_lengths.get(entry_id, random_binder_length))
+            binder_seq = make_random_binder_sequence(binder_length, rng)
+            binder_source = "random"
+
+        if selected_entry_ids and entry_id not in selected_entry_ids:
+            continue
+
+        hotspot_concat_indices: List[int] = []
+        hotspot_labels: List[str] = []
+        if target_hotspot_residues:
+            residue_start = int(target_fasta_residue_start or 1)
+            target_residues = make_fasta_target_residues(
+                target_seq,
+                chain_id="B",
+                residue_start=residue_start,
+            )
+            hotspot_concat_indices, hotspot_labels = resolve_target_hotspots(
+                {"B": target_residues},
+                target_hotspot_residues,
+            )
+
+        entries.append(
+            {
+                "entry_id": entry_id,
+                "source_pdb": str(fasta_path),
+                "binder_chain": binder_source,
+                "binder_length": len(binder_seq),
+                "init_binder_seq": binder_seq,
+                "target_chain_b_seq": target_seq,
+                "target_chain_c_seq": "",
+                "target_sequences": [target_seq],
+                "target_hotspot_residues": target_hotspot_residues,
+                "target_hotspot_concat_indices": hotspot_concat_indices,
+                "target_hotspot_labels": hotspot_labels,
+            }
+        )
+
+    return entries, []
+
 def collect_entries(
     source_dir: Path,
     target_hotspot_residues: Optional[str] = None,
@@ -403,10 +531,17 @@ def write_input_files(entries: List[Dict[str, Any]], target_sequences: List[str]
 
     target_fasta = input_dir / "target_chains.fasta"
     with target_fasta.open("w", encoding="utf-8") as handle:
-        handle.write(">A6_TCR_chain_B\n")
-        handle.write(target_sequences[0] + "\n")
-        handle.write(">A6_TCR_chain_C\n")
-        handle.write(target_sequences[1] + "\n")
+        if target_sequences:
+            handle.write(">A6_TCR_chain_B\n")
+            handle.write(target_sequences[0] + "\n")
+            handle.write(">A6_TCR_chain_C\n")
+            handle.write(target_sequences[1] + "\n")
+        else:
+            for entry in entries:
+                entry_targets = entry.get("target_sequences", [])
+                for idx, sequence in enumerate(entry_targets, start=1):
+                    handle.write(f">{entry['entry_id']}_target_chain_{idx}\n")
+                    handle.write(sequence + "\n")
 
     for entry in entries:
         fasta_path = input_dir / f"{entry['entry_id']}.fasta"
@@ -496,6 +631,26 @@ def resolve_loss_weights(args: argparse.Namespace) -> Optional[Dict[str, float]]
     return loss_weights or None
 
 
+def resolve_entry_template_path(entry_id: str, args: argparse.Namespace) -> Optional[str]:
+    template_dir = getattr(args, "target_template_dir", None)
+    if template_dir:
+        template_root = Path(template_dir)
+        candidates = [
+            template_root / f"{entry_id}.pdb",
+            template_root / f"{entry_id}.cif",
+            template_root / f"{entry_id}.mmcif",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+        raise FileNotFoundError(
+            f"{entry_id} 未找到 target template；已查找: "
+            + ", ".join(str(candidate) for candidate in candidates)
+        )
+
+    return getattr(args, "target_template_path", None)
+
+
 def run_one_entry(
     entry: Dict[str, Any],
     target_sequences: List[str],
@@ -528,9 +683,11 @@ def run_one_entry(
             f"concat_idx={hotspot_indices}"
         )
 
+    entry_target_sequences = entry.get("target_sequences") or target_sequences
+    target_len_str = "+".join(str(len(seq)) for seq in entry_target_sequences)
     logger.info(
         f"开始 {entry['entry_id']} | binder_len={entry['binder_length']} | "
-        f"target={len(target_sequences[0])}+{len(target_sequences[1])}"
+        f"target={target_len_str}"
     )
     if optimization_checkpoint_dir is not None:
         logger.info(f"{entry['entry_id']} checkpoint 输出目录: {optimization_checkpoint_dir}")
@@ -538,12 +695,15 @@ def run_one_entry(
     loss_weights = resolve_loss_weights(args)
     if loss_weights is not None:
         logger.info(f"{entry['entry_id']} loss_weights_override={loss_weights}")
+    target_template_path = resolve_entry_template_path(entry["entry_id"], args)
+    if target_template_path:
+        logger.info(f"{entry['entry_id']} target_template_path={target_template_path}")
 
     t0 = time.time()
     if args.mode == "first_order":
         best_seq, final_seq, losses_history = run_hallucination(
             model=model,
-            target_seq=target_sequences,
+            target_seq=entry_target_sequences,
             L_binder=entry["binder_length"],
             N_steps=args.n_steps,
             learning_rate=args.learning_rate,
@@ -552,11 +712,12 @@ def run_one_entry(
             loss_weights=loss_weights,
             init_binder_seq=entry["init_binder_seq"],
             hotspot_params=hotspot_params,
+            target_template_path=target_template_path,
         )
-    else:
+    elif args.mode == "hybrid":
         best_seq, final_seq, losses_history = run_hybrid_hallucination(
             model=model,
-            target_seq=target_sequences,
+            target_seq=entry_target_sequences,
             L_binder=entry["binder_length"],
             N_steps=args.n_steps,
             learning_rate=args.learning_rate,
@@ -575,6 +736,36 @@ def run_one_entry(
             init_binder_seq=entry["init_binder_seq"],
             checkpoint_dir=str(optimization_checkpoint_dir) if optimization_checkpoint_dir is not None else None,
             hotspot_params=hotspot_params,
+            target_template_path=target_template_path,
+        )
+    else:
+        best_seq, final_seq, losses_history = run_mcts_hallucination(
+            model=model,
+            target_seq=entry_target_sequences,
+            L_binder=entry["binder_length"],
+            N_steps=args.n_steps,
+            learning_rate=args.learning_rate,
+            tau_noise=args.tau_noise,
+            device=device,
+            loss_weights=loss_weights,
+            K_top=args.k_top,
+            B_candidates=args.b_candidates,
+            T_sample=args.t_sample,
+            max_mutations_per_seq=args.max_mutations_per_seq,
+            use_annealing=args.use_annealing,
+            T_init=args.t_init,
+            T_min=args.t_min,
+            num_beams=args.mcts_num_beams,
+            use_prior=args.use_prior,
+            prior_strength=args.prior_strength,
+            checkpoint_dir=str(optimization_checkpoint_dir) if optimization_checkpoint_dir is not None else None,
+            init_binder_seq=entry["init_binder_seq"],
+            hotspot_params=hotspot_params,
+            chunk_size=args.chunk_size,
+            mcts_C=args.mcts_c,
+            mcts_max_nodes=args.mcts_max_nodes,
+            mcts_tau_fixed=args.mcts_tau_fixed,
+            target_template_path=target_template_path,
         )
 
     elapsed = time.time() - t0
@@ -587,8 +778,9 @@ def run_one_entry(
         "source_pdb": entry["source_pdb"],
         "binder_length": entry["binder_length"],
         "init_binder_seq": entry["init_binder_seq"],
-        "target_chain_b_seq": target_sequences[0],
-        "target_chain_c_seq": target_sequences[1],
+        "target_chain_b_seq": entry_target_sequences[0] if entry_target_sequences else "",
+        "target_chain_c_seq": entry_target_sequences[1] if len(entry_target_sequences) > 1 else "",
+        "target_sequences": entry_target_sequences,
         "target_hotspot_residues": entry.get("target_hotspot_residues"),
         "target_hotspot_labels": entry.get("target_hotspot_labels", []),
         "target_hotspot_concat_indices": hotspot_indices,
@@ -613,7 +805,16 @@ def run_one_entry(
             "t_min": args.t_min,
             "use_tau_scheduling": args.use_tau_scheduling,
             "tau_jitter": args.tau_jitter,
+            "mcts_c": args.mcts_c,
+            "mcts_max_nodes": args.mcts_max_nodes,
+            "mcts_tau_fixed": args.mcts_tau_fixed,
+            "mcts_num_beams": args.mcts_num_beams,
+            "chunk_size": args.chunk_size,
+            "use_prior": args.use_prior,
+            "prior_strength": args.prior_strength,
             "target_hotspot_residues": args.target_hotspot_residues,
+            "target_template_path": target_template_path,
+            "target_template_dir": args.target_template_dir,
             "loss_weights_override": loss_weights,
             "model_name": args.model_name,
             "save_checkpoints": args.save_checkpoints,
@@ -645,6 +846,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="benchmark 批量 Binder 优化")
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument("--source-dir", type=str, default=argparse.SUPPRESS)
+    parser.add_argument("--target-fasta-dir", dest="target_fasta_dir", type=str, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--target-fasta-residue-start",
+        dest="target_fasta_residue_start",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="FASTA target 在结构/原始编号中的起始残基号；用于解析如 B64 的 hotspot",
+    )
+    parser.add_argument("--random-binder-length", dest="random_binder_length", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--random-binder-lengths", dest="random_binder_lengths", type=str, default=argparse.SUPPRESS)
+    parser.add_argument("--init-binder-fasta-dir", dest="init_binder_fasta_dir", type=str, default=argparse.SUPPRESS)
+    parser.add_argument("--random-seed", dest="random_seed", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--input-dir", type=str, default=argparse.SUPPRESS)
     parser.add_argument("--results-dir", type=str, default=argparse.SUPPRESS)
     parser.add_argument("--log-dir", type=str, default=argparse.SUPPRESS)
@@ -661,7 +874,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default=argparse.SUPPRESS)
     parser.add_argument(
         "--mode",
-        choices=["first_order", "hybrid"],
+        choices=["first_order", "hybrid", "mcts"],
         default=argparse.SUPPRESS,
     )
     parser.add_argument("--n-steps", dest="n_steps", type=int, default=argparse.SUPPRESS)
@@ -678,6 +891,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--t-init", dest="t_init", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--t-min", dest="t_min", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--mcts-c", dest="mcts_c", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--mcts-max-nodes", dest="mcts_max_nodes", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--mcts-tau-fixed", dest="mcts_tau_fixed", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--mcts-num-beams", dest="mcts_num_beams", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--chunk-size", dest="chunk_size", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--prior-strength", dest="prior_strength", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--w-plddt", dest="w_plddt", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--w-pae", dest="w_pae", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--w-i-pae", dest="w_i_pae", type=float, default=argparse.SUPPRESS)
@@ -696,6 +915,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=argparse.SUPPRESS,
         help="指定 target hotspot，必须带链名前缀，如 B56,B57,C12-15",
+    )
+    parser.add_argument(
+        "--target-template-path",
+        dest="target_template_path",
+        type=str,
+        default=argparse.SUPPRESS,
+        help="可选 target template 结构文件（.cif/.mmcif/.pdb），只作用于 target 链",
+    )
+    parser.add_argument(
+        "--target-template-dir",
+        dest="target_template_dir",
+        type=str,
+        default=argparse.SUPPRESS,
+        help="可选 per-entry target template 目录，按 <entry_id>.pdb/.cif/.mmcif 查找",
     )
     parser.add_argument("--entry-ids", dest="entry_ids", type=str, default=argparse.SUPPRESS)
     parser.add_argument(
@@ -717,6 +950,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_bool_argument(parser, "use-annealing", "是否启用模拟退火")
     add_bool_argument(parser, "use-tau-scheduling", "是否启用 tau 调度")
     add_bool_argument(parser, "tau-jitter", "是否启用 tau 抖动")
+    add_bool_argument(parser, "use-prior", "MCTS 是否启用 BLOSUM62 先验")
     add_bool_argument(parser, "skip-existing", "结果已存在时跳过")
     add_bool_argument(parser, "save-checkpoints", "hybrid 模式下保存优化过程 step checkpoint")
     return parser
@@ -752,22 +986,41 @@ def main() -> None:
     os.environ["PROTENIX_CHECKPOINT_DIR"] = args.model_checkpoint_dir
     logger.info(f"PROTENIX_ROOT_DIR={runtime_root}")
 
-    source_dir = Path(args.source_dir)
-    entries, target_sequences = collect_entries(
-        source_dir,
-        target_hotspot_residues=args.target_hotspot_residues,
-    )
-    logger.info(f"扫描到 {len(entries)} 个 source PDB 条目")
-    logger.info(
-        f"固定 target: chain_B={len(target_sequences[0])} aa, chain_C={len(target_sequences[1])} aa"
-    )
+    selected_entry_ids = parse_entry_ids(args.entry_ids)
+    if args.target_fasta_dir:
+        entries, target_sequences = collect_fasta_random_entries(
+            Path(args.target_fasta_dir),
+            random_binder_length=args.random_binder_length,
+            random_seed=args.random_seed,
+            random_binder_lengths=args.random_binder_lengths,
+            init_binder_fasta_dir=Path(args.init_binder_fasta_dir) if args.init_binder_fasta_dir else None,
+            target_hotspot_residues=args.target_hotspot_residues,
+            target_fasta_residue_start=args.target_fasta_residue_start,
+            selected_entry_ids=selected_entry_ids,
+        )
+        logger.info(
+            f"扫描到 {len(entries)} 个 FASTA target 条目 | "
+            f"random_binder_length={args.random_binder_length} | "
+            f"per_case_lengths={bool(args.random_binder_lengths)} | "
+            f"init_binder_fasta_dir={args.init_binder_fasta_dir} | "
+            f"random_seed={args.random_seed}"
+        )
+    else:
+        source_dir = Path(args.source_dir)
+        entries, target_sequences = collect_entries(
+            source_dir,
+            target_hotspot_residues=args.target_hotspot_residues,
+        )
+        logger.info(f"扫描到 {len(entries)} 个 source PDB 条目")
+        logger.info(
+            f"固定 target: chain_B={len(target_sequences[0])} aa, chain_C={len(target_sequences[1])} aa"
+        )
     if args.target_hotspot_residues:
         logger.info(
             f"已启用 hotspot: spec={args.target_hotspot_residues} | "
             f"concat_idx={entries[0].get('target_hotspot_concat_indices', [])}"
         )
 
-    selected_entry_ids = parse_entry_ids(args.entry_ids)
     if selected_entry_ids:
         available_entry_ids = {entry["entry_id"] for entry in entries}
         missing_entry_ids = sorted(selected_entry_ids - available_entry_ids)
