@@ -579,6 +579,7 @@ def run_hybrid_hallucination_cdr(
         contact_params=contact_params,
         chunk_size=None,
         hotspot_params=hotspot_params,
+        opt_token_mask=cdr_mask,
     )
     logger.info(
         f"  初始零阶 total_loss={init_zeroth.total_loss:.4f} | "
@@ -608,6 +609,7 @@ def run_hybrid_hallucination_cdr(
         contact_params=contact_params,
         chunk_size=None,
         hotspot_params=hotspot_params,
+        opt_token_mask=cdr_mask,
     )
     logger.info(f"  基准 loss={baseline_for_best.total_loss:.4f} | pLDDT={baseline_for_best.summary_confidence.get('plddt', 'N/A')}")
     best_zeroth_loss = baseline_for_best.total_loss
@@ -699,6 +701,7 @@ def run_hybrid_hallucination_cdr(
                     pde_params=pde_params,
                     clash_params=dict(DEFAULT_CLASH_PARAMS),
                     hotspot_params=hotspot_params,
+                    opt_token_mask=cdr_mask,
                     chunk_size=None,
                 )
                 torch.nn.utils.clip_grad_norm_([thetas[b]], 1.0)
@@ -738,6 +741,7 @@ def run_hybrid_hallucination_cdr(
                     pde_params=pde_params,
                     clash_params=dict(DEFAULT_CLASH_PARAMS),
                     hotspot_params=hotspot_params,
+                    opt_token_mask=cdr_mask,
                 )
 
                 first_order_loss.backward()
@@ -816,6 +820,7 @@ def run_hybrid_hallucination_cdr(
                 contact_params=contact_params,
                 chunk_size=None,
                 hotspot_params=hotspot_params,
+                opt_token_mask=cdr_mask,
             )
             all_zeroth_results.append(result)
             logger.debug(
@@ -1197,6 +1202,7 @@ def run_mcts_hallucination_cdr(
             contact_params=contact_params,
             chunk_size=chunk_size,
             hotspot_params=hotspot_params,
+            opt_token_mask=cdr_mask,
         )
         phase0_results.append((cand_seq, result))
         logger.info(
@@ -1335,6 +1341,7 @@ def run_mcts_hallucination_cdr(
             pde_params=pde_params,
             clash_params=dict(DEFAULT_CLASH_PARAMS),
             hotspot_params=hotspot_params,
+            opt_token_mask=cdr_mask,
         )
 
         first_order_loss.backward()
@@ -1386,6 +1393,7 @@ def run_mcts_hallucination_cdr(
                 contact_params=contact_params,
                 chunk_size=chunk_size,
                 hotspot_params=hotspot_params,
+                opt_token_mask=cdr_mask,
             )
             all_zeroth_results.append(result)
 

@@ -42,6 +42,7 @@ def compute_all_losses(
     pde_params: dict = None,
     clash_params: Dict[str, float] = None,
     hotspot_params: Dict[str, Any] = None,
+    opt_token_mask: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     在给定的全原子坐标和 confidence logits 上计算全部 12 项 loss。
@@ -61,6 +62,8 @@ def compute_all_losses(
         pde_logits:        PDE logits [N_sample, N_token, N_token, pde_bins] (None to skip)
         pde_params:        PDE 的 bin 参数 (None to skip)
         clash_params:      碰撞 loss 参数 (r_clash, bond_sep) (None to skip)
+        opt_token_mask:    可选优化区域 mask。None 表示整个 binder 参与 loss；
+                           长度可为 binder token 数或全 token 数。
 
     Returns:
         total_loss: 加权总 loss（标量 tensor）
@@ -75,17 +78,47 @@ def compute_all_losses(
     binder_token_mask = asym_id == binder_chain_id
     target_token_mask = ~binder_token_mask
 
+    design_token_mask = binder_token_mask
+    local_redesign = False
+    if opt_token_mask is not None:
+        opt_token_mask = torch.as_tensor(opt_token_mask, device=device, dtype=torch.bool)
+        if opt_token_mask.numel() == asym_id.numel():
+            if (opt_token_mask & ~binder_token_mask).any():
+                raise ValueError("opt_token_mask may only select binder tokens")
+            design_token_mask = opt_token_mask & binder_token_mask
+        elif opt_token_mask.numel() == int(binder_token_mask.sum().item()):
+            design_token_mask = torch.zeros_like(binder_token_mask, dtype=torch.bool)
+            binder_indices = binder_token_mask.nonzero(as_tuple=True)[0]
+            design_token_mask[binder_indices] = opt_token_mask
+        else:
+            raise ValueError(
+                f"opt_token_mask length {opt_token_mask.numel()} must equal binder token count "
+                f"{int(binder_token_mask.sum().item())} or total token count {asym_id.numel()}"
+            )
+        if design_token_mask.sum() == 0:
+            raise ValueError("opt_token_mask selects no binder tokens")
+        if (design_token_mask & ~binder_token_mask).any():
+            raise ValueError("opt_token_mask may only select binder tokens")
+        local_redesign = bool((design_token_mask != binder_token_mask).any().item())
+    scaffold_token_mask = binder_token_mask & ~design_token_mask
+
     binder_atom_mask = binder_token_mask[atom_to_token]
     target_atom_mask = target_token_mask[atom_to_token]
+    design_atom_mask = design_token_mask[atom_to_token]
+    scaffold_atom_mask = scaffold_token_mask[atom_to_token]
 
     rep_atom_mask = input_feature_dict.get("distogram_rep_atom_mask", None)
     if rep_atom_mask is not None:
         rep_atom_mask = rep_atom_mask.bool()
         binder_rep_atom_mask = binder_atom_mask & rep_atom_mask
+        design_rep_atom_mask = design_atom_mask & rep_atom_mask
         if binder_rep_atom_mask.sum() == 0:
             binder_rep_atom_mask = binder_atom_mask
+        if design_rep_atom_mask.sum() == 0:
+            design_rep_atom_mask = design_atom_mask
     else:
         binder_rep_atom_mask = binder_atom_mask
+        design_rep_atom_mask = design_atom_mask
 
     hotspot_token_mask = None
     _hotspot_params = hotspot_params or {}
@@ -110,26 +143,47 @@ def compute_all_losses(
         hotspot_token_mask = torch.zeros_like(target_token_mask, dtype=torch.bool)
         hotspot_token_mask[hotspot_token_indices] = True
 
+    interface_target_mask = hotspot_token_mask if hotspot_token_mask is not None else target_token_mask
+    pae_intra_pair_mask = None
+    pae_inter_pair_mask = None
+    pde_intra_pair_mask = None
+    pde_inter_pair_mask = None
+    if local_redesign:
+        design_x_design = design_token_mask.unsqueeze(0) & design_token_mask.unsqueeze(1)
+        design_x_scaffold = design_token_mask.unsqueeze(1) & scaffold_token_mask.unsqueeze(0)
+        design_x_target = design_token_mask.unsqueeze(1) & interface_target_mask.unsqueeze(0)
+        pae_intra_pair_mask = design_x_design | design_x_scaffold
+        pae_inter_pair_mask = design_x_target
+        pde_intra_pair_mask = pae_intra_pair_mask
+        pde_inter_pair_mask = design_x_target
+
     # ── 逐项计算 loss ───────────────────────────────────────────────────
     losses: Dict[str, torch.Tensor] = {}
     total_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
     # pLDDT
     if weights.get("plddt", 0) != 0:
-        l_plddt = compute_plddt_loss(plddt_logits, binder_rep_atom_mask, plddt_params)
+        plddt_atom_mask = design_rep_atom_mask if local_redesign else binder_rep_atom_mask
+        l_plddt = compute_plddt_loss(plddt_logits, plddt_atom_mask, plddt_params)
         losses["plddt"] = l_plddt
         total_loss = total_loss + weights["plddt"] * l_plddt
 
     # pAE (intra)
     if weights.get("pae", 0) != 0:
-        l_pae = compute_pae_loss(pae_logits, asym_id, pae_params, mode="intra")
+        l_pae = compute_pae_loss(
+            pae_logits, asym_id, pae_params, mode="intra",
+            pair_mask=pae_intra_pair_mask,
+        )
         losses["pae"] = l_pae
         total_loss = total_loss + weights["pae"] * l_pae
 
     # i_pAE (inter)
     if weights.get("i_pae", 0) != 0:
-        l_ipae = compute_pae_loss(pae_logits, asym_id, pae_params, mode="inter",
-                                  hotspot_token_mask=hotspot_token_mask)
+        l_ipae = compute_pae_loss(
+            pae_logits, asym_id, pae_params, mode="inter",
+            hotspot_token_mask=hotspot_token_mask,
+            pair_mask=pae_inter_pair_mask,
+        )
         losses["i_pae"] = l_ipae
         total_loss = total_loss + weights["i_pae"] * l_ipae
 
@@ -144,6 +198,8 @@ def compute_all_losses(
             seqsep=contact_params["seqsep"],
             binary=False,
             residue_index=input_feature_dict.get("residue_index"),
+            row_token_mask=design_token_mask if local_redesign else None,
+            col_token_mask=design_token_mask if local_redesign else None,
         )
         losses["con"] = l_con
         total_loss = total_loss + weights["con"] * l_con
@@ -159,6 +215,8 @@ def compute_all_losses(
             binary=False,
             residue_index=input_feature_dict.get("residue_index"),
             hotspot_token_mask=hotspot_token_mask,
+            row_token_mask=design_token_mask if local_redesign else None,
+            col_token_mask=interface_target_mask if local_redesign else None,
         )
         losses["i_con"] = l_icon
         total_loss = total_loss + weights["i_con"] * l_icon
@@ -185,15 +243,20 @@ def compute_all_losses(
 
     # Rg
     if weights.get("rg", 0) != 0:
-        binder_coords = x0_flat[binder_rep_atom_mask]
-        l_rg = compute_rg_loss(binder_coords, L_binder)
+        rg_atom_mask = design_rep_atom_mask if local_redesign else binder_rep_atom_mask
+        binder_coords = x0_flat[rg_atom_mask]
+        rg_len = int(design_token_mask.sum().item()) if local_redesign else L_binder
+        l_rg = compute_rg_loss(binder_coords, rg_len)
         losses["rg"] = l_rg
         total_loss = total_loss + weights["rg"] * l_rg
 
     # Helix（负权重 = 鼓励螺旋）
     if weights.get("helix", 0) != 0:
         l_helix = compute_helix_loss(
-            distogram_logits, binder_token_mask, distogram_params
+            distogram_logits,
+            design_token_mask if local_redesign else binder_token_mask,
+            distogram_params,
+            residue_index=input_feature_dict.get("residue_index"),
         )
         losses["helix"] = l_helix
         total_loss = total_loss + weights["helix"] * l_helix
@@ -204,25 +267,63 @@ def compute_all_losses(
 
     # clash (intra)
     if weights.get("clash", 0) != 0:
-        l_clash = compute_soft_clash_loss(
-            x0_flat, binder_atom_mask, target_atom_mask,
-            atom_to_token, input_feature_dict.get("residue_index", asym_id),
-            mode="intra",
-            r_clash=_clash_params.get("r_clash", 2.0),
-            bond_sep=_clash_params.get("bond_sep", 1),
-        )
+        if local_redesign:
+            residue_index = input_feature_dict.get("residue_index", asym_id)
+            l_clash_oo = compute_soft_clash_loss(
+                x0_flat, binder_atom_mask, target_atom_mask,
+                atom_to_token, residue_index,
+                mode="intra",
+                r_clash=_clash_params.get("r_clash", 2.0),
+                bond_sep=_clash_params.get("bond_sep", 1),
+                atom_mask_a=design_atom_mask,
+                atom_mask_b=design_atom_mask,
+                exclude_bonded=True,
+            )
+            l_clash_os = compute_soft_clash_loss(
+                x0_flat, binder_atom_mask, target_atom_mask,
+                atom_to_token, residue_index,
+                mode="intra",
+                r_clash=_clash_params.get("r_clash", 2.0),
+                bond_sep=_clash_params.get("bond_sep", 1),
+                atom_mask_a=design_atom_mask,
+                atom_mask_b=scaffold_atom_mask,
+                detach_b=True,
+                exclude_bonded=True,
+            )
+            l_clash = l_clash_oo + l_clash_os
+        else:
+            l_clash = compute_soft_clash_loss(
+                x0_flat, binder_atom_mask, target_atom_mask,
+                atom_to_token, input_feature_dict.get("residue_index", asym_id),
+                mode="intra",
+                r_clash=_clash_params.get("r_clash", 2.0),
+                bond_sep=_clash_params.get("bond_sep", 1),
+            )
         losses["clash"] = l_clash
         total_loss = total_loss + weights["clash"] * l_clash
 
     # i_clash (inter)
     if weights.get("i_clash", 0) != 0:
-        l_iclash = compute_soft_clash_loss(
-            x0_flat, binder_atom_mask, target_atom_mask,
-            atom_to_token, input_feature_dict.get("residue_index", asym_id),
-            mode="inter",
-            r_clash=_clash_params.get("r_clash", 2.0),
-            bond_sep=_clash_params.get("bond_sep", 1),
-        )
+        if local_redesign:
+            l_iclash = compute_soft_clash_loss(
+                x0_flat, binder_atom_mask, target_atom_mask,
+                atom_to_token, input_feature_dict.get("residue_index", asym_id),
+                mode="inter",
+                r_clash=_clash_params.get("r_clash", 2.0),
+                bond_sep=_clash_params.get("bond_sep", 1),
+                atom_mask_a=design_atom_mask,
+                atom_mask_b=target_atom_mask,
+                detach_b=True,
+                exclude_bonded=False,
+            )
+        else:
+            l_iclash = compute_soft_clash_loss(
+                x0_flat, binder_atom_mask, target_atom_mask,
+                atom_to_token, input_feature_dict.get("residue_index", asym_id),
+                mode="inter",
+                r_clash=_clash_params.get("r_clash", 2.0),
+                bond_sep=_clash_params.get("bond_sep", 1),
+            )
         losses["i_clash"] = l_iclash
         total_loss = total_loss + weights["i_clash"] * l_iclash
 
@@ -230,7 +331,10 @@ def compute_all_losses(
 
     # pde (intra)
     if weights.get("pde", 0) != 0 and pde_logits is not None and pde_params is not None:
-        l_pde = compute_pde_loss(pde_logits, asym_id, pde_params, mode="intra")
+        l_pde = compute_pde_loss(
+            pde_logits, asym_id, pde_params, mode="intra",
+            pair_mask=pde_intra_pair_mask,
+        )
         losses["pde"] = l_pde
         total_loss = total_loss + weights["pde"] * l_pde
 
@@ -242,6 +346,7 @@ def compute_all_losses(
         l_ipde = compute_pde_loss(
             pde_logits, asym_id, pde_params, mode="inter",
             contact_probs=contact_probs,
+            pair_mask=pde_inter_pair_mask,
         )
         losses["i_pde"] = l_ipde
         total_loss = total_loss + weights["i_pde"] * l_ipde

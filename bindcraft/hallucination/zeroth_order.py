@@ -187,6 +187,7 @@ def zeroth_order_eval(
     chunk_size: int = None,
     hotspot_params: Optional[Dict[str, Any]] = None,
     target_template_path: Optional[str] = None,
+    opt_token_mask: Optional[Any] = None,
 ) -> ZerothOrderResult:
     """
     对一条离散候选序列执行完整 AF3 推断，并在最终结构上计算全部 8 项 loss。
@@ -202,6 +203,7 @@ def zeroth_order_eval(
         chunk_size:     Attention 分块大小。当 complex 较大（如 114+ aa）
                        时建议设为 256，避免 OOM。默认为 None（不分块）。
         target_template_path: 可选 target template 结构文件
+        opt_token_mask: 可选优化区域 mask；CDR redesign 时为 binder 长度 bool mask
 
     Returns:
         ZerothOrderResult: 包含 total_loss / loss_dict / summary_confidence / coordinate
@@ -307,6 +309,7 @@ def zeroth_order_eval(
             pde_params=pde_params,
             clash_params=dict(DEFAULT_CLASH_PARAMS),
             hotspot_params=hotspot_params,
+            opt_token_mask=opt_token_mask,
         )
 
     # ── 组装结果 ─────────────────────────────────────────────────────────

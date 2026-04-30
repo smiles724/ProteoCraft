@@ -85,14 +85,35 @@ def setup_logging(log_file: Optional[Path]) -> None:
     )
 
 
+def add_bool_argument(parser: argparse.ArgumentParser, name: str) -> None:
+    """Add a boolean flag with --no- prefix for disabling."""
+    dest = name.replace("-", "_")
+    parser.add_argument(
+        f"--{name}",
+        dest=dest,
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=f"Enable {name}",
+    )
+    parser.add_argument(
+        f"--no-{name}",
+        dest=dest,
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help=f"Disable {name}",
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pdb-id", required=True)
     parser.add_argument("--pdb-path")
     parser.add_argument("--alpha-chain")
     parser.add_argument("--beta-chain")
+    parser.add_argument("--hotspot-chain", choices=("alpha", "beta"), default="alpha")
     parser.add_argument("--hotspot-start", type=int, required=True)
     parser.add_argument("--hotspot-end", type=int, required=True)
+    parser.add_argument("--output-dir")
     parser.add_argument("--init-binder-seq", default=DEFAULT_INIT_BINDER)
     parser.add_argument("--output-root", default=str(PROJECT_ROOT / "outputs" / "bindcraft_v2_tcr_cases"))
     parser.add_argument("--pdb-cache-dir", default=str(PROJECT_ROOT / "inputs" / "pdb_cache"))
@@ -106,12 +127,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tau-noise", type=float, default=4.0)
     parser.add_argument("--k-top", type=int, default=8)
     parser.add_argument("--b-candidates", type=int, default=4)
+    parser.add_argument("--t-sample", type=float, default=1.0)
     parser.add_argument("--max-mutations-per-seq", type=int, default=3)
+    parser.add_argument("--t-init", type=float, default=1.0)
+    parser.add_argument("--t-min", type=float, default=0.01)
     parser.add_argument("--log-file")
     parser.add_argument("--no-download", action="store_true")
+    # Boolean flags for annealing and tau scheduling
+    add_bool_argument(parser, "use-annealing")
+    add_bool_argument(parser, "use-tau-scheduling")
+    add_bool_argument(parser, "tau-jitter")
+    # Loss weights
     for key in LOSS_WEIGHT_KEYS:
         parser.add_argument(f"--w-{key.replace('_', '-')}", dest=f"w_{key}", type=float)
     return parser.parse_args()
+
+
+def resolve_bool_arg(args: argparse.Namespace, name: str, default: bool) -> bool:
+    """Resolve a boolean argument, returning default if not set."""
+    dest = name.replace("-", "_")
+    value = getattr(args, dest, None)
+    return default if value is None else value
 
 
 def resolve_loss_weights(args: argparse.Namespace) -> Dict[str, float]:
@@ -266,19 +302,26 @@ def infer_tcr_chains(pdb_path: Path, alpha_chain: Optional[str], beta_chain: Opt
     return inferred_alpha, inferred_beta
 
 
-def hotspot_indices(alpha_residues: List[Dict[str, Any]], start: int, end: int) -> Tuple[List[int], List[str]]:
+def hotspot_indices(
+    residues: List[Dict[str, Any]],
+    start: int,
+    end: int,
+    *,
+    label_prefix: str,
+    offset: int = 0,
+) -> Tuple[List[int], List[str]]:
     if end < start:
         raise ValueError("--hotspot-end must be >= --hotspot-start")
     indices: List[int] = []
     labels: List[str] = []
-    for idx, residue in enumerate(alpha_residues):
+    for idx, residue in enumerate(residues):
         if start <= int(residue["residue_number"]) <= end:
-            indices.append(idx)
-            labels.append(f"A{residue['residue_number']}{residue['insertion_code']}")
+            indices.append(offset + idx)
+            labels.append(f"{label_prefix}{residue['residue_number']}{residue['insertion_code']}")
     expected = end - start + 1
     if len(indices) != expected:
         raise ValueError(
-            f"Resolved {len(indices)} hotspot residues for alpha {start}-{end}, expected {expected}. "
+            f"Resolved {len(indices)} hotspot residues for {label_prefix} {start}-{end}, expected {expected}. "
             f"Resolved labels={labels}"
         )
     return indices, labels
@@ -329,7 +372,13 @@ def prepare_template_cif(pdb_path: Path, output_dir: Path, pdb_id: str) -> Path:
 def main() -> int:
     args = parse_args()
     pdb_id = args.pdb_id.upper()
-    output_dir = Path(args.output_root) / f"{pdb_id}_alpha_{args.hotspot_start}_{args.hotspot_end}"
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+    else:
+        output_dir = (
+            Path(args.output_root)
+            / f"{pdb_id}_{args.hotspot_chain}_{args.hotspot_start}_{args.hotspot_end}"
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(Path(args.log_file) if args.log_file else output_dir / "run.log")
 
@@ -342,7 +391,21 @@ def main() -> int:
         beta_residues = extract_chain_residues(pdb_path, beta_chain)
         target_alpha = "".join(res["aa"] for res in alpha_residues)
         target_beta = "".join(res["aa"] for res in beta_residues)
-        hs_indices, hs_labels = hotspot_indices(alpha_residues, args.hotspot_start, args.hotspot_end)
+        if args.hotspot_chain == "alpha":
+            hs_indices, hs_labels = hotspot_indices(
+                alpha_residues,
+                args.hotspot_start,
+                args.hotspot_end,
+                label_prefix="A",
+            )
+        else:
+            hs_indices, hs_labels = hotspot_indices(
+                beta_residues,
+                args.hotspot_start,
+                args.hotspot_end,
+                label_prefix="B",
+                offset=len(alpha_residues),
+            )
         template_path = prepare_template_cif(pdb_path, output_dir, pdb_id)
         checkpoint_dir = output_dir / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -369,6 +432,10 @@ def main() -> int:
             device=args.device,
             checkpoint_dir=args.model_checkpoint_dir,
         )
+        # Resolve boolean arguments with defaults
+        use_annealing = resolve_bool_arg(args, "use-annealing", True)
+        use_tau_scheduling = resolve_bool_arg(args, "use-tau-scheduling", True)
+        tau_jitter = resolve_bool_arg(args, "tau-jitter", True)
         best_seq, final_seq, losses = run_hybrid_hallucination(
             model=model,
             target_seq=[target_alpha, target_beta],
@@ -380,13 +447,13 @@ def main() -> int:
             loss_weights=loss_weights,
             K_top=args.k_top,
             B_candidates=args.b_candidates,
-            T_sample=1.0,
+            T_sample=args.t_sample,
             max_mutations_per_seq=args.max_mutations_per_seq,
-            use_annealing=True,
-            T_init=1.0,
-            T_min=0.01,
-            use_tau_scheduling=True,
-            tau_jitter=True,
+            use_annealing=use_annealing,
+            T_init=args.t_init,
+            T_min=args.t_min,
+            use_tau_scheduling=use_tau_scheduling,
+            tau_jitter=tau_jitter,
             init_binder_seq=init_binder,
             checkpoint_dir=str(checkpoint_dir),
             hotspot_params={"target_hotspot_concat_indices": hs_indices},
@@ -398,7 +465,7 @@ def main() -> int:
             "pdb_path": str(pdb_path),
             "target": {"alpha_chain": alpha_chain, "beta_chain": beta_chain},
             "hotspot": {
-                "chain": "alpha",
+                "chain": args.hotspot_chain,
                 "start": args.hotspot_start,
                 "end": args.hotspot_end,
                 "labels": hs_labels,
@@ -420,7 +487,13 @@ def main() -> int:
                 "tau_noise": args.tau_noise,
                 "k_top": args.k_top,
                 "b_candidates": args.b_candidates,
+                "t_sample": args.t_sample,
                 "max_mutations_per_seq": args.max_mutations_per_seq,
+                "use_annealing": use_annealing,
+                "t_init": args.t_init,
+                "t_min": args.t_min,
+                "use_tau_scheduling": use_tau_scheduling,
+                "tau_jitter": tau_jitter,
                 "model_name": args.model_name,
                 "loss_weights": loss_weights,
             },

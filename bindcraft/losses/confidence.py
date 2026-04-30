@@ -47,6 +47,7 @@ def compute_pae_loss(
     pae_params: dict,
     mode: str = "intra",
     hotspot_token_mask: Optional[torch.Tensor] = None,
+    pair_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     PAE loss: mean PAE score over intra-chain or inter-chain token pairs.
@@ -67,6 +68,13 @@ def compute_pae_loss(
     # 对齐 ColabDesign: 归一化到约 [0,1] 并对称化
     pae_score = pae_score / 31.0
     pae_score = 0.5 * (pae_score + pae_score.transpose(-1, -2))
+
+    if pair_mask is not None:
+        mask = pair_mask.to(device=pae_score.device, dtype=torch.bool)
+        n = mask.sum()
+        if n == 0:
+            return torch.tensor(0.0, device=pae_score.device, requires_grad=True)
+        return (pae_score * mask.unsqueeze(0).float()).sum() / (n * pae_score.shape[0])
 
     # 以第一个 token 所在链作为 binder 链，避免 unique() 排序带来的链顺序歧义
     binder_id = asym_id[0]
@@ -105,6 +113,8 @@ def compute_contact_loss(
     binary: bool = False,
     residue_index: torch.Tensor = None,
     hotspot_token_mask: Optional[torch.Tensor] = None,
+    row_token_mask: Optional[torch.Tensor] = None,
+    col_token_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Contact loss（对齐 ColabDesign get_con_loss / _get_con_loss）。
@@ -165,7 +175,18 @@ def compute_contact_loss(
     else:
         m = torch.ones_like(offset, dtype=torch.bool)
 
-    if mode == "intra":
+    if row_token_mask is not None or col_token_mask is not None:
+        if row_token_mask is None or col_token_mask is None:
+            raise ValueError("row_token_mask and col_token_mask must be provided together")
+        row_mask = row_token_mask.to(device=pair_loss.device, dtype=torch.bool)
+        col_mask = col_token_mask.to(device=pair_loss.device, dtype=torch.bool)
+        if mode == "intra":
+            m = m & row_mask.unsqueeze(1) & col_mask.unsqueeze(0)
+        else:
+            m = m & col_mask.unsqueeze(0)
+        mask_1d = row_mask
+        effective_num_pos = num_pos
+    elif mode == "intra":
         # binder-binder
         mask_2d = binder_token_mask.unsqueeze(0) & binder_token_mask.unsqueeze(1)
         m = m & mask_2d
@@ -299,6 +320,7 @@ def compute_pde_loss(
     pde_params: dict,
     mode: str = "intra",
     contact_probs: torch.Tensor = None,
+    pair_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     PDE loss (Predicted Distance Error).
@@ -319,6 +341,19 @@ def compute_pde_loss(
     pde_score = logits_to_score(pde_logits, **pde_params)
     pde_score = pde_score / pde_params["max_bin"]
     pde_score = 0.5 * (pde_score + pde_score.transpose(-1, -2))
+
+    if pair_mask is not None:
+        mask = pair_mask.to(device=pde_score.device, dtype=torch.bool)
+        if mode == "inter" and contact_probs is not None:
+            weighted_mask = contact_probs.to(pde_score.device) * mask.float()
+            denom = weighted_mask.sum()
+            if denom < 1e-8:
+                return torch.tensor(0.0, device=pde_score.device, requires_grad=True)
+            return (pde_score * weighted_mask.unsqueeze(0)).sum() / (denom * pde_score.shape[0])
+        n = mask.sum()
+        if n == 0:
+            return torch.tensor(0.0, device=pde_score.device, requires_grad=True)
+        return (pde_score * mask.unsqueeze(0).float()).sum() / (n * pde_score.shape[0])
 
     binder_id = asym_id[0]
 
