@@ -38,8 +38,39 @@ from bindcraft.hallucination.diffusion_one_step import (
     diffusion_one_step,
     diffusion_one_step_fused,
 )
-from bindcraft.hallucination.mutation_proposer import propose_mutations
+from bindcraft.hallucination.mutation_proposer import (
+    MutationProposal,
+    extract_action_group_position_weights,
+    propose_mutations,
+    propose_mutations_legacy,
+    propose_mutation_actions,
+    select_de_novo_action_group,
+)
 from bindcraft.hallucination.zeroth_order import zeroth_order_eval
+from bindcraft.hallucination.pipeline import (
+    MCTS_STAGE2_EXPAND_ACTIONS_PER_STEP,
+    MCTS_STAGE2_GROUP_TEMPERATURE,
+    MCTS_STAGE2_PROGRESSIVE_WIDENING_ALPHA,
+    MCTS_STAGE2_PROGRESSIVE_WIDENING_K,
+    MCTS_STAGE2_MAX_CHILDREN_PER_NODE,
+    MCTS_STAGE3_DIVERSITY_BONUS_MAX,
+    MCTS_STAGE3_DIVERSITY_BONUS_WEIGHT,
+    MCTS_STAGE3_LOSS_GROUP_BIN_WIDTH,
+    MCTS_STAGE3_REPRESENTATIVES_PER_GROUP,
+    MCTS_STAGE3_USE_DIVERSITY_BONUS,
+    MCTS_STAGE3_USE_LOSS_GROUPING,
+    MCTS_STAGE3_USE_PARETO_PRUNING,
+    MCTS_STAGE3_USE_REWARD_NORMALIZATION,
+    MCTS_STAGE3_USE_STRUCTURAL_GROUPING,
+    _allocate_action_group_budgets,
+    _handoff_structural_key,
+    _make_strict_mcts_tree,
+    _make_stage_checkpoint_manager,
+    _normalize_mcts_strategy,
+    _select_diverse_handoff_results,
+    _stageb_group_proposal_loss,
+    _stageb_max_mutations_for_step,
+)
 from bindcraft.losses.confidence import run_confidence_heads
 from bindcraft.losses.total_loss import compute_all_losses
 from protenix.model import sample_confidence
@@ -1014,6 +1045,68 @@ def _clip_seq_by_cdr_mask(
     return "".join(seq_list)
 
 
+def _cdr_stageb_position_weights(
+    sequence: str,
+    cdr_mask: List[bool],
+    action_group: Optional[str],
+    structural_signature: Optional[Dict[str, Any]],
+) -> torch.Tensor:
+    """
+    Combine document-style structural routing with the antibody CDR mask.
+
+    The CDR mask is hard: framework positions receive zero weight even when
+    structural routing points there. If no structural residue map is available,
+    all CDR residues remain eligible.
+    """
+    if len(sequence) != len(cdr_mask):
+        raise ValueError("sequence and cdr_mask lengths must match")
+
+    cdr_weights = torch.tensor(
+        [1.0 if is_cdr else 0.0 for is_cdr in cdr_mask],
+        dtype=torch.float32,
+    )
+    routed = extract_action_group_position_weights(
+        sequence,
+        action_group,
+        structural_signature=structural_signature,
+    )
+    if routed is None or routed.numel() != cdr_weights.numel():
+        return cdr_weights
+
+    routed = torch.clamp(routed.detach().cpu().flatten().float(), min=0.0)
+    combined = routed * cdr_weights
+    if float(combined.max().item()) <= 0.0:
+        return cdr_weights
+    return combined
+
+
+def _clip_mcts_proposal_by_cdr_mask(
+    proposal: MutationProposal,
+    cdr_mask: List[bool],
+    reference_seq: str,
+) -> MutationProposal:
+    clipped_sequence = _clip_seq_by_cdr_mask(
+        proposal.sequence,
+        cdr_mask,
+        reference_seq,
+    )
+    if clipped_sequence == proposal.sequence:
+        return proposal
+
+    clipped_edits = [
+        edit for edit in proposal.edits
+        if 0 <= int(edit[0]) < len(cdr_mask) and cdr_mask[int(edit[0])]
+    ]
+    return MutationProposal(
+        sequence=clipped_sequence,
+        edits=clipped_edits,
+        prior=proposal.prior,
+        benefit=proposal.benefit,
+        action_group=proposal.action_group,
+        group_prior=proposal.group_prior,
+    )
+
+
 def run_mcts_hallucination_cdr(
     model,
     pdb_id: str = None,
@@ -1041,6 +1134,12 @@ def run_mcts_hallucination_cdr(
     mcts_C: float = 1.0,
     mcts_max_nodes: int = 5000,
     mcts_tau_fixed: float = 4.0,
+    mcts_strategy: str = "two_stage",
+    mcts_bootstrap_steps: int = 50,
+    mcts_bootstrap_patience: int = 10,
+    mcts_bootstrap_min_delta: float = 0.02,
+    mcts_bootstrap_max_steps: int = 80,
+    mcts_handoff_top_k: Optional[int] = None,
     binder_chain: str = None,
     scheme: str = "chothia",
     chunk_size: int = None,
@@ -1049,11 +1148,17 @@ def run_mcts_hallucination_cdr(
     CDR-Aware MCTS：与 ``run_hybrid_hallucination_cdr`` 相同的 Mode A/B/C 检测，
     Phase 0 与主循环中透传 ``hotspot_params`` / ``chunk_size``。
     """
-    from bindcraft.hallucination.mcts_controller import MCTSTree
     from bindcraft.hallucination.scheduler import AnnealingScheduler
 
     if device is None:
         device = next(model.parameters()).device
+
+    mcts_strategy = _normalize_mcts_strategy(mcts_strategy)
+    mcts_bootstrap_steps = max(0, int(mcts_bootstrap_steps))
+    mcts_bootstrap_patience = max(1, int(mcts_bootstrap_patience))
+    mcts_bootstrap_min_delta = max(float(mcts_bootstrap_min_delta), 0.0)
+    mcts_bootstrap_max_steps = max(mcts_bootstrap_steps, int(mcts_bootstrap_max_steps))
+    mcts_handoff_top_k = max(1, int(mcts_handoff_top_k or num_beams))
 
     # ── CDR 自动推断（与 hybrid 对齐）─────────────────────────────────────
     if pdb_id is not None:
@@ -1099,14 +1204,28 @@ def run_mcts_hallucination_cdr(
 
     annealer = AnnealingScheduler(T_init=T_init, T_min=T_min) if use_annealing else None
 
-    ckpt_mgr = None
-    if checkpoint_dir is not None:
-        ckpt_mgr = CheckpointManager(
-            output_dir=checkpoint_dir,
-            binder_seq="PLACEHOLDER",
-            target_seq=target_seq,
+    if mcts_strategy == "two_stage":
+        phase0_ckpt_mgr = _make_stage_checkpoint_manager(
+            checkpoint_dir, "phase0", mcts_strategy, target_seq
         )
-        logger.info(f"Checkpoint 保存已启用: {checkpoint_dir}")
+        legacy_ckpt_mgr = _make_stage_checkpoint_manager(
+            checkpoint_dir, "legacy_bootstrap", mcts_strategy, target_seq
+        )
+        strict_ckpt_mgr = _make_stage_checkpoint_manager(
+            checkpoint_dir, "document_puct_refine", mcts_strategy, target_seq
+        )
+    elif mcts_strategy == "legacy":
+        legacy_ckpt_mgr = _make_stage_checkpoint_manager(
+            checkpoint_dir, "legacy_bootstrap", mcts_strategy, target_seq
+        )
+        phase0_ckpt_mgr = legacy_ckpt_mgr
+        strict_ckpt_mgr = None
+    else:
+        strict_ckpt_mgr = _make_stage_checkpoint_manager(
+            checkpoint_dir, "document_puct_refine", mcts_strategy, target_seq
+        )
+        phase0_ckpt_mgr = strict_ckpt_mgr
+        legacy_ckpt_mgr = None
 
     tgt_seqs = _normalize_chain_sequences(target_seq)
     tgt_len_str = "+".join(str(len(s)) for s in tgt_seqs)
@@ -1120,6 +1239,38 @@ def run_mcts_hallucination_cdr(
     logger.info(f"Binder 长度: {L_binder} aa | CDR residues: {sum(cdr_mask)}/{L_binder}")
     logger.info(f"总轮数: {N_steps} | K_top={K_top} B={B_candidates} T_sample={T_sample}")
     logger.info(f"MCTS: C={mcts_C}, max_nodes={mcts_max_nodes}, tau_fixed={mcts_tau_fixed}")
+    logger.info(
+        "CDR MCTS strategy=%s | bootstrap_steps=%d patience=%d min_delta=%.4f "
+        "max_bootstrap=%d handoff_top_k=%d",
+        mcts_strategy,
+        mcts_bootstrap_steps,
+        mcts_bootstrap_patience,
+        mcts_bootstrap_min_delta,
+        mcts_bootstrap_max_steps,
+        mcts_handoff_top_k,
+    )
+    logger.info(
+        "CDR Document PUCT: progressive_widening(k=%.1f, alpha=%.2f, max_children=%d) "
+        "+ action_puct(expand_per_step=%d) + CDR hard mask",
+        MCTS_STAGE2_PROGRESSIVE_WIDENING_K,
+        MCTS_STAGE2_PROGRESSIVE_WIDENING_ALPHA,
+        MCTS_STAGE2_MAX_CHILDREN_PER_NODE,
+        MCTS_STAGE2_EXPAND_ACTIONS_PER_STEP,
+    )
+    logger.info(
+        "CDR Stage3-lite: loss_grouping=%s(bin_width=%.2f, reps=%d) "
+        "structural_grouping=%s pareto=%s reward_normalization=%s "
+        "diversity_bonus=%s(weight=%.3f, max=%.1f)",
+        MCTS_STAGE3_USE_LOSS_GROUPING,
+        MCTS_STAGE3_LOSS_GROUP_BIN_WIDTH,
+        MCTS_STAGE3_REPRESENTATIVES_PER_GROUP,
+        MCTS_STAGE3_USE_STRUCTURAL_GROUPING,
+        MCTS_STAGE3_USE_PARETO_PRUNING,
+        MCTS_STAGE3_USE_REWARD_NORMALIZATION,
+        MCTS_STAGE3_USE_DIVERSITY_BONUS,
+        MCTS_STAGE3_DIVERSITY_BONUS_WEIGHT,
+        MCTS_STAGE3_DIVERSITY_BONUS_MAX,
+    )
     logger.info(f"Annealing: {use_annealing}")
     logger.info(f"CDR protection: {len(framework_indices)} framework residues")
     logger.info(f"M_prior (BLOSUM62): use_prior={use_prior}, prior_strength={prior_strength}")
@@ -1144,8 +1295,18 @@ def run_mcts_hallucination_cdr(
     distogram_params = sample_confidence.get_bin_params(model.configs.loss.distogram)
     pde_params = sample_confidence.get_bin_params(model.configs.loss.pde)
 
-    mcts_tree = MCTSTree(C=mcts_C, max_nodes=mcts_max_nodes, mcts_tau=mcts_tau_fixed)
-    logger.info(f"MCTS 树已创建: C={mcts_C}, max_nodes={mcts_max_nodes}, tau_fixed={mcts_tau_fixed}")
+    mcts_tree = (
+        _make_strict_mcts_tree(mcts_C, mcts_max_nodes, mcts_tau_fixed)
+        if mcts_strategy == "strict"
+        else None
+    )
+    if mcts_tree is not None:
+        logger.info(
+            "CDR Document PUCT MCTS 树已创建: C=%s, max_nodes=%s, tau_fixed=%s",
+            mcts_C,
+            mcts_max_nodes,
+            mcts_tau_fixed,
+        )
 
     logger.info("=" * 70)
     logger.info("Phase 0: 全局冷启动 (Best-of-N)")
@@ -1183,6 +1344,7 @@ def run_mcts_hallucination_cdr(
 
     logger.info(f"Phase 0：对 {len(phase0_candidates)} 条候选执行 Step3 零阶验证...")
     phase0_results = []
+    verifier_cache: Dict[str, Any] = {}
     for idx, cand_seq in enumerate(phase0_candidates):
         if has_cdr_protection:
             cand_seq = _clip_seq_by_cdr_mask(cand_seq, cdr_mask, init_binder)
@@ -1199,6 +1361,9 @@ def run_mcts_hallucination_cdr(
             hotspot_params=hotspot_params,
         )
         phase0_results.append((cand_seq, result))
+        verifier_cache[result.binder_seq] = result
+        if mcts_tree is not None:
+            mcts_tree.store_verifier_result(result)
         logger.info(
             f"    L_real={result.total_loss:.4f} "
             f"pLDDT={result.summary_confidence.get('plddt', 'N/A')} "
@@ -1216,22 +1381,37 @@ def run_mcts_hallucination_cdr(
         _sync_theta_to_seq(theta_root, seq)
         theta_root.requires_grad_(True)
 
-        mcts_tree.add_root_node(
-            sequence=seq,
-            logits=theta_root,
-            L_real=result.total_loss,
-            coordinate=result.coordinate,
-        )
-        logger.info(f"  根节点 {i+1}: {seq[:20]}... L={result.total_loss:.4f}")
+        if mcts_tree is not None:
+            mcts_tree.add_root_node(
+                sequence=seq,
+                logits=theta_root,
+                L_real=result.total_loss,
+                coordinate=result.coordinate,
+                loss_vector=result.loss_dict,
+                prior=1.0 / max(top_beam, 1),
+                structural_signature=mcts_tree.extract_structural_signature(
+                    result=result,
+                    sequence=seq,
+                    loss_vector=result.loss_dict,
+                ),
+            )
+            root_node = mcts_tree.get_node_by_sequence(seq)
+            root_reward = root_node.tree_reward if root_node is not None else mcts_tree.result_reward(result)
+            logger.info(
+                f"  根节点 {i+1}: {seq[:20]}... "
+                f"L={result.total_loss:.4f} R={root_reward:.4f}"
+            )
+        else:
+            logger.info(f"  Phase0 candidate {i+1}: {seq[:20]}... L={result.total_loss:.4f}")
 
     best_zeroth_loss = phase0_results[0][1].total_loss
     best_zeroth_seq = phase0_results[0][0]
     best_step = 0
     losses_history = []
 
-    if ckpt_mgr is not None:
+    if phase0_ckpt_mgr is not None:
         _, best_result = phase0_results[0]
-        ckpt_mgr.save(
+        phase0_ckpt_mgr.save(
             step=0,
             beam_id=0,
             zeroth_result=best_result,
@@ -1241,13 +1421,360 @@ def run_mcts_hallucination_cdr(
         )
         logger.info("[Checkpoint] Phase 0 保存完毕")
 
-    logger.info(f"Phase 0 完成：{mcts_tree.total_nodes} 个根节点, best_L={best_zeroth_loss:.4f}")
+    phase0_root_count = mcts_tree.total_nodes if mcts_tree is not None else top_beam
+    logger.info(f"Phase 0 完成：{phase0_root_count} 个根候选, best_L={best_zeroth_loss:.4f}")
     logger.info("=" * 70)
 
-    logger.info("开始 CDR-Aware MCTS 主循环...")
+    legacy_steps_done = 0
+    step_offset = 0
+    strict_loop_steps = N_steps
+    ckpt_mgr = strict_ckpt_mgr
 
-    for step in range(N_steps):
-        selected_node = mcts_tree.select()
+    if mcts_strategy in {"legacy", "two_stage"}:
+        from bindcraft.hallucination.mcts_legacy import LegacyMCTSTree
+
+        legacy_tree = LegacyMCTSTree(
+            C=mcts_C,
+            max_nodes=mcts_max_nodes,
+            mcts_tau=mcts_tau_fixed,
+        )
+        for i in range(top_beam):
+            seq, result = phase0_results[i]
+            theta_root = torch.zeros(L_binder, NUM_AMINO_ACIDS, device=device)
+            _sync_theta_to_seq(theta_root, seq)
+            theta_root.requires_grad_(True)
+            legacy_tree.add_root_node(
+                sequence=seq,
+                logits=theta_root,
+                L_real=result.total_loss,
+                coordinate=result.coordinate,
+            )
+
+        legacy_limit = N_steps if mcts_strategy == "legacy" else min(N_steps, mcts_bootstrap_max_steps)
+        legacy_min_steps = min(N_steps, mcts_bootstrap_steps)
+        significant_best_loss = best_zeroth_loss
+        stale_steps = 0
+
+        logger.info("=" * 70)
+        logger.info(
+            "CDR StageA legacy_bootstrap 启动: max_steps=%d min_steps=%d patience=%d min_delta=%.4f",
+            legacy_limit,
+            legacy_min_steps,
+            mcts_bootstrap_patience,
+            mcts_bootstrap_min_delta,
+        )
+
+        for legacy_step in range(legacy_limit):
+            selected_node = legacy_tree.select()
+            selected_seq = selected_node.sequence
+            selected_logits = selected_node.logits.clone().to(device)
+
+            if has_cdr_protection:
+                selected_seq_clipped = _clip_seq_by_cdr_mask(selected_seq, cdr_mask, init_binder)
+                if selected_seq_clipped != selected_seq:
+                    logger.debug(
+                        "StageA Step %d: CDR guard clipped selected_seq framework, id=%d",
+                        legacy_step,
+                        selected_node.node_id,
+                    )
+                    selected_seq = selected_seq_clipped
+                    _sync_theta_to_seq(selected_logits, selected_seq)
+
+            with torch.no_grad():
+                feat_binder_only, _, _ = build_single_chain_features(selected_seq, device)
+                feat_binder_only = _prepare_input_features(model, feat_binder_only)
+                if selected_node.coordinate is not None:
+                    x_coarse_cached = selected_node.coordinate.clone().to(device)
+                    if x_coarse_cached.dim() >= 3 and x_coarse_cached.size(-3) > 1:
+                        x_coarse_cached = x_coarse_cached.narrow(-3, 0, 1).contiguous()
+                else:
+                    ref_pos = feat_binder_only["ref_pos"]
+                    x_coarse_cached = ref_pos.clone().unsqueeze(0).to(device)
+                    x_coarse_cached = x_coarse_cached + torch.randn_like(x_coarse_cached) * 0.1
+
+            theta_step2 = selected_logits.detach().clone().requires_grad_(True)
+            optimizer_step2 = torch.optim.Adam([theta_step2], lr=learning_rate)
+
+            progress = legacy_step / max(N_steps - 1, 1)
+            tau_temp = 2.0 * (1.0 - progress) + 0.05 * progress
+
+            s_binder_step2, current_seq_step2, input_feature_dict_step2 = ste_bridge(
+                theta=theta_step2,
+                W_AAE=W_AAE,
+                model=model,
+                target_seq=target_seq,
+                device=device,
+                tau_temp=tau_temp,
+            )
+
+            x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
+                model=model,
+                s_binder=s_binder_step2,
+                s_target=s_target,
+                input_feature_dict=input_feature_dict_step2,
+                x_coarse=x_coarse_cached,
+                X_clean=selected_node.coordinate,
+                tau=mcts_tau_fixed,
+                device=device,
+                chunk_size=chunk_size,
+            )
+
+            x0_flat = x0_hat_step2.squeeze(0)
+            s_inputs_full = torch.cat([s_binder_step2, s_target], dim=0)
+            heads = run_confidence_heads(
+                model=model,
+                input_feature_dict=input_feature_dict_step2,
+                s_inputs=s_inputs_full,
+                s_trunk=s_trunk_step2,
+                z_trunk=z_trunk_step2,
+                x0_hat=x0_hat_step2,
+                inplace_safe=False,
+                chunk_size=chunk_size,
+            )
+
+            first_order_loss, _ = compute_all_losses(
+                x0_flat=x0_flat,
+                plddt_logits=heads["plddt_logits"],
+                pae_logits=heads["pae_logits"],
+                distogram_logits=heads["distogram_logits"],
+                input_feature_dict=input_feature_dict_step2,
+                L_binder=L_binder,
+                weights=base_weights,
+                contact_params=contact_params,
+                plddt_params=plddt_params,
+                pae_params=pae_params,
+                distogram_params=distogram_params,
+                pde_logits=heads["pde_logits"],
+                pde_params=pde_params,
+                clash_params=dict(DEFAULT_CLASH_PARAMS),
+                hotspot_params=hotspot_params,
+            )
+
+            first_order_loss.backward()
+            grad_for_proposal = theta_step2.grad.clone() if theta_step2.grad is not None else None
+            torch.nn.utils.clip_grad_norm_([theta_step2], 1.0)
+            optimizer_step2.step()
+            fo_loss_val = first_order_loss.item()
+
+            if grad_for_proposal is None:
+                logger.warning("CDR StageA Step %d: grad is None, skipping candidate generation", legacy_step)
+                losses_history.append(best_zeroth_loss)
+                stale_steps += 1
+                legacy_steps_done += 1
+                continue
+
+            grads_cpu = grad_for_proposal.detach().cpu()
+            if has_cdr_protection:
+                grads_cpu = grads_cpu.clone()
+                grads_cpu[framework_indices, :] = 0.0
+
+            candidates = propose_mutations_legacy(
+                grad_matrix=grads_cpu,
+                current_seq=current_seq_step2,
+                K_top=K_top,
+                B_candidates=B_candidates,
+                T_sample=T_sample,
+                max_mutations_per_seq=max_mutations_per_seq,
+                use_prior=use_prior,
+                prior_strength=prior_strength,
+            )
+
+            if not candidates:
+                logger.warning("CDR StageA Step %d: no candidates generated, skipping", legacy_step)
+                losses_history.append(best_zeroth_loss)
+                stale_steps += 1
+                legacy_steps_done += 1
+                continue
+
+            all_zeroth_results = []
+            for cand_seq in candidates:
+                if has_cdr_protection:
+                    cand_seq = _clip_seq_by_cdr_mask(cand_seq, cdr_mask, init_binder)
+
+                result = zeroth_order_eval(
+                    binder_seq=cand_seq,
+                    target_seq=target_seq,
+                    model=model,
+                    device=device,
+                    loss_weights=base_weights,
+                    contact_params=contact_params,
+                    chunk_size=chunk_size,
+                    hotspot_params=hotspot_params,
+                )
+                verifier_cache[result.binder_seq] = result
+                all_zeroth_results.append(result)
+
+            new_nodes = legacy_tree.expand(selected_node, all_zeroth_results)
+            for new_node in new_nodes:
+                new_node.logits = _init_child_logits_for_mcts_cdr(
+                    selected_node,
+                    new_node.sequence,
+                    cdr_mask,
+                    device,
+                ).detach().cpu()
+
+            losses_for_backprop = [result.total_loss for result in all_zeroth_results]
+            legacy_tree.backpropagate(selected_node, losses_for_backprop)
+
+            n_pruned = legacy_tree.prune()
+            if n_pruned > 0:
+                logger.debug("CDR StageA Step %d: pruned %d nodes", legacy_step, n_pruned)
+
+            round_best = min(all_zeroth_results, key=lambda result: result.total_loss)
+            round_best_loss = round_best.total_loss
+
+            accepted = False
+            prob_accept = False
+            if annealer is not None:
+                current_node_loss = selected_node.L_real
+                accepted = annealer.accept(current_node_loss, round_best_loss, legacy_step, N_steps)
+                if accepted and round_best_loss >= current_node_loss:
+                    prob_accept = True
+            else:
+                accepted = round_best_loss <= best_zeroth_loss
+
+            if accepted and round_best_loss <= best_zeroth_loss:
+                best_zeroth_loss = round_best_loss
+                best_zeroth_seq = round_best.binder_seq
+                best_step = legacy_step
+
+            if best_zeroth_loss <= significant_best_loss - mcts_bootstrap_min_delta:
+                significant_best_loss = best_zeroth_loss
+                stale_steps = 0
+            else:
+                stale_steps += 1
+
+            losses_history.append(round_best_loss)
+            legacy_steps_done += 1
+            stats = legacy_tree.get_node_stats()
+
+            logger.info(
+                "CDR StageA Step %3d/%d | sel_node=%d(d=%d) L_real=%.4f 1st=%.4f | "
+                "K=%d round_best=%.4f global_best=%.4f@%d stale=%d "
+                "tree=%dnodes max_depth=%d N_total=%d | CDR=%d/%d accepted=%s%s",
+                legacy_step,
+                legacy_limit,
+                selected_node.node_id,
+                selected_node.depth,
+                selected_node.L_real,
+                fo_loss_val,
+                len(candidates),
+                round_best_loss,
+                best_zeroth_loss,
+                best_step,
+                stale_steps,
+                stats["total_nodes"],
+                stats["max_depth"],
+                stats["N_total"],
+                sum(cdr_mask),
+                L_binder,
+                accepted,
+                "(prob)" if prob_accept else "",
+            )
+
+            if legacy_ckpt_mgr is not None:
+                legacy_ckpt_mgr.save(
+                    step=legacy_step,
+                    beam_id=0,
+                    zeroth_result=round_best,
+                    plddt_logits=round_best.plddt_logits,
+                    accepted=accepted,
+                    is_global_best=(round_best_loss == best_zeroth_loss),
+                )
+                best_info = legacy_ckpt_mgr.get_best_info()
+                logger.info(
+                    "  [CDR Legacy Checkpoint] best=%.4f @ step=%s beam=%s",
+                    best_info["loss"],
+                    best_info["step"],
+                    best_info["beam"],
+                )
+
+            if (
+                mcts_strategy == "two_stage"
+                and legacy_steps_done >= legacy_min_steps
+                and stale_steps >= mcts_bootstrap_patience
+            ):
+                logger.info(
+                    "CDR StageA plateau detected: steps=%d stale=%d best=%.4f; switching to StageB",
+                    legacy_steps_done,
+                    stale_steps,
+                    best_zeroth_loss,
+                )
+                break
+
+        legacy_tree.log_tree_summary()
+
+        if mcts_strategy == "legacy" or legacy_steps_done >= N_steps:
+            logger.info("=" * 70)
+            logger.info(
+                "CDR Legacy MCTS 完成: best_seq=%s loss=%.4f @step %d",
+                best_zeroth_seq,
+                best_zeroth_loss,
+                best_step,
+            )
+            logger.info("=" * 70)
+            return best_zeroth_seq, best_zeroth_seq, losses_history
+
+        handoff_results = _select_diverse_handoff_results(verifier_cache, mcts_handoff_top_k)
+        if not handoff_results:
+            raise RuntimeError("[CDR MCTS] two_stage handoff has no verifier results")
+
+        mcts_tree = _make_strict_mcts_tree(mcts_C, mcts_max_nodes, mcts_tau_fixed)
+        for cached_result in verifier_cache.values():
+            mcts_tree.store_verifier_result(cached_result)
+
+        for i, result in enumerate(handoff_results):
+            theta_root = torch.zeros(L_binder, NUM_AMINO_ACIDS, device=device)
+            _sync_theta_to_seq(theta_root, result.binder_seq)
+            theta_root.requires_grad_(True)
+            root_node = mcts_tree.add_root_node(
+                sequence=result.binder_seq,
+                logits=theta_root,
+                L_real=result.total_loss,
+                coordinate=result.coordinate,
+                loss_vector=result.loss_dict,
+                prior=1.0 / max(len(handoff_results), 1),
+                structural_signature=mcts_tree.extract_structural_signature(
+                    result=result,
+                    sequence=result.binder_seq,
+                    loss_vector=result.loss_dict,
+                ),
+            )
+            logger.info(
+                "CDR StageB root %d/%d: seq=%s L=%.4f R=%.4f structural=%s",
+                i + 1,
+                len(handoff_results),
+                result.binder_seq[:20],
+                result.total_loss,
+                root_node.tree_reward,
+                _handoff_structural_key(result),
+            )
+
+        step_offset = legacy_steps_done
+        strict_loop_steps = max(0, N_steps - legacy_steps_done)
+        ckpt_mgr = strict_ckpt_mgr
+        logger.info(
+            "CDR Stage switch: legacy_steps=%d strict_steps=%d legacy_best_loss=%.4f",
+            legacy_steps_done,
+            strict_loop_steps,
+            best_zeroth_loss,
+        )
+
+    logger.info("开始 CDR Document PUCT MCTS 主循环: steps=%d offset=%d", strict_loop_steps, step_offset)
+    strict_stage_best_loss = float(best_zeroth_loss)
+    strict_stale_steps = 0
+
+    for step in range(strict_loop_steps):
+        global_step = step_offset + step
+        selection = mcts_tree.select_decision()
+        selected_node = selection.node
+        if selection.decision_type.endswith("terminal"):
+            logger.warning(
+                f"Step {global_step}: selected node {selected_node.node_id} is terminal, skipping"
+            )
+            losses_history.append(best_zeroth_loss)
+            continue
+
         selected_seq = selected_node.sequence
         selected_logits = selected_node.logits.clone().to(device)
 
@@ -1255,7 +1782,7 @@ def run_mcts_hallucination_cdr(
             selected_seq_clipped = _clip_seq_by_cdr_mask(selected_seq, cdr_mask, init_binder)
             if selected_seq_clipped != selected_seq:
                 logger.debug(
-                    f"Step {step}: CDR guard clipped selected_seq framework, "
+                    f"Step {global_step}: CDR guard clipped selected_seq framework, "
                     f"id={selected_node.node_id}"
                 )
                 selected_seq = selected_seq_clipped
@@ -1276,7 +1803,7 @@ def run_mcts_hallucination_cdr(
         theta_step2 = selected_logits.detach().clone().requires_grad_(True)
         optimizer_step2 = torch.optim.Adam([theta_step2], lr=learning_rate)
 
-        progress = step / max(N_steps - 1, 1)
+        progress = global_step / max(N_steps - 1, 1)
         tau_temp = 2.0 * (1.0 - progress) + 0.05 * progress
 
         s_binder_step2, current_seq_step2, input_feature_dict_step2 = ste_bridge(
@@ -1288,18 +1815,12 @@ def run_mcts_hallucination_cdr(
             tau_temp=tau_temp,
         )
 
-        x_coarse_step2 = x_coarse_cached
-        if x_coarse_step2 is None:
-            ref_step2 = input_feature_dict_step2["ref_pos"]
-            x_coarse_step2 = ref_step2.clone().unsqueeze(0).to(device)
-            x_coarse_step2 = x_coarse_step2 + torch.randn_like(x_coarse_step2) * 0.1
-
         x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
             model=model,
             s_binder=s_binder_step2,
             s_target=s_target,
             input_feature_dict=input_feature_dict_step2,
-            x_coarse=x_coarse_step2,
+            x_coarse=x_coarse_cached,
             X_clean=selected_node.coordinate,
             tau=mcts_tau_fixed,
             device=device,
@@ -1319,6 +1840,19 @@ def run_mcts_hallucination_cdr(
             chunk_size=chunk_size,
         )
 
+        routing_info = select_de_novo_action_group(
+            selected_node.loss_vector,
+            temperature=MCTS_STAGE2_GROUP_TEMPERATURE,
+        )
+        action_group = str(routing_info["action_group"])
+        group_prior = float(routing_info["group_prior"])
+        group_priors = {
+            str(group): float(prior)
+            for group, prior in dict(routing_info.get("group_priors", {})).items()
+        }
+        if not group_priors:
+            group_priors = {action_group: group_prior}
+
         first_order_loss, first_order_losses = compute_all_losses(
             x0_flat=x0_flat,
             plddt_logits=heads["plddt_logits"],
@@ -1336,47 +1870,167 @@ def run_mcts_hallucination_cdr(
             clash_params=dict(DEFAULT_CLASH_PARAMS),
             hotspot_params=hotspot_params,
         )
+        proposal_loss, proposal_loss_mode = _stageb_group_proposal_loss(
+            first_order_losses,
+            action_group,
+            first_order_loss,
+        )
 
-        first_order_loss.backward()
+        proposal_loss.backward()
         grad_for_proposal = theta_step2.grad.clone() if theta_step2.grad is not None else None
         torch.nn.utils.clip_grad_norm_([theta_step2], 1.0)
         optimizer_step2.step()
         fo_loss_val = first_order_loss.item()
+        proposal_loss_val = float(proposal_loss.detach().item())
 
         if grad_for_proposal is None:
-            logger.warning(f"Step {step}: grad is None, skipping")
+            logger.warning(f"Step {global_step}: grad is None, skipping candidate generation")
             losses_history.append(best_zeroth_loss)
             continue
 
         grads_cpu = grad_for_proposal.detach().cpu()
-
         if has_cdr_protection:
-            grad_masked = grads_cpu.clone()
-            grad_masked[framework_indices, :] = 0.0
-        else:
-            grad_masked = grads_cpu
+            grads_cpu = grads_cpu.clone()
+            grads_cpu[framework_indices, :] = 0.0
 
-        candidates = propose_mutations(
-            grad_matrix=grad_masked,
-            current_seq=current_seq_step2,
-            K_top=K_top,
-            B_candidates=B_candidates,
-            T_sample=T_sample,
-            max_mutations_per_seq=max_mutations_per_seq,
-            use_prior=use_prior,
-            prior_strength=prior_strength,
+        stageb_max_mutations = _stageb_max_mutations_for_step(
+            base_max_mutations=max_mutations_per_seq,
+            local_step=step,
+            total_steps=strict_loop_steps,
+            stale_steps=strict_stale_steps,
         )
 
-        if not candidates:
-            logger.warning(f"Step {step}: no candidates generated, skipping")
+        widening_slots = mcts_tree.remaining_expansion_slots(selected_node)
+        expand_budget = min(MCTS_STAGE2_EXPAND_ACTIONS_PER_STEP, widening_slots)
+        if expand_budget <= 0:
+            logger.warning(
+                f"Step {global_step}: selected node {selected_node.node_id} has no progressive widening slots"
+            )
+            losses_history.append(best_zeroth_loss)
+            continue
+
+        proposal_pool_budget = max(B_candidates, expand_budget)
+        group_budgets = _allocate_action_group_budgets(group_priors, proposal_pool_budget)
+        proposal_pool: List[MutationProposal] = []
+        for group_name, group_budget in group_budgets.items():
+            position_weights = _cdr_stageb_position_weights(
+                current_seq_step2,
+                cdr_mask,
+                group_name,
+                selected_node.structural_signature,
+            )
+            proposal_pool.extend(
+                propose_mutation_actions(
+                    grad_matrix=grads_cpu,
+                    current_seq=current_seq_step2,
+                    K_top=K_top,
+                    B_candidates=group_budget,
+                    T_sample=T_sample,
+                    max_mutations_per_seq=stageb_max_mutations,
+                    use_prior=use_prior,
+                    prior_strength=prior_strength,
+                    action_group=group_name,
+                    group_prior=group_priors.get(group_name, 0.0),
+                    structural_signature=selected_node.structural_signature,
+                    position_weights=position_weights,
+                    enforce_position_mask=True,
+                )
+            )
+
+        proposal_dedup_skipped = 0
+        proposal_seen = set()
+        clipped_pool: List[MutationProposal] = []
+        for proposal in proposal_pool:
+            clipped_proposal = (
+                _clip_mcts_proposal_by_cdr_mask(proposal, cdr_mask, init_binder)
+                if has_cdr_protection else proposal
+            )
+            if clipped_proposal.sequence == selected_seq:
+                proposal_dedup_skipped += 1
+                continue
+            if clipped_proposal.sequence in proposal_seen:
+                proposal_dedup_skipped += 1
+                continue
+            proposal_seen.add(clipped_proposal.sequence)
+            clipped_pool.append(clipped_proposal)
+        proposal_pool = clipped_pool
+
+        if not proposal_pool:
+            logger.warning(f"Step {global_step}: no fresh CDR-valid candidates generated, skipping")
+            losses_history.append(best_zeroth_loss)
+            continue
+
+        registered_actions = mcts_tree.register_action_proposals(selected_node, proposal_pool)
+        selected_actions = mcts_tree.select_unexpanded_actions(
+            selected_node,
+            max_actions=expand_budget,
+            candidates=registered_actions,
+        )
+        if not selected_actions:
+            logger.warning(
+                f"Step {global_step}: no fresh unexpanded action selected from {len(proposal_pool)} proposals"
+            )
+            losses_history.append(best_zeroth_loss)
+            continue
+
+        selected_proposals = [
+            action.proposal
+            for action in selected_actions
+            if action.proposal is not None
+        ]
+        action_by_sequence = {action.sequence: action for action in selected_actions}
+
+        fresh_proposals: List[MutationProposal] = []
+        cached_proposals: List[MutationProposal] = []
+        cached_results = []
+        duplicate_results = []
+        reward_by_sequence: Dict[str, float] = {}
+        seen_step = set()
+        duplicates_skipped = proposal_dedup_skipped
+        cache_hits_before = mcts_tree.get_node_stats()["verifier_cache_hits"]
+        duplicate_merges_before = mcts_tree.get_node_stats()["duplicate_merges"]
+        for proposal in selected_proposals:
+            if proposal.sequence in seen_step:
+                duplicates_skipped += 1
+                continue
+            seen_step.add(proposal.sequence)
+
+            if mcts_tree.has_sequence(proposal.sequence):
+                duplicates_skipped += 1
+                action = action_by_sequence.get(proposal.sequence)
+                if action is not None:
+                    action.status = "duplicate"
+                cached = mcts_tree.get_cached_verifier_result(proposal.sequence)
+                existing = mcts_tree.get_node_by_sequence(proposal.sequence)
+                if cached is None and existing is not None:
+                    cached = mcts_tree.node_to_cached_result(existing)
+                reward = mcts_tree.merge_duplicate(selected_node, proposal, cached)
+                reward_by_sequence[proposal.sequence] = reward
+                if cached is not None:
+                    duplicate_results.append(cached)
+                continue
+
+            cached = mcts_tree.get_cached_verifier_result(proposal.sequence)
+            if cached is not None:
+                cached_proposals.append(proposal)
+                cached_results.append(cached)
+                continue
+
+            fresh_proposals.append(proposal)
+
+        if not fresh_proposals and not cached_results and not reward_by_sequence:
+            logger.warning(
+                f"Step {global_step}: all {len(selected_proposals)} selected actions were duplicate, skipping verifier"
+            )
             losses_history.append(best_zeroth_loss)
             continue
 
         all_zeroth_results = []
-        for cand_seq in candidates:
-            if has_cdr_protection:
-                cand_seq = _clip_seq_by_cdr_mask(cand_seq, cdr_mask, init_binder)
-
+        for proposal in fresh_proposals:
+            cand_seq = (
+                _clip_seq_by_cdr_mask(proposal.sequence, cdr_mask, init_binder)
+                if has_cdr_protection else proposal.sequence
+            )
             result = zeroth_order_eval(
                 binder_seq=cand_seq,
                 target_seq=target_seq,
@@ -1387,52 +2041,121 @@ def run_mcts_hallucination_cdr(
                 chunk_size=chunk_size,
                 hotspot_params=hotspot_params,
             )
+            verifier_cache[result.binder_seq] = result
+            mcts_tree.store_verifier_result(result)
             all_zeroth_results.append(result)
 
-        new_nodes = mcts_tree.expand(selected_node, all_zeroth_results)
+        expand_proposals = cached_proposals + fresh_proposals
+        expand_results = cached_results + all_zeroth_results
+        round_results = duplicate_results + expand_results
+
+        new_nodes = mcts_tree.expand(selected_node, expand_proposals, expand_results)
+        inserted_rewards = {
+            new_node.sequence: new_node.tree_reward
+            for new_node in new_nodes
+        }
 
         for new_node in new_nodes:
             new_node.logits = _init_child_logits_for_mcts_cdr(
-                selected_node, new_node.sequence, cdr_mask, device
+                selected_node,
+                new_node.sequence,
+                cdr_mask,
+                device,
+            ).detach().cpu()
+
+        for result in expand_results:
+            reward_by_sequence[result.binder_seq] = inserted_rewards.get(
+                result.binder_seq,
+                mcts_tree.result_reward(result),
             )
 
-        losses_for_backprop = [r.total_loss for r in all_zeroth_results]
-        mcts_tree.backpropagate(selected_node, losses_for_backprop)
+        for action in selected_actions:
+            if action.sequence not in reward_by_sequence:
+                continue
+            mcts_tree.backpropagate_action(
+                selection,
+                action,
+                reward_by_sequence[action.sequence],
+            )
 
         n_pruned = mcts_tree.prune()
         if n_pruned > 0:
-            logger.debug(f"Step {step}: pruned {n_pruned} nodes")
+            logger.debug(f"Step {global_step}: pruned {n_pruned} nodes")
 
-        round_best = min(all_zeroth_results, key=lambda r: r.total_loss)
+        if not round_results:
+            logger.warning(f"Step {global_step}: no verifier result available after duplicate merge")
+            losses_history.append(best_zeroth_loss)
+            continue
+
+        round_best = min(round_results, key=lambda r: r.total_loss)
         round_best_loss = round_best.total_loss
+        round_best_node = mcts_tree.get_node_by_sequence(round_best.binder_seq)
+        round_best_reward = (
+            round_best_node.tree_reward
+            if round_best_node is not None
+            else mcts_tree.result_reward(round_best)
+        )
 
         accepted = False
         prob_accept = False
         if annealer is not None:
             current_node_loss = selected_node.L_real
-            accepted = annealer.accept(current_node_loss, round_best_loss, step, N_steps)
+            accepted = annealer.accept(current_node_loss, round_best_loss, global_step, N_steps)
             if accepted and round_best_loss >= current_node_loss:
                 prob_accept = True
         else:
             accepted = round_best_loss <= best_zeroth_loss
 
+        previous_global_best_loss = best_zeroth_loss
         if accepted and round_best_loss <= best_zeroth_loss:
             best_zeroth_loss = round_best_loss
             best_zeroth_seq = round_best.binder_seq
-            best_step = step
+            best_step = global_step
+
+        if best_zeroth_loss < strict_stage_best_loss - 1e-12:
+            strict_stage_best_loss = float(best_zeroth_loss)
+            strict_stale_steps = 0
+        elif best_zeroth_loss < previous_global_best_loss:
+            strict_stage_best_loss = min(strict_stage_best_loss, float(best_zeroth_loss))
+            strict_stale_steps = 0
+        else:
+            strict_stale_steps += 1
 
         losses_history.append(round_best_loss)
 
         stats = mcts_tree.get_node_stats()
+        verifier_cache_hits = stats["verifier_cache_hits"] - cache_hits_before
+        duplicate_merges = stats["duplicate_merges"] - duplicate_merges_before
+        best_action_score_str = (
+            "NA" if selection.best_action_score is None
+            else f"{selection.best_action_score:.4f}"
+        )
+        frontier_score_str = (
+            "NA" if selection.frontier_score is None
+            else f"{selection.frontier_score:.4f}"
+        )
         logger.info(
-            f"Step {step:3d}/{N_steps} | "
+            f"Step {global_step:3d}/{N_steps} | "
             f"sel_node={selected_node.node_id}(d={selected_node.depth}) "
             f"L_real={selected_node.L_real:.4f} "
-            f"1st={fo_loss_val:.4f} | "
-            f"K={len(candidates)} "
+            f"R={selected_node.tree_reward:.4f} Q={selected_node.q_value:.4f} "
+            f"P={selected_node.prior:.4f} "
+            f"1st={fo_loss_val:.4f} prop={proposal_loss_val:.4f}({proposal_loss_mode}) | "
+            f"group={action_group} Pg={group_prior:.3f} "
+            f"edit_max={stageb_max_mutations} stale={strict_stale_steps} "
+            f"pw={len(selected_node.children)}/{mcts_tree.progressive_widening_limit(selected_node)} "
+            f"decision={selection.decision_type} path={len(selection.action_path)} "
+            f"score={best_action_score_str}/{frontier_score_str} "
+            f"pool={len(proposal_pool)} groups_sampled={len(group_budgets)} "
+            f"selected_actions={len(selected_actions)} fresh={len(fresh_proposals)} cached={len(cached_results)} "
+            f"dup={duplicates_skipped} dmerge={duplicate_merges} cache_hit={verifier_cache_hits} "
+            f"groups={stats['num_groups']} invalid={stats['num_invalid']} "
+            f"rmode={selected_node.status_flags.get('reward_mode', 'raw')} "
             f"round_best={round_best_loss:.4f} "
+            f"round_R={round_best_reward:.4f} "
             f"global_best={best_zeroth_loss:.4f}@{best_step} "
             f"tree={stats['total_nodes']}nodes "
+            f"max_depth={stats['max_depth']} "
             f"N_total={stats['N_total']} | "
             f"CDR={sum(cdr_mask)}/{L_binder} | "
             f"accepted={accepted}{'(prob)' if prob_accept else ''}"
@@ -1440,7 +2163,7 @@ def run_mcts_hallucination_cdr(
 
         if ckpt_mgr is not None:
             ckpt_mgr.save(
-                step=step,
+                step=global_step,
                 beam_id=0,
                 zeroth_result=round_best,
                 plddt_logits=round_best.plddt_logits,
@@ -1458,13 +2181,20 @@ def run_mcts_hallucination_cdr(
     best_final = mcts_tree.get_global_best()
     logger.info("=" * 70)
     logger.info("CDR-Aware MCTS 混合优化完成！")
-    logger.info(f"全局最优序列: {best_zeroth_seq} (loss={best_zeroth_loss:.4f} @step {best_step})")
+    logger.info(
+        f"全局最优序列(loss): {best_zeroth_seq} "
+        f"(loss={best_zeroth_loss:.4f} @step {best_step})"
+    )
+    logger.info(
+        f"全局最优序列(reward): {best_final.sequence} "
+        f"(R={best_final.tree_reward:.4f}, L={best_final.L_real:.4f})"
+    )
     logger.info(f"CDR residues: {sum(cdr_mask)}/{L_binder} | Framework: {L_binder - sum(cdr_mask)}/{L_binder}")
     logger.info(f"MCTS 树最终节点数: {mcts_tree.total_nodes}")
     logger.info(
         f"MCTS 全局最优节点: id={best_final.node_id} depth={best_final.depth} "
-        f"seq={best_final.sequence[:20]}... L={best_final.L_real:.4f}"
+        f"seq={best_final.sequence[:20]}... L={best_final.L_real:.4f} R={best_final.tree_reward:.4f}"
     )
     logger.info("=" * 70)
 
-    return best_zeroth_seq, best_zeroth_seq, losses_history
+    return best_zeroth_seq, best_final.sequence, losses_history

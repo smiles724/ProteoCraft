@@ -32,6 +32,7 @@ from bindcraft.hallucination.pipeline import (  # noqa: E402
     run_hallucination,
     run_hybrid_hallucination,
 )
+from bindcraft.utils import LOSS_WEIGHT_PRESETS  # noqa: E402
 
 
 AA3_TO_1 = {
@@ -83,6 +84,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "use_tau_scheduling": True,
     "tau_jitter": True,
     "target_hotspot_residues": None,
+    "loss_preset": "tuned",
     "w_plddt": None,
     "w_pae": None,
     "w_i_pae": None,
@@ -474,6 +476,15 @@ def parse_entry_ids(entry_ids: Any) -> Set[str]:
 
 
 def resolve_loss_weights(args: argparse.Namespace) -> Optional[Dict[str, float]]:
+    preset_name = getattr(args, "loss_preset", "tuned")
+    if preset_name not in LOSS_WEIGHT_PRESETS:
+        raise ValueError(
+            f"未知 loss_preset={preset_name!r}; 可选: {', '.join(sorted(LOSS_WEIGHT_PRESETS))}"
+        )
+    loss_weights = {}
+    if preset_name != "default":
+        loss_weights.update(LOSS_WEIGHT_PRESETS[preset_name])
+
     weight_arg_map = {
         "plddt": getattr(args, "w_plddt", None),
         "pae": getattr(args, "w_pae", None),
@@ -488,11 +499,9 @@ def resolve_loss_weights(args: argparse.Namespace) -> Optional[Dict[str, float]]
         "pde": getattr(args, "w_pde", None),
         "i_pde": getattr(args, "w_i_pde", None),
     }
-    loss_weights = {
-        key: float(value)
-        for key, value in weight_arg_map.items()
-        if value is not None
-    }
+    for key, value in weight_arg_map.items():
+        if value is not None:
+            loss_weights[key] = float(value)
     return loss_weights or None
 
 
@@ -614,6 +623,7 @@ def run_one_entry(
             "use_tau_scheduling": args.use_tau_scheduling,
             "tau_jitter": args.tau_jitter,
             "target_hotspot_residues": args.target_hotspot_residues,
+            "loss_preset": args.loss_preset,
             "loss_weights_override": loss_weights,
             "model_name": args.model_name,
             "save_checkpoints": args.save_checkpoints,
@@ -678,6 +688,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--t-init", dest="t_init", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--t-min", dest="t_min", type=float, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--loss-preset",
+        dest="loss_preset",
+        type=str,
+        choices=sorted(LOSS_WEIGHT_PRESETS.keys()),
+        default=argparse.SUPPRESS,
+    )
     parser.add_argument("--w-plddt", dest="w_plddt", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--w-pae", dest="w_pae", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--w-i-pae", dest="w_i_pae", type=float, default=argparse.SUPPRESS)

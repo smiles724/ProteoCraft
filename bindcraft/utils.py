@@ -263,6 +263,26 @@ DEFAULT_LOSS_WEIGHTS = {
     "i_pde":   0.01,
 }
 
+TUNED_LOSS_WEIGHTS = {
+    "plddt":   0.1,
+    "pae":     0.4,
+    "i_pae":   0.2,
+    "con":     0.2,
+    "i_con":   3.0,
+    "iptm":    0.3,
+    "rg":      0.3,
+    "helix":  -0.3,
+    "clash":   0.1,
+    "i_clash": 0.1,
+    "pde":     0.05,
+    "i_pde":   0.03,
+}
+
+LOSS_WEIGHT_PRESETS = {
+    "default": DEFAULT_LOSS_WEIGHTS,
+    "tuned": TUNED_LOSS_WEIGHTS,
+}
+
 DEFAULT_CONTACT_PARAMS = {
     "intra_cutoff":  14.0,
     "inter_cutoff":  21.6875,

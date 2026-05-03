@@ -47,6 +47,7 @@ from bindcraft.hallucination.pipeline_cdr import (
     run_hybrid_hallucination_cdr,
     run_mcts_hallucination_cdr,
 )
+from bindcraft.utils import LOSS_WEIGHT_PRESETS
 
 
 def setup_logging(log_file: str = None):
@@ -61,6 +62,82 @@ def setup_logging(log_file: str = None):
         sh.setFormatter(fmt)
         sh.setLevel(logging.INFO)
         logging.basicConfig(level=logging.INFO, handlers=[sh], force=True)
+
+
+def _parse_hotspot_positions_1based(raw_hotspots, target_len: int, parser: argparse.ArgumentParser, source: str):
+    if raw_hotspots is None:
+        return [], []
+
+    if isinstance(raw_hotspots, (list, tuple)):
+        tokens = list(raw_hotspots)
+    else:
+        raw_text = str(raw_hotspots).strip()
+        if not raw_text:
+            return [], []
+        tokens = raw_text.replace(";", ",").replace(" ", ",").split(",")
+
+    positions = []
+    for token in tokens:
+        if isinstance(token, int):
+            positions.append(token)
+            continue
+        token = str(token).strip()
+        if not token:
+            continue
+        if "-" in token:
+            parts = token.split("-", 1)
+            if len(parts) != 2 or not parts[0].strip().isdigit() or not parts[1].strip().isdigit():
+                parser.error(f"{source} 中无法解析 hotspot 范围: {token}")
+            start = int(parts[0])
+            end = int(parts[1])
+            if start > end:
+                parser.error(f"{source} hotspot 范围起点大于终点: {token}")
+            positions.extend(range(start, end + 1))
+        else:
+            if not token.isdigit():
+                parser.error(f"{source} 只能包含 1-based 正整数或范围；检测到: {token}")
+            positions.append(int(token))
+
+    seen = set()
+    unique_positions = []
+    for pos in positions:
+        if pos < 1 or pos > target_len:
+            parser.error(f"{source} 位置 {pos} 越界；当前 target 长度为 {target_len}。")
+        if pos not in seen:
+            seen.add(pos)
+            unique_positions.append(pos)
+
+    return unique_positions, [pos - 1 for pos in unique_positions]
+
+
+def _extract_json_hotspots_1based(cdr_data):
+    for key in (
+        "target_hotspots",
+        "target_hotspot_residues",
+        "target_hotspot_residue_indices",
+        "target_hotspot_residues_1based",
+        "hotspots",
+        "hotspot_residues",
+    ):
+        value = cdr_data.get(key)
+        if value is not None:
+            return value, key
+    return None, None
+
+
+def _build_hotspot_params(raw_hotspots, target_seq: str, parser: argparse.ArgumentParser, source: str):
+    residues_1based, concat_indices = _parse_hotspot_positions_1based(
+        raw_hotspots,
+        len(target_seq or ""),
+        parser,
+        source,
+    )
+    if not concat_indices:
+        return None
+    return {
+        "target_hotspot_residues_1based": residues_1based,
+        "target_hotspot_concat_indices": concat_indices,
+    }
 
 
 def load_protenix_model(
@@ -201,13 +278,31 @@ def main():
                     help="先验权重系数（默认：0.1）")
     g4.add_argument("--chunk_size", type=int, default=None,
                     help="Attention 分块大小。当 binder>100 aa 时建议设为 256 避免 OOM（默认：None）")
+    g4.add_argument("--target_hotspots", type=str, default=None,
+                    help="Target hotspot residues，使用 1-based 序号；Mode B/C 支持逗号/空格/范围，如 10,11,45-47")
     g4.add_argument("--mcts_c", type=float, default=1.0, help="MCTS UCB 探索常数 C（默认：1.0）")
     g4.add_argument("--mcts_max_nodes", type=int, default=5000, help="MCTS 树最大节点数（默认：5000）")
     g4.add_argument("--mcts_tau_fixed", type=float, default=4.0, help="MCTS 固定扩散 tau（默认：4.0）")
     g4.add_argument("--mcts_num_beams", type=int, default=8, help="MCTS Phase0 根节点数（默认：8）")
+    g4.add_argument("--mcts_strategy", type=str, default="two_stage",
+                    choices=["legacy", "strict", "two_stage"],
+                    help="CDR MCTS 策略：legacy 原版 / strict 文档版 / two_stage 两阶段（默认：two_stage）")
+    g4.add_argument("--mcts_bootstrap_steps", type=int, default=50,
+                    help="two_stage 中 StageA legacy 至少运行步数（默认：50）")
+    g4.add_argument("--mcts_bootstrap_patience", type=int, default=10,
+                    help="two_stage 中 StageA 停滞 patience（默认：10）")
+    g4.add_argument("--mcts_bootstrap_min_delta", type=float, default=0.02,
+                    help="two_stage 中判定 StageA 有效改善的最小 loss 降幅（默认：0.02）")
+    g4.add_argument("--mcts_bootstrap_max_steps", type=int, default=80,
+                    help="two_stage 中 StageA 最多运行步数（默认：80）")
+    g4.add_argument("--mcts_handoff_top_k", type=int, default=None,
+                    help="two_stage 交接给 StageB 的 root 数；默认等于 --mcts_num_beams")
 
     # ── 损失函数权重 ──────────────────────────────────────────────────────────
     g5 = parser.add_argument_group("损失函数权重")
+    g5.add_argument("--loss_preset", type=str, default="tuned",
+                    choices=sorted(LOSS_WEIGHT_PRESETS.keys()),
+                    help="Loss 权重预设：default 原默认 / tuned 调优版（默认：tuned）")
     g5.add_argument("--w_plddt", type=float, default=None, help="pLDDT 权重")
     g5.add_argument("--w_pae", type=float, default=None, help="pAE (intra) 权重")
     g5.add_argument("--w_i_pae", type=float, default=None, help="i_pAE (inter) 权重")
@@ -225,14 +320,22 @@ def main():
 
     if args.pdb_id is not None and args.mode == "first_order":
         parser.error("Mode A (--pdb_id) does not support --mode first_order; use hybrid or mcts")
+    if args.pdb_id is not None and args.target_hotspots:
+        parser.error(
+            "--target_hotspots currently expects target sequence 1-based indices and is supported "
+            "for Mode B/Mode C. Mode A PDB residue-number mapping is not implemented yet."
+        )
 
     setup_logging(args.log_file)
     os.makedirs(args.output_dir, exist_ok=True)
 
     model, configs = load_protenix_model(args.model_name, args.device)
 
-    # 组装 loss_weights
+    # 组装 loss_weights: default 不覆盖；非 default preset 覆盖整套权重。
+    # 单独的 --w_* 参数始终具有最高优先级。
     loss_weights = {}
+    if args.loss_preset != "default":
+        loss_weights.update(LOSS_WEIGHT_PRESETS[args.loss_preset])
     weight_arg_map = {
         "plddt": args.w_plddt, "pae": args.w_pae, "i_pae": args.w_i_pae,
         "con": args.w_con, "i_con": args.w_i_con, "iptm": args.w_iptm,
@@ -243,6 +346,8 @@ def main():
     for key, val in weight_arg_map.items():
         if val is not None:
             loss_weights[key] = val
+
+    hotspot_params = None
 
     # checkpoint_dir：None → 自动推导；"" → 禁用；显式路径 → 使用显式路径
     _ckpt_override = args.checkpoint_dir  # None / "" / str
@@ -275,10 +380,16 @@ def main():
                 use_prior=args.use_prior,
                 prior_strength=args.prior_strength,
                 checkpoint_dir=_ckpt,
-                hotspot_params=None,
+                hotspot_params=hotspot_params,
                 mcts_C=args.mcts_c,
                 mcts_max_nodes=args.mcts_max_nodes,
                 mcts_tau_fixed=args.mcts_tau_fixed,
+                mcts_strategy=args.mcts_strategy,
+                mcts_bootstrap_steps=args.mcts_bootstrap_steps,
+                mcts_bootstrap_patience=args.mcts_bootstrap_patience,
+                mcts_bootstrap_min_delta=args.mcts_bootstrap_min_delta,
+                mcts_bootstrap_max_steps=args.mcts_bootstrap_max_steps,
+                mcts_handoff_top_k=args.mcts_handoff_top_k,
                 chunk_size=args.chunk_size,
             )
         else:
@@ -303,6 +414,7 @@ def main():
                 use_prior=args.use_prior,
                 prior_strength=args.prior_strength,
                 checkpoint_dir=_ckpt,
+                hotspot_params=hotspot_params,
                 chunk_size=args.chunk_size,
             )
         run_label = f"ModeA_{args.pdb_id}"
@@ -317,6 +429,9 @@ def main():
         cdr_mask = cdr_data.get("binder_cdr_mask")
         target_from_json = cdr_data.get("target_sequence", "")
         target_seq = args.target or target_from_json
+        json_hotspots, json_hotspots_key = _extract_json_hotspots_1based(cdr_data)
+        hotspot_source = "--target_hotspots" if args.target_hotspots else json_hotspots_key
+        hotspot_input = args.target_hotspots if args.target_hotspots else json_hotspots
 
         json_basename = os.path.basename(args.cdr_json).replace('.json', '')
         ckpt_dir = _ckpt_override if _ckpt_override is not None \
@@ -329,6 +444,18 @@ def main():
         if cdr_mask is None:
             logging.error("CDR JSON missing 'binder_cdr_mask' field")
             sys.exit(1)
+        hotspot_params = _build_hotspot_params(
+            hotspot_input,
+            target_seq,
+            parser,
+            hotspot_source or "CDR JSON hotspot field",
+        )
+        if hotspot_params is not None:
+            logging.info(
+                "[CDR-Aware] Hotspot routing enabled: target_hotspots_1based=%s target_concat_indices_0based=%s",
+                hotspot_params["target_hotspot_residues_1based"],
+                hotspot_params["target_hotspot_concat_indices"],
+            )
 
         if args.mode == "mcts":
             best_seq, final_seq, losses_history = run_mcts_hallucination_cdr(
@@ -351,10 +478,16 @@ def main():
                 use_prior=args.use_prior,
                 prior_strength=args.prior_strength,
                 checkpoint_dir=_ckpt,
-                hotspot_params=None,
+                hotspot_params=hotspot_params,
                 mcts_C=args.mcts_c,
                 mcts_max_nodes=args.mcts_max_nodes,
                 mcts_tau_fixed=args.mcts_tau_fixed,
+                mcts_strategy=args.mcts_strategy,
+                mcts_bootstrap_steps=args.mcts_bootstrap_steps,
+                mcts_bootstrap_patience=args.mcts_bootstrap_patience,
+                mcts_bootstrap_min_delta=args.mcts_bootstrap_min_delta,
+                mcts_bootstrap_max_steps=args.mcts_bootstrap_max_steps,
+                mcts_handoff_top_k=args.mcts_handoff_top_k,
                 chunk_size=args.chunk_size,
             )
         else:
@@ -379,6 +512,7 @@ def main():
                 use_prior=args.use_prior,
                 prior_strength=args.prior_strength,
                 checkpoint_dir=_ckpt,
+                hotspot_params=hotspot_params,
                 chunk_size=args.chunk_size,
             )
         run_label = f"ModeB_{json_basename}"
@@ -387,6 +521,18 @@ def main():
         # Mode C：传统纯序列
         if args.target is None:
             parser.error("--pdb_id or --target is required (Mode C needs --target)")
+        hotspot_params = _build_hotspot_params(
+            args.target_hotspots,
+            args.target,
+            parser,
+            "--target_hotspots",
+        )
+        if hotspot_params is not None:
+            logging.info(
+                "[CDR-Aware] Hotspot routing enabled: target_hotspots_1based=%s target_concat_indices_0based=%s",
+                hotspot_params["target_hotspot_residues_1based"],
+                hotspot_params["target_hotspot_concat_indices"],
+            )
         ckpt_dir = _ckpt_override if _ckpt_override is not None \
             else os.path.join(args.output_dir, "ModeC_hybrid_checkpoints")
         _ckpt = ckpt_dir if ckpt_dir != "" else None
@@ -401,6 +547,7 @@ def main():
                 tau_noise=args.tau_noise,
                 device=torch.device(args.device),
                 loss_weights=loss_weights,
+                hotspot_params=hotspot_params,
             )
         elif args.mode == "mcts":
             logging.info(f"[CDR-Aware] Mode C — mcts (无 CDR mask)")
@@ -423,10 +570,16 @@ def main():
                 use_prior=args.use_prior,
                 prior_strength=args.prior_strength,
                 checkpoint_dir=_ckpt,
-                hotspot_params=None,
+                hotspot_params=hotspot_params,
                 mcts_C=args.mcts_c,
                 mcts_max_nodes=args.mcts_max_nodes,
                 mcts_tau_fixed=args.mcts_tau_fixed,
+                mcts_strategy=args.mcts_strategy,
+                mcts_bootstrap_steps=args.mcts_bootstrap_steps,
+                mcts_bootstrap_patience=args.mcts_bootstrap_patience,
+                mcts_bootstrap_min_delta=args.mcts_bootstrap_min_delta,
+                mcts_bootstrap_max_steps=args.mcts_bootstrap_max_steps,
+                mcts_handoff_top_k=args.mcts_handoff_top_k,
                 chunk_size=args.chunk_size,
             )
         else:
@@ -451,6 +604,7 @@ def main():
                 use_prior=args.use_prior,
                 prior_strength=args.prior_strength,
                 checkpoint_dir=_ckpt,
+                hotspot_params=hotspot_params,
                 chunk_size=args.chunk_size,
             )
         run_label = f"ModeC_{args.mode}"
@@ -468,10 +622,17 @@ def main():
             f.write(f"CDR JSON: {args.cdr_json}\n")
         if args.target:
             f.write(f"Target: {args.target}\n")
+        if hotspot_params is not None:
+            f.write(f"Target Hotspots 1-based: {hotspot_params['target_hotspot_residues_1based']}\n")
+            f.write(f"Target Hotspot Indices 0-based: {hotspot_params['target_hotspot_concat_indices']}\n")
         f.write(f"Binder Length: {args.binder_length}\n")
         f.write(f"Optimization Steps: {args.n_steps}\n")
         f.write(f"Learning Rate: {args.learning_rate}\n")
         f.write(f"Tau Noise: {args.tau_noise}\n")
+        if args.mode == "mcts":
+            f.write(f"MCTS Strategy: cdr_{args.mcts_strategy}\n")
+            f.write(f"MCTS Bootstrap Steps: {args.mcts_bootstrap_steps}\n")
+            f.write(f"MCTS Bootstrap Max Steps: {args.mcts_bootstrap_max_steps}\n")
         f.write(f"\n")
         f.write(f"Best Sequence: {best_seq}\n")
         f.write(f"Final Sequence: {final_seq}\n")

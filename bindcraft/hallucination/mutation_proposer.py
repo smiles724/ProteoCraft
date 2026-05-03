@@ -17,7 +17,8 @@ BindCraft v2 - 梯度引导的离散候选生成器
 import torch
 import torch.nn.functional as F
 import numpy as np
-from typing import List, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 import logging
 
 from bindcraft.utils import (
@@ -29,6 +30,19 @@ from bindcraft.utils import (
 logger = logging.getLogger(__name__)
 
 AA_1_TO_IDX = {AA_1LETTER[name]: idx for idx, name in enumerate(PROTEIN_RESIDUE_NAMES)}
+
+
+def _aa_indices(letters: str) -> List[int]:
+    return [AA_1_TO_IDX[aa] for aa in letters if aa in AA_1_TO_IDX]
+
+
+SMALL_AA = set(_aa_indices("AGST"))
+HYDROPHOBIC_AA = set(_aa_indices("AVLIMFWY"))
+BULKY_AA = set(_aa_indices("FWYILMRK"))
+AROMATIC_AA = set(_aa_indices("FWYH"))
+POLAR_CHARGED_AA = set(_aa_indices("RKDEQNHSTY"))
+CHARGED_AA = set(_aa_indices("RKDE"))
+RISKY_AA = set(_aa_indices("CPG"))
 
 # ── BLOSUM62 替换矩阵（20×20，对应 PROTEIN_RESIDUE_NAMES 顺序）─────────────
 # 行 = 目标氨基酸 (to)，列 = 源氨基酸 (from)
@@ -63,6 +77,135 @@ _BLOSUM62_ROWS = [
 BLOSUM62: np.ndarray = np.array(_BLOSUM62_ROWS, dtype=np.float32)
 
 
+@dataclass(frozen=True)
+class MutationProposal:
+    """MCTS 用的离散 edit proposal。"""
+
+    sequence: str
+    edits: List[Tuple[int, str, str]]
+    prior: float
+    benefit: float
+    action_group: str = "unrouted"
+    group_prior: float = 1.0
+
+
+DE_NOVO_ACTION_GROUPS = (
+    "core_stabilization",
+    "compactness_repair",
+    "interface_formation",
+    "clash_repair",
+    "specificity_repair",
+    "solubility_repair",
+)
+
+ACTION_GROUP_LOSS_SCALES = {
+    "plddt": 100.0,
+    "pae": 30.0,
+    "pde": 30.0,
+    "con": 1.0,
+    "i_pae": 30.0,
+    "i_pde": 30.0,
+    "i_con": 1.0,
+    "rg": 10.0,
+    "clash": 5.0,
+    "i_clash": 5.0,
+    "bond_violation": 0.5,
+    "chainbreak": 0.5,
+    "background_contact": 1.0,
+    "decoy_margin": 1.0,
+    "specificity": 1.0,
+    "exposed_hydrophobicity": 1.0,
+    "sequence_prior": 1.0,
+    "solubility": 1.0,
+}
+
+
+def _loss_value(loss_vector: Dict[str, float], *keys: str) -> float:
+    for key in keys:
+        if key in loss_vector:
+            return max(float(loss_vector[key]), 0.0)
+    return 0.0
+
+
+def _scaled_loss_value(loss_vector: Dict[str, float], key: str, weight: float = 1.0) -> float:
+    value = _loss_value(loss_vector, key)
+    scale = ACTION_GROUP_LOSS_SCALES.get(key, 1.0)
+    return float(weight) * value / max(float(scale), 1e-8)
+
+
+def compute_de_novo_action_group_priors(
+    loss_vector: Dict[str, float],
+    temperature: float = 1.0,
+) -> Dict[str, float]:
+    """
+    根据 de novo verifier loss vector 计算 action group prior。
+
+    Stage 2 只做轻量 routing：使用当前已有 loss key 的 normalized
+    residual score，不依赖结构分组或 residue-level exposure/contact
+    fingerprint。这里必须先做 component-scale normalization，否则 PAE /
+    pLDDT 等大范围 loss 会长期压制 interface、clash 等局部问题。
+    """
+    raw_scores = {
+        "core_stabilization": (
+            _scaled_loss_value(loss_vector, "plddt")
+            + _scaled_loss_value(loss_vector, "pae")
+            + _scaled_loss_value(loss_vector, "con")
+            + _scaled_loss_value(loss_vector, "pde", weight=0.5)
+        ),
+        "compactness_repair": (
+            _scaled_loss_value(loss_vector, "rg")
+            + _scaled_loss_value(loss_vector, "pae", weight=0.25)
+        ),
+        "interface_formation": (
+            _scaled_loss_value(loss_vector, "i_pae")
+            + _scaled_loss_value(loss_vector, "i_pde")
+            + _scaled_loss_value(loss_vector, "i_con")
+        ),
+        "clash_repair": (
+            _scaled_loss_value(loss_vector, "clash")
+            + _scaled_loss_value(loss_vector, "i_clash")
+            + _scaled_loss_value(loss_vector, "bond_violation")
+            + _scaled_loss_value(loss_vector, "chainbreak")
+        ),
+        "specificity_repair": (
+            _scaled_loss_value(loss_vector, "background_contact")
+            + _scaled_loss_value(loss_vector, "decoy_margin")
+            + _scaled_loss_value(loss_vector, "specificity")
+        ),
+        "solubility_repair": (
+            _scaled_loss_value(loss_vector, "exposed_hydrophobicity")
+            + _scaled_loss_value(loss_vector, "sequence_prior")
+            + _scaled_loss_value(loss_vector, "solubility")
+        ),
+    }
+
+    scores = torch.tensor(
+        [raw_scores[group] for group in DE_NOVO_ACTION_GROUPS],
+        dtype=torch.float32,
+    )
+    priors = torch.softmax(scores / max(temperature, 1e-8), dim=0)
+    return {
+        group: float(priors[i].item())
+        for i, group in enumerate(DE_NOVO_ACTION_GROUPS)
+    }
+
+
+def select_de_novo_action_group(
+    loss_vector: Dict[str, float],
+    temperature: float = 1.0,
+) -> Dict[str, object]:
+    """
+    选择当前 de novo node 最需要修复的 action group。
+    """
+    priors = compute_de_novo_action_group_priors(loss_vector, temperature=temperature)
+    action_group = max(priors, key=priors.get)
+    return {
+        "action_group": action_group,
+        "group_prior": priors[action_group],
+        "group_priors": priors,
+    }
+
+
 def _seq_to_indices(seq: str) -> List[int]:
     """单字母序列 -> 索引列表"""
     return [AA_1_TO_IDX[aa] for aa in seq]
@@ -86,8 +229,8 @@ def compute_mutation_benefit(
     其中 c_i 是位置 i 当前的氨基酸索引。
     负值表示突变为 a 可降低 loss（有利突变）。
 
-    当 use_prior=True 时，在梯度收益上叠加 BLOSUM62 替换得分：
-      adjusted[i, a] = delta_L[i, a] + prior_strength * BLOSUM62[a, c_i]
+    当 use_prior=True 时，用 BLOSUM62 降低保守替换的有效 delta：
+      adjusted[i, a] = delta_L[i, a] - prior_strength * BLOSUM62[a, c_i]
     BLOSUM62[a, c] 为从 c 替换为 a 的演化保守性得分（正值=保守）。
     这会使演化上合理的突变（高 BLOSUM62 分）更容易被选中，
     而不合理的突变（低分或负分）被抑制。
@@ -99,7 +242,7 @@ def compute_mutation_benefit(
         prior_strength:   先验权重系数（推荐 0.05~0.2，太大则梯度信息被淹没）
 
     Returns:
-        delta_L: [L_binder, 20] 突变收益矩阵
+        delta_L: [L_binder, 20] 突变收益矩阵；后续 benefit = -delta_L。
     """
     L = grad_matrix.shape[0]
     current_grad = grad_matrix[torch.arange(L), current_indices]  # [L]
@@ -111,9 +254,293 @@ def compute_mutation_benefit(
         # 从 BLOSUM62 中按行（to）和列（from）索引
         prior_scores = BLOSUM62[:, current_indices_arr]  # [20, L]
         prior_scores = prior_scores.T  # [L, 20]
+        delta_L = delta_L - prior_strength * torch.from_numpy(prior_scores).to(delta_L)
+        # 保留自身突变 delta=0 的不变量，方便旧单元测试和下游推理。
+        delta_L[torch.arange(L), current_indices] = 0.0
+
+    return delta_L
+
+
+def compute_mutation_benefit_legacy(
+    grad_matrix: torch.Tensor,
+    current_indices: List[int],
+    use_prior: bool = True,
+    prior_strength: float = 0.1,
+) -> torch.Tensor:
+    """
+    GitHub main-compatible mutation benefit for legacy MCTS bootstrap.
+
+    This intentionally keeps the original BLOSUM62 direction used by the old
+    MCTS path. StageB uses compute_mutation_benefit(), which has the corrected
+    document-style prior direction.
+    """
+    L = grad_matrix.shape[0]
+    current_grad = grad_matrix[torch.arange(L), current_indices]
+    delta_L = grad_matrix - current_grad.unsqueeze(1)
+
+    if use_prior:
+        current_indices_arr = np.array(current_indices, dtype=np.int64)
+        prior_scores = BLOSUM62[:, current_indices_arr].T
         delta_L = delta_L + prior_strength * torch.from_numpy(prior_scores).to(delta_L)
 
     return delta_L
+
+
+def _middle_position_profile(length: int) -> torch.Tensor:
+    if length <= 1:
+        return torch.ones(length, dtype=torch.float32)
+    pos = torch.arange(length, dtype=torch.float32)
+    center = (length - 1) / 2.0
+    denom = max(center, 1.0)
+    return 1.0 - torch.abs(pos - center) / denom
+
+
+def _binary_aa_profile(indices: List[int], preferred: set) -> torch.Tensor:
+    return torch.tensor(
+        [1.0 if idx in preferred else 0.0 for idx in indices],
+        dtype=torch.float32,
+    )
+
+
+def _aa_target_profile(preferred: set, discouraged: Optional[set] = None) -> torch.Tensor:
+    profile = torch.zeros(NUM_AMINO_ACIDS, dtype=torch.float32)
+    for idx in preferred:
+        profile[idx] += 1.0
+    for idx in (discouraged or set()):
+        profile[idx] -= 1.0
+    return profile
+
+
+def _coerce_position_weights(raw_value: Any, length: int) -> Optional[torch.Tensor]:
+    if raw_value is None or length <= 0:
+        return None
+    if isinstance(raw_value, torch.Tensor):
+        values = raw_value.detach().cpu().flatten().float()
+    elif isinstance(raw_value, str):
+        text = raw_value.strip()
+        if not text or text == "unknown":
+            return None
+        if set(text) <= {"0", "1"} and len(text) == length:
+            values = torch.tensor([1.0 if ch == "1" else 0.0 for ch in text], dtype=torch.float32)
+        else:
+            parts = [part.strip() for part in text.replace(";", ",").split(",") if part.strip()]
+            try:
+                indices = [int(part) for part in parts]
+            except ValueError:
+                return None
+            values = torch.zeros(length, dtype=torch.float32)
+            for idx in indices:
+                if 0 <= idx < length:
+                    values[idx] = 1.0
+    elif isinstance(raw_value, dict):
+        values = torch.zeros(length, dtype=torch.float32)
+        for key, value in raw_value.items():
+            try:
+                idx = int(key)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < length:
+                values[idx] = float(value)
+    elif isinstance(raw_value, (list, tuple, set, np.ndarray)):
+        raw_list = list(raw_value)
+        if len(raw_list) == length and all(isinstance(v, (bool, int, float)) for v in raw_list):
+            values = torch.tensor([float(v) for v in raw_list], dtype=torch.float32)
+        else:
+            values = torch.zeros(length, dtype=torch.float32)
+            for item in raw_list:
+                try:
+                    idx = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= idx < length:
+                    values[idx] = 1.0
+    else:
+        return None
+
+    if values.numel() != length:
+        return None
+    values = torch.clamp(values, min=0.0)
+    max_value = float(values.max().item()) if values.numel() else 0.0
+    if max_value <= 0.0:
+        return None
+    return values / max_value
+
+
+ACTION_GROUP_POSITION_KEYS = {
+    "core_stabilization": (
+        "core_residue_indices",
+        "buried_residue_indices",
+        "non_interface_residue_indices",
+    ),
+    "compactness_repair": (
+        "non_interface_residue_indices",
+        "core_residue_indices",
+        "helix_bundle_residue_indices",
+    ),
+    "interface_formation": (
+        "target_facing_residue_indices",
+        "interface_residue_indices",
+        "hotspot_facing_residue_indices",
+        "antigen_facing_residue_indices",
+        "surface_residue_indices",
+    ),
+    "clash_repair": (
+        "clash_residue_indices",
+        "clash_near_residue_indices",
+        "steric_conflict_residue_indices",
+    ),
+    "specificity_repair": (
+        "background_contact_residue_indices",
+        "non_hotspot_contact_residue_indices",
+        "wrong_contact_residue_indices",
+        "interface_residue_indices",
+    ),
+    "solubility_repair": (
+        "surface_residue_indices",
+        "exposed_hydrophobic_residue_indices",
+        "solubility_residue_indices",
+    ),
+}
+
+
+def extract_action_group_position_weights(
+    sequence: str,
+    action_group: Optional[str],
+    structural_signature: Optional[Dict[str, Any]] = None,
+) -> Optional[torch.Tensor]:
+    """
+    Convert structural routing metadata into per-residue mutation weights.
+
+    The keys mirror the MCTS document's preferred mutation regions. If the
+    current verifier does not provide residue-level maps yet, this returns None
+    and the caller falls back to the existing sequence-level soft bias.
+    """
+    signature = structural_signature or {}
+    length = len(sequence)
+    for key in ACTION_GROUP_POSITION_KEYS.get(action_group or "unrouted", ()):
+        weights = _coerce_position_weights(signature.get(key), length)
+        if weights is not None:
+            return weights
+    return None
+
+
+def apply_position_weight_bias(
+    delta_L: torch.Tensor,
+    position_weights: Optional[torch.Tensor],
+    strength: float = 0.5,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    if position_weights is None or strength <= 0.0:
+        return delta_L, {"position_bias_max": 0.0, "position_bias_mean": 0.0}
+    weights = position_weights.detach().cpu().flatten().float()
+    if weights.numel() != delta_L.shape[0] or float(weights.max().item()) <= 0.0:
+        return delta_L, {"position_bias_max": 0.0, "position_bias_mean": 0.0}
+    weights = torch.clamp(weights, min=0.0)
+    weights = weights / max(float(weights.max().item()), 1e-8)
+    bonus = strength * weights.unsqueeze(1)
+    adjusted = delta_L - bonus.to(delta_L)
+    return adjusted, {
+        "position_bias_max": float(bonus.max().item()) if bonus.numel() else 0.0,
+        "position_bias_mean": float(bonus.mean().item()) if bonus.numel() else 0.0,
+    }
+
+
+def apply_position_weight_mask(
+    delta_L: torch.Tensor,
+    position_weights: Optional[torch.Tensor],
+    min_active_positions: int = 1,
+    mask_penalty: float = 1.0e6,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Restrict mutation proposals to structurally routed positions when available.
+
+    The document's action groups are region-specific: interface repair should
+    spend verifier budget on target-facing/interface-shell residues, clash
+    repair near clashes, and core repair in core/buried residues. This helper
+    makes that routing strict only when the verifier supplied a non-empty
+    residue map; otherwise callers keep the existing sequence-level soft bias.
+    """
+    if position_weights is None:
+        return delta_L, {"position_mask_active": 0.0, "position_mask_fraction": 0.0}
+
+    weights = position_weights.detach().cpu().flatten().float()
+    if weights.numel() != delta_L.shape[0]:
+        return delta_L, {"position_mask_active": 0.0, "position_mask_fraction": 0.0}
+
+    active = weights > 0.0
+    active_count = int(active.sum().item())
+    if active_count < max(int(min_active_positions), 1):
+        return delta_L, {"position_mask_active": 0.0, "position_mask_fraction": 0.0}
+
+    adjusted = delta_L.clone()
+    adjusted[~active.to(adjusted.device), :] = float(mask_penalty)
+    return adjusted, {
+        "position_mask_active": float(active_count),
+        "position_mask_fraction": float(active_count) / max(int(weights.numel()), 1),
+    }
+
+
+def apply_action_group_mutation_bias(
+    delta_L: torch.Tensor,
+    current_indices: List[int],
+    action_group: Optional[str],
+    strength: float = 0.25,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Softly bias mutation scores according to the selected action group.
+
+    This is intentionally a soft bonus rather than a hard mask. The current
+    de novo path does not yet expose residue-level hotspot or clash atom maps,
+    so the bias uses conservative sequence/position proxies:
+      - clash repair: mutate bulky current residues toward smaller residues;
+      - interface/specificity/solubility: prefer exposed-like polar/charged
+        and aromatic/polar replacements;
+      - core/compactness: prefer internal positions and compact hydrophobics.
+
+    Later structural routing can replace the position profile while keeping this
+    helper as the single place where group-specific mutation priors enter.
+    """
+    group = action_group or "unrouted"
+    if group == "unrouted" or strength <= 0.0:
+        return delta_L, {"routing_bias_max": 0.0, "routing_bias_mean": 0.0}
+
+    L = delta_L.shape[0]
+    position_bonus = torch.zeros(L, dtype=torch.float32)
+    aa_bonus = torch.zeros(NUM_AMINO_ACIDS, dtype=torch.float32)
+    current_profile = torch.zeros(L, dtype=torch.float32)
+    middle_profile = _middle_position_profile(L)
+
+    if group == "core_stabilization":
+        position_bonus = 0.6 * middle_profile
+        aa_bonus = 0.45 * _aa_target_profile(HYDROPHOBIC_AA, discouraged=CHARGED_AA | RISKY_AA)
+    elif group == "compactness_repair":
+        position_bonus = 0.5 * middle_profile
+        aa_bonus = 0.35 * _aa_target_profile(HYDROPHOBIC_AA | SMALL_AA, discouraged=CHARGED_AA | {AA_1_TO_IDX["P"]})
+    elif group == "interface_formation":
+        current_profile = _binary_aa_profile(current_indices, POLAR_CHARGED_AA | AROMATIC_AA)
+        position_bonus = 0.35 * current_profile
+        aa_bonus = 0.45 * _aa_target_profile(POLAR_CHARGED_AA | AROMATIC_AA, discouraged={AA_1_TO_IDX["C"]})
+    elif group == "clash_repair":
+        current_profile = _binary_aa_profile(current_indices, BULKY_AA)
+        position_bonus = 0.7 * current_profile
+        aa_bonus = 0.75 * _aa_target_profile(SMALL_AA, discouraged=BULKY_AA | {AA_1_TO_IDX["P"]})
+    elif group == "specificity_repair":
+        current_profile = _binary_aa_profile(current_indices, HYDROPHOBIC_AA)
+        position_bonus = 0.35 * current_profile
+        aa_bonus = 0.45 * _aa_target_profile(POLAR_CHARGED_AA | AROMATIC_AA, discouraged={AA_1_TO_IDX["C"]})
+    elif group == "solubility_repair":
+        current_profile = _binary_aa_profile(current_indices, HYDROPHOBIC_AA | {AA_1_TO_IDX["C"]})
+        position_bonus = 0.55 * current_profile
+        aa_bonus = 0.60 * _aa_target_profile(POLAR_CHARGED_AA | SMALL_AA, discouraged=HYDROPHOBIC_AA | {AA_1_TO_IDX["C"]})
+    else:
+        return delta_L, {"routing_bias_max": 0.0, "routing_bias_mean": 0.0}
+
+    bonus = strength * (position_bonus.unsqueeze(1) + aa_bonus.unsqueeze(0))
+    adjusted = delta_L - bonus.to(delta_L)
+    adjusted[torch.arange(L), current_indices] = 0.0
+    return adjusted, {
+        "routing_bias_max": float(bonus.max().item()) if bonus.numel() else 0.0,
+        "routing_bias_mean": float(bonus.mean().item()) if bonus.numel() else 0.0,
+    }
 
 
 def select_top_k_mutations(
@@ -221,6 +648,234 @@ def sample_candidate_sequences(
     return candidates[:B_candidates]
 
 
+def sample_mutation_actions(
+    current_indices: List[int],
+    positions: torch.Tensor,
+    new_aas: torch.Tensor,
+    benefits: torch.Tensor,
+    B_candidates: int,
+    T_sample: float,
+    max_mutations_per_seq: int,
+    action_group: str = "unrouted",
+    group_prior: float = 1.0,
+) -> List[MutationProposal]:
+    """
+    从 Top-K 突变中采样 MCTS action，并返回序列、edit、prior、benefit。
+
+    prior 在最终返回前会按候选集合重新归一化，供 PUCT 使用。
+    """
+    K = positions.shape[0]
+    if K == 0:
+        return []
+
+    probs = F.softmax(benefits / max(T_sample, 1e-8), dim=0)
+    proposals = []
+    seen = set()
+
+    for _ in range(B_candidates * 8):
+        if len(proposals) >= B_candidates:
+            break
+
+        n_mut = torch.randint(1, max_mutations_per_seq + 1, (1,)).item()
+        n_mut = min(n_mut, K)
+        chosen_idx = torch.multinomial(probs, n_mut, replacement=False).tolist()
+
+        seq = list(current_indices)
+        edit_by_pos = {}
+        raw_prior = 0.0
+        total_benefit = 0.0
+        for ci in chosen_idx:
+            pos = int(positions[ci].item())
+            aa = int(new_aas[ci].item())
+            old = current_indices[pos]
+            if aa == old:
+                continue
+            seq[pos] = aa
+            edit_by_pos[pos] = (old, aa)
+            raw_prior += float(probs[ci].item())
+            total_benefit += float(benefits[ci].item())
+
+        key = tuple(seq)
+        if not edit_by_pos or key == tuple(current_indices) or key in seen:
+            continue
+
+        seen.add(key)
+        edits = [
+            (
+                pos,
+                AA_1LETTER[PROTEIN_RESIDUE_NAMES[old]],
+                AA_1LETTER[PROTEIN_RESIDUE_NAMES[new]],
+            )
+            for pos, (old, new) in sorted(edit_by_pos.items())
+        ]
+        proposals.append(
+            MutationProposal(
+                sequence=_indices_to_seq(seq),
+                edits=edits,
+                prior=max(raw_prior, 1e-12),
+                benefit=total_benefit,
+                action_group=action_group,
+                group_prior=group_prior,
+            )
+        )
+
+    while len(proposals) < B_candidates and proposals:
+        proposals.append(proposals[len(proposals) % len(proposals)])
+
+    if proposals:
+        prior_sum = sum(p.prior for p in proposals)
+        proposals = [
+            MutationProposal(
+                sequence=p.sequence,
+                edits=p.edits,
+                prior=float(group_prior * p.prior / max(prior_sum, 1e-12)),
+                benefit=p.benefit,
+                action_group=p.action_group,
+                group_prior=p.group_prior,
+            )
+            for p in proposals[:B_candidates]
+        ]
+
+    return proposals[:B_candidates]
+
+
+def propose_mutation_actions(
+    grad_matrix: torch.Tensor,
+    current_seq: str,
+    K_top: int = 10,
+    B_candidates: int = 8,
+    T_sample: float = 1.0,
+    max_mutations_per_seq: int = 3,
+    use_prior: bool = True,
+    prior_strength: float = 0.1,
+    action_group: Optional[str] = None,
+    group_prior: float = 1.0,
+    routing_strength: float = 0.25,
+    structural_signature: Optional[Dict[str, Any]] = None,
+    position_weights: Optional[torch.Tensor] = None,
+    position_bias_strength: float = 0.5,
+    enforce_position_mask: bool = True,
+) -> List[MutationProposal]:
+    """
+    MCTS 专用候选生成：返回 sequence + edit metadata + PUCT prior。
+    """
+    current_indices = _seq_to_indices(current_seq)
+    grad_cpu = grad_matrix.detach().cpu()
+
+    delta_L = compute_mutation_benefit(
+        grad_cpu, current_indices,
+        use_prior=use_prior, prior_strength=prior_strength,
+    )
+    delta_L, routing_stats = apply_action_group_mutation_bias(
+        delta_L,
+        current_indices,
+        action_group=action_group,
+        strength=routing_strength,
+    )
+    if position_weights is None:
+        position_weights = extract_action_group_position_weights(
+            current_seq,
+            action_group,
+            structural_signature=structural_signature,
+        )
+    delta_L, position_stats = apply_position_weight_bias(
+        delta_L,
+        position_weights,
+        strength=position_bias_strength,
+    )
+    mask_stats = {"position_mask_active": 0.0, "position_mask_fraction": 0.0}
+    if enforce_position_mask and position_weights is not None:
+        delta_L, mask_stats = apply_position_weight_mask(
+            delta_L,
+            position_weights,
+        )
+    positions, new_aas, benefits = select_top_k_mutations(
+        delta_L, current_indices, K_top
+    )
+
+    if positions.shape[0] == 0:
+        logger.warning("No valid mutations found, returning no MCTS proposals")
+        return []
+
+    proposals = sample_mutation_actions(
+        current_indices, positions, new_aas, benefits,
+        B_candidates, T_sample, max_mutations_per_seq,
+        action_group=action_group or "unrouted",
+        group_prior=group_prior,
+    )
+    if proposals:
+        logger.info(
+            f"Proposed {len(proposals)} MCTS actions | "
+            f"group={proposals[0].action_group} P_group={group_prior:.4f} | "
+            f"Top-K={positions.shape[0]} mutations | "
+            f"Best benefit={benefits[0]:.4f} at pos {positions[0].item()} | "
+            f"best_prior={max(p.prior for p in proposals):.4f} | "
+            f"routing_bias=max:{routing_stats['routing_bias_max']:.3f},"
+            f"mean:{routing_stats['routing_bias_mean']:.3f} | "
+            f"position_bias=max:{position_stats['position_bias_max']:.3f},"
+            f"mean:{position_stats['position_bias_mean']:.3f} | "
+            f"position_mask=active:{int(mask_stats['position_mask_active'])},"
+            f"frac:{mask_stats['position_mask_fraction']:.3f}"
+        )
+    return proposals
+
+
+def propose_mutations_legacy(
+    grad_matrix: torch.Tensor,
+    current_seq: str,
+    K_top: int = 10,
+    B_candidates: int = 8,
+    T_sample: float = 1.0,
+    max_mutations_per_seq: int = 3,
+    use_prior: bool = True,
+    prior_strength: float = 0.1,
+) -> List[str]:
+    """
+    GitHub main-compatible candidate generation for StageA legacy MCTS.
+
+    Returns a plain List[str], evaluates up to B_candidates sequences, and does
+    not attach action metadata or action-group routing.
+    """
+    current_indices = _seq_to_indices(current_seq)
+    grad_cpu = grad_matrix.detach().cpu()
+
+    delta_L = compute_mutation_benefit_legacy(
+        grad_cpu,
+        current_indices,
+        use_prior=use_prior,
+        prior_strength=prior_strength,
+    )
+
+    positions, new_aas, benefits = select_top_k_mutations(
+        delta_L,
+        current_indices,
+        K_top,
+    )
+
+    if positions.shape[0] == 0:
+        logger.warning("No valid legacy mutations found, returning current sequence copies")
+        return [current_seq] * B_candidates
+
+    candidate_indices = sample_candidate_sequences(
+        current_indices,
+        positions,
+        new_aas,
+        benefits,
+        B_candidates,
+        T_sample,
+        max_mutations_per_seq,
+    )
+    candidate_seqs = [_indices_to_seq(idx_list) for idx_list in candidate_indices]
+
+    logger.info(
+        f"Proposed {len(candidate_seqs)} legacy candidates | "
+        f"Top-K={positions.shape[0]} mutations | "
+        f"Best benefit={benefits[0]:.4f} at pos {positions[0].item()}"
+    )
+
+    return candidate_seqs
+
+
 def propose_mutations(
     grad_matrix: torch.Tensor,
     current_seq: str,
@@ -253,34 +908,17 @@ def propose_mutations(
     Returns:
         B 条离散候选序列（单字母 str 列表）
     """
-    current_indices = _seq_to_indices(current_seq)
-
-    grad_cpu = grad_matrix.detach().cpu()
-
-    delta_L = compute_mutation_benefit(
-        grad_cpu, current_indices,
-        use_prior=use_prior, prior_strength=prior_strength,
+    proposals = propose_mutation_actions(
+        grad_matrix=grad_matrix,
+        current_seq=current_seq,
+        K_top=K_top,
+        B_candidates=B_candidates,
+        T_sample=T_sample,
+        max_mutations_per_seq=max_mutations_per_seq,
+        use_prior=use_prior,
+        prior_strength=prior_strength,
     )
-
-    positions, new_aas, benefits = select_top_k_mutations(
-        delta_L, current_indices, K_top
-    )
-
-    if positions.shape[0] == 0:
+    if not proposals:
         logger.warning("No valid mutations found, returning current sequence copies")
         return [current_seq] * B_candidates
-
-    candidate_indices = sample_candidate_sequences(
-        current_indices, positions, new_aas, benefits,
-        B_candidates, T_sample, max_mutations_per_seq,
-    )
-
-    candidate_seqs = [_indices_to_seq(idx_list) for idx_list in candidate_indices]
-
-    logger.info(
-        f"Proposed {len(candidate_seqs)} candidates | "
-        f"Top-K={positions.shape[0]} mutations | "
-        f"Best benefit={benefits[0]:.4f} at pos {positions[0].item()}"
-    )
-
-    return candidate_seqs
+    return [p.sequence for p in proposals]

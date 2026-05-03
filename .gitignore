@@ -146,6 +146,18 @@ A6_TCR/input/
 A6_TCR/results/
 A6_TCR/protenix_runtime/
 
+# HPC/local runtime artifacts and large model/input files
+checkpoint/
+common/
+experiments/
+Targets/
+structures/
+nohup_pid.txt
+__loss_preset_sync_tmp__/
+launch_doc_order_mcts_50step.sh
+pipeline_cdr.py
+run_hallucination_cdr.py
+
 # Benchmark runner artifacts (do not push)
 benchmark/log/
 benchmark/input/

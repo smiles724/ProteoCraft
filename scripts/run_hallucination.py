@@ -48,6 +48,8 @@ from bindcraft.hallucination.pipeline import (
     run_hybrid_hallucination,
     run_mcts_hallucination,
 )
+from bindcraft.hallucination.reproducibility import set_global_seed
+from bindcraft.utils import LOSS_WEIGHT_PRESETS
 
 
 def setup_logging(log_file: str = None, level: str = "INFO"):
@@ -91,6 +93,60 @@ def resolve_checkpoint_dir(checkpoint_dir: str = None) -> str:
 
     protenix_root = os.environ.get("PROTENIX_ROOT_DIR", os.path.expanduser("~"))
     return os.path.join(protenix_root, "checkpoint")
+
+
+def _parse_target_hotspots_1based(raw_hotspots, target_len: int, parser: argparse.ArgumentParser):
+    if raw_hotspots is None:
+        return [], []
+    raw_text = str(raw_hotspots).strip()
+    if not raw_text:
+        return [], []
+
+    positions = []
+    for token in raw_text.replace(";", ",").replace(" ", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            parts = token.split("-", 1)
+            if len(parts) != 2 or not parts[0].strip().isdigit() or not parts[1].strip().isdigit():
+                parser.error(f"--target_hotspots 中无法解析范围: {token}")
+            start = int(parts[0])
+            end = int(parts[1])
+            if start > end:
+                parser.error(f"--target_hotspots 范围起点大于终点: {token}")
+            positions.extend(range(start, end + 1))
+        else:
+            if not token.isdigit():
+                parser.error(f"--target_hotspots 只能包含 1-based 正整数或范围；检测到: {token}")
+            positions.append(int(token))
+
+    seen = set()
+    unique_positions = []
+    for pos in positions:
+        if pos < 1 or pos > target_len:
+            parser.error(
+                f"--target_hotspots 位置 {pos} 越界；当前 target 长度为 {target_len}。"
+            )
+        if pos not in seen:
+            seen.add(pos)
+            unique_positions.append(pos)
+
+    return unique_positions, [pos - 1 for pos in unique_positions]
+
+
+def _build_hotspot_params(args, parser: argparse.ArgumentParser):
+    residues_1based, concat_indices = _parse_target_hotspots_1based(
+        args.target_hotspots,
+        len(args.target),
+        parser,
+    )
+    if not concat_indices:
+        return None
+    return {
+        "target_hotspot_residues_1based": residues_1based,
+        "target_hotspot_concat_indices": concat_indices,
+    }
 
 
 def load_protenix_model(
@@ -181,6 +237,8 @@ def main():
                        help="模型名称")
     parser.add_argument("--checkpoint_dir", type=str, default=None,
                        help="Checkpoint 目录；默认依次读取 --checkpoint_dir、PROTENIX_CHECKPOINT_DIR、PROTENIX_ROOT_DIR/checkpoint")
+    parser.add_argument("--save_checkpoint_dir", type=str, default=None,
+                       help="中间优化 step 的 checkpoint 保存目录（仅用于优化过程保存，不用于模型权重加载）")
     parser.add_argument("--dtype", type=str, default="bf16",
                        choices=["bf16", "fp32"],
                        help="模型计算精度（默认：bf16）")
@@ -193,6 +251,10 @@ def main():
                        help="日志级别（默认：INFO；排错可用 DEBUG）")
     parser.add_argument("--init_binder_seq", type=str, default=None,
                        help="可选的初始 Binder 单字母序列；长度必须与 --binder_length 一致")
+    parser.add_argument("--target_hotspots", type=str, default=None,
+                       help="Target hotspot residues，使用 1-based 序号；支持逗号/空格/范围，如 10,11,45-47")
+    parser.add_argument("--seed", type=int, default=42,
+                       help="随机种子；用于固定 Phase0、mutation sampling 和 verifier diffusion（默认：42）")
 
     # === 混合模式专用参数 ===
     parser.add_argument("--k_top", type=int, default=10,
@@ -219,6 +281,21 @@ def main():
     parser.add_argument("--mcts_max_nodes", type=int, default=5000, help="MCTS 树最大节点数（默认：5000）")
     parser.add_argument("--mcts_tau_fixed", type=float, default=4.0, help="MCTS 固定扩散 tau（默认：4.0）")
     parser.add_argument("--mcts_num_beams", type=int, default=8, help="MCTS Phase0 根节点数 / beam（默认：8）")
+    parser.add_argument("--mcts_strategy", type=str, default="two_stage",
+                       choices=["legacy", "strict", "two_stage"],
+                       help="MCTS 策略：legacy 原版 / strict 文档版 / two_stage 两阶段（默认：two_stage）")
+    parser.add_argument("--mcts_bootstrap_steps", type=int, default=50,
+                       help="two_stage: StageA 原版 MCTS 至少运行步数（默认：50）")
+    parser.add_argument("--mcts_bootstrap_patience", type=int, default=10,
+                       help="two_stage: StageA 停滞 patience（默认：10）")
+    parser.add_argument("--mcts_bootstrap_min_delta", type=float, default=0.02,
+                       help="two_stage: 判断 StageA 有效改善的 loss 阈值（默认：0.02）")
+    parser.add_argument("--mcts_bootstrap_max_steps", type=int, default=80,
+                       help="two_stage: StageA 最大运行步数（默认：80）")
+    parser.add_argument("--mcts_handoff_top_k", type=int, default=None,
+                       help="two_stage: 交给 StageB 的 top 序列数（默认：mcts_num_beams）")
+    parser.add_argument("--mcts_expand_actions_per_step", type=int, default=2,
+                       help="MCTS StageB 每步最多扩展并验证的 action 数（默认：2）")
     parser.add_argument("--chunk_size", type=int, default=None,
                        help="Attention 分块（MCTS 一阶/零阶）；大复合物可设 256 避免 OOM（默认：None）")
     parser.add_argument("--use_prior", type=lambda x: x.lower() == "true", default=True,
@@ -226,6 +303,9 @@ def main():
     parser.add_argument("--prior_strength", type=float, default=0.1, help="MCTS：先验强度（默认：0.1）")
 
     # === 损失函数权重（key 必须与 DEFAULT_LOSS_WEIGHTS 一致） ===
+    parser.add_argument("--loss_preset", type=str, default="tuned",
+                       choices=sorted(LOSS_WEIGHT_PRESETS.keys()),
+                       help="Loss 权重预设：default 原默认 / tuned 调优版（默认：tuned）")
     parser.add_argument("--w_plddt", type=float, default=None, help="pLDDT 权重")
     parser.add_argument("--w_pae", type=float, default=None, help="pAE (intra) 权重")
     parser.add_argument("--w_i_pae", type=float, default=None, help="i_pAE (inter) 权重")
@@ -256,8 +336,18 @@ def main():
                 f"检测到非法字符: {','.join(invalid)}"
             )
 
+    hotspot_params = _build_hotspot_params(args, parser)
+
     setup_logging(args.log_file, level=args.log_level)
     os.makedirs(args.output_dir, exist_ok=True)
+    set_global_seed(args.seed)
+    logging.info("Random seed fixed to %s", args.seed)
+    if hotspot_params is not None:
+        logging.info(
+            "Hotspot-aware routing enabled: target_hotspots_1based=%s target_concat_indices_0based=%s",
+            hotspot_params["target_hotspot_residues_1based"],
+            hotspot_params["target_hotspot_concat_indices"],
+        )
 
     model, configs = load_protenix_model(
         args.model_name,
@@ -266,8 +356,11 @@ def main():
         model_dtype=args.dtype,
     )
 
-    # 组装 loss_weights: 仅覆盖 CLI 显式指定的项，其余保持 DEFAULT_LOSS_WEIGHTS
+    # 组装 loss_weights: default 不覆盖；非 default preset 覆盖整套权重。
+    # 单独的 --w_* 参数始终具有最高优先级。
     loss_weights = {}
+    if args.loss_preset != "default":
+        loss_weights.update(LOSS_WEIGHT_PRESETS[args.loss_preset])
     weight_arg_map = {
         "plddt": args.w_plddt, "pae": args.w_pae, "i_pae": args.w_i_pae,
         "con": args.w_con, "i_con": args.w_i_con, "iptm": args.w_iptm,
@@ -290,6 +383,8 @@ def main():
             device=torch.device(args.device),
             loss_weights=loss_weights,
             init_binder_seq=args.init_binder_seq,
+            hotspot_params=hotspot_params,
+            seed=args.seed,
         )
     elif args.mode == "hybrid":
         best_seq, final_seq, losses_history = run_hybrid_hallucination(
@@ -311,6 +406,8 @@ def main():
             use_tau_scheduling=args.use_tau_scheduling,
             tau_jitter=args.tau_jitter,
             init_binder_seq=args.init_binder_seq,
+            hotspot_params=hotspot_params,
+            seed=args.seed,
         )
     else:
         best_seq, final_seq, losses_history = run_mcts_hallucination(
@@ -333,11 +430,20 @@ def main():
             use_prior=args.use_prior,
             prior_strength=args.prior_strength,
             init_binder_seq=args.init_binder_seq,
-            hotspot_params=None,
+            hotspot_params=hotspot_params,
             chunk_size=args.chunk_size,
             mcts_C=args.mcts_c,
             mcts_max_nodes=args.mcts_max_nodes,
             mcts_tau_fixed=args.mcts_tau_fixed,
+            mcts_strategy=args.mcts_strategy,
+            mcts_bootstrap_steps=args.mcts_bootstrap_steps,
+            mcts_bootstrap_patience=args.mcts_bootstrap_patience,
+            mcts_bootstrap_min_delta=args.mcts_bootstrap_min_delta,
+            mcts_bootstrap_max_steps=args.mcts_bootstrap_max_steps,
+            mcts_handoff_top_k=args.mcts_handoff_top_k,
+            mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
+            checkpoint_dir=args.save_checkpoint_dir,
+            seed=args.seed,
         )
 
     output_file = os.path.join(args.output_dir, "hallucination_result.txt")
@@ -349,7 +455,13 @@ def main():
         f.write(f"Learning Rate: {args.learning_rate}\n")
         f.write(f"Tau Noise: {args.tau_noise}\n")
         f.write(f"Checkpoint Dir: {resolve_checkpoint_dir(args.checkpoint_dir)}\n")
+        f.write(f"Save Checkpoint Dir: {args.save_checkpoint_dir or 'DISABLED'}\n")
+        f.write(f"MCTS Strategy: {args.mcts_strategy}\n")
+        f.write(f"MCTS Bootstrap Steps: {args.mcts_bootstrap_steps}\n")
+        f.write(f"MCTS Bootstrap Max Steps: {args.mcts_bootstrap_max_steps}\n")
+        f.write(f"MCTS Expand Actions Per Step: {args.mcts_expand_actions_per_step}\n")
         f.write(f"Initial Binder Sequence: {args.init_binder_seq or 'RANDOM'}\n")
+        f.write(f"Target Hotspots 1-based: {args.target_hotspots or 'NONE'}\n")
         f.write(f"\n")
         f.write(f"Best Sequence: {best_seq}\n")
         f.write(f"Final Sequence: {final_seq}\n")
@@ -375,7 +487,7 @@ if __name__ == "__main__":
 
     try:
         main()
-    except BaseException:
+    except Exception:
         traceback.print_exc()
         sys.stdout.flush()
         sys.stderr.flush()

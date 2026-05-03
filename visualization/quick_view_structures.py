@@ -28,25 +28,22 @@ def generate_html(pdb_contents, step_nums):
 
     viewers = []
     for i, (pdb_data, step_num) in enumerate(zip(pdb_contents, step_nums)):
-        # Escape PDB for JS embedding
-        pdb_escaped = pdb_data.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
         viewers.append(f"""
-        <div style="display:inline-block; margin:10px; text-align:center;">
+        <section class="viewer-card">
             <h3>Step {step_num}</h3>
-            <div id="viewer_{i}" style="width:500px; height:400px; border:1px solid #ccc;"></div>
-        </div>""")
+            <div id="viewer_{i}" class="viewer"></div>
+        </section>""")
 
     viewer_scripts = []
     for i, (pdb_data, step_num) in enumerate(zip(pdb_contents, step_nums)):
         pdb_escaped = pdb_data.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
         viewer_scripts.append(f"""
-            var viewer_{i} = $3Dmol.createViewer(document.getElementById("viewer_{i}"), {{backgroundColor: "white"}});
+            var viewer_{i} = $3Dmol.createViewer("viewer_{i}", {{backgroundColor: "white"}});
             viewer_{i}.addModel(`{pdb_escaped}`, "pdb");
-            // Binder (chain A) — colored by spectrum
             viewer_{i}.setStyle({{chain: "A"}}, {{cartoon: {{color: "spectrum"}}}});
-            // Target (chain B) — gray
             viewer_{i}.setStyle({{chain: "B"}}, {{cartoon: {{color: "gray"}}}});
             viewer_{i}.zoomTo();
+            viewer_{i}.resize();
             viewer_{i}.render();""")
 
     html = f"""<!DOCTYPE html>
@@ -55,11 +52,56 @@ def generate_html(pdb_contents, step_nums):
     <meta charset="utf-8">
     <title>BindCraft v2 — Structure Viewer</title>
     <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 24px;
+            color: #111;
+            background: #fafafa;
+        }}
+        h2 {{
+            margin: 0 0 8px;
+        }}
+        p {{
+            margin: 0 0 24px;
+        }}
+        .viewer-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(520px, 1fr));
+            gap: 24px;
+            align-items: start;
+        }}
+        .viewer-card {{
+            background: #fff;
+            border: 1px solid #d4d4d4;
+            padding: 12px;
+        }}
+        .viewer-card h3 {{
+            margin: 0 0 10px;
+            text-align: center;
+        }}
+        .viewer {{
+            position: relative;
+            width: 100%;
+            height: 430px;
+            border: 1px solid #ccc;
+            overflow: hidden;
+            background: #fff;
+        }}
+        .viewer canvas {{
+            position: absolute !important;
+            left: 0 !important;
+            top: 0 !important;
+            width: 100% !important;
+            height: 100% !important;
+        }}
+    </style>
 </head>
-<body style="font-family: Arial, sans-serif; padding: 20px;">
+<body>
     <h2>BindCraft v2 — Hallucination Trajectory Structures</h2>
     <p>Binder (chain A): rainbow spectrum &nbsp;|&nbsp; Target (chain B): gray &nbsp;|&nbsp; 可鼠标旋转/缩放</p>
-    <div>
+    <div class="viewer-grid">
         {"".join(viewers)}
     </div>
     <script>
