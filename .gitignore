@@ -172,6 +172,16 @@ benchmark/results/analysis/**/*.html
 benchmark/results/analysis/**/*.png
 benchmark/results/analysis/**/__pycache__/
 
+# Analysis artifacts that can be huge (do not push)
+benchmark/results/analysis/**/checkpoints/
+benchmark/results/analysis/**/checkpoints/**
+benchmark/results/analysis/loss_history/
+benchmark/results/analysis/loss_history/**
+
+# Local PDB cache (do not push)
+inputs/pdb_cache/
+inputs/pdb_cache/**
+
 # Generated attention cache (if present)
 protenix/model/tri_attention/TriAttentionCache/
 

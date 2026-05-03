@@ -1,16 +1,13 @@
 """
 BindCraft v2 - 几何 Loss 函数
 
-对标原版 BindCraft 的 Rg loss 和 Helix loss。
+对标原版 BindCraft 的 Rg / Helix loss，并补充 soft clash loss。
 Rg 使用动态目标值 2.38 * N^0.365 + elu 惩罚。
 Helix 使用 distogram 计算 i-(i+3) 接触概率。
 """
 
 import torch
 import torch.nn.functional as F
-import logging
-
-logger = logging.getLogger(__name__)
 
 
 def compute_rg_loss(
@@ -38,6 +35,7 @@ def compute_helix_loss(
     binder_token_mask: torch.Tensor,
     distogram_params: dict,
     cutoff: float = 6.0,
+    residue_index: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Helix loss（对标原版 BindCraft add_helix_loss）。
@@ -70,53 +68,19 @@ def compute_helix_loss(
         return torch.tensor(0.0, device=prob.device, requires_grad=True)
 
     binder_idx = binder_token_mask.nonzero(as_tuple=True)[0]
-    i_idx = binder_idx[:-3]
-    j_idx = binder_idx[3:]
+    if residue_index is not None:
+        res_idx = residue_index[binder_idx]
+        offset = res_idx.unsqueeze(1) - res_idx.unsqueeze(0)
+        pair_pos = (offset == 3).nonzero(as_tuple=False)
+        if pair_pos.shape[0] == 0:
+            return torch.tensor(0.0, device=prob.device, requires_grad=True)
+        i_idx = binder_idx[pair_pos[:, 1]]
+        j_idx = binder_idx[pair_pos[:, 0]]
+    else:
+        i_idx = binder_idx[:-3]
+        j_idx = binder_idx[3:]
     helix_vals = helix_pair_loss[i_idx, j_idx]
     return helix_vals.mean()
-
-
-def compute_hotspot_distance_loss(
-    x0_flat: torch.Tensor,
-    binder_atom_mask: torch.Tensor,
-    hotspot_target_atom_mask: torch.Tensor,
-    cutoff: float = 8.0,
-    top_k: int = 3,
-) -> tuple[torch.Tensor, dict]:
-    """
-    hotspot 距离约束：鼓励 binder 靠近指定 target hotspot 残基。
-
-    对每个 hotspot representative atom 计算其到 binder representative atoms 的最小距离，
-    再对最靠近的 top-k 个 hotspot 距离取均值，最后用 relu(distance-cutoff) 作为惩罚。
-    """
-    binder_coords = x0_flat[binder_atom_mask]
-    hotspot_coords = x0_flat[hotspot_target_atom_mask]
-
-    if binder_coords.shape[0] == 0 or hotspot_coords.shape[0] == 0:
-        zero = torch.tensor(0.0, device=x0_flat.device, requires_grad=True)
-        return zero, {
-            "hotspot_min_distance": zero,
-            "hotspot_mean_min_distance": zero,
-        }
-
-    dist = torch.cdist(hotspot_coords, binder_coords)
-    min_dist_per_hotspot = dist.min(dim=1).values
-    hotspot_min_distance = min_dist_per_hotspot.min()
-
-    if top_k is None or top_k <= 0 or top_k >= min_dist_per_hotspot.shape[0]:
-        hotspot_mean_min_distance = min_dist_per_hotspot.mean()
-    else:
-        hotspot_mean_min_distance = torch.topk(
-            min_dist_per_hotspot,
-            k=top_k,
-            largest=False,
-        ).values.mean()
-
-    hotspot_loss = torch.relu(hotspot_mean_min_distance - cutoff)
-    return hotspot_loss, {
-        "hotspot_min_distance": hotspot_min_distance,
-        "hotspot_mean_min_distance": hotspot_mean_min_distance,
-    }
 
 
 def compute_soft_clash_loss(
@@ -128,6 +92,10 @@ def compute_soft_clash_loss(
     mode: str = "intra",
     r_clash: float = 2.0,
     bond_sep: int = 1,
+    atom_mask_a: torch.Tensor = None,
+    atom_mask_b: torch.Tensor = None,
+    detach_b: bool = False,
+    exclude_bonded: bool = None,
 ) -> torch.Tensor:
     """
     Soft clash penalty: quadratic repulsion for atom pairs closer than r_clash.
@@ -147,6 +115,37 @@ def compute_soft_clash_loss(
         r_clash: clash distance threshold (Angstrom)
         bond_sep: minimum residue separation to consider (intra only)
     """
+    if atom_mask_a is not None or atom_mask_b is not None:
+        if atom_mask_a is None or atom_mask_b is None:
+            raise ValueError("atom_mask_a and atom_mask_b must be provided together")
+        coords_a = x0_flat[atom_mask_a]
+        coords_b = x0_flat[atom_mask_b]
+        if detach_b:
+            coords_b = coords_b.detach()
+        n_a = coords_a.shape[0]
+        if n_a == 0 or coords_b.shape[0] == 0:
+            return torch.tensor(0.0, device=x0_flat.device, requires_grad=True)
+
+        dist = torch.cdist(coords_a, coords_b)
+        clash = torch.clamp(r_clash - dist, min=0) ** 2
+
+        if exclude_bonded is None:
+            exclude_bonded = mode == "intra"
+        if exclude_bonded:
+            token_a = atom_to_token_idx[atom_mask_a]
+            token_b = atom_to_token_idx[atom_mask_b]
+            res_a = residue_index[token_a]
+            res_b = residue_index[token_b]
+            sep = (res_a.unsqueeze(1) - res_b.unsqueeze(0)).abs()
+            valid = sep > bond_sep
+            if atom_mask_a.shape == atom_mask_b.shape and torch.equal(atom_mask_a, atom_mask_b):
+                valid.fill_diagonal_(False)
+            clash = clash * valid.float()
+            denom = valid.sum().clamp(min=1)
+            return clash.sum() / denom
+
+        return clash.sum() / n_a
+
     if mode == "inter":
         coords_a = x0_flat[binder_atom_mask]
         coords_b = x0_flat[target_atom_mask]

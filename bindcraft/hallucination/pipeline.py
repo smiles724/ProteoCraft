@@ -234,6 +234,7 @@ def run_hallucination(
     init_binder_seq: str = None,
     hotspot_params: Optional[Dict] = None,
     seed: Optional[int] = 42,
+    target_template_path: Optional[str] = None,
 ) -> Tuple[str, str, List[float]]:
     """
     运行 Hallucination 优化循环
@@ -248,6 +249,7 @@ def run_hallucination(
         device: 计算设备
         loss_weights: Loss 权重字典
         init_binder_seq: 可选的初始 Binder 单字母序列
+        target_template_path: 可选 target template 结构文件
 
     Returns:
         best_seq: 最佳序列
@@ -333,7 +335,8 @@ def run_hallucination(
             model=model,
             target_seq=target_seq,
             device=device,
-            tau_temp=tau_temp
+            tau_temp=tau_temp,
+            target_template_path=target_template_path,
         )
 
         # ── 模块 B：单步外推 ─────────────────────────────────────────────
@@ -482,6 +485,7 @@ def run_hybrid_hallucination(
     checkpoint_dir: str = None,
     hotspot_params: Optional[Dict] = None,
     seed: Optional[int] = 42,
+    target_template_path: Optional[str] = None,
 ) -> Tuple[str, str, List[float]]:
     """
     混合优化循环：一阶梯度引导离散候选 + 零阶全链路验证 + 接受准则。
@@ -655,6 +659,7 @@ def run_hybrid_hallucination(
         contact_params=contact_params,
         hotspot_params=hotspot_params,
         seed=_verifier_seed(seed, target_seq, init_binder),
+        target_template_path=target_template_path,
     )
     logger.info(
         f"  初始零阶 total_loss={init_zeroth.total_loss:.4f} | "
@@ -731,6 +736,7 @@ def run_hybrid_hallucination(
             s_binder, current_seq, input_feature_dict = ste_bridge(
                 theta=thetas[b], W_AAE=W_AAE, model=model,
                 target_seq=target_seq, device=device, tau_temp=tau_temp,
+                target_template_path=target_template_path,
             )
 
             if use_tau_fusion:
@@ -851,6 +857,7 @@ def run_hybrid_hallucination(
                 contact_params=contact_params,
                 hotspot_params=hotspot_params,
                 seed=_verifier_seed(seed, target_seq, cand_seq),
+                target_template_path=target_template_path,
             )
             all_zeroth_results.append(result)
             beam_src = all_candidate_beams[idx]
@@ -1326,6 +1333,7 @@ def run_mcts_hallucination(
     mcts_handoff_top_k: Optional[int] = None,
     mcts_expand_actions_per_step: int = MCTS_STAGE2_EXPAND_ACTIONS_PER_STEP,
     seed: Optional[int] = 42,
+    target_template_path: Optional[str] = None,
 ) -> Tuple[str, str, List[float]]:
     """
     MCTS 调度的混合优化：UCB 选点 + 一阶提议 + 零阶验证 + Expansion/Backprop/Prune。
@@ -1490,6 +1498,7 @@ def run_mcts_hallucination(
             chunk_size=chunk_size,
             hotspot_params=hotspot_params,
             seed=_verifier_seed(seed, target_seq, tseq),
+            target_template_path=target_template_path,
         )
         phase0_results.append((tseq, result))
         verifier_cache[result.binder_seq] = result
@@ -1710,6 +1719,7 @@ def run_mcts_hallucination(
                     chunk_size=chunk_size,
                     hotspot_params=hotspot_params,
                     seed=_verifier_seed(seed, target_seq, cand_seq),
+                    target_template_path=target_template_path,
                 )
                 verifier_cache[result.binder_seq] = result
                 all_zeroth_results.append(result)
@@ -1915,6 +1925,7 @@ def run_mcts_hallucination(
             target_seq=target_seq,
             device=device,
             tau_temp=tau_temp,
+            target_template_path=target_template_path,
         )
 
         x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
@@ -2121,6 +2132,7 @@ def run_mcts_hallucination(
                 chunk_size=chunk_size,
                 hotspot_params=hotspot_params,
                 seed=_verifier_seed(seed, target_seq, proposal.sequence),
+                target_template_path=target_template_path,
             )
             mcts_tree.store_verifier_result(result)
             all_zeroth_results.append(result)

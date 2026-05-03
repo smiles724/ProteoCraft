@@ -8,7 +8,8 @@ BindCraft v2 - 入口脚本
         --binder_length 40 \
         --n_steps 200 \
         --learning_rate 0.05 \
-        --tau_noise 4.0
+        --tau_noise 4.0 \
+        --w_i_con 3.0
 
 使用方法（混合 1st+0th 模式）:
     python scripts/run_hallucination.py \
@@ -27,10 +28,8 @@ BindCraft v2 - 入口脚本
         --t_min 0.01 \
         --use_tau_scheduling true \
         --tau_jitter true \
-        --lambda_dist 2.0 \
-        --lambda_clash 1.0 \
-        --lambda_iptm -1.0 \
-        --lambda_plddt -0.5
+        --w_i_pae 0.1 \
+        --w_i_con 3.0
 """
 
 import os
@@ -255,6 +254,8 @@ def main():
                        help="Target hotspot residues，使用 1-based 序号；支持逗号/空格/范围，如 10,11,45-47")
     parser.add_argument("--seed", type=int, default=42,
                        help="随机种子；用于固定 Phase0、mutation sampling 和 verifier diffusion（默认：42）")
+    parser.add_argument("--target_template_path", type=str, default=None,
+                       help="可选 target template 结构文件（.cif/.mmcif/.pdb），只作用于 target 链")
 
     # === 混合模式专用参数 ===
     parser.add_argument("--k_top", type=int, default=10,
@@ -385,6 +386,7 @@ def main():
             init_binder_seq=args.init_binder_seq,
             hotspot_params=hotspot_params,
             seed=args.seed,
+            target_template_path=args.target_template_path,
         )
     elif args.mode == "hybrid":
         best_seq, final_seq, losses_history = run_hybrid_hallucination(
@@ -408,6 +410,7 @@ def main():
             init_binder_seq=args.init_binder_seq,
             hotspot_params=hotspot_params,
             seed=args.seed,
+            target_template_path=args.target_template_path,
         )
     else:
         best_seq, final_seq, losses_history = run_mcts_hallucination(
@@ -444,6 +447,7 @@ def main():
             mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
             checkpoint_dir=args.save_checkpoint_dir,
             seed=args.seed,
+            target_template_path=args.target_template_path,
         )
 
     output_file = os.path.join(args.output_dir, "hallucination_result.txt")
@@ -462,6 +466,7 @@ def main():
         f.write(f"MCTS Expand Actions Per Step: {args.mcts_expand_actions_per_step}\n")
         f.write(f"Initial Binder Sequence: {args.init_binder_seq or 'RANDOM'}\n")
         f.write(f"Target Hotspots 1-based: {args.target_hotspots or 'NONE'}\n")
+        f.write(f"Target Template Path: {args.target_template_path or 'None'}\n")
         f.write(f"\n")
         f.write(f"Best Sequence: {best_seq}\n")
         f.write(f"Final Sequence: {final_seq}\n")

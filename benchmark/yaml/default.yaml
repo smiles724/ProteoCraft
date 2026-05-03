@@ -19,6 +19,13 @@ t_init: 1.0
 t_min: 0.01
 use_tau_scheduling: true
 tau_jitter: true
+mcts_c: 1.0
+mcts_max_nodes: 5000
+mcts_tau_fixed: 4.0
+mcts_num_beams: 8
+chunk_size: null
+use_prior: true
+prior_strength: 0.1
 target_hotspot_residues: "B57-63"
 entry_ids: ["alpha_patch_19_23_batch_0"]
 skip_existing: false
