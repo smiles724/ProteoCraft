@@ -1,0 +1,11 @@
+This directory contains code derived from
+NVIDIA-Digital-Bio/proteina-complexa (Apache-2.0).
+
+Source: https://github.com/NVIDIA-Digital-Bio/proteina-complexa
+Reference file: src/proteinfoundation/evaluation/binder_eval_utils.py
+Vendor date: 2026-05-01
+
+This is a clean reimplementation in BioPython, not a verbatim copy.
+The chain extraction / sequence / Cα coordinate functions follow the same
+public API contract as the upstream functions but were written from
+scratch to keep the dependency surface minimal (no Hydra config).

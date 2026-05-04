@@ -1,0 +1,8 @@
+{
+  "method": "BCv1",
+  "paper_cases": [
+    "PD1", "PDL1", "IFNAR2", "BetV1", "DerF7", "DerF21", "HER2", "SpCas9",
+    "TCR_1QRN", "TCR_3QDJ", "TCR_5BS0", "TCR_6BJ8", "TCR_9C3E"
+  ],
+  "_comment": "13 paper_cases per BCv1 paper SI Table 1; report.py uses this to fill missing paper_cases as _NO_DESIGNS stubs"
+}
