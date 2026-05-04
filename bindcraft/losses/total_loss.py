@@ -9,7 +9,7 @@ BindCraft v2 - 统一 Loss 计算
 """
 
 import torch
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple, Any, List, Optional
 
 from protenix.model import sample_confidence
 
@@ -24,6 +24,80 @@ from bindcraft.losses.geometry import (
     compute_helix_loss,
     compute_soft_clash_loss,
 )
+
+
+def _normalize_task_type(task_type: Optional[str]) -> Optional[str]:
+    if task_type is None:
+        return None
+    normalized = str(task_type).strip().lower()
+    aliases = {
+        "de_novo": "type2",
+        "denovo": "type2",
+        "binder": "type2",
+        "scaffold_redesign": "type1",
+        "cdr": "type1",
+        "pmhc": "type3",
+        "tcr_mimic": "type3",
+        "tcr-mimic": "type3",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"type1", "type2", "type3"}:
+        raise ValueError(f"未知 task_type: {task_type}")
+    return normalized
+
+
+def _target_chain_masks_in_order(
+    asym_id: torch.Tensor,
+    binder_chain_id: torch.Tensor,
+) -> List[torch.Tensor]:
+    chain_ids: List[int] = []
+    for value in asym_id.detach().cpu().tolist():
+        chain_id = int(value)
+        if chain_id == int(binder_chain_id.detach().cpu().item()):
+            continue
+        if chain_id not in chain_ids:
+            chain_ids.append(chain_id)
+    return [asym_id == chain_id for chain_id in chain_ids]
+
+
+def _normalize_target_chain_roles(target_chain_roles: Any) -> List[str]:
+    if target_chain_roles is None:
+        raise ValueError("task_type='type3' requires target_chain_roles")
+    if isinstance(target_chain_roles, str):
+        raw_roles = [part.strip() for part in target_chain_roles.split(",") if part.strip()]
+    else:
+        raw_roles = [str(role).strip() for role in target_chain_roles]
+
+    normalized_roles = []
+    for role in raw_roles:
+        role_l = role.lower()
+        if role_l in {"p", "pep", "peptide"}:
+            normalized_roles.append("peptide")
+        elif role_l in {"h", "hla", "mhc", "m", "background"}:
+            normalized_roles.append("hla")
+        else:
+            raise ValueError(f"未知 target chain role: {role}")
+    return normalized_roles
+
+
+def _normalize_type1_partner_chain_roles(target_chain_roles: Any) -> List[str]:
+    if target_chain_roles is None:
+        return []
+    if isinstance(target_chain_roles, str):
+        raw_roles = [part.strip() for part in target_chain_roles.split(",") if part.strip()]
+    else:
+        raw_roles = [str(role).strip() for role in target_chain_roles]
+
+    normalized_roles = []
+    for role in raw_roles:
+        role_l = role.lower()
+        if role_l in {"a", "ag", "antigen", "target", "t", "pep", "peptide"}:
+            normalized_roles.append("target")
+        elif role_l in {"s", "scaffold", "context", "fixed", "background"}:
+            normalized_roles.append("scaffold")
+        else:
+            raise ValueError(f"未知 target/scaffold chain role: {role}")
+    return normalized_roles
 
 
 def compute_all_losses(
@@ -43,6 +117,8 @@ def compute_all_losses(
     clash_params: Dict[str, float] = None,
     hotspot_params: Dict[str, Any] = None,
     opt_token_mask: torch.Tensor = None,
+    task_type: str = None,
+    target_chain_roles: Optional[List[str]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     在给定的全原子坐标和 confidence logits 上计算全部 12 项 loss。
@@ -64,6 +140,10 @@ def compute_all_losses(
         clash_params:      碰撞 loss 参数 (r_clash, bond_sep) (None to skip)
         opt_token_mask:    可选优化区域 mask。None 表示整个 binder 参与 loss；
                            长度可为 binder token 数或全 token 数。
+        task_type:         可选任务类型；"type3" 启用 pMHC peptide/HLA 边界。
+        target_chain_roles: Type III 时为 target 链角色，如 ["peptide", "hla"]；
+                           CDR/Type I 时可传 ["target", "scaffold"]，按非 binder 链顺序
+                           把抗原和固定外部 scaffold 拆开。
 
     Returns:
         total_loss: 加权总 loss（标量 tensor）
@@ -76,7 +156,30 @@ def compute_all_losses(
     asym_id = input_feature_dict["asym_id"]
     binder_chain_id = asym_id[0]
     binder_token_mask = asym_id == binder_chain_id
-    target_token_mask = ~binder_token_mask
+    partner_token_mask = ~binder_token_mask
+    target_token_mask = partner_token_mask
+    normalized_task = _normalize_task_type(task_type)
+    is_type3 = normalized_task == "type3"
+    partner_chain_masks = _target_chain_masks_in_order(asym_id, binder_chain_id)
+
+    external_scaffold_token_mask = torch.zeros_like(target_token_mask, dtype=torch.bool)
+    has_type1_partner_roles = False
+    if target_chain_roles is not None and not is_type3:
+        roles = _normalize_type1_partner_chain_roles(target_chain_roles)
+        if len(roles) != len(partner_chain_masks):
+            raise ValueError(
+                f"target_chain_roles length {len(roles)} must equal non-binder chain count "
+                f"{len(partner_chain_masks)}"
+            )
+        target_token_mask = torch.zeros_like(partner_token_mask, dtype=torch.bool)
+        for role, chain_mask in zip(roles, partner_chain_masks):
+            if role == "target":
+                target_token_mask = target_token_mask | chain_mask
+            elif role == "scaffold":
+                external_scaffold_token_mask = external_scaffold_token_mask | chain_mask
+        if target_token_mask.sum() == 0:
+            raise ValueError("target_chain_roles must mark at least one non-binder chain as target")
+        has_type1_partner_roles = True
 
     design_token_mask = binder_token_mask
     local_redesign = False
@@ -100,7 +203,10 @@ def compute_all_losses(
         if (design_token_mask & ~binder_token_mask).any():
             raise ValueError("opt_token_mask may only select binder tokens")
         local_redesign = bool((design_token_mask != binder_token_mask).any().item())
-    scaffold_token_mask = binder_token_mask & ~design_token_mask
+    if is_type3 and local_redesign:
+        raise ValueError("task_type='type3' does not support opt_token_mask; Type III optimizes the full binder")
+    binder_scaffold_token_mask = binder_token_mask & ~design_token_mask
+    scaffold_token_mask = binder_scaffold_token_mask | external_scaffold_token_mask
 
     binder_atom_mask = binder_token_mask[atom_to_token]
     target_atom_mask = target_token_mask[atom_to_token]
@@ -124,7 +230,7 @@ def compute_all_losses(
     _hotspot_params = hotspot_params or {}
     hotspot_concat_indices = _hotspot_params.get("target_hotspot_concat_indices") or []
     if hotspot_concat_indices:
-        target_token_indices = target_token_mask.nonzero(as_tuple=True)[0]
+        target_token_indices = partner_token_mask.nonzero(as_tuple=True)[0]
         invalid_indices = [
             int(index) for index in hotspot_concat_indices
             if int(index) < 0 or int(index) >= target_token_indices.shape[0]
@@ -143,12 +249,40 @@ def compute_all_losses(
         hotspot_token_mask = torch.zeros_like(target_token_mask, dtype=torch.bool)
         hotspot_token_mask[hotspot_token_indices] = True
 
+    peptide_token_mask = None
+    hla_token_mask = None
+    hla_pair_mask = None
+    if is_type3:
+        roles = _normalize_target_chain_roles(target_chain_roles)
+        if len(roles) != len(partner_chain_masks):
+            raise ValueError(
+                f"target_chain_roles length {len(roles)} must equal target chain count {len(partner_chain_masks)}"
+            )
+        peptide_token_mask = torch.zeros_like(partner_token_mask, dtype=torch.bool)
+        hla_token_mask = torch.zeros_like(partner_token_mask, dtype=torch.bool)
+        for role, chain_mask in zip(roles, partner_chain_masks):
+            if role == "peptide":
+                peptide_token_mask = peptide_token_mask | chain_mask
+            elif role == "hla":
+                hla_token_mask = hla_token_mask | chain_mask
+        if peptide_token_mask.sum() == 0:
+            raise ValueError("task_type='type3' requires at least one peptide chain")
+        if hla_token_mask.sum() == 0:
+            raise ValueError("task_type='type3' requires at least one HLA/MHC chain")
+        if hotspot_token_mask is not None and (hotspot_token_mask & ~peptide_token_mask).any():
+            raise ValueError("Type III hotspot indices must fall on peptide chains")
+    elif hotspot_token_mask is not None and (hotspot_token_mask & ~target_token_mask).any():
+        raise ValueError("hotspot target concat indices must fall on target chains")
+
     interface_target_mask = hotspot_token_mask if hotspot_token_mask is not None else target_token_mask
+    if is_type3:
+        interface_target_mask = hotspot_token_mask if hotspot_token_mask is not None else peptide_token_mask
+
     pae_intra_pair_mask = None
     pae_inter_pair_mask = None
     pde_intra_pair_mask = None
     pde_inter_pair_mask = None
-    if local_redesign:
+    if local_redesign or has_type1_partner_roles:
         design_x_design = design_token_mask.unsqueeze(0) & design_token_mask.unsqueeze(1)
         design_x_scaffold = design_token_mask.unsqueeze(1) & scaffold_token_mask.unsqueeze(0)
         design_x_target = design_token_mask.unsqueeze(1) & interface_target_mask.unsqueeze(0)
@@ -156,6 +290,11 @@ def compute_all_losses(
         pae_inter_pair_mask = design_x_target
         pde_intra_pair_mask = pae_intra_pair_mask
         pde_inter_pair_mask = design_x_target
+    elif is_type3:
+        binder_x_peptide = binder_token_mask.unsqueeze(1) & interface_target_mask.unsqueeze(0)
+        hla_pair_mask = binder_token_mask.unsqueeze(1) & hla_token_mask.unsqueeze(0)
+        pae_inter_pair_mask = binder_x_peptide
+        pde_inter_pair_mask = binder_x_peptide
 
     # ── 逐项计算 loss ───────────────────────────────────────────────────
     losses: Dict[str, torch.Tensor] = {}
@@ -215,8 +354,8 @@ def compute_all_losses(
             binary=False,
             residue_index=input_feature_dict.get("residue_index"),
             hotspot_token_mask=hotspot_token_mask,
-            row_token_mask=design_token_mask if local_redesign else None,
-            col_token_mask=interface_target_mask if local_redesign else None,
+            row_token_mask=design_token_mask if local_redesign else (binder_token_mask if is_type3 else None),
+            col_token_mask=interface_target_mask if (local_redesign or is_type3) else None,
         )
         losses["i_con"] = l_icon
         total_loss = total_loss + weights["i_con"] * l_icon
@@ -267,7 +406,7 @@ def compute_all_losses(
 
     # clash (intra)
     if weights.get("clash", 0) != 0:
-        if local_redesign:
+        if local_redesign or has_type1_partner_roles:
             residue_index = input_feature_dict.get("residue_index", asym_id)
             l_clash_oo = compute_soft_clash_loss(
                 x0_flat, binder_atom_mask, target_atom_mask,
@@ -304,7 +443,7 @@ def compute_all_losses(
 
     # i_clash (inter)
     if weights.get("i_clash", 0) != 0:
-        if local_redesign:
+        if local_redesign or has_type1_partner_roles:
             l_iclash = compute_soft_clash_loss(
                 x0_flat, binder_atom_mask, target_atom_mask,
                 atom_to_token, input_feature_dict.get("residue_index", asym_id),
@@ -312,6 +451,18 @@ def compute_all_losses(
                 r_clash=_clash_params.get("r_clash", 2.0),
                 bond_sep=_clash_params.get("bond_sep", 1),
                 atom_mask_a=design_atom_mask,
+                atom_mask_b=target_atom_mask,
+                detach_b=True,
+                exclude_bonded=False,
+            )
+        elif is_type3:
+            l_iclash = compute_soft_clash_loss(
+                x0_flat, binder_atom_mask, target_atom_mask,
+                atom_to_token, input_feature_dict.get("residue_index", asym_id),
+                mode="inter",
+                r_clash=_clash_params.get("r_clash", 2.0),
+                bond_sep=_clash_params.get("bond_sep", 1),
+                atom_mask_a=binder_atom_mask,
                 atom_mask_b=target_atom_mask,
                 detach_b=True,
                 exclude_bonded=False,
@@ -350,6 +501,43 @@ def compute_all_losses(
         )
         losses["i_pde"] = l_ipde
         total_loss = total_loss + weights["i_pde"] * l_ipde
+
+    if is_type3:
+        l_ipae_hla = compute_pae_loss(
+            pae_logits, asym_id, pae_params, mode="inter",
+            pair_mask=hla_pair_mask,
+        )
+        losses["i_pae_hla"] = l_ipae_hla
+        if weights.get("i_pae_hla", 0) != 0:
+            total_loss = total_loss + weights["i_pae_hla"] * l_ipae_hla
+
+        l_icon_hla = compute_contact_loss(
+            distogram_logits, binder_token_mask, target_token_mask,
+            distogram_params, mode="inter",
+            cutoff=contact_params["inter_cutoff"],
+            num=contact_params["inter_num"],
+            num_pos=contact_params.get("inter_num_pos", contact_params["inter_num"]),
+            binary=False,
+            residue_index=input_feature_dict.get("residue_index"),
+            row_token_mask=binder_token_mask,
+            col_token_mask=hla_token_mask,
+        )
+        losses["i_con_hla"] = l_icon_hla
+        if weights.get("i_con_hla", 0) != 0:
+            total_loss = total_loss + weights["i_con_hla"] * l_icon_hla
+
+        if pde_logits is not None and pde_params is not None:
+            contact_probs = sample_confidence.compute_contact_prob(
+                distogram_logits=distogram_logits, **distogram_params,
+            )
+            l_ipde_hla = compute_pde_loss(
+                pde_logits, asym_id, pde_params, mode="inter",
+                contact_probs=contact_probs,
+                pair_mask=hla_pair_mask,
+            )
+            losses["i_pde_hla"] = l_ipde_hla
+            if weights.get("i_pde_hla", 0) != 0:
+                total_loss = total_loss + weights["i_pde_hla"] * l_ipde_hla
 
     losses["total"] = total_loss
     return total_loss, losses

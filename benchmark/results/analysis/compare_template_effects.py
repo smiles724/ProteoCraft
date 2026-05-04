@@ -304,22 +304,42 @@ def plot_delta_bars(rows: list[dict]) -> None:
 
 
 def plot_scatter(rows: list[dict]) -> None:
+    """Normalized scatter: each loss family is min-max scaled independently.
+
+    The three loss families use different weighted objectives, so global
+    normalization would incorrectly imply their raw best_loss values are
+    directly comparable. Per-family normalization keeps template vs
+    no-template comparisons within each loss definition.
+
+    Points below the diagonal (y < x) mean template improved (lower loss).
+    """
     plt.figure(figsize=(7, 7))
+
     markers = {"default_loss": "o", "v1_loss": "s", "custom_loss": "^"}
+    colors = {"default_loss": "#3498db", "v1_loss": "#e74c3c", "custom_loss": "#2ecc71"}
+
     for exp in EXPERIMENTS:
         exp_rows = [row for row in rows if row["loss_family"] == exp["loss_family"]]
-        x = [row["base_best_loss"] for row in exp_rows]
-        y = [row["template_best_loss"] for row in exp_rows]
-        plt.scatter(x, y, label=exp["label"], marker=markers[exp["loss_family"]], s=70)
+        exp_vals = []
         for row in exp_rows:
-            plt.annotate(row["case"], (row["base_best_loss"], row["template_best_loss"]), fontsize=7)
-    all_values = [row["base_best_loss"] for row in rows] + [row["template_best_loss"] for row in rows]
-    low, high = min(all_values), max(all_values)
-    pad = (high - low) * 0.05
-    plt.plot([low - pad, high + pad], [low - pad, high + pad], color="#555555", linewidth=1, linestyle="--")
-    plt.xlabel("No-template best_loss")
-    plt.ylabel("Template best_loss")
-    plt.title("Template vs no-template best_loss")
+            exp_vals.extend([row["base_best_loss"], row["template_best_loss"]])
+        vmin, vmax = min(exp_vals), max(exp_vals)
+        rng = vmax - vmin
+
+        def norm(v):
+            return (v - vmin) / rng if rng != 0 else 0.0
+
+        x = [norm(row["base_best_loss"]) for row in exp_rows]
+        y = [norm(row["template_best_loss"]) for row in exp_rows]
+        plt.scatter(x, y, label=exp["label"], marker=markers[exp["loss_family"]], s=70,
+                    color=colors[exp["loss_family"]], alpha=0.85)
+        for row in exp_rows:
+            plt.annotate(row["case"], (norm(row["base_best_loss"]), norm(row["template_best_loss"])), fontsize=7)
+
+    plt.plot([0, 1], [0, 1], color="#555555", linewidth=1.2, linestyle="--", label="y = x (no change)")
+    plt.xlabel("No-template best_loss (per-loss min-max normalized)")
+    plt.ylabel("Template best_loss (per-loss min-max normalized)")
+    plt.title("Template vs no-template best_loss (per-loss normalized)")
     plt.legend()
     plt.grid(True, alpha=0.25)
     plt.tight_layout()

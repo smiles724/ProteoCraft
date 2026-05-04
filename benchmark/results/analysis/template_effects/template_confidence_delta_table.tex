@@ -1,0 +1,25 @@
+\begin{table}[htbp]
+\centering
+\small
+\caption{Template-induced structural metric improvements on BCV1 custom-loss no-hotspot runs. Positive values indicate that adding the target template improves the metric; lower-is-better raw metrics are converted to signed improvements.}
+\label{tab:bcv1_template_structural_metrics}
+\begin{tabular}{lrrrrrrrr}
+\toprule
+Case & Ranking score & pLDDT & ipTM & pTM & gPDE imp. & PAE imp. & iPAE imp. & iPDE imp. \\
+\midrule
+HER2 & +0.282 & +46.7 & +0.217 & +0.542 & +2.57 & +0.056 & +0.152 & +0.115 \\
+BetV1 & +0.127 & +34.3 & +0.070 & +0.355 & +1.84 & +0.030 & +0.218 & +0.084 \\
+PD1 & +0.082 & +21.0 & +0.051 & +0.204 & +0.86 & -0.000 & +0.054 & -0.002 \\
+PD-L1 & +0.346 & +15.1 & +0.372 & +0.242 & +0.59 & -0.125 & +0.134 & +0.079 \\
+DerF21 & +0.127 & +12.5 & +0.136 & +0.088 & +0.83 & +0.168 & +0.117 & +0.057 \\
+DerF7 & +0.186 & +34.6 & +0.123 & +0.441 & +1.85 & +0.085 & +0.129 & +0.122 \\
+SpCas9 & +0.094 & +24.0 & +0.038 & +0.315 & +1.18 & -0.011 & +0.028 & +0.030 \\
+IFNAR2 & -0.158 & +7.4 & -0.211 & +0.054 & +0.02 & -0.130 & -0.108 & -0.080 \\
+\midrule
+Mean & +0.136 & +24.4 & +0.100 & +0.280 & +1.22 & +0.009 & +0.091 & +0.051 \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.4em}
+\footnotesize{Definitions: gPDE imp. $=$ no-template gPDE $-$ template gPDE; PAE/iPAE/iPDE imp. are defined analogously from the corresponding loss components.}
+\end{table}

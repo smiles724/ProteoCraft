@@ -1,0 +1,57 @@
+target_fasta_dir: /data/huangyanjie/binder_design/BindCraft-v2/benchmark/input/bc_v1_benchmark_data
+target_template_dir: /data/huangyanjie/binder_design/BindCraft-v2/benchmark/input/bc_v1_benchmark_data/pdb_template_fixed_cif
+random_binder_lengths:
+  BetV1: 102
+  DerF21: 139
+  DerF7: 115
+  HER2: 85
+  IFNAR2: 96
+  PD-L1: 93
+  PD1: 105
+  SpCas9: 116
+random_seed: 42
+input_dir: /data/huangyanjie/binder_design/BindCraft-v2/benchmark/input/derf21_custom_loss_hotspot_B63
+results_dir: /data/huangyanjie/binder_design/BindCraft-v2/benchmark/results/bcv1
+log_dir: /data/huangyanjie/binder_design/BindCraft-v2/benchmark/log/bcv1/derf21_custom_loss_hotspot_B63
+model_checkpoint_dir: /data/huangyanjie/Alphaenzyme/LGOS/checkpoints
+components_cache_dir: /data/huangyanjie/Alphaenzyme/LGOS/protenix/release_data/ccd_cache
+model_name: protenix_base_20250630_v1.0.0
+device: cuda:0
+mode: hybrid
+n_steps: 50
+learning_rate: 0.05
+tau_noise: 4.0
+k_top: 8
+b_candidates: 4
+t_sample: 1.0
+max_mutations_per_seq: 3
+use_annealing: true
+t_init: 1.0
+t_min: 0.01
+use_tau_scheduling: true
+tau_jitter: true
+mcts_c: 1.0
+mcts_max_nodes: 5000
+mcts_tau_fixed: 4.0
+mcts_num_beams: 8
+chunk_size: null
+use_prior: true
+prior_strength: 0.1
+w_con: 0.2
+w_i_con: 3.0
+w_iptm: 0.3
+w_plddt: 0.1
+w_pae: 0.4
+w_i_pae: 0.2
+w_rg: 0.3
+w_helix: -0.3
+w_clash: 0.1
+w_i_clash: 0.1
+w_pde: 0.05
+w_i_pde: 0.03
+target_hotspot_residues: "B63"
+entry_ids:
+  - DerF21
+skip_existing: false
+save_checkpoints: true
+checkpoint_subdir_name: checkpoints

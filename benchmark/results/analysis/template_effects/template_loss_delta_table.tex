@@ -1,0 +1,25 @@
+\begin{table}[htbp]
+\centering
+\small
+\caption{Template-induced loss improvements on BCV1 custom-loss no-hotspot runs. Positive improvement values indicate lower loss after adding the target template.}
+\label{tab:bcv1_template_loss_improvement}
+\begin{tabular}{lrrrrrrr}
+\toprule
+Case & No-template best & Template best & Best loss imp. & Best loss red. (\%) & No-template final & Template final & Final loss imp. \\
+\midrule
+HER2 & 1.606 & 0.080 & +1.526 & +95.0 & 1.606 & 0.080 & +1.526 \\
+BetV1 & 1.272 & -0.127 & +1.399 & +110.0 & 1.309 & -0.127 & +1.436 \\
+PD1 & 1.437 & 0.484 & +0.953 & +66.3 & 1.437 & 0.573 & +0.864 \\
+PD-L1 & 0.575 & -0.051 & +0.626 & +108.9 & 0.575 & 0.118 & +0.457 \\
+DerF21 & 0.113 & -0.269 & +0.382 & +338.6 & 0.113 & -0.269 & +0.382 \\
+DerF7 & 0.580 & 0.205 & +0.375 & +64.7 & 0.593 & 0.292 & +0.300 \\
+SpCas9 & 0.473 & 0.238 & +0.235 & +49.7 & 0.473 & 0.277 & +0.197 \\
+IFNAR2 & 0.466 & 0.290 & +0.177 & +37.9 & 0.466 & 0.290 & +0.177 \\
+\midrule
+Mean & 0.815 & 0.106 & +0.709 & +108.9 & 0.822 & 0.154 & +0.667 \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.4em}
+\footnotesize{Best loss imp. $=$ no-template best loss $-$ template best loss; final loss imp. is defined analogously. Best loss red. is the relative reduction against no-template best loss.}
+\end{table}

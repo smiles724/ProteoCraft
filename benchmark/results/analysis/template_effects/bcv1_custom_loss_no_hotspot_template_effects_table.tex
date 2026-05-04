@@ -1,0 +1,25 @@
+\begin{table}[htbp]
+\centering
+\small
+\caption{Effect of target template on BCV1 custom-loss no-hotspot runs. Loss deltas are defined as with-template minus no-template, so negative values indicate lower loss after adding template. Confidence deltas are defined in the same direction, so positive values indicate improvement.}
+\label{tab:bcv1_custom_loss_template_effect}
+\begin{tabular}{lrrrrrrrrr}
+\toprule
+Case & No-template best & Template best & $\Delta$ best & No-template final & Template final & $\Delta$ final & $\Delta$ ranking & $\Delta$ pLDDT & $\Delta$ ipTM \\
+\midrule
+BetV1 & 1.272 & -0.127 & -1.399 & 1.309 & -0.127 & -1.436 & +0.127 & +34.25 & +0.070 \\
+DerF21 & 0.113 & -0.269 & -0.382 & 0.113 & -0.269 & -0.382 & +0.127 & +12.49 & +0.136 \\
+DerF7 & 0.580 & 0.205 & -0.375 & 0.593 & 0.292 & -0.300 & +0.186 & +34.60 & +0.123 \\
+HER2 & 1.606 & 0.080 & -1.526 & 1.606 & 0.080 & -1.526 & +0.282 & +46.70 & +0.217 \\
+IFNAR2 & 0.466 & 0.290 & -0.177 & 0.466 & 0.290 & -0.177 & -0.158 & +7.37 & -0.211 \\
+PD-L1 & 0.575 & -0.051 & -0.626 & 0.575 & 0.118 & -0.457 & +0.346 & +15.09 & +0.372 \\
+PD1 & 1.437 & 0.484 & -0.953 & 1.437 & 0.573 & -0.864 & +0.082 & +20.99 & +0.051 \\
+SpCas9 & 0.473 & 0.238 & -0.235 & 0.473 & 0.277 & -0.197 & +0.094 & +23.96 & +0.038 \\
+\midrule
+Mean & -- & -- & -0.709 & -- & -- & -0.667 & +0.136 & +24.43 & +0.100 \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.4em}
+\footnotesize{$\Delta =$ with-template $-$ no-template. Lower loss is better; higher ranking score, pLDDT, and ipTM are better.}
+\end{table}

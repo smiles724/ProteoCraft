@@ -188,6 +188,8 @@ def zeroth_order_eval(
     hotspot_params: Optional[Dict[str, Any]] = None,
     target_template_path: Optional[str] = None,
     opt_token_mask: Optional[Any] = None,
+    task_type: Optional[str] = None,
+    target_chain_roles: Optional[Any] = None,
 ) -> ZerothOrderResult:
     """
     对一条离散候选序列执行完整 AF3 推断，并在最终结构上计算全部 8 项 loss。
@@ -204,6 +206,8 @@ def zeroth_order_eval(
                        时建议设为 256，避免 OOM。默认为 None（不分块）。
         target_template_path: 可选 target template 结构文件
         opt_token_mask: 可选优化区域 mask；CDR redesign 时为 binder 长度 bool mask
+        task_type: 可选任务类型；"type3" 启用 pMHC peptide/HLA loss 边界
+        target_chain_roles: Type III 时的 target 链角色，如 ["peptide", "hla"]
 
     Returns:
         ZerothOrderResult: 包含 total_loss / loss_dict / summary_confidence / coordinate
@@ -224,8 +228,20 @@ def zeroth_order_eval(
 
     with torch.no_grad():
         # ── 构建特征 ─────────────────────────────────────────────────────
+        binder_template_mask = None
+        if opt_token_mask is not None:
+            opt_mask_list = [bool(x) for x in opt_token_mask]
+            if len(opt_mask_list) != L_binder:
+                raise ValueError(
+                    f"opt_token_mask length {len(opt_mask_list)} != binder length {L_binder}"
+                )
+            binder_template_mask = [not is_opt for is_opt in opt_mask_list]
         input_feature_dict, N_token, N_atom = build_complex_features(
-            binder_seq, target_seq, device, target_template_path=target_template_path
+            binder_seq,
+            target_seq,
+            device,
+            target_template_path=target_template_path,
+            binder_template_mask=binder_template_mask,
         )
         input_feature_dict = prepare_input_features(model, input_feature_dict)
 
@@ -234,7 +250,7 @@ def zeroth_order_eval(
             coordinate, s_inputs, s_trunk, z_trunk,
             plddt_logits, pae_logits, pde_logits,
             distogram_logits, contact_probs,
-        ) = _run_full_forward(model, input_feature_dict, device, N_cycle, chunk_size=None)
+        ) = _run_full_forward(model, input_feature_dict, device, N_cycle, chunk_size=chunk_size)
 
         # ── Summary Confidence（Protenix 原生指标）────────────────────────
         summary_confidence_list, _ = sample_confidence.compute_full_data_and_summary(
@@ -310,6 +326,8 @@ def zeroth_order_eval(
             clash_params=dict(DEFAULT_CLASH_PARAMS),
             hotspot_params=hotspot_params,
             opt_token_mask=opt_token_mask,
+            task_type=task_type,
+            target_chain_roles=target_chain_roles,
         )
 
     # ── 组装结果 ─────────────────────────────────────────────────────────

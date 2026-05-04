@@ -51,6 +51,14 @@ BASELINE_RESULTS = {
     ),
 }
 
+BASELINE_PLOT_LABELS = {
+    "same_template_seed43_default_no_hotspot": "Default\nno hotspot\nsame template",
+    "same_template_seed43_v1loss_no_hotspot": "v1-like loss\nno hotspot\nsame template",
+    "custom_loss_template_seed42_no_hotspot": "Custom loss\nno hotspot\nsame template",
+    "custom_loss_no_template_seed42_no_hotspot": "Custom loss\nno hotspot\nno template",
+    "bc_v1_random_seed43_no_template_no_hotspot": "BC-v1 random\nno hotspot\nno template",
+}
+
 PRIMARY_BASELINE = "same_template_seed43_default_no_hotspot"
 LOSS_METRICS = ["total", "plddt", "pae", "i_pae", "con", "i_con", "iptm", "rg", "helix", "clash", "i_clash", "pde", "i_pde"]
 CONF_METRICS = ["ranking_score", "plddt", "iptm", "ptm", "gpde", "chain_iptm", "chain_ptm"]
@@ -314,7 +322,7 @@ def plot_comparison(comparisons: list[dict], keys: list[str], labels: list[str],
         positions = [value + (i - (len(keys) - 1) / 2) * width for value in x]
         plt.bar(positions, values, width=width, label=label)
     plt.axhline(0, color="#333333", linewidth=0.8)
-    plt.xticks(x, [row["baseline"] for row in comparisons], rotation=25, ha="right")
+    plt.xticks(x, [BASELINE_PLOT_LABELS.get(row["baseline"], row["baseline"]) for row in comparisons], rotation=20, ha="right")
     plt.ylabel(ylabel)
     plt.title(title)
     plt.grid(axis="y", alpha=0.25)

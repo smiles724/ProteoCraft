@@ -3,7 +3,7 @@
 从 AF3Score 生成的 PDB 中提取链 A 作为初始 binder，并对固定的 A6 TCR (链 B+C) 批量优化。
 
 支持：
-1. benchmark/yaml/default.yaml 作为默认配置
+1. benchmark/yaml/bcv1/betv1_custom_loss_hotspot_B24.yaml 作为默认配置
 2. CLI 显式参数覆盖 YAML 配置
 3. worker_index / num_workers 分片，便于 shell 层多 GPU 并行
 4. hybrid 模式下将每个 entry 的优化过程 step checkpoint 保存到 results/<entry_id>/checkpoints/
@@ -12,7 +12,6 @@
 import os
 import re
 import sys
-import csv
 import json
 import time
 import argparse
@@ -60,7 +59,9 @@ AA3_TO_1 = {
     "VAL": "V",
 }
 
-DEFAULT_CONFIG_PATH = Path(PROJECT_ROOT) / "benchmark" / "yaml" / "default.yaml"
+DEFAULT_CONFIG_PATH = (
+    Path(PROJECT_ROOT) / "benchmark" / "yaml" / "bcv1" / "betv1_custom_loss_hotspot_B24.yaml"
+)
 DEFAULT_CONFIG: Dict[str, Any] = {
     "source_dir": "/data/huangyanjie/binder_design/AF3Score/input",
     "target_fasta_dir": None,
@@ -100,6 +101,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "target_hotspot_residues": None,
     "target_template_path": None,
     "target_template_dir": None,
+    "task_type": None,
+    "target_chain_roles": None,
     "w_plddt": None,
     "w_pae": None,
     "w_i_pae": None,
@@ -119,7 +122,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 RUNTIME_DEFAULTS: Dict[str, Any] = {
     "prepare_only": False,
-    "skip_input_write": False,
     "worker_index": 0,
     "num_workers": 1,
 }
@@ -184,8 +186,45 @@ def load_yaml_config(config_path: Path) -> Dict[str, Any]:
     return config
 
 
+def resolve_config_path(raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if path.is_absolute() or path.exists():
+        return path
+
+    project_relative = Path(PROJECT_ROOT) / path
+    if project_relative.exists():
+        return project_relative
+
+    return path
+
+
+def resolve_repo_path(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path(PROJECT_ROOT) / path
+    return str(path)
+
+
+PATH_CONFIG_KEYS = {
+    "source_dir",
+    "target_fasta_dir",
+    "init_binder_fasta_dir",
+    "input_dir",
+    "results_dir",
+    "log_dir",
+    "model_checkpoint_dir",
+    "components_cache_dir",
+    "protenix_root_dir",
+    "target_template_path",
+    "target_template_dir",
+}
+
+
 def resolve_args(parsed_args: argparse.Namespace) -> argparse.Namespace:
-    config_path = Path(parsed_args.config).expanduser()
+    config_path = resolve_config_path(parsed_args.config)
     config = load_yaml_config(config_path)
     config.update(RUNTIME_DEFAULTS)
 
@@ -193,6 +232,9 @@ def resolve_args(parsed_args: argparse.Namespace) -> argparse.Namespace:
         if key == "config":
             continue
         config[key] = value
+
+    for key in PATH_CONFIG_KEYS:
+        config[key] = resolve_repo_path(config.get(key))
 
     config["config"] = str(config_path.resolve())
     return argparse.Namespace(**config)
@@ -504,54 +546,6 @@ def collect_entries(
     return entries, target_sequences
 
 
-def write_input_files(entries: List[Dict[str, Any]], target_sequences: List[str], input_dir: Path) -> Path:
-    input_dir.mkdir(parents=True, exist_ok=True)
-
-    manifest_path = input_dir / "init_binders.csv"
-    with manifest_path.open("w", newline="", encoding="utf-8") as handle:
-        fieldnames = [
-            "entry_id",
-            "source_pdb",
-            "binder_chain",
-            "binder_length",
-            "init_binder_seq",
-            "target_chain_b_seq",
-            "target_chain_c_seq",
-            "target_hotspot_residues",
-            "target_hotspot_concat_indices",
-        ]
-        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for entry in entries:
-            row = dict(entry)
-            row["target_hotspot_concat_indices"] = json.dumps(
-                entry.get("target_hotspot_concat_indices", []), ensure_ascii=False
-            )
-            writer.writerow(row)
-
-    target_fasta = input_dir / "target_chains.fasta"
-    with target_fasta.open("w", encoding="utf-8") as handle:
-        if target_sequences:
-            handle.write(">A6_TCR_chain_B\n")
-            handle.write(target_sequences[0] + "\n")
-            handle.write(">A6_TCR_chain_C\n")
-            handle.write(target_sequences[1] + "\n")
-        else:
-            for entry in entries:
-                entry_targets = entry.get("target_sequences", [])
-                for idx, sequence in enumerate(entry_targets, start=1):
-                    handle.write(f">{entry['entry_id']}_target_chain_{idx}\n")
-                    handle.write(sequence + "\n")
-
-    for entry in entries:
-        fasta_path = input_dir / f"{entry['entry_id']}.fasta"
-        with fasta_path.open("w", encoding="utf-8") as handle:
-            handle.write(f">{entry['entry_id']}|chain_A|len={entry['binder_length']}\n")
-            handle.write(entry["init_binder_seq"] + "\n")
-
-    return manifest_path
-
-
 def shard_entries(entries: List[Dict[str, Any]], worker_index: int, num_workers: int) -> List[Dict[str, Any]]:
     if num_workers <= 0:
         raise ValueError(f"num_workers={num_workers} 必须大于 0")
@@ -713,6 +707,8 @@ def run_one_entry(
             init_binder_seq=entry["init_binder_seq"],
             hotspot_params=hotspot_params,
             target_template_path=target_template_path,
+            task_type=args.task_type,
+            target_chain_roles=args.target_chain_roles,
         )
     elif args.mode == "hybrid":
         best_seq, final_seq, losses_history = run_hybrid_hallucination(
@@ -737,6 +733,8 @@ def run_one_entry(
             checkpoint_dir=str(optimization_checkpoint_dir) if optimization_checkpoint_dir is not None else None,
             hotspot_params=hotspot_params,
             target_template_path=target_template_path,
+            task_type=args.task_type,
+            target_chain_roles=args.target_chain_roles,
         )
     else:
         best_seq, final_seq, losses_history = run_mcts_hallucination(
@@ -766,6 +764,8 @@ def run_one_entry(
             mcts_max_nodes=args.mcts_max_nodes,
             mcts_tau_fixed=args.mcts_tau_fixed,
             target_template_path=target_template_path,
+            task_type=args.task_type,
+            target_chain_roles=args.target_chain_roles,
         )
 
     elapsed = time.time() - t0
@@ -815,6 +815,8 @@ def run_one_entry(
             "target_hotspot_residues": args.target_hotspot_residues,
             "target_template_path": target_template_path,
             "target_template_dir": args.target_template_dir,
+            "task_type": args.task_type,
+            "target_chain_roles": args.target_chain_roles,
             "loss_weights_override": loss_weights,
             "model_name": args.model_name,
             "save_checkpoints": args.save_checkpoints,
@@ -930,6 +932,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="可选 per-entry target template 目录，按 <entry_id>.pdb/.cif/.mmcif 查找",
     )
+    parser.add_argument("--task-type", dest="task_type", type=str, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--target-chain-roles",
+        dest="target_chain_roles",
+        type=str,
+        default=argparse.SUPPRESS,
+        help="Type III target 链角色，逗号分隔，如 peptide,hla",
+    )
     parser.add_argument("--entry-ids", dest="entry_ids", type=str, default=argparse.SUPPRESS)
     parser.add_argument(
         "--checkpoint-subdir-name",
@@ -945,6 +955,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="skip_input_write",
         action="store_true",
         default=argparse.SUPPRESS,
+        help="兼容旧参数；当前总是跳过 benchmark/input 任务快照写入",
     )
 
     add_bool_argument(parser, "use-annealing", "是否启用模拟退火")
@@ -1029,11 +1040,7 @@ def main() -> None:
         entries = [entry for entry in entries if entry["entry_id"] in selected_entry_ids]
         logger.info(f"按 entry_ids 过滤后剩余 {len(entries)} 个条目")
 
-    if args.skip_input_write:
-        logger.info(f"skip-input-write 已启用，跳过写入输入文件目录: {input_dir}")
-    else:
-        manifest_path = write_input_files(entries, target_sequences, input_dir)
-        logger.info(f"已生成输入清单: {manifest_path}")
+    logger.info(f"跳过写入输入快照目录: {input_dir}")
 
     if args.prepare_only:
         logger.info("prepare-only 模式，结束")

@@ -117,6 +117,7 @@ def compute_hard_features(
     target_seq: str,
     device: torch.device,
     target_template_path: str = None,
+    binder_template_mask=None,
 ) -> Tuple[torch.Tensor, str, Dict]:
     """
     从概率分布采样硬序列，并获取硬特征
@@ -148,7 +149,11 @@ def compute_hard_features(
     # 构建完整的 Binder-Target 特征
     with torch.no_grad():
         input_feature_dict, N_token, N_atom = build_complex_features(
-            binder_seq, target_seq, device, target_template_path=target_template_path
+            binder_seq,
+            target_seq,
+            device,
+            target_template_path=target_template_path,
+            binder_template_mask=binder_template_mask,
         )
         input_feature_dict = prepare_input_features(model, input_feature_dict)
         
@@ -203,6 +208,7 @@ def ste_bridge(
     device: torch.device,
     tau_temp: float = 1.0,
     target_template_path: str = None,
+    binder_template_mask=None,
 ) -> Tuple[torch.Tensor, str, Dict]:
     """
     完整的 STE 桥接流程（模块 A）
@@ -231,7 +237,12 @@ def ste_bridge(
     
     # 步骤 2：计算硬特征
     s_hard_binder, binder_seq, input_feature_dict = compute_hard_features(
-        P, model, target_seq, device, target_template_path=target_template_path
+        P,
+        model,
+        target_seq,
+        device,
+        target_template_path=target_template_path,
+        binder_template_mask=binder_template_mask,
     )
     
     # 步骤 3：STE 融合

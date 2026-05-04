@@ -19,13 +19,31 @@ def _extract_step_num(path):
         raise ValueError(f"Could not parse step number from {path}") from exc
 
 
-def discover_steps(run_dir, beam=0, accepted_only=False):
+def _checkpoint_roots(run_dir):
+    roots = []
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
-    pattern = os.path.join(checkpoint_dir, "step_*", f"step_*_beam_{beam}_meta.json")
-    meta_files = sorted(glob(pattern))
+    if os.path.isdir(checkpoint_dir):
+        roots.append(checkpoint_dir)
+    if os.path.isdir(run_dir):
+        roots.append(run_dir)
+    return list(dict.fromkeys(roots))
+
+
+def discover_steps(run_dir, beam=0, accepted_only=False):
+    checkpoint_roots = _checkpoint_roots(run_dir)
+    meta_files = []
+    for checkpoint_dir in checkpoint_roots:
+        patterns = [
+            os.path.join(checkpoint_dir, "step_*", f"step_*_beam_{beam}_meta.json"),
+            os.path.join(checkpoint_dir, "*", "step_*", f"step_*_beam_{beam}_meta.json"),
+        ]
+        for pattern in patterns:
+            meta_files.extend(glob(pattern))
+    meta_files = sorted(set(meta_files))
 
     if not meta_files:
-        raise ValueError(f"No meta files found for beam {beam} in {checkpoint_dir}")
+        searched = ", ".join(checkpoint_roots) or run_dir
+        raise ValueError(f"No meta files found for beam {beam} in {searched}")
 
     steps = []
     skipped = []
@@ -55,7 +73,8 @@ def discover_steps(run_dir, beam=0, accepted_only=False):
         print(f"Warning: skipping step {step_num} because PDB is missing: {pdb_path}")
 
     if not steps:
-        raise ValueError(f"No usable steps found in {checkpoint_dir}")
+        searched = ", ".join(checkpoint_roots) or run_dir
+        raise ValueError(f"No usable steps found in {searched}")
 
     steps.sort(key=lambda item: item["step"])
     return steps
@@ -279,6 +298,19 @@ def _meta_value(meta, *path):
     return value
 
 
+def build_3dmol_style():
+    """Enhanced 3Dmol style configuration for beautiful protein visualization."""
+    return {
+        "cartoon": {
+            "style": "trace",
+            "opacity": 0.9,
+            "color": "spectrum",
+            "resolution": 3,
+            "linewidth": 0.5,
+        }
+    }
+
+
 def build_html(frames, output_title, fps, binder_chain, target_chains, static_target_pdb):
     payload = []
     chain_colors = {
@@ -316,6 +348,9 @@ def build_html(frames, output_title, fps, binder_chain, target_chains, static_ta
   <meta charset="utf-8">
   <title>{output_title}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
   <style>
     :root {{
@@ -332,91 +367,518 @@ def build_html(frames, output_title, fps, binder_chain, target_chains, static_ta
       --ok-text: #166534;
       --bad-bg: #fee2e2;
       --bad-text: #991b1b;
+      --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+      --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -2px rgba(0,0,0,0.1);
+      --shadow-lg: 0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -4px rgba(0,0,0,0.1);
+      --shadow-xl: 0 20px 25px -5px rgba(0,0,0,0.1), 0 8px 10px -6px rgba(0,0,0,0.1);
+      --radius: 18px;
+      --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     }}
-    * {{ box-sizing: border-box; }}
-    body {{ margin: 0; font-family: Inter, Arial, sans-serif; background: linear-gradient(180deg, #e2e8f0 0%, #f8fafc 260px); color: var(--text); }}
-    .page {{ max-width: 1440px; margin: 0 auto; padding: 24px; }}
-    .hero {{ margin-bottom: 18px; }}
-    .hero h1 {{ margin: 0 0 8px; font-size: 28px; line-height: 1.2; }}
-    .hero p {{ margin: 0; color: var(--muted); font-size: 15px; }}
-    .layout {{ display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 18px; align-items: start; }}
-    .viewer-card, .side-card {{ background: rgba(255,255,255,0.96); border: 1px solid var(--line); border-radius: 18px; box-shadow: 0 14px 40px rgba(15, 23, 42, 0.08); }}
-    .viewer-card {{ padding: 18px; }}
-    .side-card {{ padding: 18px; }}
-    .controls {{ display: grid; gap: 14px; margin-bottom: 16px; }}
-    .control-row {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }}
-    .primary-btn, .ghost-btn {{ border: 0; border-radius: 12px; padding: 11px 16px; font-size: 14px; font-weight: 600; cursor: pointer; }}
-    .primary-btn {{ background: var(--accent); color: white; }}
-    .primary-btn:hover {{ background: var(--accent-2); }}
-    .ghost-btn {{ background: #e2e8f0; color: #0f172a; }}
-    .ghost-btn:hover {{ background: #cbd5e1; }}
-    .slider-wrap {{ display: grid; gap: 8px; }}
-    .slider-header {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; }}
-    .slider-header strong {{ font-size: 15px; }}
-    .slider-header span {{ color: var(--muted); font-size: 14px; }}
-    input[type=range] {{ width: 100%; accent-color: var(--accent); }}
-    .viewer {{ width: 100%; height: 780px; border: 1px solid var(--line); border-radius: 16px; background: white; overflow: hidden; }}
-    .field {{ display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 14px; }}
-    .field input {{ width: 84px; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--line); font-size: 14px; }}
-    .stats {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }}
-    .stat {{ background: var(--panel-2); border: 1px solid var(--line); border-radius: 14px; padding: 14px; }}
-    .stat-label {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }}
-    .stat-value {{ font-size: 24px; font-weight: 700; }}
-    .legend {{ display: grid; gap: 10px; margin-bottom: 16px; }}
-    .legend-item {{ display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px; }}
-    .swatch {{ width: 14px; height: 14px; border-radius: 999px; flex: 0 0 auto; }}
-    .chain-name {{ font-weight: 700; min-width: 58px; }}
-    .chain-role {{ color: var(--muted); font-size: 13px; }}
-    .status-pill {{ display: inline-flex; align-items: center; justify-content: center; min-height: 32px; border-radius: 999px; padding: 6px 12px; font-size: 14px; font-weight: 700; }}
-    .status-true {{ background: var(--ok-bg); color: var(--ok-text); }}
-    .status-false {{ background: var(--bad-bg); color: var(--bad-text); }}
-    .hint {{ color: var(--muted); font-size: 13px; line-height: 1.5; }}
-    .kbd {{ display: inline-block; padding: 2px 8px; border-radius: 8px; border: 1px solid var(--line); background: white; font-size: 12px; color: var(--muted); }}
-    @media (max-width: 1180px) {{ .layout {{ grid-template-columns: 1fr; }} .viewer {{ height: 640px; }} }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+      color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }}
+    .app-container {{
+      display: flex;
+      min-height: 100vh;
+    }}
+    .main-content {{
+      flex: 1;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      transition: var(--transition);
+    }}
+    .main-content.expanded {{
+      padding: 12px;
+    }}
+    .hero {{
+      margin-bottom: 16px;
+      padding: 0 8px;
+    }}
+    .hero h1 {{
+      margin: 0 0 6px;
+      font-size: 24px;
+      font-weight: 700;
+      color: white;
+      letter-spacing: -0.02em;
+    }}
+    .hero p {{
+      margin: 0;
+      color: rgba(255,255,255,0.6);
+      font-size: 13px;
+    }}
+    .viewer-wrapper {{
+      flex: 1;
+      background: rgba(255,255,255,0.95);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow-xl);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      transition: var(--transition);
+      position: relative;
+    }}
+    .viewer-wrapper.expanded {{
+      border-radius: 12px;
+    }}
+    .controls {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 16px;
+      background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
+      border-bottom: 1px solid var(--line);
+      flex-wrap: wrap;
+    }}
+    .btn-group {{
+      display: flex;
+      gap: 6px;
+    }}
+    .btn {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 10px 16px;
+      border: none;
+      border-radius: 12px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: var(--transition);
+      font-family: inherit;
+    }}
+    .btn-primary {{
+      background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+      color: white;
+      box-shadow: 0 2px 8px rgba(37, 99, 235, 0.3);
+    }}
+    .btn-primary:hover {{
+      background: linear-gradient(135deg, #60a5fa 0%, #3b82f6 100%);
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(37, 99, 235, 0.4);
+    }}
+    .btn-ghost {{
+      background: rgba(255,255,255,0.8);
+      color: #475569;
+      border: 1px solid var(--line);
+    }}
+    .btn-ghost:hover {{
+      background: white;
+      border-color: #cbd5e1;
+    }}
+    .btn-icon {{
+      width: 40px;
+      padding: 10px;
+    }}
+    .view-mode-group {{
+      display: flex;
+      gap: 4px;
+      margin-left: auto;
+      background: rgba(0,0,0,0.05);
+      padding: 4px;
+      border-radius: 10px;
+    }}
+    .view-mode-btn {{
+      padding: 8px 14px;
+      font-size: 12px;
+      font-weight: 500;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: var(--transition);
+      background: transparent;
+      color: var(--muted);
+      font-family: inherit;
+    }}
+    .view-mode-btn.active {{
+      background: white;
+      color: var(--accent);
+      box-shadow: var(--shadow-sm);
+    }}
+    .view-mode-btn:hover:not(.active) {{
+      color: var(--text);
+    }}
+    .slider-section {{
+      flex: 1;
+      min-width: 200px;
+      max-width: 400px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }}
+    .slider-header {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }}
+    .slider-header strong {{
+      font-size: 14px;
+      color: #1e293b;
+      font-weight: 600;
+    }}
+    .slider-header span {{
+      font-size: 13px;
+      color: var(--muted);
+      font-family: 'JetBrains Mono', monospace;
+    }}
+    .slider-wrap {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }}
+    .slider-wrap input[type=range] {{
+      flex: 1;
+      height: 6px;
+      border-radius: 3px;
+      background: linear-gradient(90deg, var(--accent), #60a5fa);
+      -webkit-appearance: none;
+      cursor: pointer;
+    }}
+    .slider-wrap input[type=range]::-webkit-slider-thumb {{
+      -webkit-appearance: none;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: white;
+      border: 3px solid var(--accent);
+      box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+      cursor: pointer;
+      transition: var(--transition);
+    }}
+    .slider-wrap input[type=range]::-webkit-slider-thumb:hover {{
+      transform: scale(1.1);
+    }}
+    .fps-control {{
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0 8px;
+      border-left: 1px solid var(--line);
+      margin-left: 8px;
+    }}
+    .fps-control label {{
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 500;
+    }}
+    .fps-control input {{
+      width: 50px;
+      padding: 6px 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      font-size: 13px;
+      font-family: 'JetBrains Mono', monospace;
+      text-align: center;
+    }}
+    .viewer {{
+      flex: 1;
+      min-height: 500px;
+      background: linear-gradient(180deg, #f8fafc 0%, #e2e8f0 100%);
+      position: relative;
+    }}
+    .viewer-hint {{
+      position: absolute;
+      bottom: 12px;
+      left: 12px;
+      background: rgba(255,255,255,0.9);
+      backdrop-filter: blur(8px);
+      padding: 8px 12px;
+      border-radius: 10px;
+      font-size: 11px;
+      color: var(--muted);
+      display: flex;
+      gap: 8px;
+      box-shadow: var(--shadow-md);
+    }}
+    .viewer-hint kbd {{
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: white;
+      border: 1px solid var(--line);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+    }}
+    .sidebar {{
+      width: 340px;
+      background: rgba(255,255,255,0.98);
+      backdrop-filter: blur(20px);
+      border-left: 1px solid rgba(255,255,255,0.1);
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      transition: var(--transition);
+      overflow-y: auto;
+    }}
+    .sidebar.collapsed {{
+      width: 0;
+      padding: 0;
+      opacity: 0;
+      overflow: hidden;
+    }}
+    .sidebar-toggle {{
+      position: fixed;
+      right: 16px;
+      top: 20px;
+      z-index: 100;
+      width: 44px;
+      height: 44px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+      color: white;
+      border: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: var(--shadow-lg);
+      transition: var(--transition);
+      font-size: 18px;
+    }}
+    .sidebar-toggle:hover {{
+      transform: scale(1.05);
+      box-shadow: 0 8px 20px rgba(37, 99, 235, 0.4);
+    }}
+    .stats-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 12px;
+    }}
+    .stat-card {{
+      background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+      transition: var(--transition);
+    }}
+    .stat-card:hover {{
+      border-color: #cbd5e1;
+      transform: translateY(-2px);
+      box-shadow: var(--shadow-md);
+    }}
+    .stat-label {{
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      margin-bottom: 6px;
+      font-weight: 600;
+    }}
+    .stat-value {{
+      font-size: 22px;
+      font-weight: 700;
+      color: #1e293b;
+      font-family: 'JetBrains Mono', monospace;
+    }}
+    .stat-card.status .stat-value {{
+      font-size: 14px;
+    }}
+    .status-pill {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 28px;
+      border-radius: 999px;
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: 700;
+      width: 100%;
+    }}
+    .status-true {{ background: linear-gradient(135deg, #86efac 0%, #4ade80 100%); color: #166534; }}
+    .status-false {{ background: linear-gradient(135deg, #fecaca 0%, #f87171 100%); color: #991b1b; }}
+    .section-title {{
+      font-size: 14px;
+      font-weight: 700;
+      color: #1e293b;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }}
+    .section-title::before {{
+      content: '';
+      width: 4px;
+      height: 16px;
+      background: linear-gradient(180deg, var(--accent), #60a5fa);
+      border-radius: 2px;
+    }}
+    .legend {{
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }}
+    .legend-item {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px;
+      background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      transition: var(--transition);
+    }}
+    .legend-item:hover {{
+      border-color: #cbd5e1;
+      transform: translateX(4px);
+    }}
+    .swatch {{
+      width: 24px;
+      height: 24px;
+      border-radius: 8px;
+      flex-shrink: 0;
+      box-shadow: inset 0 -2px 4px rgba(0,0,0,0.1);
+    }}
+    .chain-name {{
+      font-weight: 700;
+      font-size: 14px;
+      min-width: 70px;
+    }}
+    .chain-role {{
+      color: var(--muted);
+      font-size: 12px;
+      padding: 2px 8px;
+      background: rgba(0,0,0,0.05);
+      border-radius: 6px;
+    }}
+    .download-btn {{
+      width: 100%;
+      padding: 14px;
+      background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+      color: white;
+      border: none;
+      border-radius: 12px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: var(--transition);
+      font-family: inherit;
+    }}
+    .download-btn:hover {{
+      background: linear-gradient(135deg, #334155 0%, #475569 100%);
+      transform: translateY(-2px);
+    }}
+    .progress-track {{
+      height: 8px;
+      background: #e2e8f0;
+      border-radius: 4px;
+      overflow: hidden;
+      position: relative;
+    }}
+    .progress-fill {{
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), #60a5fa);
+      border-radius: 4px;
+      transition: width 0.3s ease;
+    }}
+    @media (max-width: 1024px) {{
+      .app-container {{ flex-direction: column; }}
+      .sidebar {{
+        width: 100%;
+        border-left: none;
+        border-top: 1px solid var(--line);
+      }}
+      .sidebar.collapsed {{
+        height: 0;
+        padding: 0;
+      }}
+    }}
   </style>
 </head>
 <body>
-  <div class="page">
-    <div class="hero">
-      <h1 id="title"></h1>
-      <p>target 固定为 step 0，仅更新 binder 轨迹。拖动时间轴切换 step，点击播放按钮自动播放。</p>
-    </div>
-    <div class="layout">
-      <div class="viewer-card">
+  <button class="sidebar-toggle" id="sidebar-toggle" title="Toggle sidebar (S)">
+    ☰
+  </button>
+  <div class="app-container">
+    <div class="main-content" id="main-content">
+      <div class="hero">
+        <h1 id="title"></h1>
+        <p>Target 结构固定为 step 0，仅更新 binder 轨迹。拖动时间轴或按空格键播放。</p>
+      </div>
+      <div class="viewer-wrapper" id="viewer-wrapper">
         <div class="controls">
-          <div class="control-row">
-            <button id="play-btn" class="primary-btn">▶ Play</button>
-            <button id="pause-btn" class="ghost-btn">⏸ Pause</button>
-            <button id="prev-btn" class="ghost-btn">← Prev</button>
-            <button id="next-btn" class="ghost-btn">Next →</button>
-            <label class="field">FPS <input id="fps-input" type="number" min="1" max="60" value="{int(fps)}"></label>
+          <div class="btn-group">
+            <button id="play-btn" class="btn btn-primary">▶ Play</button>
+            <button id="pause-btn" class="btn btn-ghost">⏸</button>
+            <button id="prev-btn" class="btn btn-ghost btn-icon">◀</button>
+            <button id="next-btn" class="btn btn-ghost btn-icon">▶</button>
           </div>
-          <div class="slider-wrap">
+          <div class="slider-section">
             <div class="slider-header">
               <strong id="frame-label">Frame 1 / {len(frames)}</strong>
               <span id="step-label">Step 0</span>
             </div>
-            <input id="frame-slider" type="range" min="0" max="{max(len(frames) - 1, 0)}" value="0" step="1">
+            <div class="slider-wrap">
+              <input id="frame-slider" type="range" min="0" max="{max(len(frames) - 1, 0)}" value="0" step="1">
+              <div class="progress-track" style="width: 60px;">
+                <div class="progress-fill" id="progress-fill" style="width: {100/len(frames) if len(frames) > 0 else 100}%;"></div>
+              </div>
+            </div>
+          </div>
+          <div class="fps-control">
+            <label>FPS</label>
+            <input id="fps-input" type="number" min="1" max="60" value="{int(fps)}">
+          </div>
+          <div class="view-mode-group">
+            <button class="view-mode-btn active" data-mode="cartoon">Cartoon</button>
+            <button class="view-mode-btn" data-mode="trace">Trace</button>
+            <button class="view-mode-btn" data-mode="ribbon">Ribbon</button>
+            <button class="view-mode-btn" data-mode="stick">Stick</button>
+            <button class="view-mode-btn" data-mode="sphere">Sphere</button>
+            <button class="view-mode-btn" data-mode="surface">Surface</button>
           </div>
         </div>
         <div id="viewer" class="viewer"></div>
-      </div>
-      <div class="side-card">
-        <div class="stats">
-          <div class="stat"><div class="stat-label">Step</div><div class="stat-value" id="step-value"></div></div>
-          <div class="stat"><div class="stat-label">Total loss</div><div class="stat-value" id="loss-value"></div></div>
-          <div class="stat"><div class="stat-label">Ranking score</div><div class="stat-value" id="ranking-value"></div></div>
-          <div class="stat"><div class="stat-label">Accepted</div><div class="stat-value"><span class="status-pill" id="accepted-value"></span></div></div>
-          <div class="stat"><div class="stat-label">Global best</div><div class="stat-value"><span class="status-pill" id="best-value"></span></div></div>
-          <div class="stat"><div class="stat-label">Frames</div><div class="stat-value">{len(frames)}</div></div>
-        </div>
-        <h3 style="margin:0 0 12px; font-size:16px;">Chain colors</h3>
-        <div class="legend" id="legend"></div>
-        <div class="hint">
-          target 链始终显示 step 0 的结构，只有 binder 会随 frame 变化。<br>
-          快捷方式：<span class="kbd">Space</span> 播放/暂停，<span class="kbd">←</span>/<span class="kbd">→</span> 切换 frame。
+        <div class="viewer-hint">
+          <span><kbd>Space</kbd> 播放/暂停</span>
+          <span><kbd>←</kbd><kbd>→</kbd> 切换帧</span>
+          <span><kbd>S</kbd> 侧边栏</span>
+          <span><kbd>F</kbd> 全屏</span>
         </div>
       </div>
+    </div>
+    <div class="sidebar" id="sidebar">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">Step</div>
+          <div class="stat-value" id="step-value">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Total Loss</div>
+          <div class="stat-value" id="loss-value">-</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Ranking Score</div>
+          <div class="stat-value" id="ranking-value">-</div>
+        </div>
+        <div class="stat-card status">
+          <div class="stat-label">Accepted</div>
+          <div class="stat-value"><span class="status-pill" id="accepted-value">-</span></div>
+        </div>
+        <div class="stat-card status">
+          <div class="stat-label">Global Best</div>
+          <div class="stat-value"><span class="status-pill" id="best-value">-</span></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Frames</div>
+          <div class="stat-value">{len(frames)}</div>
+        </div>
+      </div>
+      <div class="section-title">Chain Colors</div>
+      <div class="legend" id="legend"></div>
+      <button class="download-btn" id="download-btn">
+        ⬇ Download Current PDB
+      </button>
     </div>
   </div>
   <script>
@@ -428,7 +890,11 @@ def build_html(frames, output_title, fps, binder_chain, target_chains, static_ta
 
     document.getElementById('title').textContent = title;
 
-    const viewer = $3Dmol.createViewer(document.getElementById('viewer'), {{ backgroundColor: 'white' }});
+    const viewer = $3Dmol.createViewer(document.getElementById('viewer'), {{
+      backgroundColor: 'linear-gradient(180deg, #f8fafc 0%, #e2e8f0 100%)',
+      antialias: true,
+      id: 'mainViewer'
+    }});
     const slider = document.getElementById('frame-slider');
     const frameLabel = document.getElementById('frame-label');
     const stepLabel = document.getElementById('step-label');
@@ -439,37 +905,65 @@ def build_html(frames, output_title, fps, binder_chain, target_chains, static_ta
     const acceptedValue = document.getElementById('accepted-value');
     const bestValue = document.getElementById('best-value');
     const legend = document.getElementById('legend');
+    const sidebar = document.getElementById('sidebar');
+    const mainContent = document.getElementById('main-content');
+    const sidebarToggle = document.getElementById('sidebar-toggle');
+    const viewerWrapper = document.getElementById('viewer-wrapper');
+    const progressFill = document.getElementById('progress-fill');
 
     let currentIndex = 0;
     let playTimer = null;
     let savedView = null;
     let targetModel = null;
     let binderModel = null;
+    let currentViewMode = 'cartoon';
 
+    // Build color mapping per chain for 3Dmol colorscheme
+    function getChainColorMap() {{
+      const map = {{}};
+      legendItems.forEach(item => {{ map[item.chain] = item.color; }});
+      return map;
+    }}
+
+    // Apply view mode to a model with chain-color mapping
+    function applyStyle(model, chains) {{
+      const chainMap = getChainColorMap();
+      const filtered = {{}};
+      chains.forEach(c => {{ filtered[c] = chainMap[c]; }});
+      const style = {{
+        cartoon: {{ colorscheme: {{ prop: 'chain', map: filtered }}, opacity: 1.0 }},
+        ribbon: {{ cartoon: {{ style: "oval", colorscheme: {{ prop: 'chain', map: filtered }}, opacity: 0.9, thickness: 0.5 }} }},
+        trace: {{ cartoon: {{ style: "trace", colorscheme: {{ prop: 'chain', map: filtered }}, opacity: 0.95, linewidth: 1.0 }} }},
+        surface: {{ surface: {{ colorscheme: {{ prop: 'chain', map: filtered }}, opacity: 0.75 }} }},
+        stick: {{ stick: {{ colorscheme: {{ prop: 'chain', map: filtered }}, radius: 0.25 }} }},
+        sphere: {{ sphere: {{ colorscheme: {{ prop: 'chain', map: filtered }}, scale: 0.5 }} }}
+      }};
+      model.setStyle({{}}, style[currentViewMode]);
+    }}
+
+    // Initialize legend
     legendItems.forEach((item, index) => {{
       const div = document.createElement('div');
       div.className = 'legend-item';
-      const role = index === 0 ? 'binder' : 'target';
+      const role = index === 0 ? 'Binder' : 'Target';
       div.innerHTML = `<span class="swatch" style="background:${{item.color}}"></span><span class="chain-name">Chain ${{item.chain}}</span><span class="chain-role">${{role}}</span>`;
       legend.appendChild(div);
     }});
 
     function formatNumber(value) {{
-      if (value === null || value === undefined || Number.isNaN(value)) return 'NA';
-      return Number(value).toFixed(3);
+      if (value === null || value === undefined || Number.isNaN(value)) return '-';
+      return Number(value).toFixed(4);
     }}
 
     function setPill(element, value) {{
-      element.textContent = value ? 'true' : 'false';
+      element.textContent = value ? '✓ Accepted' : '✗ Rejected';
       element.className = 'status-pill ' + (value ? 'status-true' : 'status-false');
     }}
 
-    function styleModel(model, chains) {{
-      Object.entries(chainColors).forEach(([chain, color]) => {{
-        if (chains.includes(chain)) {{
-          model.setStyle({{ chain }}, {{ cartoon: {{ color }} }});
-        }}
-      }});
+    function ensureBaseModels() {{
+      if (targetModel !== null) return;
+      targetModel = viewer.addModel(staticTargetPdb, 'pdb');
+      applyStyle(targetModel, legendItems.slice(1).map(i => i.chain));
     }}
 
     function updateMeta(frame) {{
@@ -481,12 +975,6 @@ def build_html(frames, output_title, fps, binder_chain, target_chains, static_ta
       stepLabel.textContent = `Step ${{frame.step}}`;
     }}
 
-    function ensureBaseModels() {{
-      if (targetModel !== null) return;
-      targetModel = viewer.addModel(staticTargetPdb, 'pdb');
-      styleModel(targetModel, legendItems.slice(1).map((item) => item.chain));
-    }}
-
     function renderFrame(index) {{
       currentIndex = index;
       const frame = frames[index];
@@ -496,7 +984,7 @@ def build_html(frames, output_title, fps, binder_chain, target_chains, static_ta
         binderModel = null;
       }}
       binderModel = viewer.addModel(frame.binder_pdb, 'pdb');
-      styleModel(binderModel, [legendItems[0].chain]);
+      applyStyle(binderModel, [legendItems[0].chain]);
       if (savedView === null) {{
         viewer.zoomTo();
         savedView = viewer.getView();
@@ -506,6 +994,7 @@ def build_html(frames, output_title, fps, binder_chain, target_chains, static_ta
       viewer.render();
       slider.value = index;
       frameLabel.textContent = `Frame ${{index + 1}} / ${{frames.length}}`;
+      progressFill.style.width = `${{((index + 1) / frames.length) * 100}}%`;
       updateMeta(frame);
     }}
 
@@ -521,12 +1010,54 @@ def build_html(frames, output_title, fps, binder_chain, target_chains, static_ta
       if (frames.length <= 1) return;
       pausePlayback();
       const fps = Math.max(1, Number(fpsInput.value) || 1);
-      document.getElementById('play-btn').textContent = 'Playing…';
+      document.getElementById('play-btn').textContent = '⏸ Playing...';
       playTimer = window.setInterval(() => {{
         renderFrame((currentIndex + 1) % frames.length);
       }}, 1000 / fps);
     }}
 
+    function toggleSidebar() {{
+      sidebar.classList.toggle('collapsed');
+      mainContent.classList.toggle('expanded');
+      viewerWrapper.classList.toggle('expanded');
+      sidebarToggle.textContent = sidebar.classList.contains('collapsed') ? '☰' : '✕';
+      setTimeout(() => viewer.resize(), 300);
+    }}
+
+    function toggleFullscreen() {{
+      if (!document.fullscreenElement) {{
+        viewerWrapper.requestFullscreen().catch(err => {{
+          console.log('Fullscreen error:', err);
+        }});
+      }} else {{
+        document.exitFullscreen();
+      }}
+    }}
+
+    function refreshViewMode() {{
+      if (targetModel) {{
+        applyStyle(targetModel, legendItems.slice(1).map(i => i.chain));
+      }}
+      if (binderModel) {{
+        applyStyle(binderModel, [legendItems[0].chain]);
+      }}
+      viewer.render();
+    }}
+
+    function downloadCurrentPDB() {{
+      const frame = frames[currentIndex];
+      const blob = new Blob([frame.binder_pdb], {{ type: 'text/plain' }});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `step_${{String(frame.step).padStart(4, '0')}}_binder.pdb`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }}
+
+    // Event listeners
     document.getElementById('prev-btn').addEventListener('click', () => {{
       pausePlayback();
       renderFrame((currentIndex - 1 + frames.length) % frames.length);
@@ -550,6 +1081,20 @@ def build_html(frames, output_title, fps, binder_chain, target_chains, static_ta
     fpsInput.addEventListener('change', () => {{
       if (playTimer !== null) playPlayback();
     }});
+    sidebarToggle.addEventListener('click', toggleSidebar);
+    document.getElementById('download-btn').addEventListener('click', downloadCurrentPDB);
+
+    // View mode buttons
+    document.querySelectorAll('.view-mode-btn').forEach(btn => {{
+      btn.addEventListener('click', () => {{
+        document.querySelectorAll('.view-mode-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentViewMode = btn.dataset.mode;
+        refreshViewMode();
+      }});
+    }});
+
+    // Keyboard shortcuts
     window.addEventListener('keydown', (event) => {{
       if (event.code === 'Space') {{
         event.preventDefault();
@@ -562,6 +1107,12 @@ def build_html(frames, output_title, fps, binder_chain, target_chains, static_ta
         event.preventDefault();
         pausePlayback();
         renderFrame((currentIndex + 1) % frames.length);
+      }} else if (event.code === 'KeyS') {{
+        event.preventDefault();
+        toggleSidebar();
+      }} else if (event.code === 'KeyF') {{
+        event.preventDefault();
+        toggleFullscreen();
       }}
     }});
 

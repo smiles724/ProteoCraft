@@ -1,7 +1,6 @@
 run_name: tcr5_hotspot_v1like_loss
 output_root: /data/huangyanjie/binder_design/BindCraft-v2/outputs/bindcraft_v2_tcr_cases_v1like_loss
 log_dir: /data/huangyanjie/binder_design/BindCraft-v2/outputs/bindcraft_v2_tcr_cases_v1like_loss/logs
-protenix_root_dir: /data/huangyanjie/binder_design/BindCraft-v2/outputs/protenix_runtime_tcr_cases_v1like_loss
 model_checkpoint_dir: /data/huangyanjie/Alphaenzyme/LGOS/checkpoints
 components_cache_dir: /data/huangyanjie/Alphaenzyme/LGOS/protenix/release_data/ccd_cache
 model_name: protenix_base_20250630_v1.0.0

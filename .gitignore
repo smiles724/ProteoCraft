@@ -175,3 +175,10 @@ protenix/model/tri_attention/TriAttentionCache/
 
 # ESM embeddings (large pre-computed features, do not push)
 esm_embeddings/
+
+# Local Cursor/Codex artifacts (do not push)
+.codex
+benchmark/.codex
+
+# Analysis PDFs are binary artifacts (do not push)
+benchmark/results/analysis/**/*.pdf

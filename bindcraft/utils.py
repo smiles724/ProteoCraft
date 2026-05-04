@@ -36,10 +36,11 @@ TargetSeqInput = Union[str, List[str]]
 
 def _default_protenix_common_dir() -> Optional[str]:
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    protenix_root = os.environ.get("PROTENIX_ROOT_DIR")
     candidates = [
         os.environ.get("PROTENIX_COMMON_DIR"),
+        os.path.join(protenix_root, "common") if protenix_root else None,
         os.path.join(project_root, "benchmark", "protenix_runtime", "common"),
-        os.path.join(os.environ.get("PROTENIX_ROOT_DIR", ""), "common"),
     ]
     for path in candidates:
         if path and os.path.exists(os.path.join(path, "components.cif")):
@@ -194,8 +195,15 @@ def _match_target_template_chains(
     return matched_chains
 
 
-def _map_query_to_template_indices(query_seq: str, template_seq: str) -> Dict[int, int]:
+def _map_query_to_template_indices(
+    query_seq: str,
+    template_seq: str,
+    trusted_query_mask: Optional[List[bool]] = None,
+) -> Dict[int, int]:
     if query_seq == template_seq:
+        return {idx: idx for idx in range(len(query_seq))}
+
+    if len(query_seq) == len(template_seq):
         return {idx: idx for idx in range(len(query_seq))}
 
     start = template_seq.find(query_seq)
@@ -205,6 +213,29 @@ def _map_query_to_template_indices(query_seq: str, template_seq: str) -> Dict[in
     start = query_seq.find(template_seq)
     if start >= 0:
         return {start + idx: idx for idx in range(len(template_seq))}
+
+    if trusted_query_mask is not None and len(query_seq) <= len(template_seq):
+        trusted_mask = np.asarray(trusted_query_mask, dtype=bool)
+        if trusted_mask.shape[0] != len(query_seq):
+            raise ValueError(
+                f"trusted_query_mask length {trusted_mask.shape[0]} != query length {len(query_seq)}"
+            )
+        trusted_count = int(trusted_mask.sum())
+        if trusted_count == 0:
+            return {}
+        best_start = -1
+        best_matches = -1
+        for start in range(len(template_seq) - len(query_seq) + 1):
+            matches = sum(
+                query_seq[idx] == template_seq[start + idx]
+                for idx in range(len(query_seq))
+                if trusted_mask[idx]
+            )
+            if matches > best_matches:
+                best_matches = matches
+                best_start = start
+        if best_start >= 0 and best_matches == trusted_count:
+            return {idx: best_start + idx for idx in range(len(query_seq))}
 
     return {}
 
@@ -218,12 +249,19 @@ def _normalize_template_release_date(release_date: str) -> str:
 def _extract_target_template_features(
     target_seqs: List[str],
     target_template_path: str,
+    template_token_masks: Optional[List[Optional[List[bool]]]] = None,
 ) -> Dict[str, Any]:
+    from protenix.data.constants import STD_RESIDUES_WITH_GAP
     from protenix.data.template.template_parser import TemplateParser
     from protenix.data.template.template_utils import TemplateHitProcessor
 
     if not os.path.exists(target_template_path):
         raise FileNotFoundError(f"target template 文件不存在: {target_template_path}")
+    if template_token_masks is not None and len(template_token_masks) != len(target_seqs):
+        raise ValueError(
+            f"template_token_masks length {len(template_token_masks)} must equal "
+            f"target_seqs length {len(target_seqs)}"
+        )
 
     cif_string = _convert_pdb_to_cif_string(target_template_path, target_seqs)
     file_id = os.path.splitext(os.path.basename(target_template_path))[0]
@@ -234,13 +272,20 @@ def _extract_target_template_features(
     matched_chains = _match_target_template_chains(
         target_seqs, parsed.mmcif_object.chain_to_seqres
     )
-    processor = TemplateHitProcessor(mmcif_dir="", _zero_center_positions=True)
+    processor = TemplateHitProcessor(mmcif_dir="", _zero_center_positions=False)
 
     templates_by_target_idx = {}
     for target_idx, (query_seq, chain_id) in enumerate(zip(target_seqs, matched_chains)):
         actual_chain_id = chain_id
         template_seq = parsed.mmcif_object.chain_to_seqres[chain_id]
-        mapping = _map_query_to_template_indices(query_seq, template_seq)
+        trusted_query_mask = (
+            template_token_masks[target_idx]
+            if template_token_masks is not None
+            else None
+        )
+        mapping = _map_query_to_template_indices(
+            query_seq, template_seq, trusted_query_mask=trusted_query_mask
+        )
         if not mapping:
             template_seq, mapping, actual_chain_id = processor._align_query_to_hit_index_mapping(
                 query_seq=query_seq,
@@ -255,8 +300,23 @@ def _extract_target_template_features(
             template_seq=template_seq,
             query_seq=query_seq,
             chain_id=actual_chain_id,
-            _zero_center=True,
+            _zero_center=False,
         )
+        if template_token_masks is not None and template_token_masks[target_idx] is not None:
+            keep_mask = np.asarray(template_token_masks[target_idx], dtype=bool)
+            if keep_mask.shape[0] != len(query_seq):
+                raise ValueError(
+                    f"template mask length {keep_mask.shape[0]} != sequence length "
+                    f"{len(query_seq)} for template query {target_idx + 1}"
+                )
+            drop_mask = ~keep_mask
+            features["template_all_atom_masks"][drop_mask, :] = 0
+            features["template_all_atom_positions"][drop_mask, :, :] = 0.0
+            features["template_aatype"][drop_mask] = STD_RESIDUES_WITH_GAP["-"]
+            seq_chars = list(features["template_sequence"].decode())
+            for idx in np.where(drop_mask)[0].tolist():
+                seq_chars[idx] = "-"
+            features["template_sequence"] = "".join(seq_chars).encode()
         features["template_sum_probs"] = [1.0]
         release_date = _normalize_template_release_date(
             parsed.mmcif_object.header.get("release_date", "1970-01-01")
@@ -271,28 +331,51 @@ def _make_template_features_from_structure(
     sample_dict: Dict[str, Any],
     atom_array,
     target_template_path: Optional[str],
+    binder_template_mask: Optional[List[bool]] = None,
 ) -> Dict[str, np.ndarray]:
     from protenix.data.constants import PROTEIN_CHAIN
     from protenix.data.msa.msa_utils import map_to_standard
     from protenix.data.template.template_featurizer import TemplateFeatureAssemblyLine
 
+    if binder_template_mask is None:
+        template_entity_indices = list(range(1, len(sample_dict["sequences"])))
+        template_token_masks = None
+    else:
+        template_entity_indices = list(range(len(sample_dict["sequences"])))
+        template_token_masks = [None] * len(template_entity_indices)
+        binder_seq = sample_dict["sequences"][0]["proteinChain"]["sequence"]
+        if len(binder_template_mask) != len(binder_seq):
+            raise ValueError(
+                f"binder_template_mask length {len(binder_template_mask)} != "
+                f"binder sequence length {len(binder_seq)}"
+            )
+        template_token_masks[0] = [bool(x) for x in binder_template_mask]
+
     target_seqs = [
-        entity["proteinChain"]["sequence"]
-        for entity in sample_dict["sequences"][1:]
+        sample_dict["sequences"][entity_idx]["proteinChain"]["sequence"]
+        for entity_idx in template_entity_indices
     ]
     templates_by_target_idx = (
-        _extract_target_template_features(target_seqs, target_template_path)
+        _extract_target_template_features(
+            target_seqs,
+            target_template_path,
+            template_token_masks=template_token_masks,
+        )
         if target_template_path
         else {}
     )
+    templates_by_entity_idx = {
+        entity_idx: templates_by_target_idx[template_idx]
+        for template_idx, entity_idx in enumerate(template_entity_indices)
+        if template_idx in templates_by_target_idx
+    }
 
     template_meta_infos = {}
     curr_asym_id = 0
     for entity_idx, entity in enumerate(sample_dict["sequences"]):
         chain = entity["proteinChain"]
         count = chain["count"]
-        target_idx = entity_idx - 1
-        templates = templates_by_target_idx.get(target_idx, [])
+        templates = templates_by_entity_idx.get(entity_idx, [])
         for i in range(count):
             asym_id = curr_asym_id + i
             template_meta_infos[asym_id] = {
@@ -318,6 +401,7 @@ def _build_features_from_sequences(
     device: torch.device,
     name: str,
     target_template_path: Optional[str] = None,
+    binder_template_mask: Optional[List[bool]] = None,
 ) -> Tuple[Dict, int, int]:
     """
     基于一条或多条蛋白链序列构建 Protenix 输入特征。
@@ -349,6 +433,7 @@ def _build_features_from_sequences(
             sample_dict=sample_dict,
             atom_array=atom_array,
             target_template_path=target_template_path,
+            binder_template_mask=binder_template_mask,
         )
     else:
         template_features = InferenceTemplateFeaturizer.make_template_feature(
@@ -363,6 +448,11 @@ def _build_features_from_sequences(
         dummy_feats.append("template")
     else:
         features_dict.update(dict_to_tensor(template_features))
+        if len(seqs) > 1:
+            n_token = features_dict["token_index"].shape[0]
+            features_dict["template_multichain_mask"] = torch.ones(
+                (n_token, n_token), dtype=torch.float32
+            )
     features_dict = make_dummy_feature(features_dict=features_dict, dummy_feats=dummy_feats)
 
     feat = data_type_transform(feat_or_label_dict=features_dict)
@@ -404,6 +494,7 @@ def build_complex_features(
     target_seq: TargetSeqInput,
     device: torch.device,
     target_template_path: Optional[str] = None,
+    binder_template_mask: Optional[List[bool]] = None,
 ) -> Tuple[Dict, int, int]:
     """
     构建 Binder-Target 复合物的输入特征，支持单链或多链 target。
@@ -426,6 +517,7 @@ def build_complex_features(
         device,
         name="binder_target_complex",
         target_template_path=target_template_path,
+        binder_template_mask=binder_template_mask,
     )
 
 

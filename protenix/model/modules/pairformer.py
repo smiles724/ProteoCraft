@@ -1010,7 +1010,13 @@ class TemplateEmbedder(nn.Module):
             # Compatible with the Protenix 0.5.0 model series
             return 0
         asym_id = input_feature_dict["asym_id"]
-        multichain_mask = (asym_id[:, None] == asym_id[None, :]).to(z.dtype)
+        if "template_multichain_mask" in input_feature_dict:
+            multichain_mask = input_feature_dict["template_multichain_mask"].to(
+                device=z.device,
+                dtype=z.dtype,
+            )
+        else:
+            multichain_mask = (asym_id[:, None] == asym_id[None, :]).to(z.dtype)
 
         num_residues = z.shape[0]
         # determine whether the number of templates is the configured maximum value, otherwise error out

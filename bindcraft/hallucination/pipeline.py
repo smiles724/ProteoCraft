@@ -121,6 +121,8 @@ def run_hallucination(
     init_binder_seq: str = None,
     hotspot_params: Optional[Dict] = None,
     target_template_path: Optional[str] = None,
+    task_type: Optional[str] = None,
+    target_chain_roles: Optional[List[str]] = None,
 ) -> Tuple[str, str, List[float]]:
     """
     运行 Hallucination 优化循环
@@ -267,6 +269,8 @@ def run_hallucination(
             pde_params=pde_params,
             clash_params=dict(DEFAULT_CLASH_PARAMS),
             hotspot_params=hotspot_params,
+            task_type=task_type,
+            target_chain_roles=target_chain_roles,
         )
 
         # ── 反向传播 ─────────────────────────────────────────────────────
@@ -371,6 +375,8 @@ def run_hybrid_hallucination(
     checkpoint_dir: str = None,
     hotspot_params: Optional[Dict] = None,
     target_template_path: Optional[str] = None,
+    task_type: Optional[str] = None,
+    target_chain_roles: Optional[List[str]] = None,
 ) -> Tuple[str, str, List[float]]:
     """
     混合优化循环：一阶梯度引导离散候选 + 零阶全链路验证 + 接受准则。
@@ -544,6 +550,8 @@ def run_hybrid_hallucination(
         contact_params=contact_params,
         hotspot_params=hotspot_params,
         target_template_path=target_template_path,
+        task_type=task_type,
+        target_chain_roles=target_chain_roles,
     )
     logger.info(
         f"  初始零阶 total_loss={init_zeroth.total_loss:.4f} | "
@@ -646,6 +654,8 @@ def run_hybrid_hallucination(
                     pde_params=pde_params,
                     clash_params=dict(DEFAULT_CLASH_PARAMS),
                     hotspot_params=hotspot_params,
+                    task_type=task_type,
+                    target_chain_roles=target_chain_roles,
                 )
                 torch.nn.utils.clip_grad_norm_([thetas[b]], 1.0)
                 optimizers[b].step()
@@ -684,6 +694,8 @@ def run_hybrid_hallucination(
                     pde_params=pde_params,
                     clash_params=dict(DEFAULT_CLASH_PARAMS),
                     hotspot_params=hotspot_params,
+                    task_type=task_type,
+                    target_chain_roles=target_chain_roles,
                 )
 
                 first_order_loss.backward()
@@ -741,6 +753,8 @@ def run_hybrid_hallucination(
                 contact_params=contact_params,
                 hotspot_params=hotspot_params,
                 target_template_path=target_template_path,
+                task_type=task_type,
+                target_chain_roles=target_chain_roles,
             )
             all_zeroth_results.append(result)
             beam_src = all_candidate_beams[idx]
@@ -971,6 +985,8 @@ def run_mcts_hallucination(
     mcts_max_nodes: int = 5000,
     mcts_tau_fixed: float = 4.0,
     target_template_path: Optional[str] = None,
+    task_type: Optional[str] = None,
+    target_chain_roles: Optional[List[str]] = None,
 ) -> Tuple[str, str, List[float]]:
     """
     MCTS 调度的混合优化：UCB 选点 + 一阶提议 + 零阶验证 + Expansion/Backprop/Prune。
@@ -1061,6 +1077,8 @@ def run_mcts_hallucination(
             chunk_size=chunk_size,
             hotspot_params=hotspot_params,
             target_template_path=target_template_path,
+            task_type=task_type,
+            target_chain_roles=target_chain_roles,
         )
         phase0_results.append((tseq, result))
         logger.info(
@@ -1187,6 +1205,8 @@ def run_mcts_hallucination(
             pde_params=pde_params,
             clash_params=dict(DEFAULT_CLASH_PARAMS),
             hotspot_params=hotspot_params,
+            task_type=task_type,
+            target_chain_roles=target_chain_roles,
         )
 
         first_order_loss.backward()
@@ -1229,6 +1249,8 @@ def run_mcts_hallucination(
                 chunk_size=chunk_size,
                 hotspot_params=hotspot_params,
                 target_template_path=target_template_path,
+                task_type=task_type,
+                target_chain_roles=target_chain_roles,
             )
             all_zeroth_results.append(result)
 
