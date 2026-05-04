@@ -153,6 +153,14 @@ benchmark/input/
 benchmark/protenix_runtime/
 benchmark/protenix_runtime_*/
 
+# Keep only selected benchmark scripts in git
+benchmark/script/*
+!benchmark/script/run_benchmark.sh
+!benchmark/script/run_bindcraft_tcr_case.py
+!benchmark/script/run_bindcraft_tcr_case.sh
+!benchmark/script/run_cdr_tcr_domain_redesign.py
+!benchmark/script/run_cdr_tcr_domain_redesign.sh
+
 # Benchmark run outputs (large); keep analysis scripts + directory placeholders
 benchmark/results/*
 !benchmark/results/analysis/
