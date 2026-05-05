@@ -297,6 +297,9 @@ def main():
                        help="two_stage: 交给 StageB 的 top 序列数（默认：mcts_num_beams）")
     parser.add_argument("--mcts_expand_actions_per_step", type=int, default=2,
                        help="MCTS StageB 每步最多扩展并验证的 action 数（默认：2）")
+    parser.add_argument("--mcts_prior_mode", type=str, default="full",
+                       choices=["full", "uniform", "no_gradient", "no_group", "no_sequence"],
+                       help="MCTS StageB prior 消融模式（默认：full，保持当前完整逻辑）")
     parser.add_argument("--chunk_size", type=int, default=None,
                        help="Attention 分块（MCTS 一阶/零阶）；大复合物可设 256 避免 OOM（默认：None）")
     parser.add_argument("--use_prior", type=lambda x: x.lower() == "true", default=True,
@@ -445,6 +448,7 @@ def main():
             mcts_bootstrap_max_steps=args.mcts_bootstrap_max_steps,
             mcts_handoff_top_k=args.mcts_handoff_top_k,
             mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
+            mcts_prior_mode=args.mcts_prior_mode,
             checkpoint_dir=args.save_checkpoint_dir,
             seed=args.seed,
             target_template_path=args.target_template_path,
@@ -464,6 +468,7 @@ def main():
         f.write(f"MCTS Bootstrap Steps: {args.mcts_bootstrap_steps}\n")
         f.write(f"MCTS Bootstrap Max Steps: {args.mcts_bootstrap_max_steps}\n")
         f.write(f"MCTS Expand Actions Per Step: {args.mcts_expand_actions_per_step}\n")
+        f.write(f"MCTS Prior Mode: {args.mcts_prior_mode}\n")
         f.write(f"Initial Binder Sequence: {args.init_binder_seq or 'RANDOM'}\n")
         f.write(f"Target Hotspots 1-based: {args.target_hotspots or 'NONE'}\n")
         f.write(f"Target Template Path: {args.target_template_path or 'None'}\n")

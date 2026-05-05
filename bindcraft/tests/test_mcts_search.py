@@ -18,7 +18,10 @@ from bindcraft.hallucination.mutation_proposer import (
     propose_mutation_actions,
     propose_mutations,
     propose_mutations_legacy,
+    normalize_mcts_prior_mode,
+    sample_mutation_actions,
     select_de_novo_action_group,
+    should_use_sequence_prior,
     apply_position_weight_mask,
 )
 from bindcraft.hallucination.zeroth_order import compute_mcts_structural_metadata
@@ -115,6 +118,42 @@ class TestStage1GradientPriorPuct:
         assert -with_prior[0, ser].item() > -no_prior[0, ser].item()
         assert -with_prior[0, trp].item() < -no_prior[0, trp].item()
         assert with_prior[0, current_indices[0]].item() == pytest.approx(0.0)
+
+    def test_prior_mode_helpers_preserve_full_default_and_disable_sequence_prior(self):
+        assert normalize_mcts_prior_mode(None) == "full"
+        assert normalize_mcts_prior_mode("NO_GRADIENT") == "no_gradient"
+        assert should_use_sequence_prior("full", True)
+        assert not should_use_sequence_prior("no_sequence", True)
+        assert not should_use_sequence_prior("uniform", True)
+        assert not should_use_sequence_prior("full", False)
+        with pytest.raises(ValueError):
+            normalize_mcts_prior_mode("bad_mode")
+
+    def test_no_gradient_prior_keeps_actions_uniform_within_group(self):
+        torch.manual_seed(0)
+        current_indices = [AA_1_TO_IDX["A"], AA_1_TO_IDX["A"], AA_1_TO_IDX["A"]]
+        positions = torch.tensor([0, 1, 2], dtype=torch.long)
+        new_aas = torch.tensor(
+            [AA_1_TO_IDX["S"], AA_1_TO_IDX["T"], AA_1_TO_IDX["G"]],
+            dtype=torch.long,
+        )
+        benefits = torch.tensor([10.0, 1.0, 0.1])
+
+        proposals = sample_mutation_actions(
+            current_indices,
+            positions,
+            new_aas,
+            benefits,
+            B_candidates=3,
+            T_sample=1.0,
+            max_mutations_per_seq=1,
+            group_prior=0.6,
+            prior_mode="no_gradient",
+        )
+
+        assert proposals
+        expected = 0.6 / len(proposals)
+        assert all(p.prior == pytest.approx(expected) for p in proposals)
 
     def test_mcts_tree_puct_reward_backup_dedup_and_global_best(self):
         logits = torch.zeros(4, 20, requires_grad=True)

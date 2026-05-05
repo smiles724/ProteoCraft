@@ -297,6 +297,15 @@ def main():
                     help="two_stage 中 StageA 最多运行步数（默认：80）")
     g4.add_argument("--mcts_handoff_top_k", type=int, default=None,
                     help="two_stage 交接给 StageB 的 root 数；默认等于 --mcts_num_beams")
+    g4.add_argument("--mcts_expand_actions_per_step", type=int, default=2,
+                    help="文档式 StageB 每轮最多展开 action 数（默认：2）")
+    g4.add_argument("--mcts_prior_mode", type=str, default="full",
+                    choices=["full", "uniform", "no_gradient", "no_group", "no_sequence"],
+                    help="StageB prior 消融模式；full 为正常两阶段 MCTS（默认：full）")
+    g4.add_argument("--target_template_path", type=str, default=None,
+                    help="可选复合物 template 文件；CDR/TCR 局部重设计时可保留 binder framework template")
+    g4.add_argument("--target_chain_roles", type=str, default=None,
+                    help="可选 partner 链角色，按 --target 多链顺序传入，如 target,scaffold")
 
     # ── 损失函数权重 ──────────────────────────────────────────────────────────
     g5 = parser.add_argument_group("损失函数权重")
@@ -390,7 +399,11 @@ def main():
                 mcts_bootstrap_min_delta=args.mcts_bootstrap_min_delta,
                 mcts_bootstrap_max_steps=args.mcts_bootstrap_max_steps,
                 mcts_handoff_top_k=args.mcts_handoff_top_k,
+                mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
+                mcts_prior_mode=args.mcts_prior_mode,
                 chunk_size=args.chunk_size,
+                target_template_path=args.target_template_path,
+                target_chain_roles=args.target_chain_roles,
             )
         else:
             best_seq, final_seq, losses_history = run_hybrid_hallucination_cdr(
@@ -416,6 +429,8 @@ def main():
                 checkpoint_dir=_ckpt,
                 hotspot_params=hotspot_params,
                 chunk_size=args.chunk_size,
+                target_template_path=args.target_template_path,
+                target_chain_roles=args.target_chain_roles,
             )
         run_label = f"ModeA_{args.pdb_id}"
 
@@ -488,7 +503,11 @@ def main():
                 mcts_bootstrap_min_delta=args.mcts_bootstrap_min_delta,
                 mcts_bootstrap_max_steps=args.mcts_bootstrap_max_steps,
                 mcts_handoff_top_k=args.mcts_handoff_top_k,
+                mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
+                mcts_prior_mode=args.mcts_prior_mode,
                 chunk_size=args.chunk_size,
+                target_template_path=args.target_template_path,
+                target_chain_roles=args.target_chain_roles,
             )
         else:
             best_seq, final_seq, losses_history = run_hybrid_hallucination_cdr(
@@ -514,6 +533,8 @@ def main():
                 checkpoint_dir=_ckpt,
                 hotspot_params=hotspot_params,
                 chunk_size=args.chunk_size,
+                target_template_path=args.target_template_path,
+                target_chain_roles=args.target_chain_roles,
             )
         run_label = f"ModeB_{json_basename}"
 
@@ -580,7 +601,11 @@ def main():
                 mcts_bootstrap_min_delta=args.mcts_bootstrap_min_delta,
                 mcts_bootstrap_max_steps=args.mcts_bootstrap_max_steps,
                 mcts_handoff_top_k=args.mcts_handoff_top_k,
+                mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
+                mcts_prior_mode=args.mcts_prior_mode,
                 chunk_size=args.chunk_size,
+                target_template_path=args.target_template_path,
+                target_chain_roles=args.target_chain_roles,
             )
         else:
             logging.info(f"[CDR-Aware] Mode C — hybrid (无 CDR mask)")
@@ -606,6 +631,8 @@ def main():
                 checkpoint_dir=_ckpt,
                 hotspot_params=hotspot_params,
                 chunk_size=args.chunk_size,
+                target_template_path=args.target_template_path,
+                target_chain_roles=args.target_chain_roles,
             )
         run_label = f"ModeC_{args.mode}"
 
@@ -631,8 +658,14 @@ def main():
         f.write(f"Tau Noise: {args.tau_noise}\n")
         if args.mode == "mcts":
             f.write(f"MCTS Strategy: cdr_{args.mcts_strategy}\n")
+            f.write(f"MCTS Prior Mode: {args.mcts_prior_mode}\n")
+            f.write(f"MCTS Expand Actions Per Step: {args.mcts_expand_actions_per_step}\n")
             f.write(f"MCTS Bootstrap Steps: {args.mcts_bootstrap_steps}\n")
             f.write(f"MCTS Bootstrap Max Steps: {args.mcts_bootstrap_max_steps}\n")
+        if args.target_template_path:
+            f.write(f"Target Template Path: {args.target_template_path}\n")
+        if args.target_chain_roles:
+            f.write(f"Target Chain Roles: {args.target_chain_roles}\n")
         f.write(f"\n")
         f.write(f"Best Sequence: {best_seq}\n")
         f.write(f"Final Sequence: {final_seq}\n")

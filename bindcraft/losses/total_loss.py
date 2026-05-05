@@ -9,7 +9,7 @@ BindCraft v2 - 统一 Loss 计算
 """
 
 import torch
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple, Any, List, Optional
 
 from protenix.model import sample_confidence
 
@@ -24,6 +24,33 @@ from bindcraft.losses.geometry import (
     compute_helix_loss,
     compute_soft_clash_loss,
 )
+
+
+def _normalize_type1_partner_chain_roles(target_chain_roles: Any) -> Optional[List[str]]:
+    """
+    Normalize non-binder chain roles for local CDR/TCR redesign.
+
+    Roles are ordered like target_seq chains. "target" chains contribute to
+    design-target interface losses; "scaffold" chains are fixed structural
+    context and contribute to intra/local physical consistency.
+    """
+    if target_chain_roles is None:
+        return None
+    if isinstance(target_chain_roles, str):
+        raw_roles = [part.strip() for part in target_chain_roles.split(",") if part.strip()]
+    else:
+        raw_roles = [str(role).strip() for role in target_chain_roles]
+
+    normalized_roles: List[str] = []
+    for role in raw_roles:
+        role_l = role.lower()
+        if role_l in {"t", "target", "antigen", "peptide"}:
+            normalized_roles.append("target")
+        elif role_l in {"s", "scaffold", "context", "fixed", "background"}:
+            normalized_roles.append("scaffold")
+        else:
+            raise ValueError(f"未知 target/scaffold chain role: {role}")
+    return normalized_roles
 
 
 def compute_all_losses(
@@ -43,6 +70,7 @@ def compute_all_losses(
     clash_params: Dict[str, float] = None,
     hotspot_params: Dict[str, Any] = None,
     opt_token_mask: torch.Tensor = None,
+    target_chain_roles: Optional[List[str]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     在给定的全原子坐标和 confidence logits 上计算全部 12 项 loss。
@@ -64,6 +92,9 @@ def compute_all_losses(
         clash_params:      碰撞 loss 参数 (r_clash, bond_sep) (None to skip)
         opt_token_mask:    可选优化区域 mask。None 表示整个 binder 参与 loss；
                            长度可为 binder token 数或全 token 数。
+        target_chain_roles: 可选非 binder 链角色，按 target_seq 链顺序传入。
+                           CDR/TCR local redesign 可用 ["target", "scaffold"]
+                           将抗原和固定外部结构拆开。
 
     Returns:
         total_loss: 加权总 loss（标量 tensor）
@@ -76,7 +107,32 @@ def compute_all_losses(
     asym_id = input_feature_dict["asym_id"]
     binder_chain_id = asym_id[0]
     binder_token_mask = asym_id == binder_chain_id
-    target_token_mask = ~binder_token_mask
+    non_binder_token_mask = ~binder_token_mask
+    target_token_mask = non_binder_token_mask
+    external_scaffold_token_mask = torch.zeros_like(target_token_mask, dtype=torch.bool)
+
+    partner_roles = _normalize_type1_partner_chain_roles(target_chain_roles)
+    has_type1_partner_roles = partner_roles is not None
+    if partner_roles is not None:
+        partner_chain_ids = [
+            chain_id
+            for chain_id in torch.unique(asym_id, sorted=True).tolist()
+            if chain_id != binder_chain_id.item()
+        ]
+        if len(partner_roles) != len(partner_chain_ids):
+            raise ValueError(
+                f"target_chain_roles length {len(partner_roles)} must equal non-binder chain count "
+                f"{len(partner_chain_ids)}"
+            )
+        target_token_mask = torch.zeros_like(non_binder_token_mask, dtype=torch.bool)
+        for role, chain_id in zip(partner_roles, partner_chain_ids):
+            chain_mask = asym_id == chain_id
+            if role == "target":
+                target_token_mask = target_token_mask | chain_mask
+            elif role == "scaffold":
+                external_scaffold_token_mask = external_scaffold_token_mask | chain_mask
+        if target_token_mask.sum() == 0:
+            raise ValueError("target_chain_roles must mark at least one non-binder chain as target")
 
     design_token_mask = binder_token_mask
     local_redesign = False
@@ -100,10 +156,12 @@ def compute_all_losses(
         if (design_token_mask & ~binder_token_mask).any():
             raise ValueError("opt_token_mask may only select binder tokens")
         local_redesign = bool((design_token_mask != binder_token_mask).any().item())
-    scaffold_token_mask = binder_token_mask & ~design_token_mask
+    binder_scaffold_token_mask = binder_token_mask & ~design_token_mask
+    scaffold_token_mask = binder_scaffold_token_mask | external_scaffold_token_mask
 
     binder_atom_mask = binder_token_mask[atom_to_token]
     target_atom_mask = target_token_mask[atom_to_token]
+    non_binder_atom_mask = non_binder_token_mask[atom_to_token]
     design_atom_mask = design_token_mask[atom_to_token]
     scaffold_atom_mask = scaffold_token_mask[atom_to_token]
 
@@ -148,7 +206,7 @@ def compute_all_losses(
     pae_inter_pair_mask = None
     pde_intra_pair_mask = None
     pde_inter_pair_mask = None
-    if local_redesign:
+    if local_redesign or has_type1_partner_roles:
         design_x_design = design_token_mask.unsqueeze(0) & design_token_mask.unsqueeze(1)
         design_x_scaffold = design_token_mask.unsqueeze(1) & scaffold_token_mask.unsqueeze(0)
         design_x_target = design_token_mask.unsqueeze(1) & interface_target_mask.unsqueeze(0)
@@ -198,8 +256,8 @@ def compute_all_losses(
             seqsep=contact_params["seqsep"],
             binary=False,
             residue_index=input_feature_dict.get("residue_index"),
-            row_token_mask=design_token_mask if local_redesign else None,
-            col_token_mask=design_token_mask if local_redesign else None,
+            row_token_mask=design_token_mask if (local_redesign or has_type1_partner_roles) else None,
+            col_token_mask=design_token_mask if (local_redesign or has_type1_partner_roles) else None,
         )
         losses["con"] = l_con
         total_loss = total_loss + weights["con"] * l_con
@@ -215,8 +273,8 @@ def compute_all_losses(
             binary=False,
             residue_index=input_feature_dict.get("residue_index"),
             hotspot_token_mask=hotspot_token_mask,
-            row_token_mask=design_token_mask if local_redesign else None,
-            col_token_mask=interface_target_mask if local_redesign else None,
+            row_token_mask=design_token_mask if (local_redesign or has_type1_partner_roles) else None,
+            col_token_mask=interface_target_mask if (local_redesign or has_type1_partner_roles) else None,
         )
         losses["i_con"] = l_icon
         total_loss = total_loss + weights["i_con"] * l_icon
@@ -267,10 +325,10 @@ def compute_all_losses(
 
     # clash (intra)
     if weights.get("clash", 0) != 0:
-        if local_redesign:
+        if local_redesign or has_type1_partner_roles:
             residue_index = input_feature_dict.get("residue_index", asym_id)
             l_clash_oo = compute_soft_clash_loss(
-                x0_flat, binder_atom_mask, target_atom_mask,
+                x0_flat, binder_atom_mask, non_binder_atom_mask,
                 atom_to_token, residue_index,
                 mode="intra",
                 r_clash=_clash_params.get("r_clash", 2.0),
@@ -280,7 +338,7 @@ def compute_all_losses(
                 exclude_bonded=True,
             )
             l_clash_os = compute_soft_clash_loss(
-                x0_flat, binder_atom_mask, target_atom_mask,
+                x0_flat, binder_atom_mask, non_binder_atom_mask,
                 atom_to_token, residue_index,
                 mode="intra",
                 r_clash=_clash_params.get("r_clash", 2.0),
@@ -304,9 +362,9 @@ def compute_all_losses(
 
     # i_clash (inter)
     if weights.get("i_clash", 0) != 0:
-        if local_redesign:
+        if local_redesign or has_type1_partner_roles:
             l_iclash = compute_soft_clash_loss(
-                x0_flat, binder_atom_mask, target_atom_mask,
+                x0_flat, binder_atom_mask, non_binder_atom_mask,
                 atom_to_token, input_feature_dict.get("residue_index", asym_id),
                 mode="inter",
                 r_clash=_clash_params.get("r_clash", 2.0),

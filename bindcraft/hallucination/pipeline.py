@@ -19,6 +19,7 @@ from typing import Dict, Tuple, List, Union, Optional, Any
 import logging
 import os
 import math
+from dataclasses import replace
 
 from bindcraft.hallucination.ste_bridge import (
     precompute_waa_embeddings,
@@ -42,9 +43,11 @@ from bindcraft.hallucination.diffusion_one_step import (
 )
 from bindcraft.hallucination.mutation_proposer import (
     AA_1_TO_IDX,
+    DE_NOVO_ACTION_GROUPS,
     propose_mutations,
     propose_mutations_legacy,
     propose_mutation_actions,
+    normalize_mcts_prior_mode,
     select_de_novo_action_group,
 )
 from bindcraft.hallucination.zeroth_order import zeroth_order_eval
@@ -161,6 +164,37 @@ def _allocate_action_group_budgets(group_priors: dict, total_budget: int) -> dic
     return {group: count for group, count in budgets.items() if count > 0}
 
 
+def _uniform_de_novo_group_priors() -> Dict[str, float]:
+    prior = 1.0 / max(len(DE_NOVO_ACTION_GROUPS), 1)
+    return {group: prior for group in DE_NOVO_ACTION_GROUPS}
+
+
+def _apply_stageb_prior_mode_to_groups(
+    prior_mode: str,
+    action_group: str,
+    group_priors: Dict[str, float],
+) -> Tuple[str, Dict[str, float]]:
+    """
+    Apply prior-ablation modes to StageB verifier-loss group priors.
+
+    full/no_gradient/no_sequence keep verifier-loss group routing. no_group and
+    uniform remove that signal and fall back to the unguided total-loss proposal.
+    """
+    prior_mode = normalize_mcts_prior_mode(prior_mode)
+    if prior_mode in {"uniform", "no_group"}:
+        return "unrouted", _uniform_de_novo_group_priors()
+    return action_group, group_priors
+
+
+def _renormalize_stageb_proposal_priors(proposals: list, prior_mode: str) -> list:
+    """Make final PUCT action priors uniform when running the uniform ablation."""
+    prior_mode = normalize_mcts_prior_mode(prior_mode)
+    if prior_mode != "uniform" or not proposals:
+        return proposals
+    uniform_prior = 1.0 / max(len(proposals), 1)
+    return [replace(proposal, prior=uniform_prior, group_prior=uniform_prior) for proposal in proposals]
+
+
 def _normalize_init_binder_seq(init_binder_seq: str, L_binder: int) -> str:
     """
     校验并标准化用户提供的初始 Binder 序列。
@@ -235,6 +269,7 @@ def run_hallucination(
     hotspot_params: Optional[Dict] = None,
     seed: Optional[int] = 42,
     target_template_path: Optional[str] = None,
+    target_chain_roles: Optional[Any] = None,
 ) -> Tuple[str, str, List[float]]:
     """
     运行 Hallucination 优化循环
@@ -381,6 +416,7 @@ def run_hallucination(
             pde_params=pde_params,
             clash_params=dict(DEFAULT_CLASH_PARAMS),
             hotspot_params=hotspot_params,
+            target_chain_roles=target_chain_roles,
         )
 
         # ── 反向传播 ─────────────────────────────────────────────────────
@@ -486,6 +522,7 @@ def run_hybrid_hallucination(
     hotspot_params: Optional[Dict] = None,
     seed: Optional[int] = 42,
     target_template_path: Optional[str] = None,
+    target_chain_roles: Optional[Any] = None,
 ) -> Tuple[str, str, List[float]]:
     """
     混合优化循环：一阶梯度引导离散候选 + 零阶全链路验证 + 接受准则。
@@ -589,6 +626,8 @@ def run_hybrid_hallucination(
     else:
         logger.info("Beam Search: 关闭（单路径模式）")
     logger.info(f"M_prior (BLOSUM62): use_prior={use_prior}, prior_strength={prior_strength}")
+    if target_chain_roles is not None:
+        logger.info("Target chain roles: %s", target_chain_roles)
     if use_tau_fusion:
         logger.info(f"τ-fusion: tau_coarse={tau_coarse}, tau_fine={tau_fine}, alpha={alpha}")
     else:
@@ -660,6 +699,7 @@ def run_hybrid_hallucination(
         hotspot_params=hotspot_params,
         seed=_verifier_seed(seed, target_seq, init_binder),
         target_template_path=target_template_path,
+        target_chain_roles=target_chain_roles,
     )
     logger.info(
         f"  初始零阶 total_loss={init_zeroth.total_loss:.4f} | "
@@ -800,6 +840,7 @@ def run_hybrid_hallucination(
                     pde_params=pde_params,
                     clash_params=dict(DEFAULT_CLASH_PARAMS),
                     hotspot_params=hotspot_params,
+                    target_chain_roles=target_chain_roles,
                 )
 
                 first_order_loss.backward()
@@ -858,6 +899,7 @@ def run_hybrid_hallucination(
                 hotspot_params=hotspot_params,
                 seed=_verifier_seed(seed, target_seq, cand_seq),
                 target_template_path=target_template_path,
+                target_chain_roles=target_chain_roles,
             )
             all_zeroth_results.append(result)
             beam_src = all_candidate_beams[idx]
@@ -1332,8 +1374,10 @@ def run_mcts_hallucination(
     mcts_bootstrap_max_steps: int = 80,
     mcts_handoff_top_k: Optional[int] = None,
     mcts_expand_actions_per_step: int = MCTS_STAGE2_EXPAND_ACTIONS_PER_STEP,
+    mcts_prior_mode: str = "full",
     seed: Optional[int] = 42,
     target_template_path: Optional[str] = None,
+    target_chain_roles: Optional[Any] = None,
 ) -> Tuple[str, str, List[float]]:
     """
     MCTS 调度的混合优化：UCB 选点 + 一阶提议 + 零阶验证 + Expansion/Backprop/Prune。
@@ -1353,6 +1397,7 @@ def run_mcts_hallucination(
     mcts_bootstrap_max_steps = max(mcts_bootstrap_steps, int(mcts_bootstrap_max_steps))
     mcts_handoff_top_k = max(1, int(mcts_handoff_top_k or num_beams))
     mcts_expand_actions_per_step = max(int(mcts_expand_actions_per_step), 1)
+    mcts_prior_mode = normalize_mcts_prior_mode(mcts_prior_mode)
 
     base_weights = dict(DEFAULT_LOSS_WEIGHTS)
     if loss_weights is not None:
@@ -1435,7 +1480,14 @@ def run_mcts_hallucination(
         MCTS_STAGE3_USE_DIVERSITY_BONUS,
     )
     logger.info(f"Annealing: {use_annealing} (C={mcts_C} is primary exploration control)")
-    logger.info(f"M_prior (BLOSUM62): use_prior={use_prior}, prior_strength={prior_strength}")
+    logger.info(
+        "MCTS prior mode: %s | M_prior(BLOSUM62) requested=%s prior_strength=%.3f",
+        mcts_prior_mode,
+        use_prior,
+        prior_strength,
+    )
+    if target_chain_roles is not None:
+        logger.info("Target chain roles: %s", target_chain_roles)
     logger.info(f"Base loss 权重: {base_weights}")
     logger.info("=" * 70)
 
@@ -1499,6 +1551,7 @@ def run_mcts_hallucination(
             hotspot_params=hotspot_params,
             seed=_verifier_seed(seed, target_seq, tseq),
             target_template_path=target_template_path,
+            target_chain_roles=target_chain_roles,
         )
         phase0_results.append((tseq, result))
         verifier_cache[result.binder_seq] = result
@@ -1631,6 +1684,7 @@ def run_mcts_hallucination(
                 target_seq=target_seq,
                 device=device,
                 tau_temp=tau_temp,
+                target_template_path=target_template_path,
             )
 
             x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
@@ -1674,6 +1728,7 @@ def run_mcts_hallucination(
                 pde_params=pde_params,
                 clash_params=dict(DEFAULT_CLASH_PARAMS),
                 hotspot_params=hotspot_params,
+                target_chain_roles=target_chain_roles,
             )
 
             first_order_loss.backward()
@@ -1720,6 +1775,7 @@ def run_mcts_hallucination(
                     hotspot_params=hotspot_params,
                     seed=_verifier_seed(seed, target_seq, cand_seq),
                     target_template_path=target_template_path,
+                    target_chain_roles=target_chain_roles,
                 )
                 verifier_cache[result.binder_seq] = result
                 all_zeroth_results.append(result)
@@ -1763,7 +1819,9 @@ def run_mcts_hallucination(
             else:
                 stale_steps += 1
 
-            losses_history.append(round_best_loss)
+            # Public MCTS loss history is the global best trace. The per-round
+            # verifier best is still logged as round_best for diagnostics.
+            losses_history.append(best_zeroth_loss)
             legacy_steps_done += 1
             stats = legacy_tree.get_node_stats()
 
@@ -1965,6 +2023,17 @@ def run_mcts_hallucination(
         }
         if not group_priors:
             group_priors = {action_group: group_prior}
+        action_group, group_priors = _apply_stageb_prior_mode_to_groups(
+            mcts_prior_mode,
+            action_group,
+            group_priors,
+        )
+        group_prior = float(
+            group_priors.get(
+                action_group,
+                max(group_priors.values()) if group_priors else 1.0,
+            )
+        )
 
         first_order_loss, first_order_losses = compute_all_losses(
             x0_flat=x0_flat,
@@ -1982,6 +2051,7 @@ def run_mcts_hallucination(
             pde_params=pde_params,
             clash_params=dict(DEFAULT_CLASH_PARAMS),
             hotspot_params=hotspot_params,
+            target_chain_roles=target_chain_roles,
         )
         proposal_loss, proposal_loss_mode = _stageb_group_proposal_loss(
             first_order_losses,
@@ -2042,8 +2112,13 @@ def run_mcts_hallucination(
                     action_group=group_name,
                     group_prior=group_priors.get(group_name, 0.0),
                     structural_signature=selected_node.structural_signature,
+                    prior_mode=mcts_prior_mode,
                 )
             )
+        proposal_pool = _renormalize_stageb_proposal_priors(
+            proposal_pool,
+            mcts_prior_mode,
+        )
 
         if not proposal_pool:
             logger.warning(f"Step {global_step}: no candidates generated, skipping")
@@ -2133,6 +2208,7 @@ def run_mcts_hallucination(
                 hotspot_params=hotspot_params,
                 seed=_verifier_seed(seed, target_seq, proposal.sequence),
                 target_template_path=target_template_path,
+                target_chain_roles=target_chain_roles,
             )
             mcts_tree.store_verifier_result(result)
             all_zeroth_results.append(result)
@@ -2206,7 +2282,9 @@ def run_mcts_hallucination(
         else:
             strict_stale_steps += 1
 
-        losses_history.append(round_best_loss)
+        # Public MCTS loss history is the global best trace. The per-round
+        # verifier best is still logged as round_best for diagnostics.
+        losses_history.append(best_zeroth_loss)
 
         stats = mcts_tree.get_node_stats()
         verifier_cache_hits = stats["verifier_cache_hits"] - cache_hits_before

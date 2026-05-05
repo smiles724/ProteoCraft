@@ -14,7 +14,7 @@ CDR mask 注入的两个位置：
 
 import torch
 import numpy as np
-from typing import Dict, Tuple, List, Optional, Any
+from typing import Dict, Tuple, List, Optional, Any, Union
 import logging
 from pathlib import Path
 
@@ -44,6 +44,7 @@ from bindcraft.hallucination.mutation_proposer import (
     propose_mutations,
     propose_mutations_legacy,
     propose_mutation_actions,
+    normalize_mcts_prior_mode,
     select_de_novo_action_group,
 )
 from bindcraft.hallucination.zeroth_order import zeroth_order_eval
@@ -63,10 +64,12 @@ from bindcraft.hallucination.pipeline import (
     MCTS_STAGE3_USE_REWARD_NORMALIZATION,
     MCTS_STAGE3_USE_STRUCTURAL_GROUPING,
     _allocate_action_group_budgets,
+    _apply_stageb_prior_mode_to_groups,
     _handoff_structural_key,
     _make_strict_mcts_tree,
     _make_stage_checkpoint_manager,
     _normalize_mcts_strategy,
+    _renormalize_stageb_proposal_priors,
     _select_diverse_handoff_results,
     _stageb_group_proposal_loss,
     _stageb_max_mutations_for_step,
@@ -366,7 +369,8 @@ def run_hybrid_hallucination_cdr(
     pdb_id: str = None,
     binder_sequence: str = None,
     cdr_mask: List[bool] = None,
-    target_seq: str = None,
+    target_seq: Union[str, List[str]] = None,
+    target_chain_roles: Optional[Any] = None,
     L_binder: int = None,
     N_steps: int = 100,
     learning_rate: float = 0.05,
@@ -396,6 +400,7 @@ def run_hybrid_hallucination_cdr(
     breath_recovery_steps: int = 3,
     checkpoint_dir: str = None,
     hotspot_params: Optional[Dict] = None,
+    target_template_path: Optional[str] = None,
     # ── Mode A 专属参数 ───────────────────────────────────────────
     binder_chain: str = None,
     scheme: str = "chothia",
@@ -417,7 +422,9 @@ def run_hybrid_hallucination_cdr(
         pdb_id:        PDB ID 或文件路径（Mode A）
         binder_sequence: Binder 全长序列（Mode B/C）
         cdr_mask:      CDR mask List[bool]（Mode B）
-        target_seq:    抗原序列（Mode B/C 必需，Mode A 可省略）
+        target_seq:    抗原/partner 序列（Mode B/C 必需，Mode A 可省略）
+        target_chain_roles: 可选 partner 链角色，按 target_seq 顺序传入，
+                          例如 ["target", "scaffold"]。
         L_binder:      Binder 长度（可省略，自动从 binder_sequence 推断）
         N_steps:       混合优化总轮数
         learning_rate: 一阶优化学习率
@@ -446,6 +453,8 @@ def run_hybrid_hallucination_cdr(
         breath_con_factor:     呼吸状态下 con/i_con 权重缩减系数
         breath_recovery_steps: 呼吸状态持续步数
         checkpoint_dir:         每步保存 checkpoint 的根目录，None 则不保存
+        target_template_path:   可选复合物 template 文件；CDR 模式下 framework
+                                binder residues 作为 template context 保留
         binder_chain:   指定 binder chain ID（Mode A，默认为第一条 heavy chain）
         scheme:         ANARCI numbering scheme（Mode A，默认 chothia）
 
@@ -499,6 +508,8 @@ def run_hybrid_hallucination_cdr(
     if loss_weights is not None:
         base_weights.update(loss_weights)
     contact_params = dict(DEFAULT_CONTACT_PARAMS)
+    partner_roles = _normalize_partner_chain_roles(target_seq, target_chain_roles)
+    binder_template_mask = _cdr_binder_template_mask(cdr_mask, target_template_path)
 
     annealer = AnnealingScheduler(T_init=T_init, T_min=T_min) if use_annealing else None
     tau_sched = TauScheduler(jitter=tau_jitter) if use_tau_scheduling else None
@@ -520,7 +531,15 @@ def run_hybrid_hallucination_cdr(
 
     logger.info("=" * 70)
     logger.info("CDR-Aware 混合优化 (Mode A/B/C auto-detected above)")
-    logger.info(f"Target: {target_seq} ({len(target_seq)} aa)")
+    tgt_seqs = _normalize_chain_sequences(target_seq)
+    logger.info(
+        "Target/partner chains: %d | lengths=%s | total=%d aa",
+        len(tgt_seqs),
+        "+".join(str(len(seq)) for seq in tgt_seqs),
+        sum(len(seq) for seq in tgt_seqs),
+    )
+    if partner_roles is not None:
+        logger.info("Partner chain roles: %s", partner_roles)
     logger.info(f"Binder 长度: {L_binder} aa | CDR residues: {sum(cdr_mask)}/{L_binder}")
     logger.info(f"总轮数: {N_steps} | K_top={K_top} B={B_candidates} T_sample={T_sample}")
     logger.info(f"Annealing: {use_annealing} (T_init={T_init}, T_min={T_min})")
@@ -542,6 +561,7 @@ def run_hybrid_hallucination_cdr(
         logger.info(f"τ-fusion: tau_coarse={tau_coarse}, tau_fine={tau_fine}, alpha={alpha}")
     else:
         logger.info("τ-fusion: 关闭")
+    logger.info("Template: %s | binder_template_mask=%s", target_template_path, binder_template_mask is not None)
     logger.info(f"Base loss 权重: {base_weights}")
     logger.info("Step 0: 零阶全链路初始化，将在优化循环前执行完整 AF3 推断获取初始锚点骨架")
     logger.info("=" * 70)
@@ -611,6 +631,9 @@ def run_hybrid_hallucination_cdr(
         chunk_size=None,
         hotspot_params=hotspot_params,
         opt_token_mask=cdr_mask,
+        target_template_path=target_template_path,
+        binder_template_mask=binder_template_mask,
+        target_chain_roles=partner_roles,
     )
     logger.info(
         f"  初始零阶 total_loss={init_zeroth.total_loss:.4f} | "
@@ -641,6 +664,9 @@ def run_hybrid_hallucination_cdr(
         chunk_size=None,
         hotspot_params=hotspot_params,
         opt_token_mask=cdr_mask,
+        target_template_path=target_template_path,
+        binder_template_mask=binder_template_mask,
+        target_chain_roles=partner_roles,
     )
     logger.info(f"  基准 loss={baseline_for_best.total_loss:.4f} | pLDDT={baseline_for_best.summary_confidence.get('plddt', 'N/A')}")
     best_zeroth_loss = baseline_for_best.total_loss
@@ -708,6 +734,8 @@ def run_hybrid_hallucination_cdr(
             s_binder, current_seq, input_feature_dict = ste_bridge(
                 theta=thetas[b], W_AAE=W_AAE, model=model,
                 target_seq=target_seq, device=device, tau_temp=tau_temp,
+                target_template_path=target_template_path,
+                binder_template_mask=binder_template_mask,
             )
 
             if use_tau_fusion:
@@ -733,6 +761,7 @@ def run_hybrid_hallucination_cdr(
                     clash_params=dict(DEFAULT_CLASH_PARAMS),
                     hotspot_params=hotspot_params,
                     opt_token_mask=cdr_mask,
+                    target_chain_roles=partner_roles,
                     chunk_size=None,
                 )
                 torch.nn.utils.clip_grad_norm_([thetas[b]], 1.0)
@@ -773,6 +802,7 @@ def run_hybrid_hallucination_cdr(
                     clash_params=dict(DEFAULT_CLASH_PARAMS),
                     hotspot_params=hotspot_params,
                     opt_token_mask=cdr_mask,
+                    target_chain_roles=partner_roles,
                 )
 
                 first_order_loss.backward()
@@ -852,6 +882,9 @@ def run_hybrid_hallucination_cdr(
                 chunk_size=None,
                 hotspot_params=hotspot_params,
                 opt_token_mask=cdr_mask,
+                target_template_path=target_template_path,
+                binder_template_mask=binder_template_mask,
+                target_chain_roles=partner_roles,
             )
             all_zeroth_results.append(result)
             logger.debug(
@@ -1050,6 +1083,42 @@ def _clip_seq_by_cdr_mask(
     return "".join(seq_list)
 
 
+def _normalize_partner_chain_roles(
+    target_seq: Union[str, List[str]],
+    target_chain_roles: Optional[Any],
+) -> Optional[List[str]]:
+    """Normalize optional CDR/TCR partner roles ordered like target_seq chains."""
+    if target_chain_roles is None:
+        return None
+    if isinstance(target_chain_roles, str):
+        roles = [part.strip() for part in target_chain_roles.split(",") if part.strip()]
+    else:
+        roles = [str(role).strip() for role in target_chain_roles]
+    target_sequences = _normalize_chain_sequences(target_seq)
+    if len(roles) != len(target_sequences):
+        raise ValueError(
+            f"target_chain_roles length {len(roles)} must equal target_seq chain count "
+            f"{len(target_sequences)}"
+        )
+    return roles
+
+
+def _cdr_binder_template_mask(
+    cdr_mask: List[bool],
+    target_template_path: Optional[str],
+) -> Optional[List[bool]]:
+    """
+    Keep framework template coordinates while masking mutable CDR residues.
+
+    Returning None preserves the de novo target-only template path.
+    """
+    if target_template_path is None:
+        return None
+    if not cdr_mask or all(cdr_mask):
+        return None
+    return [not is_cdr for is_cdr in cdr_mask]
+
+
 def _cdr_stageb_position_weights(
     sequence: str,
     cdr_mask: List[bool],
@@ -1117,7 +1186,8 @@ def run_mcts_hallucination_cdr(
     pdb_id: str = None,
     binder_sequence: str = None,
     cdr_mask: List[bool] = None,
-    target_seq: str = None,
+    target_seq: Union[str, List[str]] = None,
+    target_chain_roles: Optional[Any] = None,
     L_binder: int = None,
     N_steps: int = 100,
     learning_rate: float = 0.05,
@@ -1145,9 +1215,12 @@ def run_mcts_hallucination_cdr(
     mcts_bootstrap_min_delta: float = 0.02,
     mcts_bootstrap_max_steps: int = 80,
     mcts_handoff_top_k: Optional[int] = None,
+    mcts_expand_actions_per_step: int = MCTS_STAGE2_EXPAND_ACTIONS_PER_STEP,
+    mcts_prior_mode: str = "full",
     binder_chain: str = None,
     scheme: str = "chothia",
     chunk_size: int = None,
+    target_template_path: Optional[str] = None,
 ) -> Tuple[str, str, List[float]]:
     """
     CDR-Aware MCTS：与 ``run_hybrid_hallucination_cdr`` 相同的 Mode A/B/C 检测，
@@ -1164,6 +1237,8 @@ def run_mcts_hallucination_cdr(
     mcts_bootstrap_min_delta = max(float(mcts_bootstrap_min_delta), 0.0)
     mcts_bootstrap_max_steps = max(mcts_bootstrap_steps, int(mcts_bootstrap_max_steps))
     mcts_handoff_top_k = max(1, int(mcts_handoff_top_k or num_beams))
+    mcts_expand_actions_per_step = max(int(mcts_expand_actions_per_step), 1)
+    mcts_prior_mode = normalize_mcts_prior_mode(mcts_prior_mode)
 
     # ── CDR 自动推断（与 hybrid 对齐）─────────────────────────────────────
     if pdb_id is not None:
@@ -1198,6 +1273,8 @@ def run_mcts_hallucination_cdr(
     assert len(cdr_mask) == L_binder, (
         f"cdr_mask length {len(cdr_mask)} != L_binder {L_binder}"
     )
+    partner_roles = _normalize_partner_chain_roles(target_seq, target_chain_roles)
+    binder_template_mask = _cdr_binder_template_mask(cdr_mask, target_template_path)
 
     base_weights = dict(DEFAULT_LOSS_WEIGHTS)
     if loss_weights is not None:
@@ -1242,6 +1319,8 @@ def run_mcts_hallucination_cdr(
         f"Target chains: {len(tgt_seqs)} | lengths={tgt_len_str} | total={tgt_total} aa"
     )
     logger.info(f"Binder 长度: {L_binder} aa | CDR residues: {sum(cdr_mask)}/{L_binder}")
+    logger.info("Partner roles: %s", partner_roles or "all_target")
+    logger.info("Template: %s | binder_template_mask=%s", target_template_path, binder_template_mask is not None)
     logger.info(f"总轮数: {N_steps} | K_top={K_top} B={B_candidates} T_sample={T_sample}")
     logger.info(f"MCTS: C={mcts_C}, max_nodes={mcts_max_nodes}, tau_fixed={mcts_tau_fixed}")
     logger.info(
@@ -1260,8 +1339,9 @@ def run_mcts_hallucination_cdr(
         MCTS_STAGE2_PROGRESSIVE_WIDENING_K,
         MCTS_STAGE2_PROGRESSIVE_WIDENING_ALPHA,
         MCTS_STAGE2_MAX_CHILDREN_PER_NODE,
-        MCTS_STAGE2_EXPAND_ACTIONS_PER_STEP,
+        mcts_expand_actions_per_step,
     )
+    logger.info("CDR MCTS prior mode: %s", mcts_prior_mode)
     logger.info(
         "CDR Stage3-lite: loss_grouping=%s(bin_width=%.2f, reps=%d) "
         "structural_grouping=%s pareto=%s reward_normalization=%s "
@@ -1301,7 +1381,12 @@ def run_mcts_hallucination_cdr(
     pde_params = sample_confidence.get_bin_params(model.configs.loss.pde)
 
     mcts_tree = (
-        _make_strict_mcts_tree(mcts_C, mcts_max_nodes, mcts_tau_fixed)
+        _make_strict_mcts_tree(
+            mcts_C,
+            mcts_max_nodes,
+            mcts_tau_fixed,
+            mcts_expand_actions_per_step,
+        )
         if mcts_strategy == "strict"
         else None
     )
@@ -1365,6 +1450,9 @@ def run_mcts_hallucination_cdr(
             chunk_size=chunk_size,
             hotspot_params=hotspot_params,
             opt_token_mask=cdr_mask,
+            target_template_path=target_template_path,
+            binder_template_mask=binder_template_mask,
+            target_chain_roles=partner_roles,
         )
         phase0_results.append((cand_seq, result))
         verifier_cache[result.binder_seq] = result
@@ -1511,6 +1599,8 @@ def run_mcts_hallucination_cdr(
                 target_seq=target_seq,
                 device=device,
                 tau_temp=tau_temp,
+                target_template_path=target_template_path,
+                binder_template_mask=binder_template_mask,
             )
 
             x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
@@ -1554,6 +1644,8 @@ def run_mcts_hallucination_cdr(
                 pde_params=pde_params,
                 clash_params=dict(DEFAULT_CLASH_PARAMS),
                 hotspot_params=hotspot_params,
+                opt_token_mask=cdr_mask,
+                target_chain_roles=partner_roles,
             )
 
             first_order_loss.backward()
@@ -1606,6 +1698,10 @@ def run_mcts_hallucination_cdr(
                     contact_params=contact_params,
                     chunk_size=chunk_size,
                     hotspot_params=hotspot_params,
+                    opt_token_mask=cdr_mask,
+                    target_template_path=target_template_path,
+                    binder_template_mask=binder_template_mask,
+                    target_chain_roles=partner_roles,
                 )
                 verifier_cache[result.binder_seq] = result
                 all_zeroth_results.append(result)
@@ -1725,7 +1821,12 @@ def run_mcts_hallucination_cdr(
         if not handoff_results:
             raise RuntimeError("[CDR MCTS] two_stage handoff has no verifier results")
 
-        mcts_tree = _make_strict_mcts_tree(mcts_C, mcts_max_nodes, mcts_tau_fixed)
+        mcts_tree = _make_strict_mcts_tree(
+            mcts_C,
+            mcts_max_nodes,
+            mcts_tau_fixed,
+            mcts_expand_actions_per_step,
+        )
         for cached_result in verifier_cache.values():
             mcts_tree.store_verifier_result(cached_result)
 
@@ -1819,6 +1920,8 @@ def run_mcts_hallucination_cdr(
             target_seq=target_seq,
             device=device,
             tau_temp=tau_temp,
+            target_template_path=target_template_path,
+            binder_template_mask=binder_template_mask,
         )
 
         x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
@@ -1858,6 +1961,17 @@ def run_mcts_hallucination_cdr(
         }
         if not group_priors:
             group_priors = {action_group: group_prior}
+        action_group, group_priors = _apply_stageb_prior_mode_to_groups(
+            mcts_prior_mode,
+            action_group,
+            group_priors,
+        )
+        group_prior = float(
+            group_priors.get(
+                action_group,
+                max(group_priors.values()) if group_priors else 1.0,
+            )
+        )
 
         first_order_loss, first_order_losses = compute_all_losses(
             x0_flat=x0_flat,
@@ -1876,6 +1990,7 @@ def run_mcts_hallucination_cdr(
             clash_params=dict(DEFAULT_CLASH_PARAMS),
             hotspot_params=hotspot_params,
             opt_token_mask=cdr_mask,
+            target_chain_roles=partner_roles,
         )
         proposal_loss, proposal_loss_mode = _stageb_group_proposal_loss(
             first_order_losses,
@@ -1908,7 +2023,7 @@ def run_mcts_hallucination_cdr(
         )
 
         widening_slots = mcts_tree.remaining_expansion_slots(selected_node)
-        expand_budget = min(MCTS_STAGE2_EXPAND_ACTIONS_PER_STEP, widening_slots)
+        expand_budget = min(mcts_expand_actions_per_step, widening_slots)
         if expand_budget <= 0:
             logger.warning(
                 f"Step {global_step}: selected node {selected_node.node_id} has no progressive widening slots"
@@ -1941,8 +2056,13 @@ def run_mcts_hallucination_cdr(
                     structural_signature=selected_node.structural_signature,
                     position_weights=position_weights,
                     enforce_position_mask=True,
+                    prior_mode=mcts_prior_mode,
                 )
             )
+        proposal_pool = _renormalize_stageb_proposal_priors(
+            proposal_pool,
+            mcts_prior_mode,
+        )
 
         proposal_dedup_skipped = 0
         proposal_seen = set()
@@ -2048,6 +2168,9 @@ def run_mcts_hallucination_cdr(
                 chunk_size=chunk_size,
                 hotspot_params=hotspot_params,
                 opt_token_mask=cdr_mask,
+                target_template_path=target_template_path,
+                binder_template_mask=binder_template_mask,
+                target_chain_roles=partner_roles,
             )
             verifier_cache[result.binder_seq] = result
             mcts_tree.store_verifier_result(result)

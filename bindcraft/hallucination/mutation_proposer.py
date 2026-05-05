@@ -30,6 +30,7 @@ from bindcraft.utils import (
 logger = logging.getLogger(__name__)
 
 AA_1_TO_IDX = {AA_1LETTER[name]: idx for idx, name in enumerate(PROTEIN_RESIDUE_NAMES)}
+MCTS_PRIOR_MODES = ("full", "uniform", "no_gradient", "no_group", "no_sequence")
 
 
 def _aa_indices(letters: str) -> List[int]:
@@ -87,6 +88,22 @@ class MutationProposal:
     benefit: float
     action_group: str = "unrouted"
     group_prior: float = 1.0
+
+
+def normalize_mcts_prior_mode(mode: str) -> str:
+    """Normalize the StageB prior ablation mode used by MCTS."""
+    normalized = str(mode or "full").strip().lower()
+    if normalized not in MCTS_PRIOR_MODES:
+        raise ValueError(
+            f"Unknown mcts_prior_mode={mode!r}; expected one of {', '.join(MCTS_PRIOR_MODES)}"
+        )
+    return normalized
+
+
+def should_use_sequence_prior(prior_mode: str, use_prior: bool) -> bool:
+    """Return whether BLOSUM62 sequence prior should be active."""
+    prior_mode = normalize_mcts_prior_mode(prior_mode)
+    return bool(use_prior) and prior_mode not in {"uniform", "no_sequence"}
 
 
 DE_NOVO_ACTION_GROUPS = (
@@ -658,12 +675,15 @@ def sample_mutation_actions(
     max_mutations_per_seq: int,
     action_group: str = "unrouted",
     group_prior: float = 1.0,
+    prior_mode: str = "full",
 ) -> List[MutationProposal]:
     """
     从 Top-K 突变中采样 MCTS action，并返回序列、edit、prior、benefit。
 
     prior 在最终返回前会按候选集合重新归一化，供 PUCT 使用。
+    no_gradient/uniform 模式下，PUCT action prior 不使用 gradient benefit。
     """
+    prior_mode = normalize_mcts_prior_mode(prior_mode)
     K = positions.shape[0]
     if K == 0:
         return []
@@ -692,12 +712,15 @@ def sample_mutation_actions(
                 continue
             seq[pos] = aa
             edit_by_pos[pos] = (old, aa)
-            raw_prior += float(probs[ci].item())
+            if prior_mode not in {"uniform", "no_gradient"}:
+                raw_prior += float(probs[ci].item())
             total_benefit += float(benefits[ci].item())
 
         key = tuple(seq)
         if not edit_by_pos or key == tuple(current_indices) or key in seen:
             continue
+        if prior_mode in {"uniform", "no_gradient"}:
+            raw_prior = 1.0
 
         seen.add(key)
         edits = [
@@ -755,16 +778,19 @@ def propose_mutation_actions(
     position_weights: Optional[torch.Tensor] = None,
     position_bias_strength: float = 0.5,
     enforce_position_mask: bool = True,
+    prior_mode: str = "full",
 ) -> List[MutationProposal]:
     """
     MCTS 专用候选生成：返回 sequence + edit metadata + PUCT prior。
     """
+    prior_mode = normalize_mcts_prior_mode(prior_mode)
     current_indices = _seq_to_indices(current_seq)
     grad_cpu = grad_matrix.detach().cpu()
 
     delta_L = compute_mutation_benefit(
         grad_cpu, current_indices,
-        use_prior=use_prior, prior_strength=prior_strength,
+        use_prior=should_use_sequence_prior(prior_mode, use_prior),
+        prior_strength=prior_strength,
     )
     delta_L, routing_stats = apply_action_group_mutation_bias(
         delta_L,
@@ -802,10 +828,12 @@ def propose_mutation_actions(
         B_candidates, T_sample, max_mutations_per_seq,
         action_group=action_group or "unrouted",
         group_prior=group_prior,
+        prior_mode=prior_mode,
     )
     if proposals:
         logger.info(
             f"Proposed {len(proposals)} MCTS actions | "
+            f"prior_mode={prior_mode} | "
             f"group={proposals[0].action_group} P_group={group_prior:.4f} | "
             f"Top-K={positions.shape[0]} mutations | "
             f"Best benefit={benefits[0]:.4f} at pos {positions[0].item()} | "

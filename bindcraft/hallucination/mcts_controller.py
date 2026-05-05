@@ -14,7 +14,7 @@ not be retained by nodes.
 import math
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Union
 
 import torch
 
@@ -116,6 +116,17 @@ def _cpu_detached(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     if tensor is None:
         return None
     return tensor.detach().cpu().clone()
+
+
+def _copy_target_sequence(target_seq: Any) -> Union[str, List[str]]:
+    """Preserve multi-chain target sequences while normalizing scalar values."""
+    if target_seq is None:
+        return ""
+    if isinstance(target_seq, list):
+        return [str(seq) for seq in target_seq]
+    if isinstance(target_seq, tuple):
+        return [str(seq) for seq in target_seq]
+    return str(target_seq)
 
 
 def compute_hard_constraint_status(loss_vector: Dict[str, float]) -> Dict[str, Any]:
@@ -232,7 +243,7 @@ class CachedVerifierResult:
     """CPU-only verifier result cached by exact binder sequence."""
 
     binder_seq: str
-    target_seq: str
+    target_seq: Union[str, List[str]]
     total_loss: float
     loss_dict: Dict[str, float]
     summary_confidence: Dict[str, Any]
@@ -1020,7 +1031,7 @@ class MCTSTree:
     def store_verifier_result(self, result: Any) -> CachedVerifierResult:
         cached = CachedVerifierResult(
             binder_seq=str(result.binder_seq),
-            target_seq=str(getattr(result, "target_seq", "")),
+            target_seq=_copy_target_sequence(getattr(result, "target_seq", "")),
             total_loss=float(result.total_loss),
             loss_dict={k: float(v) for k, v in result.loss_dict.items()},
             summary_confidence=dict(getattr(result, "summary_confidence", {}) or {}),

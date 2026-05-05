@@ -393,6 +393,8 @@ def zeroth_order_eval(
     seed: Optional[int] = None,
     target_template_path: Optional[str] = None,
     opt_token_mask: Optional[Any] = None,
+    target_chain_roles: Optional[Any] = None,
+    binder_template_mask: Optional[Any] = None,
 ) -> ZerothOrderResult:
     """
     对一条离散候选序列执行完整 AF3 推断，并在最终结构上计算全部 8 项 loss。
@@ -410,6 +412,9 @@ def zeroth_order_eval(
         seed:           可选 verifier 随机种子；同一序列/输入可复现 AF3 sampling。
         target_template_path: 可选 target template 结构文件
         opt_token_mask: 可选优化区域 mask；CDR redesign 时为 binder 长度 bool mask
+        target_chain_roles: 可选非 binder 链角色，例如 ["target", "scaffold"]
+        binder_template_mask: 可选 binder template token mask；CDR redesign 时
+                              用于保留 framework template、屏蔽设计区域
 
     Returns:
         ZerothOrderResult: 包含 total_loss / loss_dict / summary_confidence / coordinate
@@ -431,7 +436,11 @@ def zeroth_order_eval(
     with temporary_seed(seed, device=device), torch.no_grad():
         # ── 构建特征 ─────────────────────────────────────────────────────
         input_feature_dict, N_token, N_atom = build_complex_features(
-            binder_seq, target_seq, device, target_template_path=target_template_path
+            binder_seq,
+            target_seq,
+            device,
+            target_template_path=target_template_path,
+            binder_template_mask=binder_template_mask,
         )
         input_feature_dict = prepare_input_features(model, input_feature_dict)
 
@@ -516,6 +525,7 @@ def zeroth_order_eval(
             clash_params=dict(DEFAULT_CLASH_PARAMS),
             hotspot_params=hotspot_params,
             opt_token_mask=opt_token_mask,
+            target_chain_roles=target_chain_roles,
         )
 
         structural_metadata = compute_mcts_structural_metadata(
