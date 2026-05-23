@@ -148,6 +148,38 @@ def _build_hotspot_params(args, parser: argparse.ArgumentParser):
     }
 
 
+
+def _cuequivariance_backend_available() -> bool:
+    try:
+        if not hasattr(torch.library, "custom_op"):
+            logging.warning(
+                "cuequivariance backend unavailable: torch.library.custom_op is missing; "
+                "falling back to torch triangle kernels."
+            )
+            return False
+        import cuequivariance_ops_torch  # noqa: F401
+        import cuequivariance_torch  # noqa: F401
+        return True
+    except Exception as exc:
+        logging.warning(
+            "cuequivariance backend unavailable (%s); falling back to torch triangle kernels.",
+            exc,
+        )
+        return False
+
+
+def _apply_triangle_backend_fallback(configs: dict) -> None:
+    needs_cue = (
+        configs.get("triangle_attention") == "cuequivariance"
+        or configs.get("triangle_multiplicative") == "cuequivariance"
+    )
+    if not needs_cue or _cuequivariance_backend_available():
+        return
+    if configs.get("triangle_attention") == "cuequivariance":
+        configs["triangle_attention"] = "torch"
+    if configs.get("triangle_multiplicative") == "cuequivariance":
+        configs["triangle_multiplicative"] = "torch"
+
 def load_protenix_model(
     model_name: str = "protenix_base_default_v1.0.0",
     device: str = "cuda",
@@ -185,6 +217,7 @@ def load_protenix_model(
     base_configs = {**configs_base, **{"data": data_configs}, **inference_configs}
     model_specific = model_configs[model_name]
     deep_update(base_configs, model_specific)
+    _apply_triangle_backend_fallback(base_configs)
 
     arg_str = (
         f"--model_name {model_name} "
@@ -238,6 +271,9 @@ def main():
                        help="Checkpoint 目录；默认依次读取 --checkpoint_dir、PROTENIX_CHECKPOINT_DIR、PROTENIX_ROOT_DIR/checkpoint")
     parser.add_argument("--save_checkpoint_dir", type=str, default=None,
                        help="中间优化 step 的 checkpoint 保存目录（仅用于优化过程保存，不用于模型权重加载）")
+    parser.add_argument("--checkpoint_save_policy", type=str, default="all",
+                       choices=["all", "best_only"],
+                       help="checkpoint 保存策略：all 保存每次调用；best_only 只保存刷新 best loss 的帧")
     parser.add_argument("--dtype", type=str, default="bf16",
                        choices=["bf16", "fp32"],
                        help="模型计算精度（默认：bf16）")
@@ -300,6 +336,13 @@ def main():
     parser.add_argument("--mcts_prior_mode", type=str, default="full",
                        choices=["full", "uniform", "no_gradient", "no_group", "no_sequence"],
                        help="MCTS StageB prior 消融模式（默认：full，保持当前完整逻辑）")
+    parser.add_argument("--mcts_proposal_method", type=str, default="one_step_fixed",
+                       choices=["one_step_fixed", "one_step_adaptive", "two_step_truncated"],
+                       help="MCTS StageB proposal 消融方法（默认：one_step_fixed，保持当前逻辑）")
+    parser.add_argument("--mcts_adaptive_tau_start", type=float, default=160.0,
+                       help="MCTS StageB one_step_adaptive 起始 tau（默认：160.0）")
+    parser.add_argument("--mcts_adaptive_tau_end", type=float, default=0.1,
+                       help="MCTS StageB one_step_adaptive 结束 tau；必须大于 0（默认：0.1）")
     parser.add_argument("--chunk_size", type=int, default=None,
                        help="Attention 分块（MCTS 一阶/零阶）；大复合物可设 256 避免 OOM（默认：None）")
     parser.add_argument("--use_prior", type=lambda x: x.lower() == "true", default=True,
@@ -411,6 +454,7 @@ def main():
             use_tau_scheduling=args.use_tau_scheduling,
             tau_jitter=args.tau_jitter,
             init_binder_seq=args.init_binder_seq,
+            checkpoint_save_policy=args.checkpoint_save_policy,
             hotspot_params=hotspot_params,
             seed=args.seed,
             target_template_path=args.target_template_path,
@@ -449,7 +493,11 @@ def main():
             mcts_handoff_top_k=args.mcts_handoff_top_k,
             mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
             mcts_prior_mode=args.mcts_prior_mode,
+            mcts_proposal_method=args.mcts_proposal_method,
+            mcts_adaptive_tau_start=args.mcts_adaptive_tau_start,
+            mcts_adaptive_tau_end=args.mcts_adaptive_tau_end,
             checkpoint_dir=args.save_checkpoint_dir,
+            checkpoint_save_policy=args.checkpoint_save_policy,
             seed=args.seed,
             target_template_path=args.target_template_path,
         )
@@ -464,11 +512,15 @@ def main():
         f.write(f"Tau Noise: {args.tau_noise}\n")
         f.write(f"Checkpoint Dir: {resolve_checkpoint_dir(args.checkpoint_dir)}\n")
         f.write(f"Save Checkpoint Dir: {args.save_checkpoint_dir or 'DISABLED'}\n")
+        f.write(f"Checkpoint Save Policy: {args.checkpoint_save_policy}\n")
         f.write(f"MCTS Strategy: {args.mcts_strategy}\n")
         f.write(f"MCTS Bootstrap Steps: {args.mcts_bootstrap_steps}\n")
         f.write(f"MCTS Bootstrap Max Steps: {args.mcts_bootstrap_max_steps}\n")
         f.write(f"MCTS Expand Actions Per Step: {args.mcts_expand_actions_per_step}\n")
         f.write(f"MCTS Prior Mode: {args.mcts_prior_mode}\n")
+        f.write(f"MCTS Proposal Method: {args.mcts_proposal_method}\n")
+        f.write(f"MCTS Adaptive Tau Start: {args.mcts_adaptive_tau_start}\n")
+        f.write(f"MCTS Adaptive Tau End: {args.mcts_adaptive_tau_end}\n")
         f.write(f"Initial Binder Sequence: {args.init_binder_seq or 'RANDOM'}\n")
         f.write(f"Target Hotspots 1-based: {args.target_hotspots or 'NONE'}\n")
         f.write(f"Target Template Path: {args.target_template_path or 'None'}\n")

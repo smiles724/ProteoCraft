@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-PYTHON_BIN="${PYTHON_BIN:-/hpc2hdd/home/hlin199/.conda/envs/protenix/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/huangyanjie/miniconda3/bin/python}"
 CONFIG_FILE="${CONFIG_FILE:-${PROJECT_ROOT}/benchmark/yaml/cdr_tcr/cdr_tcr_domain_redesign.yaml}"
 GPU_IDS=(${GPU_IDS:-0 1 2 3})
 RUN_ID="${RUN_ID:-cdr_tcr_$(date '+%Y%m%d_%H%M%S')}"

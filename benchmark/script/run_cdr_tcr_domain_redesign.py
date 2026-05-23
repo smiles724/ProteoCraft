@@ -85,6 +85,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mcts-handoff-top-k", dest="mcts_handoff_top_k", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--mcts-expand-actions-per-step", dest="mcts_expand_actions_per_step", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--mcts-prior-mode", dest="mcts_prior_mode", default=argparse.SUPPRESS)
+    parser.add_argument("--mcts-proposal-method", dest="mcts_proposal_method", default=argparse.SUPPRESS)
+    parser.add_argument("--mcts-adaptive-tau-start", dest="mcts_adaptive_tau_start", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--mcts-adaptive-tau-end", dest="mcts_adaptive_tau_end", type=float, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--checkpoint-save-policy",
+        dest="checkpoint_save_policy",
+        choices=("all", "best_only"),
+        default=argparse.SUPPRESS,
+    )
     parser.add_argument("--chunk-size", dest="chunk_size", type=int, default=argparse.SUPPRESS)
     add_bool_argument(parser, "save-checkpoints")
     return parser.parse_args()
@@ -356,6 +365,7 @@ def run_case(
                 use_prior=bool(config.get("use_prior", True)),
                 prior_strength=float(config.get("prior_strength", 0.1)),
                 checkpoint_dir=checkpoint_arg,
+                checkpoint_save_policy=str(config.get("checkpoint_save_policy", "all")),
                 target_template_path=case_info["template_path"],
                 chunk_size=config.get("chunk_size"),
             )
@@ -382,6 +392,7 @@ def run_case(
                 use_prior=bool(config.get("use_prior", True)),
                 prior_strength=float(config.get("prior_strength", 0.1)),
                 checkpoint_dir=checkpoint_arg,
+                checkpoint_save_policy=str(config.get("checkpoint_save_policy", "all")),
                 target_template_path=case_info["template_path"],
                 mcts_C=float(config.get("mcts_c", 1.0)),
                 mcts_max_nodes=int(config.get("mcts_max_nodes", 5000)),
@@ -394,6 +405,9 @@ def run_case(
                 mcts_handoff_top_k=config.get("mcts_handoff_top_k"),
                 mcts_expand_actions_per_step=int(config.get("mcts_expand_actions_per_step", 2)),
                 mcts_prior_mode=str(config.get("mcts_prior_mode", "full")),
+                mcts_proposal_method=str(config.get("mcts_proposal_method", "one_step_fixed")),
+                mcts_adaptive_tau_start=float(config.get("mcts_adaptive_tau_start", 160.0)),
+                mcts_adaptive_tau_end=float(config.get("mcts_adaptive_tau_end", 0.1)),
                 chunk_size=config.get("chunk_size"),
             )
         else:
@@ -453,11 +467,15 @@ def run_case(
                 "mcts_handoff_top_k": config.get("mcts_handoff_top_k"),
                 "mcts_expand_actions_per_step": int(config.get("mcts_expand_actions_per_step", 2)),
                 "mcts_prior_mode": str(config.get("mcts_prior_mode", "full")),
+                "mcts_proposal_method": str(config.get("mcts_proposal_method", "one_step_fixed")),
+                "mcts_adaptive_tau_start": float(config.get("mcts_adaptive_tau_start", 160.0)),
+                "mcts_adaptive_tau_end": float(config.get("mcts_adaptive_tau_end", 0.1)),
                 "mcts_c": float(config.get("mcts_c", 1.0)),
                 "mcts_max_nodes": int(config.get("mcts_max_nodes", 5000)),
                 "mcts_tau_fixed": float(config.get("mcts_tau_fixed", 4.0)),
                 "mcts_num_beams": int(config.get("mcts_num_beams", 8)),
                 "chunk_size": config.get("chunk_size"),
+                "checkpoint_save_policy": str(config.get("checkpoint_save_policy", "all")),
                 "model_name": config.get("model_name"),
                 "loss_weights": loss_weights,
             },

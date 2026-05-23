@@ -48,6 +48,7 @@ from bindcraft.hallucination.mutation_proposer import (
     propose_mutations_legacy,
     propose_mutation_actions,
     normalize_mcts_prior_mode,
+    normalize_mcts_proposal_method,
     select_de_novo_action_group,
 )
 from bindcraft.hallucination.zeroth_order import zeroth_order_eval
@@ -519,6 +520,7 @@ def run_hybrid_hallucination(
     breath_con_factor: float = 0.3,
     breath_recovery_steps: int = 3,
     checkpoint_dir: str = None,
+    checkpoint_save_policy: str = "all",
     hotspot_params: Optional[Dict] = None,
     seed: Optional[int] = 42,
     target_template_path: Optional[str] = None,
@@ -566,6 +568,8 @@ def run_hybrid_hallucination(
         breath_con_factor:     呼吸状态下 con/i_con 权重缩减系数
         breath_recovery_steps: 呼吸状态持续步数
         checkpoint_dir:         每步保存 checkpoint 的根目录，None 则不保存
+        checkpoint_save_policy: checkpoint 保存策略；"all" 保存全部，
+                                "best_only" 只保存刷新 best loss 的帧
 
     Returns:
         best_seq:        零阶验证下的最优序列
@@ -601,8 +605,9 @@ def run_hybrid_hallucination(
             output_dir=checkpoint_dir,
             binder_seq="PLACEHOLDER",  # 实际序列每步不同，atom_array 动态构建
             target_seq=target_seq,
+            save_policy=checkpoint_save_policy,
         )
-        logger.info(f"Checkpoint 保存已启用: {checkpoint_dir}")
+        logger.info(f"Checkpoint 保存已启用: {checkpoint_dir} | policy={checkpoint_save_policy}")
 
     logger.info("=" * 70)
     logger.info("开始混合优化循环 (Hybrid: 1st-Order Proposal + 0th-Order Verification)")
@@ -1122,6 +1127,7 @@ def _make_stage_checkpoint_manager(
     stage_name: str,
     strategy: str,
     target_seq: Union[str, List[str]],
+    checkpoint_save_policy: str = "all",
 ) -> Optional[CheckpointManager]:
     if checkpoint_dir is None:
         return None
@@ -1132,8 +1138,14 @@ def _make_stage_checkpoint_manager(
         output_dir=output_dir,
         binder_seq="PLACEHOLDER",
         target_seq=target_seq,
+        save_policy=checkpoint_save_policy,
     )
-    logger.info("Checkpoint 保存已启用[%s]: %s", stage_name, output_dir)
+    logger.info(
+        "Checkpoint 保存已启用[%s]: %s | policy=%s",
+        stage_name,
+        output_dir,
+        checkpoint_save_policy,
+    )
     return manager
 
 
@@ -1311,6 +1323,41 @@ def _stageb_group_proposal_loss(
     return proposal_loss, "+".join(selected_terms)
 
 
+def _stageb_proposal_tau(
+    proposal_method: str,
+    base_tau: float,
+    local_step: int,
+    total_steps: int,
+    stale_steps: int = 0,
+    adaptive_tau_start: float = 160.0,
+    adaptive_tau_end: float = 0.1,
+) -> float:
+    """
+    Resolve the diffusion tau used by StageB proposal gradients.
+
+    ``one_step_fixed`` and ``two_step_truncated`` preserve the historical
+    ``base_tau`` behavior. ``one_step_adaptive`` follows the Protenix EDM noise
+    scale more closely: it starts from a high-noise proposal and anneals to a
+    small positive floor. The floor must stay above zero because Protenix
+    embeds ``log(tau / sigma_data)`` inside the diffusion conditioning.
+    """
+    proposal_method = normalize_mcts_proposal_method(proposal_method)
+    base_tau = float(base_tau)
+    if proposal_method != "one_step_adaptive":
+        return base_tau
+
+    progress = float(local_step) / max(float(total_steps - 1), 1.0)
+    progress = min(max(progress, 0.0), 1.0)
+
+    tau_start = max(float(adaptive_tau_start), 1e-6)
+    tau_end = max(float(adaptive_tau_end), 1e-6)
+    tau_high = max(tau_start, tau_end)
+    tau_low = min(tau_start, tau_end)
+
+    tau = tau_start + (tau_end - tau_start) * progress
+    return float(min(max(tau, tau_low), tau_high))
+
+
 def _make_strict_mcts_tree(
     mcts_C: float,
     mcts_max_nodes: int,
@@ -1361,6 +1408,7 @@ def run_mcts_hallucination(
     use_prior: bool = True,
     prior_strength: float = 0.1,
     checkpoint_dir: str = None,
+    checkpoint_save_policy: str = "all",
     init_binder_seq: Optional[str] = None,
     hotspot_params: Optional[Dict] = None,
     chunk_size: int = None,
@@ -1375,6 +1423,9 @@ def run_mcts_hallucination(
     mcts_handoff_top_k: Optional[int] = None,
     mcts_expand_actions_per_step: int = MCTS_STAGE2_EXPAND_ACTIONS_PER_STEP,
     mcts_prior_mode: str = "full",
+    mcts_proposal_method: str = "one_step_fixed",
+    mcts_adaptive_tau_start: float = 160.0,
+    mcts_adaptive_tau_end: float = 0.1,
     seed: Optional[int] = 42,
     target_template_path: Optional[str] = None,
     target_chain_roles: Optional[Any] = None,
@@ -1398,6 +1449,9 @@ def run_mcts_hallucination(
     mcts_handoff_top_k = max(1, int(mcts_handoff_top_k or num_beams))
     mcts_expand_actions_per_step = max(int(mcts_expand_actions_per_step), 1)
     mcts_prior_mode = normalize_mcts_prior_mode(mcts_prior_mode)
+    mcts_proposal_method = normalize_mcts_proposal_method(mcts_proposal_method)
+    mcts_adaptive_tau_start = float(mcts_adaptive_tau_start)
+    mcts_adaptive_tau_end = float(mcts_adaptive_tau_end)
 
     base_weights = dict(DEFAULT_LOSS_WEIGHTS)
     if loss_weights is not None:
@@ -1412,23 +1466,23 @@ def run_mcts_hallucination(
 
     if mcts_strategy == "two_stage":
         phase0_ckpt_mgr = _make_stage_checkpoint_manager(
-            checkpoint_dir, "phase0", mcts_strategy, target_seq
+            checkpoint_dir, "phase0", mcts_strategy, target_seq, checkpoint_save_policy
         )
         legacy_ckpt_mgr = _make_stage_checkpoint_manager(
-            checkpoint_dir, "legacy_bootstrap", mcts_strategy, target_seq
+            checkpoint_dir, "legacy_bootstrap", mcts_strategy, target_seq, checkpoint_save_policy
         )
         strict_ckpt_mgr = _make_stage_checkpoint_manager(
-            checkpoint_dir, "document_puct_refine", mcts_strategy, target_seq
+            checkpoint_dir, "document_puct_refine", mcts_strategy, target_seq, checkpoint_save_policy
         )
     elif mcts_strategy == "legacy":
         legacy_ckpt_mgr = _make_stage_checkpoint_manager(
-            checkpoint_dir, "legacy_bootstrap", mcts_strategy, target_seq
+            checkpoint_dir, "legacy_bootstrap", mcts_strategy, target_seq, checkpoint_save_policy
         )
         phase0_ckpt_mgr = legacy_ckpt_mgr
         strict_ckpt_mgr = None
     else:
         strict_ckpt_mgr = _make_stage_checkpoint_manager(
-            checkpoint_dir, "document_puct_refine", mcts_strategy, target_seq
+            checkpoint_dir, "document_puct_refine", mcts_strategy, target_seq, checkpoint_save_policy
         )
         phase0_ckpt_mgr = strict_ckpt_mgr
         legacy_ckpt_mgr = None
@@ -1486,6 +1540,13 @@ def run_mcts_hallucination(
         use_prior,
         prior_strength,
     )
+    logger.info("MCTS StageB proposal method: %s", mcts_proposal_method)
+    if mcts_proposal_method == "one_step_adaptive":
+        logger.info(
+            "MCTS StageB adaptive tau schedule: %.3f -> %.3f",
+            mcts_adaptive_tau_start,
+            mcts_adaptive_tau_end,
+        )
     if target_chain_roles is not None:
         logger.info("Target chain roles: %s", target_chain_roles)
     logger.info(f"Base loss 权重: {base_weights}")
@@ -1986,6 +2047,15 @@ def run_mcts_hallucination(
             target_template_path=target_template_path,
         )
 
+        proposal_tau = _stageb_proposal_tau(
+            mcts_proposal_method,
+            mcts_tau_fixed,
+            local_step=step,
+            total_steps=strict_loop_steps,
+            stale_steps=strict_stale_steps,
+            adaptive_tau_start=mcts_adaptive_tau_start,
+            adaptive_tau_end=mcts_adaptive_tau_end,
+        )
         x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
             model=model,
             s_binder=s_binder_step2,
@@ -1993,7 +2063,7 @@ def run_mcts_hallucination(
             input_feature_dict=input_feature_dict_step2,
             x_coarse=x_coarse_cached,
             X_clean=selected_node.coordinate,
-            tau=mcts_tau_fixed,
+            tau=proposal_tau,
             device=device,
             chunk_size=chunk_size,
         )
@@ -2065,6 +2135,72 @@ def run_mcts_hallucination(
         optimizer_step2.step()
         fo_loss_val = first_order_loss.item()
         proposal_loss_val = float(proposal_loss.detach().item())
+        proposal_passes = 1
+
+        if mcts_proposal_method == "two_step_truncated" and grad_for_proposal is not None:
+            optimizer_step2.zero_grad(set_to_none=True)
+            s_binder_step2, current_seq_step2, input_feature_dict_step2 = ste_bridge(
+                theta=theta_step2,
+                W_AAE=W_AAE,
+                model=model,
+                target_seq=target_seq,
+                device=device,
+                tau_temp=tau_temp,
+                target_template_path=target_template_path,
+            )
+            x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
+                model=model,
+                s_binder=s_binder_step2,
+                s_target=s_target,
+                input_feature_dict=input_feature_dict_step2,
+                x_coarse=x_coarse_cached,
+                X_clean=selected_node.coordinate,
+                tau=proposal_tau,
+                device=device,
+                chunk_size=chunk_size,
+            )
+            x0_flat = x0_hat_step2.squeeze(0)
+            s_inputs_full = torch.cat([s_binder_step2, s_target], dim=0)
+            heads = run_confidence_heads(
+                model=model,
+                input_feature_dict=input_feature_dict_step2,
+                s_inputs=s_inputs_full,
+                s_trunk=s_trunk_step2,
+                z_trunk=z_trunk_step2,
+                x0_hat=x0_hat_step2,
+                inplace_safe=False,
+                chunk_size=chunk_size,
+            )
+            first_order_loss, first_order_losses = compute_all_losses(
+                x0_flat=x0_flat,
+                plddt_logits=heads["plddt_logits"],
+                pae_logits=heads["pae_logits"],
+                distogram_logits=heads["distogram_logits"],
+                input_feature_dict=input_feature_dict_step2,
+                L_binder=L_binder,
+                weights=base_weights,
+                contact_params=contact_params,
+                plddt_params=plddt_params,
+                pae_params=pae_params,
+                distogram_params=distogram_params,
+                pde_logits=heads["pde_logits"],
+                pde_params=pde_params,
+                clash_params=dict(DEFAULT_CLASH_PARAMS),
+                hotspot_params=hotspot_params,
+                target_chain_roles=target_chain_roles,
+            )
+            proposal_loss, proposal_loss_mode = _stageb_group_proposal_loss(
+                first_order_losses,
+                action_group,
+                first_order_loss,
+            )
+            proposal_loss.backward()
+            grad_for_proposal = theta_step2.grad.clone() if theta_step2.grad is not None else None
+            torch.nn.utils.clip_grad_norm_([theta_step2], 1.0)
+            optimizer_step2.step()
+            fo_loss_val = first_order_loss.item()
+            proposal_loss_val = float(proposal_loss.detach().item())
+            proposal_passes = 2
 
         if grad_for_proposal is None:
             logger.warning(f"Step {global_step}: grad is None, skipping candidate generation")
@@ -2305,6 +2441,7 @@ def run_mcts_hallucination(
             f"R={selected_node.tree_reward:.4f} Q={selected_node.q_value:.4f} "
             f"P={selected_node.prior:.4f} "
             f"1st={fo_loss_val:.4f} prop={proposal_loss_val:.4f}({proposal_loss_mode}) | "
+            f"proposal={mcts_proposal_method} pass={proposal_passes} tau={proposal_tau:.3f} "
             f"group={action_group} Pg={group_prior:.3f} "
             f"edit_max={stageb_max_mutations} stale={strict_stale_steps} "
             f"pw={len(selected_node.children)}/{mcts_tree.progressive_widening_limit(selected_node)} "

@@ -19,12 +19,14 @@ from bindcraft.hallucination.mutation_proposer import (
     propose_mutations,
     propose_mutations_legacy,
     normalize_mcts_prior_mode,
+    normalize_mcts_proposal_method,
     sample_mutation_actions,
     select_de_novo_action_group,
     should_use_sequence_prior,
     apply_position_weight_mask,
 )
 from bindcraft.hallucination.zeroth_order import compute_mcts_structural_metadata
+from bindcraft.hallucination.pipeline import _stageb_proposal_tau
 
 
 @dataclass
@@ -128,6 +130,51 @@ class TestStage1GradientPriorPuct:
         assert not should_use_sequence_prior("full", False)
         with pytest.raises(ValueError):
             normalize_mcts_prior_mode("bad_mode")
+
+    def test_proposal_method_helper_preserves_current_default(self):
+        assert normalize_mcts_proposal_method(None) == "one_step_fixed"
+        assert normalize_mcts_proposal_method("ONE_STEP_FIXED") == "one_step_fixed"
+        assert normalize_mcts_proposal_method("one_step_adaptive") == "one_step_adaptive"
+        assert normalize_mcts_proposal_method("two_step_truncated") == "two_step_truncated"
+        with pytest.raises(ValueError):
+            normalize_mcts_proposal_method("bad_method")
+
+    def test_stageb_adaptive_tau_anneals_from_high_noise_to_positive_floor(self):
+        assert _stageb_proposal_tau(
+            "one_step_fixed", 4.0, local_step=0, total_steps=120
+        ) == pytest.approx(4.0)
+        assert _stageb_proposal_tau(
+            "two_step_truncated", 4.0, local_step=0, total_steps=120
+        ) == pytest.approx(4.0)
+
+        start_tau = _stageb_proposal_tau(
+            "one_step_adaptive",
+            4.0,
+            local_step=0,
+            total_steps=120,
+            adaptive_tau_start=160.0,
+            adaptive_tau_end=0.1,
+        )
+        mid_tau = _stageb_proposal_tau(
+            "one_step_adaptive",
+            4.0,
+            local_step=60,
+            total_steps=120,
+            adaptive_tau_start=160.0,
+            adaptive_tau_end=0.1,
+        )
+        end_tau = _stageb_proposal_tau(
+            "one_step_adaptive",
+            4.0,
+            local_step=119,
+            total_steps=120,
+            adaptive_tau_start=160.0,
+            adaptive_tau_end=0.1,
+        )
+
+        assert start_tau == pytest.approx(160.0)
+        assert 0.1 < mid_tau < start_tau
+        assert end_tau == pytest.approx(0.1)
 
     def test_no_gradient_prior_keeps_actions_uniform_within_group(self):
         torch.manual_seed(0)

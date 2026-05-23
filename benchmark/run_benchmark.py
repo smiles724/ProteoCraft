@@ -102,6 +102,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "mcts_bootstrap_max_steps": 80,
     "mcts_handoff_top_k": None,
     "mcts_expand_actions_per_step": 2,
+    "mcts_prior_mode": "full",
+    "mcts_proposal_method": "one_step_fixed",
+    "mcts_adaptive_tau_start": 160.0,
+    "mcts_adaptive_tau_end": 0.1,
     "chunk_size": None,
     "use_prior": True,
     "prior_strength": 0.1,
@@ -790,6 +794,10 @@ def run_one_entry(
             mcts_bootstrap_max_steps=args.mcts_bootstrap_max_steps,
             mcts_handoff_top_k=args.mcts_handoff_top_k,
             mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
+            mcts_prior_mode=args.mcts_prior_mode,
+            mcts_proposal_method=args.mcts_proposal_method,
+            mcts_adaptive_tau_start=args.mcts_adaptive_tau_start,
+            mcts_adaptive_tau_end=args.mcts_adaptive_tau_end,
             seed=args.random_seed,
             target_template_path=target_template_path,
         )
@@ -842,6 +850,10 @@ def run_one_entry(
             "mcts_bootstrap_max_steps": args.mcts_bootstrap_max_steps,
             "mcts_handoff_top_k": args.mcts_handoff_top_k,
             "mcts_expand_actions_per_step": args.mcts_expand_actions_per_step,
+            "mcts_prior_mode": args.mcts_prior_mode,
+            "mcts_proposal_method": args.mcts_proposal_method,
+            "mcts_adaptive_tau_start": args.mcts_adaptive_tau_start,
+            "mcts_adaptive_tau_end": args.mcts_adaptive_tau_end,
             "chunk_size": args.chunk_size,
             "use_prior": args.use_prior,
             "prior_strength": args.prior_strength,
@@ -948,6 +960,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcts-bootstrap-max-steps", dest="mcts_bootstrap_max_steps", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--mcts-handoff-top-k", dest="mcts_handoff_top_k", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--mcts-expand-actions-per-step", dest="mcts_expand_actions_per_step", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--mcts-prior-mode", dest="mcts_prior_mode", default=argparse.SUPPRESS)
+    parser.add_argument("--mcts-proposal-method", dest="mcts_proposal_method", default=argparse.SUPPRESS)
+    parser.add_argument("--mcts-adaptive-tau-start", dest="mcts_adaptive_tau_start", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--mcts-adaptive-tau-end", dest="mcts_adaptive_tau_end", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--chunk-size", dest="chunk_size", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--prior-strength", dest="prior_strength", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--w-plddt", dest="w_plddt", type=float, default=argparse.SUPPRESS)

@@ -64,11 +64,21 @@ logger = get_logger(__name__)
 # PDBX_COVALENT_TYPES was removed in biotite commit
 # https://github.com/biotite-dev/biotite/commit/5f584ac3d73650ea7ec657df185f08ff55e8037f
 if not hasattr(pdbx_convert, "PDBX_COVALENT_TYPES"):
-    pdbx_convert.PDBX_COVALENT_TYPES = list(
-        pdbx_convert.PDBX_BOND_TYPE_ID_TO_TYPE.keys()
-    )
+    if hasattr(pdbx_convert, "PDBX_BOND_TYPE_ID_TO_TYPE"):
+        pdbx_convert.PDBX_COVALENT_TYPES = list(
+            pdbx_convert.PDBX_BOND_TYPE_ID_TO_TYPE.keys()
+        )
+    else:
+        pdbx_convert.PDBX_COVALENT_TYPES = []
 # Ignore inter residue metal coordinate bonds in mmcif _struct_conn
-pdbx_convert.PDBX_BOND_TYPE_ID_TO_TYPE.pop("metalc", None)
+if hasattr(pdbx_convert, "PDBX_BOND_TYPE_ID_TO_TYPE"):
+    pdbx_convert.PDBX_BOND_TYPE_ID_TO_TYPE.pop("metalc", None)
+if hasattr(pdbx_convert, "PDBX_COVALENT_TYPES"):
+    pdbx_convert.PDBX_COVALENT_TYPES = [
+        bond_type
+        for bond_type in pdbx_convert.PDBX_COVALENT_TYPES
+        if bond_type != "metalc"
+    ]
 
 
 class MMCIFParser:

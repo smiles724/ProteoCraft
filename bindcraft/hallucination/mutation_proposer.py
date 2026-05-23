@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 AA_1_TO_IDX = {AA_1LETTER[name]: idx for idx, name in enumerate(PROTEIN_RESIDUE_NAMES)}
 MCTS_PRIOR_MODES = ("full", "uniform", "no_gradient", "no_group", "no_sequence")
+MCTS_PROPOSAL_METHODS = ("one_step_fixed", "one_step_adaptive", "two_step_truncated")
 
 
 def _aa_indices(letters: str) -> List[int]:
@@ -96,6 +97,17 @@ def normalize_mcts_prior_mode(mode: str) -> str:
     if normalized not in MCTS_PRIOR_MODES:
         raise ValueError(
             f"Unknown mcts_prior_mode={mode!r}; expected one of {', '.join(MCTS_PRIOR_MODES)}"
+        )
+    return normalized
+
+
+def normalize_mcts_proposal_method(method: str) -> str:
+    """Normalize the StageB truncated-gradient proposal ablation method."""
+    normalized = str(method or "one_step_fixed").strip().lower()
+    if normalized not in MCTS_PROPOSAL_METHODS:
+        raise ValueError(
+            "Unknown mcts_proposal_method="
+            f"{method!r}; expected one of {', '.join(MCTS_PROPOSAL_METHODS)}"
         )
     return normalized
 

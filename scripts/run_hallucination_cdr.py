@@ -140,6 +140,38 @@ def _build_hotspot_params(raw_hotspots, target_seq: str, parser: argparse.Argume
     }
 
 
+
+def _cuequivariance_backend_available() -> bool:
+    try:
+        if not hasattr(torch.library, "custom_op"):
+            logging.warning(
+                "cuequivariance backend unavailable: torch.library.custom_op is missing; "
+                "falling back to torch triangle kernels."
+            )
+            return False
+        import cuequivariance_ops_torch  # noqa: F401
+        import cuequivariance_torch  # noqa: F401
+        return True
+    except Exception as exc:
+        logging.warning(
+            "cuequivariance backend unavailable (%s); falling back to torch triangle kernels.",
+            exc,
+        )
+        return False
+
+
+def _apply_triangle_backend_fallback(configs: dict) -> None:
+    needs_cue = (
+        configs.get("triangle_attention") == "cuequivariance"
+        or configs.get("triangle_multiplicative") == "cuequivariance"
+    )
+    if not needs_cue or _cuequivariance_backend_available():
+        return
+    if configs.get("triangle_attention") == "cuequivariance":
+        configs["triangle_attention"] = "torch"
+    if configs.get("triangle_multiplicative") == "cuequivariance":
+        configs["triangle_multiplicative"] = "torch"
+
 def load_protenix_model(
     model_name: str = "protenix_base_default_v1.0.0",
     device: str = "cuda"
@@ -173,6 +205,7 @@ def load_protenix_model(
     base_configs = {**configs_base, **{"data": data_configs}, **inference_configs}
     model_specific = model_configs[model_name]
     deep_update(base_configs, model_specific)
+    _apply_triangle_backend_fallback(base_configs)
 
     arg_str = (
         f"--model_name {model_name} "
@@ -278,6 +311,9 @@ def main():
                     help="先验权重系数（默认：0.1）")
     g4.add_argument("--chunk_size", type=int, default=None,
                     help="Attention 分块大小。当 binder>100 aa 时建议设为 256 避免 OOM（默认：None）")
+    g4.add_argument("--checkpoint_save_policy", type=str, default="all",
+                    choices=["all", "best_only"],
+                    help="checkpoint 保存策略：all 保存每次调用；best_only 只保存刷新 best loss 的帧")
     g4.add_argument("--target_hotspots", type=str, default=None,
                     help="Target hotspot residues，使用 1-based 序号；Mode B/C 支持逗号/空格/范围，如 10,11,45-47")
     g4.add_argument("--mcts_c", type=float, default=1.0, help="MCTS UCB 探索常数 C（默认：1.0）")
@@ -302,6 +338,13 @@ def main():
     g4.add_argument("--mcts_prior_mode", type=str, default="full",
                     choices=["full", "uniform", "no_gradient", "no_group", "no_sequence"],
                     help="StageB prior 消融模式；full 为正常两阶段 MCTS（默认：full）")
+    g4.add_argument("--mcts_proposal_method", type=str, default="one_step_fixed",
+                    choices=["one_step_fixed", "one_step_adaptive", "two_step_truncated"],
+                    help="StageB proposal 消融方法；one_step_fixed 保持当前默认逻辑")
+    g4.add_argument("--mcts_adaptive_tau_start", type=float, default=160.0,
+                    help="StageB one_step_adaptive 起始 tau（默认：160.0）")
+    g4.add_argument("--mcts_adaptive_tau_end", type=float, default=0.1,
+                    help="StageB one_step_adaptive 结束 tau；必须大于 0（默认：0.1）")
     g4.add_argument("--target_template_path", type=str, default=None,
                     help="可选复合物 template 文件；CDR/TCR 局部重设计时可保留 binder framework template")
     g4.add_argument("--target_chain_roles", type=str, default=None,
@@ -389,6 +432,7 @@ def main():
                 use_prior=args.use_prior,
                 prior_strength=args.prior_strength,
                 checkpoint_dir=_ckpt,
+                checkpoint_save_policy=args.checkpoint_save_policy,
                 hotspot_params=hotspot_params,
                 mcts_C=args.mcts_c,
                 mcts_max_nodes=args.mcts_max_nodes,
@@ -401,6 +445,9 @@ def main():
                 mcts_handoff_top_k=args.mcts_handoff_top_k,
                 mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
                 mcts_prior_mode=args.mcts_prior_mode,
+                mcts_proposal_method=args.mcts_proposal_method,
+                mcts_adaptive_tau_start=args.mcts_adaptive_tau_start,
+                mcts_adaptive_tau_end=args.mcts_adaptive_tau_end,
                 chunk_size=args.chunk_size,
                 target_template_path=args.target_template_path,
                 target_chain_roles=args.target_chain_roles,
@@ -427,6 +474,7 @@ def main():
                 use_prior=args.use_prior,
                 prior_strength=args.prior_strength,
                 checkpoint_dir=_ckpt,
+                checkpoint_save_policy=args.checkpoint_save_policy,
                 hotspot_params=hotspot_params,
                 chunk_size=args.chunk_size,
                 target_template_path=args.target_template_path,
@@ -493,6 +541,7 @@ def main():
                 use_prior=args.use_prior,
                 prior_strength=args.prior_strength,
                 checkpoint_dir=_ckpt,
+                checkpoint_save_policy=args.checkpoint_save_policy,
                 hotspot_params=hotspot_params,
                 mcts_C=args.mcts_c,
                 mcts_max_nodes=args.mcts_max_nodes,
@@ -505,6 +554,9 @@ def main():
                 mcts_handoff_top_k=args.mcts_handoff_top_k,
                 mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
                 mcts_prior_mode=args.mcts_prior_mode,
+                mcts_proposal_method=args.mcts_proposal_method,
+                mcts_adaptive_tau_start=args.mcts_adaptive_tau_start,
+                mcts_adaptive_tau_end=args.mcts_adaptive_tau_end,
                 chunk_size=args.chunk_size,
                 target_template_path=args.target_template_path,
                 target_chain_roles=args.target_chain_roles,
@@ -531,6 +583,7 @@ def main():
                 use_prior=args.use_prior,
                 prior_strength=args.prior_strength,
                 checkpoint_dir=_ckpt,
+                checkpoint_save_policy=args.checkpoint_save_policy,
                 hotspot_params=hotspot_params,
                 chunk_size=args.chunk_size,
                 target_template_path=args.target_template_path,
@@ -591,6 +644,7 @@ def main():
                 use_prior=args.use_prior,
                 prior_strength=args.prior_strength,
                 checkpoint_dir=_ckpt,
+                checkpoint_save_policy=args.checkpoint_save_policy,
                 hotspot_params=hotspot_params,
                 mcts_C=args.mcts_c,
                 mcts_max_nodes=args.mcts_max_nodes,
@@ -603,6 +657,9 @@ def main():
                 mcts_handoff_top_k=args.mcts_handoff_top_k,
                 mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
                 mcts_prior_mode=args.mcts_prior_mode,
+                mcts_proposal_method=args.mcts_proposal_method,
+                mcts_adaptive_tau_start=args.mcts_adaptive_tau_start,
+                mcts_adaptive_tau_end=args.mcts_adaptive_tau_end,
                 chunk_size=args.chunk_size,
                 target_template_path=args.target_template_path,
                 target_chain_roles=args.target_chain_roles,
@@ -629,6 +686,7 @@ def main():
                 use_prior=args.use_prior,
                 prior_strength=args.prior_strength,
                 checkpoint_dir=_ckpt,
+                checkpoint_save_policy=args.checkpoint_save_policy,
                 hotspot_params=hotspot_params,
                 chunk_size=args.chunk_size,
                 target_template_path=args.target_template_path,
@@ -659,6 +717,9 @@ def main():
         if args.mode == "mcts":
             f.write(f"MCTS Strategy: cdr_{args.mcts_strategy}\n")
             f.write(f"MCTS Prior Mode: {args.mcts_prior_mode}\n")
+            f.write(f"MCTS Proposal Method: {args.mcts_proposal_method}\n")
+            f.write(f"MCTS Adaptive Tau Start: {args.mcts_adaptive_tau_start}\n")
+            f.write(f"MCTS Adaptive Tau End: {args.mcts_adaptive_tau_end}\n")
             f.write(f"MCTS Expand Actions Per Step: {args.mcts_expand_actions_per_step}\n")
             f.write(f"MCTS Bootstrap Steps: {args.mcts_bootstrap_steps}\n")
             f.write(f"MCTS Bootstrap Max Steps: {args.mcts_bootstrap_max_steps}\n")

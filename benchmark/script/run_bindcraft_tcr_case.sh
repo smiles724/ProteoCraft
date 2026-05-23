@@ -183,6 +183,9 @@ YAML_MCTS_BOOTSTRAP_MAX_STEPS=$(parse_yaml "${CONFIG_FILE}" "mcts_bootstrap_max_
 YAML_MCTS_HANDOFF_TOP_K=$(parse_yaml "${CONFIG_FILE}" "mcts_handoff_top_k")
 YAML_MCTS_EXPAND_ACTIONS_PER_STEP=$(parse_yaml "${CONFIG_FILE}" "mcts_expand_actions_per_step")
 YAML_MCTS_PRIOR_MODE=$(parse_yaml "${CONFIG_FILE}" "mcts_prior_mode")
+YAML_MCTS_PROPOSAL_METHOD=$(parse_yaml "${CONFIG_FILE}" "mcts_proposal_method")
+YAML_MCTS_ADAPTIVE_TAU_START=$(parse_yaml "${CONFIG_FILE}" "mcts_adaptive_tau_start")
+YAML_MCTS_ADAPTIVE_TAU_END=$(parse_yaml "${CONFIG_FILE}" "mcts_adaptive_tau_end")
 YAML_MODEL_CHECKPOINT_DIR=$(parse_yaml "${CONFIG_FILE}" "model_checkpoint_dir")
 YAML_COMPONENTS_CACHE_DIR=$(parse_yaml "${CONFIG_FILE}" "components_cache_dir")
 YAML_MODEL_NAME=$(parse_yaml "${CONFIG_FILE}" "model_name")
@@ -337,6 +340,9 @@ add_yaml_arg "${YAML_MCTS_BOOTSTRAP_MAX_STEPS}" "--mcts-bootstrap-max-steps"
 add_yaml_arg "${YAML_MCTS_HANDOFF_TOP_K}" "--mcts-handoff-top-k"
 add_yaml_arg "${YAML_MCTS_EXPAND_ACTIONS_PER_STEP}" "--mcts-expand-actions-per-step"
 add_yaml_arg "${YAML_MCTS_PRIOR_MODE}" "--mcts-prior-mode"
+add_yaml_arg "${YAML_MCTS_PROPOSAL_METHOD}" "--mcts-proposal-method"
+add_yaml_arg "${YAML_MCTS_ADAPTIVE_TAU_START}" "--mcts-adaptive-tau-start"
+add_yaml_arg "${YAML_MCTS_ADAPTIVE_TAU_END}" "--mcts-adaptive-tau-end"
 add_yaml_arg "${YAML_MODEL_CHECKPOINT_DIR}" "--model-checkpoint-dir"
 add_yaml_arg "${YAML_COMPONENTS_CACHE_DIR}" "--components-cache-dir"
 add_yaml_arg "${YAML_MODEL_NAME}" "--model-name"

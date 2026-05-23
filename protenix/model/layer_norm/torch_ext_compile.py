@@ -16,6 +16,7 @@
 import os
 from typing import Any
 
+import torch
 from torch.utils.cpp_extension import load
 
 
@@ -42,7 +43,28 @@ def compile(
     except Exception:
         _supported = {"70", "80", "86", "90"}  # safe defaults
 
-    _wanted = [("70", "70"), ("80", "80"), ("86", "86"), ("89", "89"), ("90", "90"), ("100", "100")]
+    _torch_supported = {
+        arch.removeprefix("sm_")
+        for arch in torch.cuda.get_arch_list()
+        if arch.startswith("sm_")
+    }
+    if _torch_supported:
+        _supported &= _torch_supported
+
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        current_arch = f"{major}{minor}"
+        if current_arch in _supported:
+            _supported = {current_arch}
+
+    _wanted = [
+        ("70", "70"),
+        ("80", "80"),
+        ("86", "86"),
+        ("89", "89"),
+        ("90", "90"),
+        ("100", "100"),
+    ]
     gencode_flags = []
     for compute, sm in _wanted:
         if compute in _supported:

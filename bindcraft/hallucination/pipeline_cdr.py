@@ -45,6 +45,7 @@ from bindcraft.hallucination.mutation_proposer import (
     propose_mutations_legacy,
     propose_mutation_actions,
     normalize_mcts_prior_mode,
+    normalize_mcts_proposal_method,
     select_de_novo_action_group,
 )
 from bindcraft.hallucination.zeroth_order import zeroth_order_eval
@@ -73,6 +74,7 @@ from bindcraft.hallucination.pipeline import (
     _select_diverse_handoff_results,
     _stageb_group_proposal_loss,
     _stageb_max_mutations_for_step,
+    _stageb_proposal_tau,
 )
 from bindcraft.losses.confidence import run_confidence_heads
 from bindcraft.losses.total_loss import compute_all_losses
@@ -399,6 +401,7 @@ def run_hybrid_hallucination_cdr(
     breath_con_factor: float = 0.3,
     breath_recovery_steps: int = 3,
     checkpoint_dir: str = None,
+    checkpoint_save_policy: str = "all",
     hotspot_params: Optional[Dict] = None,
     target_template_path: Optional[str] = None,
     # ── Mode A 专属参数 ───────────────────────────────────────────
@@ -453,6 +456,8 @@ def run_hybrid_hallucination_cdr(
         breath_con_factor:     呼吸状态下 con/i_con 权重缩减系数
         breath_recovery_steps: 呼吸状态持续步数
         checkpoint_dir:         每步保存 checkpoint 的根目录，None 则不保存
+        checkpoint_save_policy: checkpoint 保存策略；"all" 保存全部，
+                                "best_only" 只保存刷新 best loss 的帧
         target_template_path:   可选复合物 template 文件；CDR 模式下 framework
                                 binder residues 作为 template context 保留
         binder_chain:   指定 binder chain ID（Mode A，默认为第一条 heavy chain）
@@ -526,8 +531,9 @@ def run_hybrid_hallucination_cdr(
             output_dir=checkpoint_dir,
             binder_seq="PLACEHOLDER",
             target_seq=target_seq,
+            save_policy=checkpoint_save_policy,
         )
-        logger.info(f"Checkpoint 保存已启用: {checkpoint_dir}")
+        logger.info(f"Checkpoint 保存已启用: {checkpoint_dir} | policy={checkpoint_save_policy}")
 
     logger.info("=" * 70)
     logger.info("CDR-Aware 混合优化 (Mode A/B/C auto-detected above)")
@@ -1205,6 +1211,7 @@ def run_mcts_hallucination_cdr(
     use_prior: bool = True,
     prior_strength: float = 0.1,
     checkpoint_dir: str = None,
+    checkpoint_save_policy: str = "all",
     hotspot_params: Optional[Dict] = None,
     mcts_C: float = 1.0,
     mcts_max_nodes: int = 5000,
@@ -1217,6 +1224,9 @@ def run_mcts_hallucination_cdr(
     mcts_handoff_top_k: Optional[int] = None,
     mcts_expand_actions_per_step: int = MCTS_STAGE2_EXPAND_ACTIONS_PER_STEP,
     mcts_prior_mode: str = "full",
+    mcts_proposal_method: str = "one_step_fixed",
+    mcts_adaptive_tau_start: float = 160.0,
+    mcts_adaptive_tau_end: float = 0.1,
     binder_chain: str = None,
     scheme: str = "chothia",
     chunk_size: int = None,
@@ -1239,6 +1249,9 @@ def run_mcts_hallucination_cdr(
     mcts_handoff_top_k = max(1, int(mcts_handoff_top_k or num_beams))
     mcts_expand_actions_per_step = max(int(mcts_expand_actions_per_step), 1)
     mcts_prior_mode = normalize_mcts_prior_mode(mcts_prior_mode)
+    mcts_proposal_method = normalize_mcts_proposal_method(mcts_proposal_method)
+    mcts_adaptive_tau_start = float(mcts_adaptive_tau_start)
+    mcts_adaptive_tau_end = float(mcts_adaptive_tau_end)
 
     # ── CDR 自动推断（与 hybrid 对齐）─────────────────────────────────────
     if pdb_id is not None:
@@ -1288,23 +1301,23 @@ def run_mcts_hallucination_cdr(
 
     if mcts_strategy == "two_stage":
         phase0_ckpt_mgr = _make_stage_checkpoint_manager(
-            checkpoint_dir, "phase0", mcts_strategy, target_seq
+            checkpoint_dir, "phase0", mcts_strategy, target_seq, checkpoint_save_policy
         )
         legacy_ckpt_mgr = _make_stage_checkpoint_manager(
-            checkpoint_dir, "legacy_bootstrap", mcts_strategy, target_seq
+            checkpoint_dir, "legacy_bootstrap", mcts_strategy, target_seq, checkpoint_save_policy
         )
         strict_ckpt_mgr = _make_stage_checkpoint_manager(
-            checkpoint_dir, "document_puct_refine", mcts_strategy, target_seq
+            checkpoint_dir, "document_puct_refine", mcts_strategy, target_seq, checkpoint_save_policy
         )
     elif mcts_strategy == "legacy":
         legacy_ckpt_mgr = _make_stage_checkpoint_manager(
-            checkpoint_dir, "legacy_bootstrap", mcts_strategy, target_seq
+            checkpoint_dir, "legacy_bootstrap", mcts_strategy, target_seq, checkpoint_save_policy
         )
         phase0_ckpt_mgr = legacy_ckpt_mgr
         strict_ckpt_mgr = None
     else:
         strict_ckpt_mgr = _make_stage_checkpoint_manager(
-            checkpoint_dir, "document_puct_refine", mcts_strategy, target_seq
+            checkpoint_dir, "document_puct_refine", mcts_strategy, target_seq, checkpoint_save_policy
         )
         phase0_ckpt_mgr = strict_ckpt_mgr
         legacy_ckpt_mgr = None
@@ -1342,6 +1355,13 @@ def run_mcts_hallucination_cdr(
         mcts_expand_actions_per_step,
     )
     logger.info("CDR MCTS prior mode: %s", mcts_prior_mode)
+    logger.info("CDR StageB proposal method: %s", mcts_proposal_method)
+    if mcts_proposal_method == "one_step_adaptive":
+        logger.info(
+            "CDR StageB adaptive tau schedule: %.3f -> %.3f",
+            mcts_adaptive_tau_start,
+            mcts_adaptive_tau_end,
+        )
     logger.info(
         "CDR Stage3-lite: loss_grouping=%s(bin_width=%.2f, reps=%d) "
         "structural_grouping=%s pareto=%s reward_normalization=%s "
@@ -1924,6 +1944,15 @@ def run_mcts_hallucination_cdr(
             binder_template_mask=binder_template_mask,
         )
 
+        proposal_tau = _stageb_proposal_tau(
+            mcts_proposal_method,
+            mcts_tau_fixed,
+            local_step=step,
+            total_steps=strict_loop_steps,
+            stale_steps=strict_stale_steps,
+            adaptive_tau_start=mcts_adaptive_tau_start,
+            adaptive_tau_end=mcts_adaptive_tau_end,
+        )
         x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
             model=model,
             s_binder=s_binder_step2,
@@ -1931,7 +1960,7 @@ def run_mcts_hallucination_cdr(
             input_feature_dict=input_feature_dict_step2,
             x_coarse=x_coarse_cached,
             X_clean=selected_node.coordinate,
-            tau=mcts_tau_fixed,
+            tau=proposal_tau,
             device=device,
             chunk_size=chunk_size,
         )
@@ -2004,6 +2033,74 @@ def run_mcts_hallucination_cdr(
         optimizer_step2.step()
         fo_loss_val = first_order_loss.item()
         proposal_loss_val = float(proposal_loss.detach().item())
+        proposal_passes = 1
+
+        if mcts_proposal_method == "two_step_truncated" and grad_for_proposal is not None:
+            optimizer_step2.zero_grad(set_to_none=True)
+            s_binder_step2, current_seq_step2, input_feature_dict_step2 = ste_bridge(
+                theta=theta_step2,
+                W_AAE=W_AAE,
+                model=model,
+                target_seq=target_seq,
+                device=device,
+                tau_temp=tau_temp,
+                target_template_path=target_template_path,
+                binder_template_mask=binder_template_mask,
+            )
+            x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
+                model=model,
+                s_binder=s_binder_step2,
+                s_target=s_target,
+                input_feature_dict=input_feature_dict_step2,
+                x_coarse=x_coarse_cached,
+                X_clean=selected_node.coordinate,
+                tau=proposal_tau,
+                device=device,
+                chunk_size=chunk_size,
+            )
+            x0_flat = x0_hat_step2.squeeze(0)
+            s_inputs_full = torch.cat([s_binder_step2, s_target], dim=0)
+            heads = run_confidence_heads(
+                model=model,
+                input_feature_dict=input_feature_dict_step2,
+                s_inputs=s_inputs_full,
+                s_trunk=s_trunk_step2,
+                z_trunk=z_trunk_step2,
+                x0_hat=x0_hat_step2,
+                inplace_safe=False,
+                chunk_size=chunk_size,
+            )
+            first_order_loss, first_order_losses = compute_all_losses(
+                x0_flat=x0_flat,
+                plddt_logits=heads["plddt_logits"],
+                pae_logits=heads["pae_logits"],
+                distogram_logits=heads["distogram_logits"],
+                input_feature_dict=input_feature_dict_step2,
+                L_binder=L_binder,
+                weights=base_weights,
+                contact_params=contact_params,
+                plddt_params=plddt_params,
+                pae_params=pae_params,
+                distogram_params=distogram_params,
+                pde_logits=heads["pde_logits"],
+                pde_params=pde_params,
+                clash_params=dict(DEFAULT_CLASH_PARAMS),
+                hotspot_params=hotspot_params,
+                opt_token_mask=cdr_mask,
+                target_chain_roles=partner_roles,
+            )
+            proposal_loss, proposal_loss_mode = _stageb_group_proposal_loss(
+                first_order_losses,
+                action_group,
+                first_order_loss,
+            )
+            proposal_loss.backward()
+            grad_for_proposal = theta_step2.grad.clone() if theta_step2.grad is not None else None
+            torch.nn.utils.clip_grad_norm_([theta_step2], 1.0)
+            optimizer_step2.step()
+            fo_loss_val = first_order_loss.item()
+            proposal_loss_val = float(proposal_loss.detach().item())
+            proposal_passes = 2
 
         if grad_for_proposal is None:
             logger.warning(f"Step {global_step}: grad is None, skipping candidate generation")
@@ -2272,6 +2369,7 @@ def run_mcts_hallucination_cdr(
             f"R={selected_node.tree_reward:.4f} Q={selected_node.q_value:.4f} "
             f"P={selected_node.prior:.4f} "
             f"1st={fo_loss_val:.4f} prop={proposal_loss_val:.4f}({proposal_loss_mode}) | "
+            f"proposal={mcts_proposal_method} pass={proposal_passes} tau={proposal_tau:.3f} "
             f"group={action_group} Pg={group_prior:.3f} "
             f"edit_max={stageb_max_mutations} stale={strict_stale_steps} "
             f"pw={len(selected_node.children)}/{mcts_tree.progressive_widening_limit(selected_node)} "

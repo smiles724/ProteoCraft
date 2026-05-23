@@ -1,10 +1,10 @@
 input_dir: benchmark/input/cdr_tcr_case
 output_dir: benchmark/outputs/cdr_tcr
 log_file: benchmark/outputs/cdr_tcr/launcher.log
-model_checkpoint_dir: /hpc2hdd/home/hlin199/Bingchen/BindCraft-v2-fix/checkpoint
-components_cache_dir: /hpc2hdd/home/hlin199/Bingchen/BindCraft-v2-cdr-mcts-integration/common
-protenix_root_dir: /hpc2hdd/home/hlin199/Bingchen/BindCraft-v2-cdr-mcts-integration/benchmark/protenix_runtime
-model_name: protenix_base_default_v1.0.0
+model_checkpoint_dir: /data/huangyanjie/Alphaenzyme/LGOS/checkpoints
+components_cache_dir: /data/huangyanjie/Alphaenzyme/LGOS/protenix/release_data/ccd_cache
+protenix_root_dir: /data/huangyanjie/binder_design/BindCraft-v2-bingchen/benchmark/protenix_runtime
+model_name: protenix_base_20250630_v1.0.0
 device: cuda:0
 mode: mcts
 n_steps: 150

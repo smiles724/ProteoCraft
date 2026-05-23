@@ -20,6 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from bindcraft.hallucination.pipeline import run_hybrid_hallucination, run_mcts_hallucination  # noqa: E402
+from bindcraft.hallucination.reproducibility import set_global_seed  # noqa: E402
 from bindcraft.utils import configure_protenix_common_paths  # noqa: E402
 from protenix.data.utils import pdb_to_cif  # noqa: E402
 from scripts.run_hallucination import load_protenix_model  # noqa: E402
@@ -157,7 +158,21 @@ def parse_args() -> argparse.Namespace:
         choices=("full", "uniform", "no_gradient", "no_group", "no_sequence"),
         default="full",
     )
+    parser.add_argument(
+        "--mcts-proposal-method",
+        choices=("one_step_fixed", "one_step_adaptive", "two_step_truncated"),
+        default="one_step_fixed",
+    )
+    parser.add_argument("--mcts-adaptive-tau-start", type=float, default=160.0)
+    parser.add_argument("--mcts-adaptive-tau-end", type=float, default=0.1)
+    parser.add_argument(
+        "--checkpoint-save-policy",
+        choices=("all", "best_only"),
+        default="all",
+        help="Checkpoint save policy: all saves every call; best_only saves only frames that improve best loss.",
+    )
     parser.add_argument("--log-file")
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--no-download", action="store_true")
     # Boolean flags for annealing and tau scheduling
     add_bool_argument(parser, "use-annealing")
@@ -398,6 +413,8 @@ def prepare_template_cif(pdb_path: Path, output_dir: Path, pdb_id: str) -> Path:
 
 def main() -> int:
     args = parse_args()
+    if args.seed is not None:
+        set_global_seed(args.seed)
     pdb_id = args.pdb_id.upper()
     if args.output_dir:
         output_dir = Path(args.output_dir)
@@ -515,6 +532,10 @@ def main() -> int:
                 mcts_handoff_top_k=args.mcts_handoff_top_k,
                 mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
                 mcts_prior_mode=args.mcts_prior_mode,
+                mcts_proposal_method=args.mcts_proposal_method,
+                mcts_adaptive_tau_start=args.mcts_adaptive_tau_start,
+                mcts_adaptive_tau_end=args.mcts_adaptive_tau_end,
+                checkpoint_save_policy=args.checkpoint_save_policy,
                 target_template_path=str(template_path),
                 target_chain_roles=args.target_chain_roles,
             )
@@ -541,6 +562,7 @@ def main() -> int:
                 use_prior=use_prior,
                 prior_strength=args.prior_strength,
                 checkpoint_dir=str(checkpoint_dir),
+                checkpoint_save_policy=args.checkpoint_save_policy,
                 hotspot_params=hotspot_params,
                 target_template_path=str(template_path),
                 target_chain_roles=args.target_chain_roles,
@@ -601,6 +623,11 @@ def main() -> int:
                 "mcts_handoff_top_k": args.mcts_handoff_top_k,
                 "mcts_expand_actions_per_step": args.mcts_expand_actions_per_step,
                 "mcts_prior_mode": args.mcts_prior_mode,
+                "mcts_proposal_method": args.mcts_proposal_method,
+                "mcts_adaptive_tau_start": args.mcts_adaptive_tau_start,
+                "mcts_adaptive_tau_end": args.mcts_adaptive_tau_end,
+                "checkpoint_save_policy": args.checkpoint_save_policy,
+                "seed": args.seed,
                 "model_name": args.model_name,
                 "loss_weights": loss_weights,
             },

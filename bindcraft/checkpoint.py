@@ -402,6 +402,7 @@ class CheckpointManager:
         binder_seq: str = "",
         target_seq: str = "",
         overwrite: bool = True,
+        save_policy: str = "all",
     ):
         """
         Args:
@@ -409,11 +410,20 @@ class CheckpointManager:
             binder_seq:    Binder 序列（提前传入避免重复构建）
             target_seq:    Target 序列
             overwrite:     是否覆盖已有文件
+            save_policy:   保存策略；"all" 保存每次调用，"best_only" 仅保存刷新
+                           当前 manager 最优 total_loss 的 checkpoint
         """
+        save_policy = str(save_policy or "all").lower()
+        if save_policy not in {"all", "best_only"}:
+            raise ValueError(
+                f"Unsupported checkpoint save_policy={save_policy!r}; "
+                "expected 'all' or 'best_only'."
+            )
         self.output_dir = Path(output_dir)
         self.overwrite = overwrite
         self.binder_seq = binder_seq
         self.target_seq = target_seq
+        self.save_policy = save_policy
 
         self._best_loss: float = float("inf")
         self._best_step: int = -1
@@ -421,6 +431,8 @@ class CheckpointManager:
         self._best_pdb: Optional[Path] = None
         self._best_json: Optional[Path] = None
         self._best_plddt: Optional[Path] = None
+        self._num_saved: int = 0
+        self._num_skipped: int = 0
 
         # 预构建 atom_array（用占位序列，第一次 save 时替换）
         self._atom_array = None
@@ -588,9 +600,20 @@ class CheckpointManager:
         # ── 从 zeroth_result 提取数据 ────────────────────────────────
         binder_seq      = zeroth_result.binder_seq
         target_seq      = zeroth_result.target_seq
-        total_loss      = zeroth_result.total_loss
+        total_loss      = float(zeroth_result.total_loss)
         loss_dict       = zeroth_result.loss_dict
         summary_conf    = zeroth_result.summary_confidence
+
+        is_loss_improvement = total_loss < self._best_loss
+        if self.save_policy == "best_only" and not is_loss_improvement:
+            self._num_skipped += 1
+            return {
+                "pdb": None,
+                "json": None,
+                "plddt": None,
+                "skipped": True,
+                "reason": "not_best_loss",
+            }
 
         # coordinate 形状 [N_sample, N_atom, 3]，取第一个 sample
         coord_tensor    = zeroth_result.coordinate
@@ -644,7 +667,7 @@ class CheckpointManager:
 
         # ── 更新全局最优 ──────────────────────────────────────────────
         plddt_path = self._step_dir(step) / plddt_filename if plddt_filename else None
-        if accepted or is_global_best:
+        if accepted or is_global_best or (self.save_policy == "best_only" and is_loss_improvement):
             self._update_best(
                 step=step, beam_id=beam_id,
                 loss=total_loss,
@@ -652,11 +675,13 @@ class CheckpointManager:
                 json_path=json_path,
                 plddt_path=plddt_path,
             )
+        self._num_saved += 1
 
         return {
             "pdb":   pdb_filename,
             "json":  json_filename,
             "plddt": plddt_filename,
+            "skipped": False,
         }
 
     # ------------------------------------------------------------------
@@ -672,6 +697,9 @@ class CheckpointManager:
             "pdb":      str(self._best_pdb) if self._best_pdb else None,
             "json":     str(self._best_json) if self._best_json else None,
             "plddt":    str(self._best_plddt) if self._best_plddt else None,
+            "save_policy": self.save_policy,
+            "num_saved": self._num_saved,
+            "num_skipped": self._num_skipped,
         }
 
     @property
