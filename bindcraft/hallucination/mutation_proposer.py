@@ -118,6 +118,12 @@ def should_use_sequence_prior(prior_mode: str, use_prior: bool) -> bool:
     return bool(use_prior) and prior_mode not in {"uniform", "no_sequence"}
 
 
+def should_use_gradient_prior(prior_mode: str) -> bool:
+    """Return whether AF3 mutation-gradient signal should guide StageB proposals."""
+    prior_mode = normalize_mcts_prior_mode(prior_mode)
+    return prior_mode not in {"uniform", "no_gradient"}
+
+
 DE_NOVO_ACTION_GROUPS = (
     "core_stabilization",
     "compactness_repair",
@@ -128,16 +134,16 @@ DE_NOVO_ACTION_GROUPS = (
 )
 
 ACTION_GROUP_LOSS_SCALES = {
-    "plddt": 100.0,
-    "pae": 30.0,
-    "pde": 30.0,
+    "plddt": 1.0,
+    "pae": 1.0,
+    "pde": 1.0,
     "con": 1.0,
-    "i_pae": 30.0,
-    "i_pde": 30.0,
+    "i_pae": 1.0,
+    "i_pde": 1.0,
     "i_con": 1.0,
-    "rg": 10.0,
-    "clash": 5.0,
-    "i_clash": 5.0,
+    "rg": 1.0,
+    "clash": 1.0,
+    "i_clash": 1.0,
     "bond_violation": 0.5,
     "chainbreak": 0.5,
     "background_contact": 1.0,
@@ -148,6 +154,15 @@ ACTION_GROUP_LOSS_SCALES = {
     "solubility": 1.0,
 }
 
+ACTION_GROUP_LOSS_KEYS = {
+    "core_stabilization": ("plddt", "pae", "con", "pde"),
+    "compactness_repair": ("rg",),
+    "interface_formation": ("i_pae", "i_con", "i_pde"),
+    "clash_repair": ("clash", "i_clash"),
+    "specificity_repair": ("background_contact", "decoy_margin", "specificity"),
+    "solubility_repair": ("exposed_hydrophobicity", "sequence_prior", "solubility"),
+}
+
 
 def _loss_value(loss_vector: Dict[str, float], *keys: str) -> float:
     for key in keys:
@@ -156,77 +171,108 @@ def _loss_value(loss_vector: Dict[str, float], *keys: str) -> float:
     return 0.0
 
 
-def _scaled_loss_value(loss_vector: Dict[str, float], key: str, weight: float = 1.0) -> float:
+def _loss_weight(loss_weights: Optional[Dict[str, float]], key: str) -> float:
+    if loss_weights is None:
+        return 1.0
+    return max(float(loss_weights.get(key, 0.0)), 0.0)
+
+
+def _loss_scale(key: str, binder_length: Optional[int] = None) -> float:
+    if key == "rg" and binder_length is not None and int(binder_length) > 0:
+        return 2.38 * (float(binder_length) ** 0.365)
+    return ACTION_GROUP_LOSS_SCALES.get(key, 1.0)
+
+
+def _scaled_loss_value(
+    loss_vector: Dict[str, float],
+    key: str,
+    weight: float = 1.0,
+    binder_length: Optional[int] = None,
+) -> float:
     value = _loss_value(loss_vector, key)
-    scale = ACTION_GROUP_LOSS_SCALES.get(key, 1.0)
+    scale = _loss_scale(key, binder_length=binder_length)
     return float(weight) * value / max(float(scale), 1e-8)
+
+
+def _weighted_group_mean(
+    loss_vector: Dict[str, float],
+    keys: Tuple[str, ...],
+    loss_weights: Optional[Dict[str, float]] = None,
+    binder_length: Optional[int] = None,
+) -> Optional[float]:
+    values = []
+    for key in keys:
+        if key not in loss_vector:
+            continue
+        weight = _loss_weight(loss_weights, key)
+        if weight <= 0.0:
+            continue
+        values.append(
+            _scaled_loss_value(
+                loss_vector,
+                key,
+                weight=weight,
+                binder_length=binder_length,
+            )
+        )
+    if not values or sum(values) <= 1e-8:
+        return None
+    return float(sum(values) / len(values))
 
 
 def compute_de_novo_action_group_priors(
     loss_vector: Dict[str, float],
     temperature: float = 1.0,
+    loss_weights: Optional[Dict[str, float]] = None,
+    binder_length: Optional[int] = None,
 ) -> Dict[str, float]:
     """
     根据 de novo verifier loss vector 计算 action group prior。
 
-    Stage 2 只做轻量 routing：使用当前已有 loss key 的 normalized
-    residual score，不依赖结构分组或 residue-level exposure/contact
-    fingerprint。这里必须先做 component-scale normalization，否则 PAE /
-    pLDDT 等大范围 loss 会长期压制 interface、clash 等局部问题。
+    Stage 2 只做轻量 routing：使用当前 total loss 权重下的 normalized
+    residual contribution，并在每个 group 内部取 mean，避免项数更多的
+    group 天然占优。
     """
-    raw_scores = {
-        "core_stabilization": (
-            _scaled_loss_value(loss_vector, "plddt")
-            + _scaled_loss_value(loss_vector, "pae")
-            + _scaled_loss_value(loss_vector, "con")
-            + _scaled_loss_value(loss_vector, "pde", weight=0.5)
-        ),
-        "compactness_repair": (
-            _scaled_loss_value(loss_vector, "rg")
-            + _scaled_loss_value(loss_vector, "pae", weight=0.25)
-        ),
-        "interface_formation": (
-            _scaled_loss_value(loss_vector, "i_pae")
-            + _scaled_loss_value(loss_vector, "i_pde")
-            + _scaled_loss_value(loss_vector, "i_con")
-        ),
-        "clash_repair": (
-            _scaled_loss_value(loss_vector, "clash")
-            + _scaled_loss_value(loss_vector, "i_clash")
-            + _scaled_loss_value(loss_vector, "bond_violation")
-            + _scaled_loss_value(loss_vector, "chainbreak")
-        ),
-        "specificity_repair": (
-            _scaled_loss_value(loss_vector, "background_contact")
-            + _scaled_loss_value(loss_vector, "decoy_margin")
-            + _scaled_loss_value(loss_vector, "specificity")
-        ),
-        "solubility_repair": (
-            _scaled_loss_value(loss_vector, "exposed_hydrophobicity")
-            + _scaled_loss_value(loss_vector, "sequence_prior")
-            + _scaled_loss_value(loss_vector, "solubility")
-        ),
-    }
+    raw_scores = {}
+    for group in DE_NOVO_ACTION_GROUPS:
+        score = _weighted_group_mean(
+            loss_vector,
+            ACTION_GROUP_LOSS_KEYS[group],
+            loss_weights=loss_weights,
+            binder_length=binder_length,
+        )
+        if score is not None:
+            raw_scores[group] = score
+
+    if not raw_scores:
+        return {"unrouted": 1.0}
 
     scores = torch.tensor(
-        [raw_scores[group] for group in DE_NOVO_ACTION_GROUPS],
+        [raw_scores[group] for group in raw_scores],
         dtype=torch.float32,
     )
     priors = torch.softmax(scores / max(temperature, 1e-8), dim=0)
     return {
         group: float(priors[i].item())
-        for i, group in enumerate(DE_NOVO_ACTION_GROUPS)
+        for i, group in enumerate(raw_scores)
     }
 
 
 def select_de_novo_action_group(
     loss_vector: Dict[str, float],
     temperature: float = 1.0,
+    loss_weights: Optional[Dict[str, float]] = None,
+    binder_length: Optional[int] = None,
 ) -> Dict[str, object]:
     """
     选择当前 de novo node 最需要修复的 action group。
     """
-    priors = compute_de_novo_action_group_priors(loss_vector, temperature=temperature)
+    priors = compute_de_novo_action_group_priors(
+        loss_vector,
+        temperature=temperature,
+        loss_weights=loss_weights,
+        binder_length=binder_length,
+    )
     action_group = max(priors, key=priors.get)
     return {
         "action_group": action_group,
@@ -798,6 +844,8 @@ def propose_mutation_actions(
     prior_mode = normalize_mcts_prior_mode(prior_mode)
     current_indices = _seq_to_indices(current_seq)
     grad_cpu = grad_matrix.detach().cpu()
+    if not should_use_gradient_prior(prior_mode):
+        grad_cpu = torch.zeros_like(grad_cpu)
 
     delta_L = compute_mutation_benefit(
         grad_cpu, current_indices,
@@ -827,8 +875,11 @@ def propose_mutation_actions(
             delta_L,
             position_weights,
         )
+    candidate_k_top = K_top
+    if prior_mode == "uniform":
+        candidate_k_top = delta_L.shape[0] * max(NUM_AMINO_ACIDS - 1, 1)
     positions, new_aas, benefits = select_top_k_mutations(
-        delta_L, current_indices, K_top
+        delta_L, current_indices, candidate_k_top
     )
 
     if positions.shape[0] == 0:

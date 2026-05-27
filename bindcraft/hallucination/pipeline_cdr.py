@@ -47,6 +47,7 @@ from bindcraft.hallucination.mutation_proposer import (
     normalize_mcts_prior_mode,
     normalize_mcts_proposal_method,
     select_de_novo_action_group,
+    should_use_gradient_prior,
 )
 from bindcraft.hallucination.zeroth_order import zeroth_order_eval
 from bindcraft.hallucination.pipeline import (
@@ -1981,6 +1982,8 @@ def run_mcts_hallucination_cdr(
         routing_info = select_de_novo_action_group(
             selected_node.loss_vector,
             temperature=MCTS_STAGE2_GROUP_TEMPERATURE,
+            loss_weights=base_weights,
+            binder_length=sum(1 for is_cdr in cdr_mask if is_cdr),
         )
         action_group = str(routing_info["action_group"])
         group_prior = float(routing_info["group_prior"])
@@ -2027,15 +2030,23 @@ def run_mcts_hallucination_cdr(
             first_order_loss,
         )
 
-        proposal_loss.backward()
-        grad_for_proposal = theta_step2.grad.clone() if theta_step2.grad is not None else None
-        torch.nn.utils.clip_grad_norm_([theta_step2], 1.0)
-        optimizer_step2.step()
+        use_gradient_proposal = should_use_gradient_prior(mcts_prior_mode)
+        if use_gradient_proposal:
+            proposal_loss.backward()
+            grad_for_proposal = theta_step2.grad.clone() if theta_step2.grad is not None else None
+            torch.nn.utils.clip_grad_norm_([theta_step2], 1.0)
+            optimizer_step2.step()
+        else:
+            grad_for_proposal = torch.zeros_like(theta_step2.detach())
         fo_loss_val = first_order_loss.item()
         proposal_loss_val = float(proposal_loss.detach().item())
-        proposal_passes = 1
+        proposal_passes = 1 if use_gradient_proposal else 0
 
-        if mcts_proposal_method == "two_step_truncated" and grad_for_proposal is not None:
+        if (
+            use_gradient_proposal
+            and mcts_proposal_method == "two_step_truncated"
+            and grad_for_proposal is not None
+        ):
             optimizer_step2.zero_grad(set_to_none=True)
             s_binder_step2, current_seq_step2, input_feature_dict_step2 = ste_bridge(
                 theta=theta_step2,

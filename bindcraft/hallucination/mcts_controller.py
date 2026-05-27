@@ -63,17 +63,17 @@ REWARD_LOSS_WEIGHTS = {
     "i_clash": 1.0,
 }
 DEFAULT_REWARD_LOSS_SCALES = {
-    "plddt": 100.0,
-    "pae": 30.0,
+    "plddt": 1.0,
+    "pae": 1.0,
     "con": 1.0,
-    "i_pae": 30.0,
-    "i_pde": 30.0,
+    "i_pae": 1.0,
+    "i_pde": 1.0,
     "i_con": 1.0,
-    "pde": 30.0,
-    "rg": 10.0,
-    "clash": 5.0,
-    "i_clash": 5.0,
-    "total": 10.0,
+    "pde": 1.0,
+    "rg": 1.0,
+    "clash": 1.0,
+    "i_clash": 1.0,
+    "total": 1.0,
 }
 PARETO_EPS = 1e-8
 PARETO_LOSS_DIMENSIONS = {

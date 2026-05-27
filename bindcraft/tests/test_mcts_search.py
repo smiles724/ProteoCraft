@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from bindcraft.hallucination.mcts_controller import MCTSTree
+from bindcraft.hallucination.mcts_controller import MCTSTree, RunningLossNormalizer
 from bindcraft.hallucination.mcts_controller import HARD_CONSTRAINT_INVALID_REWARD
 from bindcraft.hallucination.mcts_legacy import LegacyMCTSTree
 from bindcraft.hallucination.mutation_proposer import (
@@ -22,11 +22,16 @@ from bindcraft.hallucination.mutation_proposer import (
     normalize_mcts_proposal_method,
     sample_mutation_actions,
     select_de_novo_action_group,
+    should_use_gradient_prior,
     should_use_sequence_prior,
     apply_position_weight_mask,
 )
 from bindcraft.hallucination.zeroth_order import compute_mcts_structural_metadata
-from bindcraft.hallucination.pipeline import _stageb_proposal_tau
+from bindcraft.hallucination.pipeline import (
+    _allocate_action_group_budgets,
+    _apply_stageb_prior_mode_to_groups,
+    _stageb_proposal_tau,
+)
 
 
 @dataclass
@@ -124,6 +129,11 @@ class TestStage1GradientPriorPuct:
     def test_prior_mode_helpers_preserve_full_default_and_disable_sequence_prior(self):
         assert normalize_mcts_prior_mode(None) == "full"
         assert normalize_mcts_prior_mode("NO_GRADIENT") == "no_gradient"
+        assert should_use_gradient_prior("full")
+        assert should_use_gradient_prior("no_group")
+        assert should_use_gradient_prior("no_sequence")
+        assert not should_use_gradient_prior("no_gradient")
+        assert not should_use_gradient_prior("uniform")
         assert should_use_sequence_prior("full", True)
         assert not should_use_sequence_prior("no_sequence", True)
         assert not should_use_sequence_prior("uniform", True)
@@ -201,6 +211,87 @@ class TestStage1GradientPriorPuct:
         assert proposals
         expected = 0.6 / len(proposals)
         assert all(p.prior == pytest.approx(expected) for p in proposals)
+
+    def test_no_gradient_proposal_ignores_gradient_matrix(self):
+        seq = "AAAA"
+        grad_a = torch.zeros(4, 20)
+        grad_a[0, AA_1_TO_IDX["S"]] = -10.0
+        grad_b = torch.zeros(4, 20)
+        grad_b[1, AA_1_TO_IDX["T"]] = -10.0
+
+        torch.manual_seed(7)
+        proposals_a = propose_mutation_actions(
+            grad_a,
+            seq,
+            K_top=4,
+            B_candidates=6,
+            T_sample=0.5,
+            max_mutations_per_seq=1,
+            use_prior=False,
+            prior_mode="no_gradient",
+            action_group="unrouted",
+            group_prior=1.0,
+        )
+        torch.manual_seed(7)
+        proposals_b = propose_mutation_actions(
+            grad_b,
+            seq,
+            K_top=4,
+            B_candidates=6,
+            T_sample=0.5,
+            max_mutations_per_seq=1,
+            use_prior=False,
+            prior_mode="no_gradient",
+            action_group="unrouted",
+            group_prior=1.0,
+        )
+
+        assert [(p.sequence, p.edits) for p in proposals_a] == [
+            (p.sequence, p.edits) for p in proposals_b
+        ]
+
+    def test_uniform_proposal_samples_beyond_gradient_top_k(self):
+        torch.manual_seed(3)
+        grad = torch.zeros(4, 20)
+        grad[0, AA_1_TO_IDX["S"]] = -10.0
+
+        proposals = propose_mutation_actions(
+            grad,
+            "AAAA",
+            K_top=1,
+            B_candidates=12,
+            T_sample=1.0,
+            max_mutations_per_seq=1,
+            use_prior=True,
+            prior_mode="uniform",
+            action_group="unrouted",
+            group_prior=1.0,
+        )
+
+        assert len({p.sequence for p in proposals}) > 1
+        assert any(p.sequence != "SAAA" for p in proposals)
+        assert all(p.prior == pytest.approx(1.0 / len(proposals)) for p in proposals)
+
+    def test_full_proposal_still_uses_gradient_top_k(self):
+        torch.manual_seed(0)
+        grad = torch.zeros(4, 20)
+        grad[0, AA_1_TO_IDX["S"]] = -10.0
+
+        proposals = propose_mutation_actions(
+            grad,
+            "AAAA",
+            K_top=1,
+            B_candidates=4,
+            T_sample=0.2,
+            max_mutations_per_seq=1,
+            use_prior=False,
+            prior_mode="full",
+            action_group="unrouted",
+            group_prior=1.0,
+        )
+
+        assert proposals
+        assert {p.sequence for p in proposals} == {"SAAA"}
 
     def test_mcts_tree_puct_reward_backup_dedup_and_global_best(self):
         logits = torch.zeros(4, 20, requires_grad=True)
@@ -505,8 +596,8 @@ class TestStage2ActionRouting:
 
     def test_action_group_routing_uses_component_scale_normalization(self):
         losses = {
-            "plddt": 20.0,
-            "pae": 20.0,
+            "plddt": 0.20,
+            "pae": 0.10,
             "con": 0.0,
             "i_pae": 0.0,
             "i_pde": 0.0,
@@ -519,6 +610,144 @@ class TestStage2ActionRouting:
 
         assert selected["action_group"] == "interface_formation"
         assert selected["group_priors"]["interface_formation"] > selected["group_priors"]["core_stabilization"]
+
+    def test_action_group_routing_uses_loss_weights_and_group_mean(self):
+        losses = {
+            "plddt": 0.20,
+            "pae": 0.10,
+            "con": 0.50,
+            "pde": 0.03,
+            "i_pae": 0.10,
+            "i_con": 0.20,
+            "i_pde": 0.05,
+        }
+        loss_weights = {
+            "plddt": 1.0,
+            "pae": 1.0,
+            "con": 1.0,
+            "pde": 1.0,
+            "i_pae": 1.0,
+            "i_con": 3.0,
+            "i_pde": 1.0,
+        }
+
+        selected = select_de_novo_action_group(losses, loss_weights=loss_weights)
+
+        assert selected["action_group"] == "interface_formation"
+        assert selected["group_priors"]["interface_formation"] > selected["group_priors"]["core_stabilization"]
+
+    def test_action_group_routing_uses_current_normalized_loss_scales(self):
+        losses = {
+            "plddt": 0.20,
+            "pae": 0.10,
+            "con": 1.0,
+            "pde": 0.03,
+            "i_pae": 0.60,
+            "i_con": 0.04,
+            "i_pde": 0.20,
+            "clash": 0.0,
+            "i_clash": 0.0,
+        }
+        tuned_weights = {
+            "plddt": 0.1,
+            "pae": 0.4,
+            "con": 0.2,
+            "pde": 0.05,
+            "i_pae": 0.2,
+            "i_con": 3.0,
+            "i_pde": 0.03,
+            "clash": 0.1,
+            "i_clash": 0.1,
+        }
+
+        selected = select_de_novo_action_group(losses, loss_weights=tuned_weights)
+
+        assert selected["action_group"] == "interface_formation"
+        assert selected["group_priors"]["interface_formation"] > selected["group_priors"]["core_stabilization"]
+
+    def test_rg_routing_normalizes_by_binder_length(self):
+        losses = {
+            "rg": 1.0,
+            "i_pae": 0.10,
+            "i_con": 0.08,
+            "i_pde": 0.10,
+        }
+        tuned_weights = {
+            "rg": 0.3,
+            "i_pae": 0.2,
+            "i_con": 3.0,
+            "i_pde": 0.03,
+        }
+
+        selected = select_de_novo_action_group(
+            losses,
+            loss_weights=tuned_weights,
+            binder_length=80,
+        )
+
+        assert selected["action_group"] == "interface_formation"
+        assert selected["group_priors"]["interface_formation"] > selected["group_priors"]["compactness_repair"]
+
+    def test_action_group_routing_drops_zero_score_groups(self):
+        losses = {
+            "plddt": 0.2,
+            "pae": 0.1,
+            "con": 0.5,
+            "i_pae": 0.0,
+            "i_con": 0.0,
+            "i_pde": 0.0,
+            "clash": 0.0,
+            "i_clash": 0.0,
+        }
+        loss_weights = {
+            "plddt": 1.0,
+            "pae": 1.0,
+            "con": 1.0,
+            "i_pae": 1.0,
+            "i_con": 1.0,
+            "i_pde": 1.0,
+            "clash": 1.0,
+            "i_clash": 1.0,
+        }
+
+        priors = compute_de_novo_action_group_priors(losses, loss_weights=loss_weights)
+
+        assert "clash_repair" not in priors
+        assert "interface_formation" not in priors
+        assert set(priors) == {"core_stabilization"}
+
+    def test_action_group_routing_skips_zero_weight_reserved_groups(self):
+        losses = {
+            "plddt": 0.2,
+            "i_con": 0.4,
+            "specificity": 50.0,
+            "solubility": 50.0,
+        }
+        loss_weights = {
+            "plddt": 0.1,
+            "i_con": 3.0,
+            "specificity": 0.0,
+            "solubility": 0.0,
+        }
+
+        priors = compute_de_novo_action_group_priors(losses, loss_weights=loss_weights)
+        selected = select_de_novo_action_group(losses, loss_weights=loss_weights)
+
+        assert "specificity_repair" not in priors
+        assert "solubility_repair" not in priors
+        assert selected["action_group"] == "interface_formation"
+
+    def test_no_group_and_uniform_prior_modes_route_only_unrouted_actions(self):
+        for prior_mode in ("no_group", "uniform"):
+            action_group, group_priors = _apply_stageb_prior_mode_to_groups(
+                prior_mode,
+                "interface_formation",
+                {"interface_formation": 0.9, "core_stabilization": 0.1},
+            )
+
+            assert action_group == "unrouted"
+            assert group_priors == {"unrouted": 1.0}
+            assert _allocate_action_group_budgets(group_priors, 4) == {"unrouted": 4}
 
     def test_action_group_bias_changes_mutation_search_space(self):
         current_indices = [AA_1_TO_IDX["F"], AA_1_TO_IDX["A"]]
@@ -1045,22 +1274,28 @@ class TestRewardNormalization:
         root = tree.add_root_node(
             "AAAA",
             torch.zeros(4, 20),
-            L_real=10.0,
-            loss_vector={"total": 10.0, "plddt": 20.0, "i_pae": 6.0, "clash": 0.0},
+            L_real=1.0,
+            loss_vector={"total": 1.0, "plddt": 0.2, "i_pae": 0.6, "clash": 0.0},
         )
 
         assert root.status_flags["reward_mode"] == "normalized_loss_vector"
-        assert root.status_flags["normalized_loss"] == pytest.approx((0.2 + 0.2 + 0.0) / 3.0)
+        assert root.status_flags["normalized_loss"] == pytest.approx((0.2 + 0.6 + 0.0) / 3.0)
         assert root.tree_reward == pytest.approx(-root.status_flags["normalized_loss"])
-        assert root.tree_reward != pytest.approx(-10.0)
+        assert root.tree_reward != pytest.approx(-1.0)
         assert tree.get_node_stats()["reward_stats_count"] == 1
 
         before = tree.reward_normalizer.observations
         reward = tree.result_reward(
-            _result("AAAC", 8.0, {"total": 8.0, "plddt": 10.0, "i_pae": 3.0, "clash": 0.0})
+            _result("AAAC", 0.8, {"total": 0.8, "plddt": 0.1, "i_pae": 0.3, "clash": 0.0})
         )
         assert tree.reward_normalizer.observations == before
-        assert reward != pytest.approx(-8.0)
+        assert reward == pytest.approx(-((0.1 + 0.3 + 0.0) / 3.0))
+
+    def test_default_reward_scales_match_current_loss_units(self):
+        normalizer = RunningLossNormalizer()
+
+        for key in ("plddt", "pae", "pde", "i_pae", "i_pde", "rg", "clash", "i_clash"):
+            assert normalizer.default_scales[key] == pytest.approx(1.0)
 
     def test_running_normalizer_switches_to_component_z_score(self):
         tree = MCTSTree(C=1.0, max_nodes=20)

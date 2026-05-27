@@ -21,7 +21,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from bindcraft.hallucination.pipeline import run_hybrid_hallucination, run_mcts_hallucination  # noqa: E402
 from bindcraft.hallucination.reproducibility import set_global_seed  # noqa: E402
-from bindcraft.utils import configure_protenix_common_paths  # noqa: E402
+from bindcraft.utils import TUNED_LOSS_WEIGHTS, configure_protenix_common_paths  # noqa: E402
 from protenix.data.utils import pdb_to_cif  # noqa: E402
 from scripts.run_hallucination import load_protenix_model  # noqa: E402
 
@@ -55,20 +55,7 @@ DEFAULT_INIT_BINDER = (
     "VAAGSALLTVT"
 )
 
-DEFAULT_LOSS_WEIGHTS = {
-    "plddt": 0.1,
-    "pae": 0.4,
-    "i_pae": 0.1,
-    "con": 1.0,
-    "i_con": 3.0,
-    "iptm": 0.05,
-    "rg": 0.3,
-    "helix": -0.3,
-    "clash": 0.5,
-    "i_clash": 0.5,
-    "pde": 0.02,
-    "i_pde": 0.01,
-}
+DEFAULT_LOSS_WEIGHTS = dict(TUNED_LOSS_WEIGHTS)
 
 LOSS_WEIGHT_KEYS = tuple(DEFAULT_LOSS_WEIGHTS)
 
