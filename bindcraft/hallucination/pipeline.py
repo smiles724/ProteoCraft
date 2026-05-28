@@ -112,6 +112,10 @@ MCTS_STAGE2_DESCEND_SCORE_MARGIN = _env_float("BINDCRAFT_MCTS_DESCEND_MARGIN", 0
 MCTS_STAGE2_EXPAND_ACTIONS_PER_STEP = _env_int("BINDCRAFT_MCTS_EXPAND_ACTIONS_PER_STEP", 2)
 MCTS_STAGE2_GROUP_TEMPERATURE = _env_float("BINDCRAFT_MCTS_GROUP_TEMPERATURE", 1.0)
 MCTS_STAGE2_HANDOFF_MIN_DISTANCE_FRAC = _env_float("BINDCRAFT_MCTS_HANDOFF_MIN_DISTANCE_FRAC", 0.03)
+MCTS_STAGE2_GROUP_PROPOSAL_LOSS_WEIGHT = _env_float(
+    "BINDCRAFT_MCTS_GROUP_PROPOSAL_LOSS_WEIGHT",
+    0.5,
+)
 MCTS_STAGE2_STALE_EDIT_STEPS = _env_int("BINDCRAFT_MCTS_STALE_EDIT_STEPS", 5)
 MCTS_STAGE3_USE_LOSS_GROUPING = _env_bool("BINDCRAFT_MCTS_USE_LOSS_GROUPING", True)
 MCTS_STAGE3_USE_STRUCTURAL_GROUPING = _env_bool("BINDCRAFT_MCTS_USE_STRUCTURAL_GROUPING", True)
@@ -1298,14 +1302,15 @@ def _stageb_group_proposal_loss(
     losses: Dict[str, torch.Tensor],
     action_group: str,
     fallback_loss: torch.Tensor,
+    group_loss_weight: float = MCTS_STAGE2_GROUP_PROPOSAL_LOSS_WEIGHT,
 ) -> Tuple[torch.Tensor, str]:
     """
     Build the one-step proposal loss used only for mutation gradients.
 
-    Full verifier loss still supplies tree reward. This helper makes the
-    gradient proposal match the selected repair direction: interface gradients
-    emphasize interface losses, clash repair emphasizes clash terms, and core
-    repair emphasizes fold/core terms.
+    Full verifier loss still supplies tree reward. Keep the proposal gradient
+    anchored to the same tuned total loss used for final evaluation, then add a
+    softer group-specific term to bias proposals toward the selected repair
+    direction.
     """
     weights = STAGEB_PROPOSAL_LOSS_WEIGHTS.get(action_group or "", {})
     selected_terms: List[str] = []
@@ -1317,9 +1322,12 @@ def _stageb_group_proposal_loss(
         proposal_loss = term if proposal_loss is None else proposal_loss + term
         selected_terms.append(key)
 
-    if proposal_loss is None:
+    if proposal_loss is None or float(group_loss_weight) <= 0.0:
         return fallback_loss, "fallback_total"
-    return proposal_loss, "+".join(selected_terms)
+    weight = float(group_loss_weight)
+    mixed_loss = fallback_loss + weight * proposal_loss
+    term_label = "+".join(selected_terms)
+    return mixed_loss, f"total+{weight:g}*({term_label})"
 
 
 def _stageb_proposal_tau(
