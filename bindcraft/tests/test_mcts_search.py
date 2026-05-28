@@ -30,7 +30,6 @@ from bindcraft.hallucination.zeroth_order import compute_mcts_structural_metadat
 from bindcraft.hallucination.pipeline import (
     _allocate_action_group_budgets,
     _apply_stageb_prior_mode_to_groups,
-    _stageb_group_proposal_loss,
     _stageb_proposal_tau,
 )
 
@@ -186,37 +185,6 @@ class TestStage1GradientPriorPuct:
         assert start_tau == pytest.approx(160.0)
         assert 0.1 < mid_tau < start_tau
         assert end_tau == pytest.approx(0.1)
-
-    def test_stageb_group_proposal_loss_keeps_total_loss_anchor(self):
-        fallback_total = torch.tensor(10.0)
-        losses = {
-            "i_pae": torch.tensor(2.0),
-            "i_con": torch.tensor(3.0),
-            "iptm": torch.tensor(5.0),
-        }
-
-        proposal_loss, mode = _stageb_group_proposal_loss(
-            losses,
-            "interface_formation",
-            fallback_total,
-            group_loss_weight=0.5,
-        )
-
-        group_loss = 0.30 * 2.0 + 1.50 * 3.0 + 0.10 * 5.0
-        assert proposal_loss.item() == pytest.approx(10.0 + 0.5 * group_loss)
-        assert mode == "total+0.5*(i_pae+i_con+iptm)"
-
-    def test_stageb_group_proposal_loss_falls_back_for_unrouted(self):
-        fallback_total = torch.tensor(10.0)
-
-        proposal_loss, mode = _stageb_group_proposal_loss(
-            {"i_con": torch.tensor(3.0)},
-            "unrouted",
-            fallback_total,
-        )
-
-        assert proposal_loss is fallback_total
-        assert mode == "fallback_total"
 
     def test_no_gradient_prior_keeps_actions_uniform_within_group(self):
         torch.manual_seed(0)
@@ -854,28 +822,6 @@ class TestStage2ActionRouting:
 
         assert len(proposals) == 1
         assert proposals[0].edits[0][0] == 3
-
-    def test_mcts_structural_position_weights_are_soft_by_default(self):
-        grad = torch.zeros(4, 20)
-        grad[0, AA_1_TO_IDX["S"]] = -5.0
-        grad[3, AA_1_TO_IDX["T"]] = -0.1
-
-        proposals = propose_mutation_actions(
-            grad,
-            "AAAA",
-            K_top=1,
-            B_candidates=1,
-            T_sample=0.01,
-            max_mutations_per_seq=1,
-            use_prior=False,
-            action_group="interface_formation",
-            structural_signature={"target_facing_residue_indices": [3]},
-            position_bias_strength=0.5,
-            routing_strength=0.0,
-        )
-
-        assert len(proposals) == 1
-        assert proposals[0].edits[0][0] == 0
 
 
 class TestStage3LiteGrouping:

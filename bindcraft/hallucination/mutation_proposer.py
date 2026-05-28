@@ -835,7 +835,7 @@ def propose_mutation_actions(
     structural_signature: Optional[Dict[str, Any]] = None,
     position_weights: Optional[torch.Tensor] = None,
     position_bias_strength: float = 0.5,
-    enforce_position_mask: bool = False,
+    enforce_position_mask: bool = True,
     prior_mode: str = "full",
 ) -> List[MutationProposal]:
     """

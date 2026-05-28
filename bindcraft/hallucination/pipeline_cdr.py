@@ -1135,9 +1135,9 @@ def _cdr_stageb_position_weights(
     """
     Combine document-style structural routing with the antibody CDR mask.
 
-    Framework positions receive zero weight even when structural routing points
-    there. Stage B uses these weights as a soft proposal bias; the hard
-    framework-protection safety net is applied after proposal generation.
+    The CDR mask is hard: framework positions receive zero weight even when
+    structural routing points there. If no structural residue map is available,
+    all CDR residues remain eligible.
     """
     if len(sequence) != len(cdr_mask):
         raise ValueError("sequence and cdr_mask lengths must match")
@@ -2163,7 +2163,7 @@ def run_mcts_hallucination_cdr(
                     group_prior=group_priors.get(group_name, 0.0),
                     structural_signature=selected_node.structural_signature,
                     position_weights=position_weights,
-                    enforce_position_mask=False,
+                    enforce_position_mask=True,
                     prior_mode=mcts_prior_mode,
                 )
             )
