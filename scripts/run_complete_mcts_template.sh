@@ -181,6 +181,8 @@ case "${TASK}" in
     require_var OUTPUT_DIR
     CDR_CONFIG="${CDR_CONFIG:-benchmark/yaml/cdr_tcr/cdr_tcr_domain_redesign.yaml}"
     : "${N_STEPS:=150}"
+    : "${K_TOP:=8}"
+    : "${B_CANDIDATES:=4}"
     mkdir -p "${OUTPUT_DIR}"
     cmd=("${PYTHON_BIN}" -u benchmark/script/run_cdr_tcr_domain_redesign.py)
     cmd+=(--config "${CDR_CONFIG}")
@@ -188,7 +190,13 @@ case "${TASK}" in
     cmd+=(--log-file "${OUTPUT_DIR}/launcher.log")
     cmd+=(--mode mcts)
     cmd+=(--device "${DEVICE}")
+    cmd+=(--model-name "${MODEL_NAME}")
+    [[ -n "${PROTENIX_CHECKPOINT_DIR:-}" ]] && cmd+=(--model-checkpoint-dir "${PROTENIX_CHECKPOINT_DIR}")
+    [[ -n "${COMPONENTS_CACHE_DIR:-}" ]] && cmd+=(--components-cache-dir "${COMPONENTS_CACHE_DIR}")
+    [[ -n "${PROTENIX_ROOT_DIR:-}" ]] && cmd+=(--protenix-root-dir "${PROTENIX_ROOT_DIR}")
     cmd+=(--n-steps "${N_STEPS}")
+    cmd+=(--k-top "${K_TOP}")
+    cmd+=(--b-candidates "${B_CANDIDATES}")
     cmd+=(--mcts-strategy two_stage)
     cmd+=(--mcts-bootstrap-steps "${MCTS_BOOTSTRAP_STEPS}")
     cmd+=(--mcts-bootstrap-patience "${MCTS_BOOTSTRAP_PATIENCE}")

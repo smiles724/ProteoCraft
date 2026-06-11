@@ -27,11 +27,20 @@ import logging
 import json
 import torch
 import numpy as np
+from typing import Optional
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_model_n_cycle(model, fallback: int = 4) -> int:
+    model_cfg = getattr(getattr(model, "configs", None), "model", None)
+    n_cycle = getattr(model_cfg, "N_cycle", None)
+    if n_cycle is None:
+        return fallback
+    return int(n_cycle)
 
 
 # ============================================================
@@ -43,7 +52,7 @@ def run_full_inference(
     binder_seq: str,
     target_seq: str,
     device: torch.device,
-    N_cycle: int = 4,
+    N_cycle: Optional[int] = None,
     N_sample: int = 1,
 ) -> dict:
     """
@@ -65,6 +74,9 @@ def run_full_inference(
         }
     """
     from bindcraft.utils import build_complex_features, prepare_input_features
+
+    if N_cycle is None:
+        N_cycle = _resolve_model_n_cycle(model)
 
     with torch.no_grad():
         input_feature_dict, N_token, N_atom = build_complex_features(

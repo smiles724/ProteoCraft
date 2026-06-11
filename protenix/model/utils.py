@@ -19,6 +19,7 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import optree
 import torch
+import torch.utils.checkpoint
 import torch.nn as nn
 from scipy.spatial.transform import Rotation
 

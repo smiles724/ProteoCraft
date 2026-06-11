@@ -39,6 +39,17 @@ from bindcraft.hallucination.reproducibility import temporary_seed
 logger = logging.getLogger(__name__)
 
 
+def _resolve_model_n_cycle(model, fallback: int = 4) -> int:
+    """Return the model-configured Pairformer recycle count when available."""
+    model_cfg = getattr(getattr(model, "configs", None), "model", None)
+    n_cycle = getattr(model_cfg, "N_cycle", None)
+    if n_cycle is None:
+        n_cycle = getattr(model, "N_cycle", None)
+    if n_cycle is None:
+        return fallback
+    return int(n_cycle)
+
+
 @dataclass
 class ZerothOrderResult:
     """零阶推断的结构化返回值"""
@@ -259,7 +270,7 @@ def _run_full_forward(
     model,
     input_feature_dict: Dict,
     device: torch.device,
-    N_cycle: int = 4,
+    N_cycle: Optional[int] = None,
     chunk_size: int = None,
 ) -> tuple:
     """
@@ -284,6 +295,9 @@ def _run_full_forward(
         distogram_logits: [N_token, N_token, no_bins]
         contact_probs:    [N_token, N_token]
     """
+    if N_cycle is None:
+        N_cycle = _resolve_model_n_cycle(model)
+
     # Step 1: Pairformer
     s_inputs, s_trunk, z_trunk = model.get_pairformer_output(
         input_feature_dict=input_feature_dict,
@@ -387,7 +401,7 @@ def zeroth_order_eval(
     device: torch.device,
     loss_weights: Dict[str, float] = None,
     contact_params: Dict[str, float] = None,
-    N_cycle: int = 4,
+    N_cycle: Optional[int] = None,
     chunk_size: int = None,
     hotspot_params: Optional[Dict[str, Any]] = None,
     seed: Optional[int] = None,
@@ -406,7 +420,8 @@ def zeroth_order_eval(
         device:         计算设备
         loss_weights:   各项 loss 权重（默认使用 DEFAULT_LOSS_WEIGHTS）
         contact_params: 接触 loss 参数（默认使用 DEFAULT_CONTACT_PARAMS）
-        N_cycle:        Pairformer 循环次数
+        N_cycle:        Pairformer 循环次数；默认 None 时使用模型配置
+                        model.configs.model.N_cycle
         chunk_size:     Attention 分块大小。当 complex 较大（如 114+ aa）
                        时建议设为 256，避免 OOM。默认为 None（不分块）。
         seed:           可选 verifier 随机种子；同一序列/输入可复现 AF3 sampling。
@@ -425,6 +440,8 @@ def zeroth_order_eval(
     c_params = dict(DEFAULT_CONTACT_PARAMS)
     if contact_params is not None:
         c_params.update(contact_params)
+    if N_cycle is None:
+        N_cycle = _resolve_model_n_cycle(model)
 
     L_binder = len(binder_seq)
 

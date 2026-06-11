@@ -186,6 +186,7 @@ def load_protenix_model(
     checkpoint_dir: str = None,
     model_dtype: str = "bf16",
 ):
+    import copy
     from collections.abc import Mapping
     from protenix.config.config import parse_configs
     from configs.configs_base import configs as configs_base
@@ -195,6 +196,9 @@ def load_protenix_model(
     from protenix.model.protenix import Protenix
 
     logging.info(f"加载模型: {model_name} | dtype={model_dtype}")
+    if model_name not in model_configs:
+        supported = ", ".join(sorted(model_configs))
+        raise ValueError(f"未知 Protenix model_name: {model_name}. Supported: {supported}")
 
     checkpoint_dir = resolve_checkpoint_dir(checkpoint_dir)
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -214,7 +218,7 @@ def load_protenix_model(
                 d[k] = v
         return d
 
-    base_configs = {**configs_base, **{"data": data_configs}, **inference_configs}
+    base_configs = copy.deepcopy({**configs_base, **{"data": data_configs}, **inference_configs})
     model_specific = model_configs[model_name]
     deep_update(base_configs, model_specific)
     _apply_triangle_backend_fallback(base_configs)
@@ -229,6 +233,16 @@ def load_protenix_model(
     configs = parse_configs(
         configs=base_configs, arg_str=arg_str, fill_required_with_null=True,
     )
+    logging.info(
+        "Resolved Protenix config: c_z=%s diffusion_batch_size=%s N_cycle=%s "
+        "pairformer_hidden_scale_up=%s confidence_hidden_scale_up=%s sample_N_step=%s",
+        getattr(configs, "c_z", None),
+        getattr(configs, "diffusion_batch_size", None),
+        getattr(getattr(configs, "model", None), "N_cycle", None),
+        getattr(getattr(getattr(configs, "model", None), "pairformer", None), "hidden_scale_up", None),
+        getattr(getattr(getattr(configs, "model", None), "confidence_head", None), "hidden_scale_up", None),
+        getattr(getattr(configs, "sample_diffusion", None), "N_step", None),
+    )
 
     device_obj = torch.device(device)
     model = Protenix(configs).to(device_obj)
@@ -237,7 +251,19 @@ def load_protenix_model(
     state_dict = checkpoint["model"]
     if list(state_dict.keys())[0].startswith("module."):
         state_dict = {k[len("module."):]: v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict, strict=False)
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    if incompatible.missing_keys:
+        logging.warning(
+            "Missing checkpoint keys (%d): %s",
+            len(incompatible.missing_keys),
+            incompatible.missing_keys[:20],
+        )
+    if incompatible.unexpected_keys:
+        logging.warning(
+            "Unexpected checkpoint keys (%d): %s",
+            len(incompatible.unexpected_keys),
+            incompatible.unexpected_keys[:20],
+        )
     model.eval()
 
     logging.info(f"模型加载完成")

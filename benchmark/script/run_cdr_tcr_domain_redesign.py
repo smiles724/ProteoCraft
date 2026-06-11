@@ -76,7 +76,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-steps", dest="n_steps", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--output-dir", dest="output_dir", default=argparse.SUPPRESS)
     parser.add_argument("--log-file", dest="log_file", default=argparse.SUPPRESS)
+    parser.add_argument("--model-name", dest="model_name", default=argparse.SUPPRESS)
+    parser.add_argument("--model-checkpoint-dir", dest="model_checkpoint_dir", default=argparse.SUPPRESS)
+    parser.add_argument("--components-cache-dir", dest="components_cache_dir", default=argparse.SUPPRESS)
+    parser.add_argument("--protenix-root-dir", dest="protenix_root_dir", default=argparse.SUPPRESS)
     parser.add_argument("--mode", choices=("hybrid", "mcts"), default=argparse.SUPPRESS)
+    parser.add_argument("--k-top", dest="k_top", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--b-candidates", dest="b_candidates", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--mcts-strategy", dest="mcts_strategy", default=argparse.SUPPRESS)
     parser.add_argument("--mcts-bootstrap-steps", dest="mcts_bootstrap_steps", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--mcts-bootstrap-patience", dest="mcts_bootstrap_patience", type=int, default=argparse.SUPPRESS)
@@ -201,8 +207,14 @@ def prepare_runtime(config: Dict[str, Any]) -> None:
     for name in ("components.cif", "components.cif.rdkit_mol.pkl"):
         src = common_dir / name
         dst = runtime_common / name
+        try:
+            same_location = src.resolve(strict=False) == dst.resolve(strict=False)
+        except OSError:
+            same_location = src.absolute() == dst.absolute()
         if not src.exists():
             raise FileNotFoundError(src)
+        if same_location:
+            continue
         if dst.is_symlink() and Path(os.path.realpath(dst)) == src.resolve():
             continue
         if dst.exists() or dst.is_symlink():

@@ -160,7 +160,21 @@ def resolve_loss_weights(args: argparse.Namespace) -> Dict[str, float]:
 
 
 def ensure_link(src: Path, dst: Path) -> None:
+    src = src.expanduser()
+    dst = dst.expanduser()
     dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if src.resolve(strict=False) == dst.resolve(strict=False):
+            if not src.exists():
+                raise FileNotFoundError(src)
+            return
+    except OSError:
+        if src.absolute() == dst.absolute():
+            if not src.exists():
+                raise FileNotFoundError(src)
+            return
+    if not src.exists():
+        raise FileNotFoundError(src)
     if dst.is_symlink() and Path(os.path.realpath(dst)) == src.resolve():
         return
     if dst.exists() or dst.is_symlink():
