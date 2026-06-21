@@ -42,7 +42,7 @@ def compute_helix_loss(
 
     计算 binder 区域内 i-(i+3) 残基对的接触概率。
     接触概率越高说明越倾向于形成 alpha-helix。
-    返回值越小表示越多螺旋（loss = 1 - contact_prob）。
+    返回值越小表示越多螺旋（loss = -log(contact_prob)）。
 
     Args:
         distogram_logits: [N_token, N_token, no_bins]

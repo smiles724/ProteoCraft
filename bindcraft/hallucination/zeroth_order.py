@@ -33,7 +33,7 @@ from bindcraft.utils import (
     DEFAULT_CONTACT_PARAMS,
     DEFAULT_CLASH_PARAMS,
 )
-from bindcraft.losses.total_loss import compute_all_losses
+from bindcraft.losses.total_loss import compute_all_losses, normalize_type1_partner_chain_roles
 from bindcraft.hallucination.reproducibility import temporary_seed
 
 logger = logging.getLogger(__name__)
@@ -111,6 +111,7 @@ def compute_mcts_structural_metadata(
     input_feature_dict: Dict[str, torch.Tensor],
     L_binder: int,
     binder_seq: Optional[str] = None,
+    target_chain_roles: Optional[Any] = None,
     hotspot_params: Optional[Dict[str, Any]] = None,
     contact_prob_threshold: float = 0.20,
     patch_size: int = 10,
@@ -131,8 +132,29 @@ def compute_mcts_structural_metadata(
     atom_to_token = input_feature_dict["atom_to_token_idx"]
     binder_chain_id = asym_id[0]
     binder_token_mask = asym_id == binder_chain_id
-    target_token_mask = ~binder_token_mask
+    non_binder_token_mask = ~binder_token_mask
+    target_token_mask = non_binder_token_mask
     binder_token_indices = binder_token_mask.nonzero(as_tuple=True)[0]
+
+    partner_roles = normalize_type1_partner_chain_roles(target_chain_roles)
+    if partner_roles is not None:
+        partner_chain_ids = [
+            chain_id
+            for chain_id in torch.unique(asym_id, sorted=True).tolist()
+            if chain_id != binder_chain_id.item()
+        ]
+        if len(partner_roles) != len(partner_chain_ids):
+            raise ValueError(
+                f"target_chain_roles length {len(partner_roles)} must equal non-binder chain count "
+                f"{len(partner_chain_ids)}"
+            )
+        target_token_mask = torch.zeros_like(non_binder_token_mask, dtype=torch.bool)
+        for role, chain_id in zip(partner_roles, partner_chain_ids):
+            if role == "target":
+                target_token_mask = target_token_mask | (asym_id == chain_id)
+        if target_token_mask.sum() == 0:
+            raise ValueError("target_chain_roles must mark at least one non-binder chain as target")
+
     target_token_indices = target_token_mask.nonzero(as_tuple=True)[0]
 
     metadata: Dict[str, Any] = {
@@ -203,7 +225,7 @@ def compute_mcts_structural_metadata(
         metadata["non_hotspot_contact_residue_indices"] = metadata["background_contact_residue_indices"]
 
     atom_binder_mask = binder_token_mask[atom_to_token]
-    atom_target_mask = target_token_mask[atom_to_token]
+    atom_non_binder_mask = non_binder_token_mask[atom_to_token]
     binder_to_local = _binder_token_to_local_index(atom_to_token, binder_token_mask)
 
     rep_atom_mask = input_feature_dict.get("distogram_rep_atom_mask", None)
@@ -247,11 +269,11 @@ def compute_mcts_structural_metadata(
             ]
 
     binder_atom_indices = atom_binder_mask.nonzero(as_tuple=True)[0]
-    target_atom_indices = atom_target_mask.nonzero(as_tuple=True)[0]
-    if binder_atom_indices.numel() > 0 and target_atom_indices.numel() > 0:
+    non_binder_atom_indices = atom_non_binder_mask.nonzero(as_tuple=True)[0]
+    if binder_atom_indices.numel() > 0 and non_binder_atom_indices.numel() > 0:
         binder_coords = x0_flat[binder_atom_indices]
-        target_coords = x0_flat[target_atom_indices]
-        dist = torch.cdist(binder_coords, target_coords)
+        non_binder_coords = x0_flat[non_binder_atom_indices]
+        dist = torch.cdist(binder_coords, non_binder_coords)
         clashing_binder_atoms = (dist < clash_distance).any(dim=1)
         clash_atom_indices = binder_atom_indices[clashing_binder_atoms]
         clash_local = set()
@@ -551,6 +573,7 @@ def zeroth_order_eval(
             input_feature_dict=input_feature_dict,
             L_binder=L_binder,
             binder_seq=binder_seq,
+            target_chain_roles=target_chain_roles,
             hotspot_params=hotspot_params,
             contact_prob_threshold=float(
                 (hotspot_params or {}).get("mcts_contact_prob_threshold", 0.20)

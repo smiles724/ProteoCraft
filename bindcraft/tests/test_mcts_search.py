@@ -1234,6 +1234,47 @@ class TestZerothOrderStructuralMetadata:
             "mixed",
         }
 
+    def test_structural_metadata_uses_target_roles_for_interface_only(self):
+        x0_flat = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0],
+                [20.0, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+                [20.5, 0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+        contact_probs = torch.zeros(5, 5)
+        contact_probs[0, 3] = 0.40  # binder-target peptide contact
+        contact_probs[3, 0] = 0.40
+        contact_probs[2, 4] = 0.95  # binder-scaffold contact, not target interface
+        contact_probs[4, 2] = 0.95
+        input_feature_dict = {
+            "asym_id": torch.tensor([1, 1, 1, 2, 3]),
+            "atom_to_token_idx": torch.arange(5),
+            "distogram_rep_atom_mask": torch.ones(5, dtype=torch.bool),
+        }
+
+        metadata = compute_mcts_structural_metadata(
+            x0_flat=x0_flat,
+            contact_probs=contact_probs,
+            input_feature_dict=input_feature_dict,
+            L_binder=3,
+            binder_seq="AVK",
+            target_chain_roles=["target", "scaffold"],
+            contact_prob_threshold=0.2,
+            patch_size=1,
+            clash_distance=0.6,
+        )
+
+        assert metadata["contact_fingerprint"] == "1"
+        assert metadata["interface_patch_id"] == "patch_0"
+        assert metadata["interface_residue_indices"] == [0]
+        assert metadata["target_facing_residue_indices"] == [0]
+        assert metadata["non_interface_residue_indices"] == [1, 2]
+        assert metadata["clash_residue_indices"] == [0, 2]
+
 
 class TestHardConstraintGate:
     def test_hard_constraint_marks_invalid_and_assigns_low_reward(self):

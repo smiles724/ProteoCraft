@@ -26,7 +26,7 @@ from bindcraft.losses.geometry import (
 )
 
 
-def _normalize_type1_partner_chain_roles(target_chain_roles: Any) -> Optional[List[str]]:
+def normalize_type1_partner_chain_roles(target_chain_roles: Any) -> Optional[List[str]]:
     """
     Normalize non-binder chain roles for local CDR/TCR redesign.
 
@@ -51,6 +51,9 @@ def _normalize_type1_partner_chain_roles(target_chain_roles: Any) -> Optional[Li
         else:
             raise ValueError(f"未知 target/scaffold chain role: {role}")
     return normalized_roles
+
+
+_normalize_type1_partner_chain_roles = normalize_type1_partner_chain_roles
 
 
 def compute_all_losses(
@@ -111,7 +114,7 @@ def compute_all_losses(
     target_token_mask = non_binder_token_mask
     external_scaffold_token_mask = torch.zeros_like(target_token_mask, dtype=torch.bool)
 
-    partner_roles = _normalize_type1_partner_chain_roles(target_chain_roles)
+    partner_roles = normalize_type1_partner_chain_roles(target_chain_roles)
     has_type1_partner_roles = partner_roles is not None
     if partner_roles is not None:
         partner_chain_ids = [
@@ -308,7 +311,7 @@ def compute_all_losses(
         losses["rg"] = l_rg
         total_loss = total_loss + weights["rg"] * l_rg
 
-    # Helix（负权重 = 鼓励螺旋）
+    # Helix loss = -log(i, i+3 接触概率)；正权重鼓励螺旋，负权重降低螺旋倾向
     if weights.get("helix", 0) != 0:
         l_helix = compute_helix_loss(
             distogram_logits,
