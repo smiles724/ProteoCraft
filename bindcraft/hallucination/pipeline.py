@@ -19,6 +19,7 @@ from typing import Dict, Tuple, List, Union, Optional, Any
 import logging
 import os
 import math
+from contextlib import nullcontext
 from dataclasses import replace
 
 from bindcraft.hallucination.ste_bridge import (
@@ -59,6 +60,31 @@ from protenix.model import sample_confidence
 
 logger = logging.getLogger(__name__)
 VALID_BINDER_AAS = "ACDEFGHIKLMNPQRSTVWY"
+
+
+def _resolve_proposal_amp_dtype(model_name: Optional[str], proposal_amp: str = "auto"):
+    """Resolve proposal-only autocast dtype without changing V1 defaults."""
+    mode = (proposal_amp or "auto").strip().lower()
+    if mode == "off":
+        return None
+    if mode == "bf16":
+        return torch.bfloat16
+    if mode == "auto":
+        normalized_model = (model_name or "").strip().lower()
+        return torch.bfloat16 if normalized_model == "protenix-v2" else None
+    raise ValueError(
+        "proposal_amp must be one of {'auto', 'off', 'bf16'}, "
+        f"got {proposal_amp!r}"
+    )
+
+
+def _proposal_amp_context(device: torch.device, amp_dtype):
+    if amp_dtype is None:
+        return nullcontext()
+    device_obj = torch.device(device)
+    if device_obj.type != "cuda":
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=amp_dtype)
 
 
 def _verifier_seed(base_seed: Optional[int], target_seq: Union[str, List[str]], binder_seq: str) -> Optional[int]:
@@ -1428,6 +1454,7 @@ def run_mcts_hallucination(
     seed: Optional[int] = 42,
     target_template_path: Optional[str] = None,
     target_chain_roles: Optional[Any] = None,
+    proposal_amp: str = "auto",
 ) -> Tuple[str, str, List[float]]:
     """
     MCTS 调度的混合优化：UCB 选点 + 一阶提议 + 零阶验证 + Expansion/Backprop/Prune。
@@ -1451,6 +1478,11 @@ def run_mcts_hallucination(
     mcts_proposal_method = normalize_mcts_proposal_method(mcts_proposal_method)
     mcts_adaptive_tau_start = float(mcts_adaptive_tau_start)
     mcts_adaptive_tau_end = float(mcts_adaptive_tau_end)
+    model_name_for_amp = str(
+        getattr(model, "bindcraft_model_name", None)
+        or getattr(getattr(model, "configs", None), "model_name", "")
+    )
+    proposal_amp_dtype = _resolve_proposal_amp_dtype(model_name_for_amp, proposal_amp)
 
     base_weights = dict(DEFAULT_LOSS_WEIGHTS)
     if loss_weights is not None:
@@ -1540,6 +1572,12 @@ def run_mcts_hallucination(
         prior_strength,
     )
     logger.info("MCTS StageB proposal method: %s", mcts_proposal_method)
+    logger.info(
+        "Proposal AMP: mode=%s | model=%s | resolved_dtype=%s",
+        proposal_amp,
+        model_name_for_amp or "unknown",
+        proposal_amp_dtype,
+    )
     if mcts_proposal_method == "one_step_adaptive":
         logger.info(
             "MCTS StageB adaptive tau schedule: %.3f -> %.3f",
@@ -1747,49 +1785,50 @@ def run_mcts_hallucination(
                 target_template_path=target_template_path,
             )
 
-            x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
-                model=model,
-                s_binder=s_binder_step2,
-                s_target=s_target,
-                input_feature_dict=input_feature_dict_step2,
-                x_coarse=x_coarse_cached,
-                X_clean=selected_node.coordinate,
-                tau=mcts_tau_fixed,
-                device=device,
-                chunk_size=chunk_size,
-            )
+            with _proposal_amp_context(device, proposal_amp_dtype):
+                x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
+                    model=model,
+                    s_binder=s_binder_step2,
+                    s_target=s_target,
+                    input_feature_dict=input_feature_dict_step2,
+                    x_coarse=x_coarse_cached,
+                    X_clean=selected_node.coordinate,
+                    tau=mcts_tau_fixed,
+                    device=device,
+                    chunk_size=chunk_size,
+                )
 
-            x0_flat = x0_hat_step2.squeeze(0)
-            s_inputs_full = torch.cat([s_binder_step2, s_target], dim=0)
-            heads = run_confidence_heads(
-                model=model,
-                input_feature_dict=input_feature_dict_step2,
-                s_inputs=s_inputs_full,
-                s_trunk=s_trunk_step2,
-                z_trunk=z_trunk_step2,
-                x0_hat=x0_hat_step2,
-                inplace_safe=False,
-                chunk_size=chunk_size,
-            )
+                x0_flat = x0_hat_step2.squeeze(0)
+                s_inputs_full = torch.cat([s_binder_step2, s_target], dim=0)
+                heads = run_confidence_heads(
+                    model=model,
+                    input_feature_dict=input_feature_dict_step2,
+                    s_inputs=s_inputs_full,
+                    s_trunk=s_trunk_step2,
+                    z_trunk=z_trunk_step2,
+                    x0_hat=x0_hat_step2,
+                    inplace_safe=False,
+                    chunk_size=chunk_size,
+                )
 
-            first_order_loss, first_order_losses = compute_all_losses(
-                x0_flat=x0_flat,
-                plddt_logits=heads["plddt_logits"],
-                pae_logits=heads["pae_logits"],
-                distogram_logits=heads["distogram_logits"],
-                input_feature_dict=input_feature_dict_step2,
-                L_binder=L_binder,
-                weights=base_weights,
-                contact_params=contact_params,
-                plddt_params=plddt_params,
-                pae_params=pae_params,
-                distogram_params=distogram_params,
-                pde_logits=heads["pde_logits"],
-                pde_params=pde_params,
-                clash_params=dict(DEFAULT_CLASH_PARAMS),
-                hotspot_params=hotspot_params,
-                target_chain_roles=target_chain_roles,
-            )
+                first_order_loss, first_order_losses = compute_all_losses(
+                    x0_flat=x0_flat,
+                    plddt_logits=heads["plddt_logits"],
+                    pae_logits=heads["pae_logits"],
+                    distogram_logits=heads["distogram_logits"],
+                    input_feature_dict=input_feature_dict_step2,
+                    L_binder=L_binder,
+                    weights=base_weights,
+                    contact_params=contact_params,
+                    plddt_params=plddt_params,
+                    pae_params=pae_params,
+                    distogram_params=distogram_params,
+                    pde_logits=heads["pde_logits"],
+                    pde_params=pde_params,
+                    clash_params=dict(DEFAULT_CLASH_PARAMS),
+                    hotspot_params=hotspot_params,
+                    target_chain_roles=target_chain_roles,
+                )
 
             first_order_loss.backward()
             grad_for_proposal = theta_step2.grad.clone() if theta_step2.grad is not None else None
@@ -2055,80 +2094,81 @@ def run_mcts_hallucination(
             adaptive_tau_start=mcts_adaptive_tau_start,
             adaptive_tau_end=mcts_adaptive_tau_end,
         )
-        x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
-            model=model,
-            s_binder=s_binder_step2,
-            s_target=s_target,
-            input_feature_dict=input_feature_dict_step2,
-            x_coarse=x_coarse_cached,
-            X_clean=selected_node.coordinate,
-            tau=proposal_tau,
-            device=device,
-            chunk_size=chunk_size,
-        )
-
-        x0_flat = x0_hat_step2.squeeze(0)
-        s_inputs_full = torch.cat([s_binder_step2, s_target], dim=0)
-        heads = run_confidence_heads(
-            model=model,
-            input_feature_dict=input_feature_dict_step2,
-            s_inputs=s_inputs_full,
-            s_trunk=s_trunk_step2,
-            z_trunk=z_trunk_step2,
-            x0_hat=x0_hat_step2,
-            inplace_safe=False,
-            chunk_size=chunk_size,
-        )
-
-        routing_info = select_de_novo_action_group(
-            selected_node.loss_vector,
-            temperature=MCTS_STAGE2_GROUP_TEMPERATURE,
-            loss_weights=base_weights,
-            binder_length=L_binder,
-        )
-        action_group = str(routing_info["action_group"])
-        group_prior = float(routing_info["group_prior"])
-        group_priors = {
-            str(group): float(prior)
-            for group, prior in dict(routing_info.get("group_priors", {})).items()
-        }
-        if not group_priors:
-            group_priors = {action_group: group_prior}
-        action_group, group_priors = _apply_stageb_prior_mode_to_groups(
-            mcts_prior_mode,
-            action_group,
-            group_priors,
-        )
-        group_prior = float(
-            group_priors.get(
-                action_group,
-                max(group_priors.values()) if group_priors else 1.0,
+        with _proposal_amp_context(device, proposal_amp_dtype):
+            x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
+                model=model,
+                s_binder=s_binder_step2,
+                s_target=s_target,
+                input_feature_dict=input_feature_dict_step2,
+                x_coarse=x_coarse_cached,
+                X_clean=selected_node.coordinate,
+                tau=proposal_tau,
+                device=device,
+                chunk_size=chunk_size,
             )
-        )
 
-        first_order_loss, first_order_losses = compute_all_losses(
-            x0_flat=x0_flat,
-            plddt_logits=heads["plddt_logits"],
-            pae_logits=heads["pae_logits"],
-            distogram_logits=heads["distogram_logits"],
-            input_feature_dict=input_feature_dict_step2,
-            L_binder=L_binder,
-            weights=base_weights,
-            contact_params=contact_params,
-            plddt_params=plddt_params,
-            pae_params=pae_params,
-            distogram_params=distogram_params,
-            pde_logits=heads["pde_logits"],
-            pde_params=pde_params,
-            clash_params=dict(DEFAULT_CLASH_PARAMS),
-            hotspot_params=hotspot_params,
-            target_chain_roles=target_chain_roles,
-        )
-        proposal_loss, proposal_loss_mode = _stageb_group_proposal_loss(
-            first_order_losses,
-            action_group,
-            first_order_loss,
-        )
+            x0_flat = x0_hat_step2.squeeze(0)
+            s_inputs_full = torch.cat([s_binder_step2, s_target], dim=0)
+            heads = run_confidence_heads(
+                model=model,
+                input_feature_dict=input_feature_dict_step2,
+                s_inputs=s_inputs_full,
+                s_trunk=s_trunk_step2,
+                z_trunk=z_trunk_step2,
+                x0_hat=x0_hat_step2,
+                inplace_safe=False,
+                chunk_size=chunk_size,
+            )
+
+            routing_info = select_de_novo_action_group(
+                selected_node.loss_vector,
+                temperature=MCTS_STAGE2_GROUP_TEMPERATURE,
+                loss_weights=base_weights,
+                binder_length=L_binder,
+            )
+            action_group = str(routing_info["action_group"])
+            group_prior = float(routing_info["group_prior"])
+            group_priors = {
+                str(group): float(prior)
+                for group, prior in dict(routing_info.get("group_priors", {})).items()
+            }
+            if not group_priors:
+                group_priors = {action_group: group_prior}
+            action_group, group_priors = _apply_stageb_prior_mode_to_groups(
+                mcts_prior_mode,
+                action_group,
+                group_priors,
+            )
+            group_prior = float(
+                group_priors.get(
+                    action_group,
+                    max(group_priors.values()) if group_priors else 1.0,
+                )
+            )
+
+            first_order_loss, first_order_losses = compute_all_losses(
+                x0_flat=x0_flat,
+                plddt_logits=heads["plddt_logits"],
+                pae_logits=heads["pae_logits"],
+                distogram_logits=heads["distogram_logits"],
+                input_feature_dict=input_feature_dict_step2,
+                L_binder=L_binder,
+                weights=base_weights,
+                contact_params=contact_params,
+                plddt_params=plddt_params,
+                pae_params=pae_params,
+                distogram_params=distogram_params,
+                pde_logits=heads["pde_logits"],
+                pde_params=pde_params,
+                clash_params=dict(DEFAULT_CLASH_PARAMS),
+                hotspot_params=hotspot_params,
+                target_chain_roles=target_chain_roles,
+            )
+            proposal_loss, proposal_loss_mode = _stageb_group_proposal_loss(
+                first_order_losses,
+                action_group,
+                first_order_loss,
+            )
 
         use_gradient_proposal = should_use_gradient_prior(mcts_prior_mode)
         if use_gradient_proposal:
@@ -2157,52 +2197,53 @@ def run_mcts_hallucination(
                 tau_temp=tau_temp,
                 target_template_path=target_template_path,
             )
-            x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
-                model=model,
-                s_binder=s_binder_step2,
-                s_target=s_target,
-                input_feature_dict=input_feature_dict_step2,
-                x_coarse=x_coarse_cached,
-                X_clean=selected_node.coordinate,
-                tau=proposal_tau,
-                device=device,
-                chunk_size=chunk_size,
-            )
-            x0_flat = x0_hat_step2.squeeze(0)
-            s_inputs_full = torch.cat([s_binder_step2, s_target], dim=0)
-            heads = run_confidence_heads(
-                model=model,
-                input_feature_dict=input_feature_dict_step2,
-                s_inputs=s_inputs_full,
-                s_trunk=s_trunk_step2,
-                z_trunk=z_trunk_step2,
-                x0_hat=x0_hat_step2,
-                inplace_safe=False,
-                chunk_size=chunk_size,
-            )
-            first_order_loss, first_order_losses = compute_all_losses(
-                x0_flat=x0_flat,
-                plddt_logits=heads["plddt_logits"],
-                pae_logits=heads["pae_logits"],
-                distogram_logits=heads["distogram_logits"],
-                input_feature_dict=input_feature_dict_step2,
-                L_binder=L_binder,
-                weights=base_weights,
-                contact_params=contact_params,
-                plddt_params=plddt_params,
-                pae_params=pae_params,
-                distogram_params=distogram_params,
-                pde_logits=heads["pde_logits"],
-                pde_params=pde_params,
-                clash_params=dict(DEFAULT_CLASH_PARAMS),
-                hotspot_params=hotspot_params,
-                target_chain_roles=target_chain_roles,
-            )
-            proposal_loss, proposal_loss_mode = _stageb_group_proposal_loss(
-                first_order_losses,
-                action_group,
-                first_order_loss,
-            )
+            with _proposal_amp_context(device, proposal_amp_dtype):
+                x0_hat_step2, s_trunk_step2, z_trunk_step2 = diffusion_one_step(
+                    model=model,
+                    s_binder=s_binder_step2,
+                    s_target=s_target,
+                    input_feature_dict=input_feature_dict_step2,
+                    x_coarse=x_coarse_cached,
+                    X_clean=selected_node.coordinate,
+                    tau=proposal_tau,
+                    device=device,
+                    chunk_size=chunk_size,
+                )
+                x0_flat = x0_hat_step2.squeeze(0)
+                s_inputs_full = torch.cat([s_binder_step2, s_target], dim=0)
+                heads = run_confidence_heads(
+                    model=model,
+                    input_feature_dict=input_feature_dict_step2,
+                    s_inputs=s_inputs_full,
+                    s_trunk=s_trunk_step2,
+                    z_trunk=z_trunk_step2,
+                    x0_hat=x0_hat_step2,
+                    inplace_safe=False,
+                    chunk_size=chunk_size,
+                )
+                first_order_loss, first_order_losses = compute_all_losses(
+                    x0_flat=x0_flat,
+                    plddt_logits=heads["plddt_logits"],
+                    pae_logits=heads["pae_logits"],
+                    distogram_logits=heads["distogram_logits"],
+                    input_feature_dict=input_feature_dict_step2,
+                    L_binder=L_binder,
+                    weights=base_weights,
+                    contact_params=contact_params,
+                    plddt_params=plddt_params,
+                    pae_params=pae_params,
+                    distogram_params=distogram_params,
+                    pde_logits=heads["pde_logits"],
+                    pde_params=pde_params,
+                    clash_params=dict(DEFAULT_CLASH_PARAMS),
+                    hotspot_params=hotspot_params,
+                    target_chain_roles=target_chain_roles,
+                )
+                proposal_loss, proposal_loss_mode = _stageb_group_proposal_loss(
+                    first_order_losses,
+                    action_group,
+                    first_order_loss,
+                )
             proposal_loss.backward()
             grad_for_proposal = theta_step2.grad.clone() if theta_step2.grad is not None else None
             torch.nn.utils.clip_grad_norm_([theta_step2], 1.0)

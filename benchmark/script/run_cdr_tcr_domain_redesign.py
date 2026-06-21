@@ -77,6 +77,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", dest="output_dir", default=argparse.SUPPRESS)
     parser.add_argument("--log-file", dest="log_file", default=argparse.SUPPRESS)
     parser.add_argument("--model-name", dest="model_name", default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--proposal-amp",
+        dest="proposal_amp",
+        choices=("auto", "off", "bf16"),
+        default=argparse.SUPPRESS,
+    )
     parser.add_argument("--model-checkpoint-dir", dest="model_checkpoint_dir", default=argparse.SUPPRESS)
     parser.add_argument("--components-cache-dir", dest="components_cache_dir", default=argparse.SUPPRESS)
     parser.add_argument("--protenix-root-dir", dest="protenix_root_dir", default=argparse.SUPPRESS)
@@ -421,6 +427,7 @@ def run_case(
                 mcts_adaptive_tau_start=float(config.get("mcts_adaptive_tau_start", 160.0)),
                 mcts_adaptive_tau_end=float(config.get("mcts_adaptive_tau_end", 0.1)),
                 chunk_size=config.get("chunk_size"),
+                proposal_amp=str(config.get("proposal_amp", "auto")),
             )
         else:
             raise ValueError(f"Unsupported mode for CDR TCR redesign: {mode}")

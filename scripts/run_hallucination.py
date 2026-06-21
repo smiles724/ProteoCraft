@@ -246,6 +246,7 @@ def load_protenix_model(
 
     device_obj = torch.device(device)
     model = Protenix(configs).to(device_obj)
+    model.bindcraft_model_name = model_name
 
     checkpoint = torch.load(checkpoint_path, map_location=device_obj, weights_only=False)
     state_dict = checkpoint["model"]
@@ -303,6 +304,9 @@ def main():
     parser.add_argument("--dtype", type=str, default="bf16",
                        choices=["bf16", "fp32"],
                        help="模型计算精度（默认：bf16）")
+    parser.add_argument("--proposal_amp", type=str, default="auto",
+                       choices=["auto", "off", "bf16"],
+                       help="MCTS proposal forward/backward autocast：auto 仅对 protenix-v2 启用 bf16（默认：auto）")
     parser.add_argument("--output_dir", type=str, default="outputs",
                        help="输出目录（默认：./outputs）")
     parser.add_argument("--log_file", type=str, default=None,
@@ -526,6 +530,7 @@ def main():
             checkpoint_save_policy=args.checkpoint_save_policy,
             seed=args.seed,
             target_template_path=args.target_template_path,
+            proposal_amp=args.proposal_amp,
         )
 
     output_file = os.path.join(args.output_dir, "hallucination_result.txt")
@@ -545,6 +550,7 @@ def main():
         f.write(f"MCTS Expand Actions Per Step: {args.mcts_expand_actions_per_step}\n")
         f.write(f"MCTS Prior Mode: {args.mcts_prior_mode}\n")
         f.write(f"MCTS Proposal Method: {args.mcts_proposal_method}\n")
+        f.write(f"MCTS Proposal AMP: {args.proposal_amp}\n")
         f.write(f"MCTS Adaptive Tau Start: {args.mcts_adaptive_tau_start}\n")
         f.write(f"MCTS Adaptive Tau End: {args.mcts_adaptive_tau_end}\n")
         f.write(f"Initial Binder Sequence: {args.init_binder_seq or 'RANDOM'}\n")

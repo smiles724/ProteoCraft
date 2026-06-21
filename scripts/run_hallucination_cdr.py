@@ -220,6 +220,7 @@ def load_protenix_model(
 
     device_obj = torch.device(device)
     model = Protenix(configs).to(device_obj)
+    model.bindcraft_model_name = model_name
 
     checkpoint = torch.load(checkpoint_path, map_location=device_obj, weights_only=False)
     state_dict = checkpoint["model"]
@@ -349,6 +350,9 @@ def main():
                     help="可选复合物 template 文件；CDR/TCR 局部重设计时可保留 binder framework template")
     g4.add_argument("--target_chain_roles", type=str, default=None,
                     help="可选 partner 链角色，按 --target 多链顺序传入，如 target,scaffold")
+    g4.add_argument("--proposal_amp", type=str, default="auto",
+                    choices=["auto", "off", "bf16"],
+                    help="MCTS proposal forward/backward autocast：auto 仅对 protenix-v2 启用 bf16（默认：auto）")
 
     # ── 损失函数权重 ──────────────────────────────────────────────────────────
     g5 = parser.add_argument_group("损失函数权重")
@@ -451,6 +455,7 @@ def main():
                 chunk_size=args.chunk_size,
                 target_template_path=args.target_template_path,
                 target_chain_roles=args.target_chain_roles,
+                proposal_amp=args.proposal_amp,
             )
         else:
             best_seq, final_seq, losses_history = run_hybrid_hallucination_cdr(
@@ -560,6 +565,7 @@ def main():
                 chunk_size=args.chunk_size,
                 target_template_path=args.target_template_path,
                 target_chain_roles=args.target_chain_roles,
+                proposal_amp=args.proposal_amp,
             )
         else:
             best_seq, final_seq, losses_history = run_hybrid_hallucination_cdr(
@@ -663,6 +669,7 @@ def main():
                 chunk_size=args.chunk_size,
                 target_template_path=args.target_template_path,
                 target_chain_roles=args.target_chain_roles,
+                proposal_amp=args.proposal_amp,
             )
         else:
             logging.info(f"[CDR-Aware] Mode C — hybrid (无 CDR mask)")

@@ -30,6 +30,7 @@ from bindcraft.hallucination.zeroth_order import compute_mcts_structural_metadat
 from bindcraft.hallucination.pipeline import (
     _allocate_action_group_budgets,
     _apply_stageb_prior_mode_to_groups,
+    _resolve_proposal_amp_dtype,
     _stageb_proposal_tau,
 )
 
@@ -185,6 +186,14 @@ class TestStage1GradientPriorPuct:
         assert start_tau == pytest.approx(160.0)
         assert 0.1 < mid_tau < start_tau
         assert end_tau == pytest.approx(0.1)
+
+    def test_proposal_amp_auto_is_v2_only(self):
+        assert _resolve_proposal_amp_dtype("protenix-v2", "auto") is torch.bfloat16
+        assert _resolve_proposal_amp_dtype("protenix_base_default_v1.0.0", "auto") is None
+        assert _resolve_proposal_amp_dtype("protenix-v2", "off") is None
+        assert _resolve_proposal_amp_dtype("protenix_base_default_v1.0.0", "bf16") is torch.bfloat16
+        with pytest.raises(ValueError):
+            _resolve_proposal_amp_dtype("protenix-v2", "fp16")
 
     def test_no_gradient_prior_keeps_actions_uniform_within_group(self):
         torch.manual_seed(0)

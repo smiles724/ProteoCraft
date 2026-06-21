@@ -116,6 +116,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protenix-root-dir", default=str(PROJECT_ROOT / "benchmark" / "protenix_runtime"))
     parser.add_argument("--model-name", default="protenix_base_default_v1.0.0")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--proposal-amp", choices=("auto", "off", "bf16"), default="auto")
     parser.add_argument("--task-type", default=None)
     parser.add_argument("--target-chain-roles", default=None, help="逗号分隔，如 peptide,hla")
     parser.add_argument("--n-steps", type=int, default=50)
@@ -539,6 +540,7 @@ def main() -> int:
                 checkpoint_save_policy=args.checkpoint_save_policy,
                 target_template_path=str(template_path),
                 target_chain_roles=args.target_chain_roles,
+                proposal_amp=args.proposal_amp,
             )
         else:
             best_seq, final_seq, losses = run_hybrid_hallucination(
