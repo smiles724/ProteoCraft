@@ -42,11 +42,6 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, PROJECT_ROOT)
 
-from bindcraft.hallucination.pipeline import (
-    run_hallucination,
-    run_hybrid_hallucination,
-    run_mcts_hallucination,
-)
 from bindcraft.hallucination.reproducibility import set_global_seed
 from bindcraft.utils import LOSS_WEIGHT_PRESETS
 
@@ -146,6 +141,43 @@ def _build_hotspot_params(args, parser: argparse.ArgumentParser):
         "target_hotspot_residues_1based": residues_1based,
         "target_hotspot_concat_indices": concat_indices,
     }
+
+
+def parse_esmfold2_mutable_mask(raw_mask, binder_length: int, parser: argparse.ArgumentParser):
+    if raw_mask is None:
+        return None
+    raw_text = str(raw_mask).strip()
+    if not raw_text:
+        return None
+
+    true_tokens = {"1", "true", "t", "yes", "y"}
+    false_tokens = {"0", "false", "f", "no", "n"}
+    if all(ch in "01" for ch in raw_text):
+        tokens = list(raw_text)
+    else:
+        tokens = [
+            token.strip().lower()
+            for token in raw_text.replace(";", ",").replace(" ", ",").split(",")
+            if token.strip()
+        ]
+
+    mask = []
+    for token in tokens:
+        if token in true_tokens:
+            mask.append(True)
+        elif token in false_tokens:
+            mask.append(False)
+        else:
+            parser.error(
+                "--esmfold2_mutable_mask 只能包含 0/1 或 true/false；"
+                f"检测到: {token}"
+            )
+    if len(mask) != int(binder_length):
+        parser.error(
+            f"--esmfold2_mutable_mask 长度为 {len(mask)}，"
+            f"但 --binder_length 为 {binder_length}。"
+        )
+    return mask
 
 
 
@@ -271,7 +303,29 @@ def load_protenix_model(
     return model, configs
 
 
-def main():
+def load_esmfold2_backend(args, device: str = "cuda"):
+    """Lazy-load the real ESMFold2 backend only when explicitly requested."""
+    from bindcraft.hallucination.esmfold2_backend import ESMFold2ProposalConfig
+    from bindcraft.hallucination.esmfold2_runtime import ESMFold2RuntimeBackend
+
+    config = ESMFold2ProposalConfig(
+        experimental_model_name=args.esmfold2_experimental_model,
+        verifier_model_name=args.esmfold2_verifier_model,
+        verifier_num_loops=args.esmfold2_verifier_num_loops,
+        verifier_num_sampling_steps=args.esmfold2_verifier_num_sampling_steps,
+        soft_steps=args.esmfold2_soft_steps,
+        lambda_esmc=args.esmfold2_lambda_esmc,
+        num_loops=args.esmfold2_proposal_num_loops,
+        num_sampling_steps=args.esmfold2_proposal_num_sampling_steps,
+    )
+    return ESMFold2RuntimeBackend(
+        config=config,
+        device=device,
+        task_type=args.esmfold2_task_type,
+    )
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="BindCraft v2 — Hallucination Pipeline")
 
     # === 基础参数 ===
@@ -294,6 +348,32 @@ def main():
                        help="计算设备（默认：cuda）")
     parser.add_argument("--model_name", type=str, default="protenix_base_default_v1.0.0",
                        help="模型名称")
+    parser.add_argument("--model_backend", type=str, default="protenix",
+                       choices=["protenix", "esmfold2"],
+                       help="模型 backend：protenix 保持原有 V1/V2 流程；esmfold2 启用 ESMFold2 第一版闭环")
+    parser.add_argument("--esmfold2_verifier_model", type=str, default="biohub/ESMFold2",
+                       help="ESMFold2 verifier 模型名（仅 --model_backend esmfold2 使用）")
+    parser.add_argument("--esmfold2_experimental_model", type=str, default="biohub/ESMFold2-Experimental",
+                       help="ESMFold2Experimental proposal 模型名（仅 --model_backend esmfold2 使用）")
+    parser.add_argument("--esmfold2_soft_steps", type=int, default=3,
+                       help="ESMFold2 proposal 每个 MCTS 节点的 soft gradient update 步数（默认：3）")
+    parser.add_argument("--esmfold2_lambda_esmc", type=str, default="auto",
+                       help="ESMC sequence prior 权重；auto 按任务类型选择，或传入数值字符串")
+    parser.add_argument("--esmfold2_task_type", type=str, default="denovo",
+                       choices=["denovo", "de_novo", "minibinder", "binder", "tcr", "cdr", "cdr_redesign", "antibody", "antibody_like"],
+                       help="ESMFold2/ESMC 任务类型；用于解析 lambda_ESMC=auto（默认：denovo）")
+    parser.add_argument("--esmfold2_mutable_mask", type=str, default=None,
+                       help="ESMFold2 可变位点 mask；长度需等于 binder_length，支持 01101 或 0,1,1,true")
+    parser.add_argument("--esmfold2_artifact_dir", type=str, default=None,
+                       help="ESMFold2 每步结构化记录目录；默认写入 output_dir/esmfold2_artifacts")
+    parser.add_argument("--esmfold2_verifier_num_loops", type=int, default=20,
+                       help="ESMFold2 verifier full fold loop 数（默认：20；smoke test 可显式调小）")
+    parser.add_argument("--esmfold2_verifier_num_sampling_steps", type=int, default=200,
+                       help="ESMFold2 verifier diffusion sampling steps（默认：200；smoke test 可显式调小）")
+    parser.add_argument("--esmfold2_proposal_num_loops", type=int, default=1,
+                       help="ESMFold2 proposal distogram forward loop 数（默认：1）")
+    parser.add_argument("--esmfold2_proposal_num_sampling_steps", type=int, default=1,
+                       help="ESMFold2 proposal distogram forward diffusion steps（默认：1）")
     parser.add_argument("--checkpoint_dir", type=str, default=None,
                        help="Checkpoint 目录；默认依次读取 --checkpoint_dir、PROTENIX_CHECKPOINT_DIR、PROTENIX_ROOT_DIR/checkpoint")
     parser.add_argument("--save_checkpoint_dir", type=str, default=None,
@@ -349,8 +429,8 @@ def main():
     parser.add_argument("--mcts_tau_fixed", type=float, default=4.0, help="MCTS 固定扩散 tau（默认：4.0）")
     parser.add_argument("--mcts_num_beams", type=int, default=8, help="MCTS Phase0 根节点数 / beam（默认：8）")
     parser.add_argument("--mcts_strategy", type=str, default="two_stage",
-                       choices=["legacy", "strict", "two_stage"],
-                       help="MCTS 策略：legacy 原版 / strict 文档版 / two_stage 两阶段（默认：two_stage）")
+                       choices=["legacy", "stage_a_only", "strict", "two_stage"],
+                       help="MCTS 策略：stage_a_only 只跑 StageA / legacy 兼容旧名 / strict 文档版 / two_stage 两阶段（默认：two_stage）")
     parser.add_argument("--mcts_bootstrap_steps", type=int, default=50,
                        help="two_stage: StageA 原版 MCTS 至少运行步数（默认：50）")
     parser.add_argument("--mcts_bootstrap_patience", type=int, default=10,
@@ -396,7 +476,33 @@ def main():
     parser.add_argument("--w_pde", type=float, default=None, help="PDE (intra) 权重")
     parser.add_argument("--w_i_pde", type=float, default=None, help="i_PDE (inter) 权重")
 
+    return parser
+
+
+def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
+    backend = str(getattr(args, "model_backend", "protenix") or "protenix").strip().lower()
+    if backend not in {"protenix", "esmfold2"}:
+        message = f"--model_backend must be one of protenix, esmfold2; got {backend!r}"
+        if parser is not None:
+            parser.error(message)
+        raise ValueError(message)
+    if backend == "esmfold2" and getattr(args, "mode", None) != "mcts":
+        message = "ESMFold2 backend first version only supports --mode mcts"
+        if parser is not None:
+            parser.error(message)
+        raise ValueError(message)
+    if backend == "esmfold2" and int(getattr(args, "esmfold2_soft_steps", 0)) <= 0:
+        message = "--esmfold2_soft_steps must be positive"
+        if parser is not None:
+            parser.error(message)
+        raise ValueError(message)
+    return backend
+
+
+def main():
+    parser = build_arg_parser()
     args = parser.parse_args()
+    model_backend = resolve_model_backend(args, parser)
 
     if args.init_binder_seq is not None:
         args.init_binder_seq = args.init_binder_seq.strip().upper()
@@ -412,6 +518,13 @@ def main():
                 "--init_binder_seq 只能包含 20 种标准氨基酸单字母代码；"
                 f"检测到非法字符: {','.join(invalid)}"
             )
+    esmfold2_mutable_mask = None
+    if model_backend == "esmfold2":
+        esmfold2_mutable_mask = parse_esmfold2_mutable_mask(
+            args.esmfold2_mutable_mask,
+            args.binder_length,
+            parser,
+        )
 
     hotspot_params = _build_hotspot_params(args, parser)
 
@@ -420,18 +533,37 @@ def main():
     set_global_seed(args.seed)
     logging.info("Random seed fixed to %s", args.seed)
     if hotspot_params is not None:
+        if model_backend == "esmfold2":
+            logging.info(
+                "ESMFold2 backend received target_hotspots but does not use hotspot-aware routing yet: "
+                "target_hotspots_1based=%s target_concat_indices_0based=%s",
+                hotspot_params["target_hotspot_residues_1based"],
+                hotspot_params["target_hotspot_concat_indices"],
+            )
+        else:
+            logging.info(
+                "Hotspot-aware routing enabled: target_hotspots_1based=%s target_concat_indices_0based=%s",
+                hotspot_params["target_hotspot_residues_1based"],
+                hotspot_params["target_hotspot_concat_indices"],
+            )
+    if model_backend == "esmfold2" and args.target_template_path:
         logging.info(
-            "Hotspot-aware routing enabled: target_hotspots_1based=%s target_concat_indices_0based=%s",
-            hotspot_params["target_hotspot_residues_1based"],
-            hotspot_params["target_hotspot_concat_indices"],
+            "ESMFold2 backend received target_template_path but does not use templates yet: %s",
+            args.target_template_path,
         )
 
-    model, configs = load_protenix_model(
-        args.model_name,
-        args.device,
-        checkpoint_dir=args.checkpoint_dir,
-        model_dtype=args.dtype,
-    )
+    model = None
+    configs = None
+    esmfold2_backend = None
+    if model_backend == "protenix":
+        model, configs = load_protenix_model(
+            args.model_name,
+            args.device,
+            checkpoint_dir=args.checkpoint_dir,
+            model_dtype=args.dtype,
+        )
+    else:
+        esmfold2_backend = load_esmfold2_backend(args, device=args.device)
 
     # 组装 loss_weights: default 不覆盖；非 default preset 覆盖整套权重。
     # 单独的 --w_* 参数始终具有最高优先级。
@@ -449,7 +581,38 @@ def main():
         if val is not None:
             loss_weights[key] = val
 
-    if args.mode == "first_order":
+    if model_backend == "esmfold2":
+        from bindcraft.hallucination.esmfold2_pipeline import run_esmfold2_mcts_hallucination
+
+        best_seq, final_seq, losses_history = run_esmfold2_mcts_hallucination(
+            backend=esmfold2_backend,
+            target_seq=args.target,
+            L_binder=args.binder_length,
+            N_steps=args.n_steps,
+            K_top=args.k_top,
+            B_candidates=args.b_candidates,
+            T_sample=args.t_sample,
+            max_mutations_per_seq=args.max_mutations_per_seq,
+            num_beams=args.mcts_num_beams,
+            init_binder_seq=args.init_binder_seq,
+            mcts_C=args.mcts_c,
+            mcts_max_nodes=args.mcts_max_nodes,
+            mcts_strategy=args.mcts_strategy,
+            mcts_bootstrap_steps=args.mcts_bootstrap_steps,
+            mcts_bootstrap_patience=args.mcts_bootstrap_patience,
+            mcts_bootstrap_min_delta=args.mcts_bootstrap_min_delta,
+            mcts_bootstrap_max_steps=args.mcts_bootstrap_max_steps,
+            mcts_handoff_top_k=args.mcts_handoff_top_k,
+            mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
+            mcts_prior_mode=args.mcts_prior_mode,
+            seed=args.seed,
+            mutable_mask=esmfold2_mutable_mask,
+            artifact_dir=args.esmfold2_artifact_dir
+            or os.path.join(args.output_dir, "esmfold2_artifacts"),
+        )
+    elif args.mode == "first_order":
+        from bindcraft.hallucination.pipeline import run_hallucination
+
         best_seq, final_seq, losses_history = run_hallucination(
             model=model,
             target_seq=args.target,
@@ -465,6 +628,8 @@ def main():
             target_template_path=args.target_template_path,
         )
     elif args.mode == "hybrid":
+        from bindcraft.hallucination.pipeline import run_hybrid_hallucination
+
         best_seq, final_seq, losses_history = run_hybrid_hallucination(
             model=model,
             target_seq=args.target,
@@ -490,6 +655,8 @@ def main():
             target_template_path=args.target_template_path,
         )
     else:
+        from bindcraft.hallucination.pipeline import run_mcts_hallucination
+
         best_seq, final_seq, losses_history = run_mcts_hallucination(
             model=model,
             target_seq=args.target,
@@ -538,6 +705,14 @@ def main():
         f.write(f"Target: {args.target}\n")
         f.write(f"Binder Length: {args.binder_length}\n")
         f.write(f"Mode: {args.mode}\n")
+        f.write(f"Model Backend: {model_backend}\n")
+        f.write(f"Model Name: {args.model_name if model_backend == 'protenix' else args.esmfold2_verifier_model}\n")
+        if model_backend == "esmfold2":
+            f.write(f"ESMFold2 Experimental Model: {args.esmfold2_experimental_model}\n")
+            f.write(f"ESMFold2 Soft Steps: {args.esmfold2_soft_steps}\n")
+            f.write(f"ESMFold2 Lambda ESMC: {args.esmfold2_lambda_esmc}\n")
+            f.write(f"ESMFold2 Task Type: {args.esmfold2_task_type}\n")
+            f.write(f"ESMFold2 Mutable Mask: {args.esmfold2_mutable_mask or 'ALL'}\n")
         f.write(f"Optimization Steps: {args.n_steps}\n")
         f.write(f"Learning Rate: {args.learning_rate}\n")
         f.write(f"Tau Noise: {args.tau_noise}\n")

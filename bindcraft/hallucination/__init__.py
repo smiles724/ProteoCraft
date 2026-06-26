@@ -1,54 +1,52 @@
 """
-BindCraft v2 - Hallucination 模块
+BindCraft v2 - Hallucination module.
 
-基于 AlphaFold 3 / Protenix 的蛋白质序列逆向设计
+Exports are loaded lazily so optional non-Protenix backends can import their
+helpers without requiring Protenix runtime modules.
 """
 
-from .ste_bridge import (
-    precompute_waa_embeddings,
-    compute_soft_features,
-    compute_hard_features,
-    apply_ste,
-    ste_bridge,
-)
+from __future__ import annotations
 
-from .diffusion_one_step import (
-    get_coarse_structure,
-    one_step_denoise,
-    diffusion_one_step,
-    diffusion_one_step_fused,
-)
+import importlib
 
-from .pipeline import run_hallucination, run_hybrid_hallucination, run_mcts_hallucination
-from .pipeline_cdr import run_hybrid_hallucination_cdr, run_mcts_hallucination_cdr
-from .mcts_controller import MCTSNode, MCTSTree
-from .mutation_proposer import propose_mutations
-from .scheduler import AnnealingScheduler, TauScheduler, MacroBreathTracker
 
-__all__ = [
+_EXPORTS = {
     # STE Bridge
-    "precompute_waa_embeddings",
-    "compute_soft_features",
-    "compute_hard_features",
-    "apply_ste",
-    "ste_bridge",
+    "precompute_waa_embeddings": ".ste_bridge",
+    "compute_soft_features": ".ste_bridge",
+    "compute_hard_features": ".ste_bridge",
+    "apply_ste": ".ste_bridge",
+    "ste_bridge": ".ste_bridge",
     # Diffusion One-Step
-    "get_coarse_structure",
-    "one_step_denoise",
-    "diffusion_one_step",
-    "diffusion_one_step_fused",
+    "get_coarse_structure": ".diffusion_one_step",
+    "one_step_denoise": ".diffusion_one_step",
+    "diffusion_one_step": ".diffusion_one_step",
+    "diffusion_one_step_fused": ".diffusion_one_step",
     # Pipeline
-    "run_hallucination",
-    "run_hybrid_hallucination",
-    "run_mcts_hallucination",
-    "run_hybrid_hallucination_cdr",
-    "run_mcts_hallucination_cdr",
-    "MCTSNode",
-    "MCTSTree",
+    "run_hallucination": ".pipeline",
+    "run_hybrid_hallucination": ".pipeline",
+    "run_mcts_hallucination": ".pipeline",
+    "run_hybrid_hallucination_cdr": ".pipeline_cdr",
+    "run_mcts_hallucination_cdr": ".pipeline_cdr",
+    # MCTS
+    "MCTSNode": ".mcts_controller",
+    "MCTSTree": ".mcts_controller",
     # Mutation Proposer
-    "propose_mutations",
+    "propose_mutations": ".mutation_proposer",
     # Schedulers
-    "AnnealingScheduler",
-    "TauScheduler",
-    "MacroBreathTracker",
-]
+    "AnnealingScheduler": ".scheduler",
+    "TauScheduler": ".scheduler",
+    "MacroBreathTracker": ".scheduler",
+}
+
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = importlib.import_module(_EXPORTS[name], package=__name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
