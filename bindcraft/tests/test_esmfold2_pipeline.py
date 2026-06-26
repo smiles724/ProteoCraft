@@ -61,6 +61,7 @@ class FakeESMFold2Backend:
                 "seed": seed,
                 "action_group": action_group,
                 "mutable_mask": mutable_mask,
+                "max_mutations_per_seq": max_mutations_per_seq,
             }
         )
         if current_seq == "AAA":
@@ -200,6 +201,35 @@ def test_esmfold2_two_stage_pipeline_passes_mutable_mask_to_stageb():
 
     assert backend.propose_calls[0]["mutable_mask"] == [False, True, True]
     assert backend.propose_calls[1]["mutable_mask"] == [False, True, True]
+
+
+def test_esmfold2_two_stage_uses_separate_stagea_and_stageb_mutation_budgets():
+    backend = FakeESMFold2Backend()
+
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=3,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=2,
+        T_sample=1.0,
+        max_mutations_per_seq=3,
+        stagea_max_mutations_per_seq=6,
+        stageb_max_mutations_per_seq=1,
+        seed=7,
+        mcts_strategy="two_stage",
+        mcts_bootstrap_steps=1,
+        mcts_bootstrap_max_steps=1,
+        mcts_expand_actions_per_step=1,
+    )
+
+    assert backend.propose_calls[0]["action_group"] is None
+    assert backend.propose_calls[0]["max_mutations_per_seq"] == 6
+    assert backend.propose_calls[1]["action_group"] == "interface_formation"
+    assert backend.propose_calls[1]["max_mutations_per_seq"] == 1
 
 
 def test_esmfold2_pipeline_writes_structured_step_artifacts(tmp_path):

@@ -76,6 +76,10 @@ def test_esmfold2_backend_exposes_separate_model_and_proposal_options():
             "1",
             "--esmfold2_proposal_num_sampling_steps",
             "3",
+            "--stagea_max_mutations_per_seq",
+            "9",
+            "--stageb_max_mutations_per_seq",
+            "1",
         ]
     )
 
@@ -90,6 +94,8 @@ def test_esmfold2_backend_exposes_separate_model_and_proposal_options():
     assert args.esmfold2_verifier_num_sampling_steps == 12
     assert args.esmfold2_proposal_num_loops == 1
     assert args.esmfold2_proposal_num_sampling_steps == 3
+    assert args.stagea_max_mutations_per_seq == 9
+    assert args.stageb_max_mutations_per_seq == 1
 
 
 def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path):
@@ -147,6 +153,10 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
             "1",
             "--b_candidates",
             "1",
+            "--stagea_max_mutations_per_seq",
+            "7",
+            "--stageb_max_mutations_per_seq",
+            "1",
             "--init_binder_seq",
             "AAA",
             "--esmfold2_task_type",
@@ -176,6 +186,8 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     assert captured["mcts_bootstrap_steps"] == 50
     assert captured["mcts_expand_actions_per_step"] == 2
     assert captured["mcts_prior_mode"] == "full"
+    assert captured["stagea_max_mutations_per_seq"] == 7
+    assert captured["stageb_max_mutations_per_seq"] == 1
     assert captured["mutable_mask"] == [False, True, True]
     assert captured["task_type_arg"] == "tcr"
 

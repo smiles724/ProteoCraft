@@ -444,6 +444,8 @@ def run_esmfold2_mcts_hallucination(
     B_candidates: int = 8,
     T_sample: float = 1.0,
     max_mutations_per_seq: int = 3,
+    stagea_max_mutations_per_seq: Optional[int] = None,
+    stageb_max_mutations_per_seq: Optional[int] = None,
     num_beams: int = 8,
     init_binder_seq: Optional[str] = None,
     mcts_C: float = 1.0,
@@ -481,6 +483,16 @@ def run_esmfold2_mcts_hallucination(
     K_top = max(int(K_top), 1)
     B_candidates = max(int(B_candidates), 1)
     max_mutations_per_seq = max(int(max_mutations_per_seq), 1)
+    stagea_max_mutations = (
+        max(int(stagea_max_mutations_per_seq), 1)
+        if stagea_max_mutations_per_seq is not None
+        else max_mutations_per_seq
+    )
+    stageb_max_mutations = (
+        max(int(stageb_max_mutations_per_seq), 1)
+        if stageb_max_mutations_per_seq is not None
+        else max_mutations_per_seq
+    )
     strategy = str(mcts_strategy or "legacy").strip().lower()
     if strategy == "strict":
         strategy = "two_stage"
@@ -498,7 +510,15 @@ def run_esmfold2_mcts_hallucination(
     logger.info("=" * 70)
     logger.info("ESMFold2 MCTS closed loop")
     logger.info("Target length key=%s | binder length=%d | steps=%d", target_key, L_binder, N_steps)
-    logger.info("K_top=%d B=%d T_sample=%.3f max_mut=%d", K_top, B_candidates, T_sample, max_mutations_per_seq)
+    logger.info(
+        "K_top=%d B=%d T_sample=%.3f max_mut=%d stagea_max_mut=%d stageb_max_mut=%d",
+        K_top,
+        B_candidates,
+        T_sample,
+        max_mutations_per_seq,
+        stagea_max_mutations,
+        stageb_max_mutations,
+    )
     logger.info("strategy=%s bootstrap_steps=%d max=%d", strategy, mcts_bootstrap_steps, mcts_bootstrap_max_steps)
     logger.info("=" * 70)
 
@@ -580,7 +600,7 @@ def run_esmfold2_mcts_hallucination(
             K_top=K_top,
             B_candidates=B_candidates,
             T_sample=T_sample,
-            max_mutations_per_seq=max_mutations_per_seq,
+            max_mutations_per_seq=stagea_max_mutations,
             seed=proposal_seed,
             action_group=None,
             mutable_mask=mutable_mask,
@@ -748,7 +768,7 @@ def run_esmfold2_mcts_hallucination(
                 K_top=K_top,
                 B_candidates=group_budget,
                 T_sample=T_sample,
-                max_mutations_per_seq=max_mutations_per_seq,
+                max_mutations_per_seq=stageb_max_mutations,
                 seed=_stable_seed(seed, "esm_stageb_propose", target_key, current_seq, step, group_name),
                 action_group=group_name,
                 mutable_mask=mutable_mask,

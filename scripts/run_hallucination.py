@@ -412,6 +412,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="突变采样温度（默认：1.0）")
     parser.add_argument("--max_mutations_per_seq", type=int, default=3,
                        help="每条序列的最大突变数（默认：3）")
+    parser.add_argument("--stagea_max_mutations_per_seq", type=int, default=None,
+                       help="ESMFold2/两阶段搜索 StageA 每条候选最大突变数；默认沿用 --max_mutations_per_seq")
+    parser.add_argument("--stageb_max_mutations_per_seq", type=int, default=None,
+                       help="ESMFold2/两阶段搜索 StageB 每条候选最大突变数；默认沿用 --max_mutations_per_seq")
     parser.add_argument("--use_annealing", type=lambda x: x.lower() == "true", default=True,
                        help="是否启用模拟退火（默认：true）")
     parser.add_argument("--t_init", type=float, default=1.0,
@@ -593,6 +597,8 @@ def main():
             B_candidates=args.b_candidates,
             T_sample=args.t_sample,
             max_mutations_per_seq=args.max_mutations_per_seq,
+            stagea_max_mutations_per_seq=args.stagea_max_mutations_per_seq,
+            stageb_max_mutations_per_seq=args.stageb_max_mutations_per_seq,
             num_beams=args.mcts_num_beams,
             init_binder_seq=args.init_binder_seq,
             mcts_C=args.mcts_c,
