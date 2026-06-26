@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterator, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -118,6 +118,30 @@ class ESMFold2VerifierResult:
     summary_confidence: Dict[str, Any]
     coordinate: Optional[torch.Tensor] = field(default=None, repr=False)
     plddt_logits: Optional[torch.Tensor] = field(default=None, repr=False)
+
+
+@dataclass
+class ESMFold2ProposalBatch:
+    """Mutation proposal output plus optional persistent soft-logit state."""
+
+    sequences: Sequence[str]
+    logits_before: Optional[torch.Tensor] = field(default=None, repr=False)
+    logits_after: Optional[torch.Tensor] = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self.sequences = [str(sequence) for sequence in self.sequences]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.sequences)
+
+    def __len__(self) -> int:
+        return len(self.sequences)
+
+    def __getitem__(self, index: int) -> str:
+        return self.sequences[index]
+
+    def __contains__(self, sequence: object) -> bool:
+        return sequence in self.sequences
 
 
 def _as_bool_mask(
@@ -386,6 +410,68 @@ def init_binder_logits(
 
     logits.requires_grad_(requires_grad)
     return logits
+
+
+def anchor_binder_logits_to_sequence(
+    logits: torch.Tensor,
+    sequence: str,
+    mutable_mask: Optional[Sequence[bool]] = None,
+    *,
+    anchor_logit: float = 2.0,
+    fixed_logit: float = 10.0,
+    anchor_margin: float = 0.1,
+    suppress_cys: bool = True,
+    clone: bool = True,
+) -> torch.Tensor:
+    """Return node-local logits anchored to a verified discrete sequence.
+
+    The ESMFold2 proposal state should remain logits, not probabilities.  This
+    helper preserves the existing soft-logit landscape while making the node's
+    verified sequence the row-wise argmax, so child nodes do not drift away from
+    the sequence that was actually verifier-scored.
+    """
+
+    if logits.ndim == 3:
+        if logits.shape[0] != 1:
+            raise ValueError("node-local ESM logits must have batch size 1")
+        logits_2d = logits[0]
+    elif logits.ndim == 2:
+        logits_2d = logits
+    else:
+        raise ValueError("node-local ESM logits must have shape [L, 20] or [1, L, 20]")
+
+    length = len(sequence)
+    if logits_2d.shape != (length, len(ESM_AA_ORDER)):
+        raise ValueError(
+            f"logits shape {tuple(logits_2d.shape)} does not match sequence shape "
+            f"({length}, {len(ESM_AA_ORDER)})"
+        )
+
+    anchored = logits_2d.detach().clone() if clone else logits_2d
+    current_idx = _sequence_indices(sequence).to(device=anchored.device)
+    mutable = _as_bool_mask(mutable_mask, length, device=anchored.device)
+
+    if suppress_cys:
+        anchored[:, CYS_INDEX] = float("-inf")
+
+    for pos in range(length):
+        aa_idx = int(current_idx[pos].item())
+        if not bool(mutable[pos].item()):
+            anchored[pos, :] = 0.0
+            if suppress_cys:
+                anchored[pos, CYS_INDEX] = float("-inf")
+            anchored[pos, aa_idx] = float(fixed_logit)
+            continue
+
+        row = anchored[pos]
+        finite_row = row[torch.isfinite(row)]
+        row_max = float(finite_row.max().item()) if finite_row.numel() else 0.0
+        desired = max(float(row[aa_idx].item()), float(anchor_logit))
+        if desired < row_max:
+            desired = row_max + float(anchor_margin)
+        row[aa_idx] = desired
+
+    return anchored.detach().cpu().clone()
 
 
 def build_gradient_mask(

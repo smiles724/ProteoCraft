@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import math
 import string
+import inspect
 from functools import lru_cache
 from typing import Any, Callable, Optional, Sequence, Tuple, Union
 
@@ -20,9 +21,11 @@ import torch.optim as optim
 
 from bindcraft.hallucination.esmfold2_backend import (
     AA_TO_ESM_IDX,
+    ESMFold2ProposalBatch,
     ESMFold2ProposalConfig,
     ESMFOLD2_ACTION_GROUP_LOSS_KEYS,
     ESM_AA_ORDER,
+    anchor_binder_logits_to_sequence,
     build_esm_verifier_result,
     build_gradient_mask,
     combine_normalized_gradients,
@@ -54,6 +57,21 @@ def _as_float(value: Any) -> Optional[float]:
     if not math.isfinite(scalar):
         return None
     return scalar
+
+
+def _callable_accepts_argument(func: Callable[..., Any], name: str) -> bool:
+    """Return True when a callable can accept a keyword argument."""
+
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == name:
+            return True
+    return False
 
 
 def _target_sequences(target_seq: Union[str, Sequence[str]]) -> list[str]:
@@ -264,7 +282,8 @@ class ESMFold2RuntimeBackend:
         seed: Optional[int] = None,
         mutable_mask: Optional[Sequence[bool]] = None,
         action_group: Optional[str] = None,
-    ) -> list[str]:
+        proposal_logits: Optional[torch.Tensor] = None,
+    ) -> ESMFold2ProposalBatch:
         logits_before, logits_after = self._run_soft_update(
             current_seq=current_seq,
             target_seq=target_seq,
@@ -272,6 +291,7 @@ class ESMFold2RuntimeBackend:
             seed=seed,
             mutable_mask=mutable_mask,
             action_group=action_group,
+            proposal_logits=proposal_logits,
         )
         candidates = propose_sequences_from_logit_delta(
             logits_before,
@@ -283,7 +303,11 @@ class ESMFold2RuntimeBackend:
             T_sample=T_sample,
             max_mutations_per_seq=max_mutations_per_seq,
         )
-        return candidates
+        return ESMFold2ProposalBatch(
+            sequences=candidates,
+            logits_before=logits_before,
+            logits_after=logits_after,
+        )
 
     def preview_loss_dict(
         self,
@@ -415,9 +439,10 @@ class ESMFold2RuntimeBackend:
         seed: Optional[int],
         mutable_mask: Optional[Sequence[bool]],
         action_group: Optional[str],
+        proposal_logits: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.soft_update_fn is not None:
-            return self.soft_update_fn(
+            kwargs = dict(
                 current_seq=current_seq,
                 target_seq=target_seq,
                 global_step=global_step,
@@ -425,13 +450,20 @@ class ESMFold2RuntimeBackend:
                 action_group=action_group,
                 mutable_mask=mutable_mask,
             )
+            if _callable_accepts_argument(self.soft_update_fn, "proposal_logits"):
+                kwargs["proposal_logits"] = proposal_logits
+            return self.soft_update_fn(**kwargs)
 
         targets = _target_sequences(target_seq)
         if len(targets) != 1:
             raise ValueError("ESMFold2 proposal-gradient first version supports one target chain")
         self._ensure_proposal_models_loaded()
 
-        logits = self._init_current_sequence_logits(current_seq, mutable_mask=mutable_mask)
+        logits = self._init_current_sequence_logits(
+            current_seq,
+            mutable_mask=mutable_mask,
+            proposal_logits=proposal_logits,
+        )
         logits_before = logits.detach().clone()[0]
         gradient_mask = build_gradient_mask(
             current_seq,
@@ -491,7 +523,16 @@ class ESMFold2RuntimeBackend:
         current_seq: str,
         *,
         mutable_mask: Optional[Sequence[bool]],
+        proposal_logits: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if proposal_logits is not None:
+            logits = anchor_binder_logits_to_sequence(
+                proposal_logits,
+                current_seq,
+                mutable_mask=mutable_mask,
+            ).to(device=self.device)
+            return logits.unsqueeze(0).detach().clone().requires_grad_(True)
+
         logits = init_binder_logits(
             current_seq,
             mutable_mask=mutable_mask,

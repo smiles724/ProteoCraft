@@ -9,6 +9,7 @@ Protenix V1/V2 execution remains unchanged.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -22,6 +23,9 @@ import torch
 
 from bindcraft.hallucination.esmfold2_backend import (
     ESM_AA_ORDER,
+    ESMFold2ProposalBatch,
+    anchor_binder_logits_to_sequence,
+    init_binder_logits,
     select_esmfold2_action_group,
 )
 from bindcraft.hallucination.mcts_legacy import LegacyMCTSTree
@@ -40,6 +44,7 @@ class ESMFold2MutationProposal:
     benefit: float = 0.0
     action_group: str = "unrouted"
     group_prior: float = 1.0
+    proposal_logits: Optional[torch.Tensor] = None
 
 
 class _NoopArtifactRecorder:
@@ -168,6 +173,77 @@ def _normalize_target_key(target_seq: Union[str, Sequence[str]]) -> str:
 
 def _placeholder_logits(sequence: str) -> torch.Tensor:
     return torch.zeros(len(sequence), len(ESM_AA_ORDER), dtype=torch.float32)
+
+
+def _initial_proposal_logits(
+    sequence: str,
+    mutable_mask: Optional[Sequence[bool]],
+) -> torch.Tensor:
+    logits = init_binder_logits(
+        sequence,
+        mutable_mask=mutable_mask,
+        batch_size=1,
+        random_scale=0.0,
+        requires_grad=False,
+    )[0]
+    with torch.no_grad():
+        for pos, aa in enumerate(str(sequence)):
+            aa_index = ESM_AA_ORDER.index(aa)
+            if torch.isfinite(logits[pos, aa_index]):
+                logits[pos, aa_index] = max(float(logits[pos, aa_index].item()), 2.0)
+    return anchor_binder_logits_to_sequence(
+        logits,
+        str(sequence),
+        mutable_mask=mutable_mask,
+    )
+
+
+def _anchor_proposal_logits(
+    logits: Optional[torch.Tensor],
+    sequence: str,
+    mutable_mask: Optional[Sequence[bool]],
+) -> torch.Tensor:
+    if logits is None:
+        return _initial_proposal_logits(sequence, mutable_mask)
+    return anchor_binder_logits_to_sequence(
+        logits,
+        str(sequence),
+        mutable_mask=mutable_mask,
+    )
+
+
+def _normalize_proposal_batch(raw: Any) -> ESMFold2ProposalBatch:
+    if isinstance(raw, ESMFold2ProposalBatch):
+        return raw
+    return ESMFold2ProposalBatch(sequences=[str(sequence) for sequence in raw])
+
+
+def _call_backend_propose(
+    backend: Any,
+    *,
+    proposal_logits: Optional[torch.Tensor],
+    **kwargs: Any,
+) -> ESMFold2ProposalBatch:
+    propose_kwargs = dict(kwargs)
+    if _callable_accepts_argument(backend.propose, "proposal_logits"):
+        propose_kwargs["proposal_logits"] = (
+            proposal_logits.detach().clone() if proposal_logits is not None else None
+        )
+    raw = backend.propose(**propose_kwargs)
+    return _normalize_proposal_batch(raw)
+
+
+def _callable_accepts_argument(func: Any, name: str) -> bool:
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == name:
+            return True
+    return False
 
 
 def _sequence_edits(parent_seq: str, child_seq: str) -> List[Tuple[int, str, str]]:
@@ -414,6 +490,7 @@ def _make_stageb_proposals(
     candidates: Sequence[str],
     action_group: str,
     group_prior: float,
+    proposal_logits: Optional[torch.Tensor] = None,
 ) -> List[ESMFold2MutationProposal]:
     unique = [seq for seq in dict.fromkeys(str(item) for item in candidates) if seq != current_seq]
     if not unique:
@@ -429,6 +506,7 @@ def _make_stageb_proposals(
                 benefit=0.0,
                 action_group=action_group,
                 group_prior=max(float(group_prior), 1.0e-12),
+                proposal_logits=proposal_logits.detach().clone() if proposal_logits is not None else None,
             )
         )
     return proposals
@@ -555,13 +633,16 @@ def run_esmfold2_mcts_hallucination(
         )
 
     phase0_results.sort(key=lambda result: result.total_loss)
+    proposal_logits_by_sequence: Dict[str, torch.Tensor] = {}
     for result in phase0_results[: max(int(num_beams), 1)]:
+        root_logits = _initial_proposal_logits(result.binder_seq, mutable_mask)
         tree.add_root_node(
             sequence=result.binder_seq,
-            logits=_placeholder_logits(result.binder_seq),
+            logits=root_logits,
             L_real=result.total_loss,
             coordinate=result.coordinate,
         )
+        proposal_logits_by_sequence[str(result.binder_seq)] = root_logits
 
     best_result = phase0_results[0]
     best_seq = str(best_result.binder_seq)
@@ -593,7 +674,8 @@ def run_esmfold2_mcts_hallucination(
         selected_node = tree.select()
         current_seq = selected_node.sequence
         proposal_seed = _stable_seed(seed, "esm_propose", target_key, current_seq, step)
-        candidates = backend.propose(
+        proposal_batch = _call_backend_propose(
+            backend,
             current_seq=current_seq,
             target_seq=target_seq,
             global_step=step,
@@ -604,7 +686,12 @@ def run_esmfold2_mcts_hallucination(
             seed=proposal_seed,
             action_group=None,
             mutable_mask=mutable_mask,
+            proposal_logits=selected_node.logits,
         )
+        if proposal_batch.logits_after is not None:
+            selected_node.logits = proposal_batch.logits_after.detach().cpu().clone()
+            proposal_logits_by_sequence[current_seq] = selected_node.logits
+        candidates = list(proposal_batch.sequences)
         candidates = [
             _clip_sequence_by_mutable_mask(str(seq), mutable_mask, current_seq)
             for seq in candidates
@@ -636,7 +723,12 @@ def run_esmfold2_mcts_hallucination(
 
         new_nodes = tree.expand(selected_node, round_results)
         for node in new_nodes:
-            node.logits = _placeholder_logits(node.sequence)
+            node.logits = _anchor_proposal_logits(
+                proposal_batch.logits_after,
+                node.sequence,
+                mutable_mask,
+            )
+            proposal_logits_by_sequence[str(node.sequence)] = node.logits
         tree.backpropagate(selected_node, [result.total_loss for result in round_results])
         tree.prune()
 
@@ -705,9 +797,10 @@ def run_esmfold2_mcts_hallucination(
     )
     for idx, result in enumerate(handoff_results):
         strict_tree.store_verifier_result(result)
+        handoff_logits = proposal_logits_by_sequence.get(str(result.binder_seq))
         strict_tree.add_root_node(
             sequence=result.binder_seq,
-            logits=_placeholder_logits(result.binder_seq),
+            logits=_anchor_proposal_logits(handoff_logits, result.binder_seq, mutable_mask),
             L_real=result.total_loss,
             coordinate=result.coordinate,
             loss_vector=result.loss_dict,
@@ -760,8 +853,10 @@ def run_esmfold2_mcts_hallucination(
         proposal_pool_budget = max(B_candidates, expand_budget)
         group_budgets = _allocate_group_budgets(group_priors, proposal_pool_budget)
         proposal_pool: List[ESMFold2MutationProposal] = []
+        selected_update_logits: Optional[torch.Tensor] = None
         for group_name, group_budget in group_budgets.items():
-            candidates = backend.propose(
+            proposal_batch = _call_backend_propose(
+                backend,
                 current_seq=current_seq,
                 target_seq=target_seq,
                 global_step=step,
@@ -772,7 +867,13 @@ def run_esmfold2_mcts_hallucination(
                 seed=_stable_seed(seed, "esm_stageb_propose", target_key, current_seq, step, group_name),
                 action_group=group_name,
                 mutable_mask=mutable_mask,
+                proposal_logits=selected_node.logits,
             )
+            if proposal_batch.logits_after is not None and (
+                selected_update_logits is None or group_name == action_group
+            ):
+                selected_update_logits = proposal_batch.logits_after.detach().cpu().clone()
+            candidates = list(proposal_batch.sequences)
             candidates = [
                 _clip_sequence_by_mutable_mask(str(seq), mutable_mask, current_seq)
                 for seq in candidates
@@ -783,8 +884,12 @@ def run_esmfold2_mcts_hallucination(
                     candidates=candidates,
                     action_group=group_name,
                     group_prior=group_priors.get(group_name, group_prior),
+                    proposal_logits=proposal_batch.logits_after,
                 )
             )
+        if selected_update_logits is not None:
+            selected_node.logits = selected_update_logits
+            proposal_logits_by_sequence[current_seq] = selected_node.logits
 
         if not proposal_pool:
             logger.warning("ESM StageB step %d: no candidates from backend", step)
@@ -833,8 +938,18 @@ def run_esmfold2_mcts_hallucination(
             expand_results.append(cached)
 
         new_nodes = strict_tree.expand(selected_node, expand_proposals, expand_results)
+        proposal_by_sequence = {
+            str(proposal.sequence): proposal
+            for proposal in expand_proposals
+        }
         for node in new_nodes:
-            node.logits = _placeholder_logits(node.sequence)
+            proposal = proposal_by_sequence.get(str(node.sequence))
+            node.logits = _anchor_proposal_logits(
+                getattr(proposal, "proposal_logits", None),
+                node.sequence,
+                mutable_mask,
+            )
+            proposal_logits_by_sequence[str(node.sequence)] = node.logits
             reward_by_sequence[node.sequence] = node.tree_reward
 
         for result in expand_results:

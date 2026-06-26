@@ -2,7 +2,11 @@ import torch
 import pytest
 import json
 
-from bindcraft.hallucination.esmfold2_backend import build_esm_verifier_result
+from bindcraft.hallucination.esmfold2_backend import (
+    AA_TO_ESM_IDX,
+    ESMFold2ProposalBatch,
+    build_esm_verifier_result,
+)
 from bindcraft.hallucination.esmfold2_pipeline import run_esmfold2_mcts_hallucination
 
 
@@ -52,6 +56,7 @@ class FakeESMFold2Backend:
         seed=None,
         action_group=None,
         mutable_mask=None,
+        proposal_logits=None,
     ):
         self.propose_calls.append(
             {
@@ -62,6 +67,7 @@ class FakeESMFold2Backend:
                 "action_group": action_group,
                 "mutable_mask": mutable_mask,
                 "max_mutations_per_seq": max_mutations_per_seq,
+                "proposal_logits": proposal_logits.detach().clone() if proposal_logits is not None else None,
             }
         )
         if current_seq == "AAA":
@@ -230,6 +236,102 @@ def test_esmfold2_two_stage_uses_separate_stagea_and_stageb_mutation_budgets():
     assert backend.propose_calls[0]["max_mutations_per_seq"] == 6
     assert backend.propose_calls[1]["action_group"] == "interface_formation"
     assert backend.propose_calls[1]["max_mutations_per_seq"] == 1
+
+
+def test_esmfold2_pipeline_persists_node_local_logits_between_stagea_visits():
+    class StatefulLogitBackend(FakeESMFold2Backend):
+        def propose(self, **kwargs):
+            proposal_logits = kwargs.get("proposal_logits")
+            self.propose_calls.append(
+                {
+                    "current_seq": kwargs["current_seq"],
+                    "proposal_logits": (
+                        proposal_logits.detach().clone()
+                        if proposal_logits is not None
+                        else None
+                    ),
+                }
+            )
+            if kwargs["current_seq"] == "AAA":
+                assert proposal_logits is not None
+                updated = proposal_logits.detach().clone()
+                updated[1, AA_TO_ESM_IDX["F"]] = 4.0
+                updated[2, AA_TO_ESM_IDX["Y"]] = 3.0
+                return ESMFold2ProposalBatch(
+                    sequences=["AAY"],
+                    logits_after=updated,
+                )
+            return ESMFold2ProposalBatch(
+                sequences=[],
+                logits_after=proposal_logits,
+            )
+
+    backend = StatefulLogitBackend()
+
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=2,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=1,
+        T_sample=1.0,
+        max_mutations_per_seq=1,
+        seed=7,
+        mcts_strategy="stage_a_only",
+    )
+
+    assert [call["current_seq"] for call in backend.propose_calls] == ["AAA", "AAY"]
+    second_logits = backend.propose_calls[1]["proposal_logits"]
+    assert second_logits is not None
+    assert second_logits[1, AA_TO_ESM_IDX["F"]].item() == pytest.approx(4.0)
+    assert second_logits[2, AA_TO_ESM_IDX["Y"]].item() >= 3.0
+
+
+def test_esmfold2_pipeline_remains_compatible_with_list_only_proposal_backend():
+    class ListOnlyBackend(FakeESMFold2Backend):
+        def propose(
+            self,
+            *,
+            current_seq,
+            target_seq,
+            global_step,
+            K_top,
+            B_candidates,
+            T_sample,
+            max_mutations_per_seq,
+            seed=None,
+            action_group=None,
+            mutable_mask=None,
+        ):
+            self.propose_calls.append(
+                {
+                    "current_seq": current_seq,
+                    "action_group": action_group,
+                }
+            )
+            return ["AAY"][:B_candidates] if current_seq == "AAA" else []
+
+    backend = ListOnlyBackend()
+
+    best_seq, final_seq, losses = run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=1,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=1,
+        T_sample=1.0,
+        max_mutations_per_seq=1,
+        seed=7,
+    )
+
+    assert best_seq == final_seq == "AAY"
+    assert losses[-1] == pytest.approx(0.20)
 
 
 def test_esmfold2_pipeline_writes_structured_step_artifacts(tmp_path):

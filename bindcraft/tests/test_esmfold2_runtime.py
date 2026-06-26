@@ -81,9 +81,19 @@ def test_runtime_propose_uses_injected_soft_update_and_logit_delta_candidates():
 
     seen = {}
 
-    def fake_soft_update(*, current_seq, target_seq, global_step, seed, action_group, mutable_mask):
+    def fake_soft_update(
+        *,
+        current_seq,
+        target_seq,
+        global_step,
+        seed,
+        action_group,
+        mutable_mask,
+        proposal_logits=None,
+    ):
         seen["action_group"] = action_group
         seen["mutable_mask"] = mutable_mask
+        seen["proposal_logits"] = proposal_logits
         before = torch.zeros(len(current_seq), 20)
         after = before.clone()
         after[1, aa_to_idx["Y"]] = 3.0
@@ -118,6 +128,57 @@ def test_runtime_propose_uses_injected_soft_update_and_logit_delta_candidates():
     assert all(seq[0] == "A" for seq in candidates)
     assert seen["action_group"] == "interface_formation"
     assert seen["mutable_mask"] == [False, True, True]
+    assert seen["proposal_logits"] is None
+
+
+def test_runtime_propose_can_continue_from_saved_proposal_logits():
+    aa_to_idx = {aa: idx for idx, aa in enumerate("ARNDCQEGHILKMFPSTWYV")}
+    saved_logits = torch.zeros(3, 20)
+    saved_logits[1, aa_to_idx["F"]] = 4.0
+    seen = {}
+
+    def fake_soft_update(
+        *,
+        current_seq,
+        target_seq,
+        global_step,
+        seed,
+        action_group,
+        mutable_mask,
+        proposal_logits=None,
+    ):
+        seen["proposal_logits"] = proposal_logits
+        before = proposal_logits.detach().clone()
+        after = before.clone()
+        after[2, aa_to_idx["Y"]] = 5.0
+        return before, after
+
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(),
+        device="cpu",
+        verifier_model=object(),
+        input_builder=FakeInputBuilder(),
+        protein_input_cls=FakeProteinInput,
+        structure_prediction_input_cls=FakeStructurePredictionInput,
+        soft_update_fn=fake_soft_update,
+    )
+
+    batch = backend.propose(
+        current_seq="AAA",
+        target_seq="TTTT",
+        global_step=0,
+        K_top=2,
+        B_candidates=1,
+        T_sample=0.01,
+        max_mutations_per_seq=1,
+        proposal_logits=saved_logits,
+    )
+
+    assert seen["proposal_logits"] is not None
+    assert seen["proposal_logits"][1, aa_to_idx["F"]].item() == pytest.approx(4.0)
+    assert batch.sequences == ["AAY"]
+    assert batch.logits_after[1, aa_to_idx["F"]].item() == pytest.approx(4.0)
+    assert batch.logits_after[2, aa_to_idx["Y"]].item() == pytest.approx(5.0)
 
 
 def test_stageb_structure_loss_keeps_base_total_when_group_is_selected():
