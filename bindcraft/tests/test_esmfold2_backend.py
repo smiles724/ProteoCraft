@@ -145,10 +145,12 @@ def test_combine_normalized_gradients_respects_mask_and_task_lambda():
 
 
 def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
+    default_config = ESMFold2ProposalConfig(lambda_esmc="auto")
+    assert default_config.soft_steps == 5
+    assert default_config.experimental_model_name.endswith("ESMFold2-Experimental")
+
     config = ESMFold2ProposalConfig(soft_steps=3, lambda_esmc="auto")
     assert config.soft_steps == 3
-    assert config.experimental_model_name.endswith("ESMFold2-Experimental")
-
     first = esm_temperature(0, total_steps=3)
     last = esm_temperature(2, total_steps=3)
     assert first > last

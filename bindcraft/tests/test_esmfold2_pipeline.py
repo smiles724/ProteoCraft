@@ -7,6 +7,7 @@ from bindcraft.hallucination.esmfold2_backend import (
     ESMFold2ProposalBatch,
     build_esm_verifier_result,
 )
+from bindcraft.hallucination.mcts_legacy import LegacyMCTSTree
 from bindcraft.hallucination.esmfold2_pipeline import run_esmfold2_mcts_hallucination
 
 
@@ -30,7 +31,11 @@ class FakeESMFold2Backend:
         return build_esm_verifier_result(
             binder_seq=binder_seq,
             target_seq=target_seq,
-            summary_confidence={"pair_chain_iptm": score, "iptm": score},
+            summary_confidence={
+                "pair_chain_iptm": score,
+                "iptm": score,
+                "mmcif": f"data_{binder_seq}\n#\n",
+            },
             extra_loss_dict=extra,
             coordinate=torch.zeros(1, len(binder_seq) + len(str(target_seq)), 3),
         )
@@ -100,6 +105,24 @@ def test_esmfold2_stagea_pipeline_uses_backend_for_verify_and_proposal():
     assert [call[0] for call in backend.verify_calls] == ["AAA", "AAY", "AAF", "AYY"]
     assert [call["current_seq"] for call in backend.propose_calls] == ["AAA", "AAY"]
     assert [call["action_group"] for call in backend.propose_calls] == [None, None]
+
+
+def test_stagea_legacy_tree_selects_lower_average_loss_path():
+    tree = LegacyMCTSTree(C=0.0)
+    low_loss = tree.add_root_node(
+        sequence="AAA",
+        logits=torch.zeros(3, 20),
+        L_real=0.2,
+    )
+    tree.add_root_node(
+        sequence="BBB",
+        logits=torch.zeros(3, 20),
+        L_real=0.8,
+    )
+
+    tree.backpropagate(low_loss, [0.1])
+
+    assert tree.select().sequence == "AAA"
 
 
 def test_esmfold2_stage_a_only_strategy_never_enters_stageb():
@@ -362,13 +385,25 @@ def test_esmfold2_pipeline_writes_structured_step_artifacts(tmp_path):
 
     trajectory_path = artifact_dir / "trajectory.jsonl"
     candidates_path = artifact_dir / "candidates.jsonl"
+    nodes_path = artifact_dir / "mcts_nodes.jsonl"
+    edges_path = artifact_dir / "mcts_edges.jsonl"
+    actions_path = artifact_dir / "mcts_actions.jsonl"
+    handoff_path = artifact_dir / "mcts_handoff.jsonl"
     summary_path = artifact_dir / "run_summary.json"
     assert trajectory_path.exists()
     assert candidates_path.exists()
+    assert nodes_path.exists()
+    assert edges_path.exists()
+    assert actions_path.exists()
+    assert handoff_path.exists()
     assert summary_path.exists()
 
     trajectory = [json.loads(line) for line in trajectory_path.read_text().splitlines()]
     candidates = [json.loads(line) for line in candidates_path.read_text().splitlines()]
+    nodes = [json.loads(line) for line in nodes_path.read_text().splitlines()]
+    edges = [json.loads(line) for line in edges_path.read_text().splitlines()]
+    actions = [json.loads(line) for line in actions_path.read_text().splitlines()]
+    handoff = [json.loads(line) for line in handoff_path.read_text().splitlines()]
     summary = json.loads(summary_path.read_text())
 
     assert [event["stage"] for event in trajectory] == ["phase0", "stage_a", "stage_b"]
@@ -377,5 +412,18 @@ def test_esmfold2_pipeline_writes_structured_step_artifacts(tmp_path):
     assert trajectory[2]["selected_group_counts"] == {"interface_formation": 1}
     assert any(event["stage"] == "stage_b" and event["sequence"] == "AYY" for event in candidates)
     assert candidates[-1]["loss_dict"]["total"] == pytest.approx(0.10)
+    assert any(node["stage"] == "stage_a" and node["parent_node_id"] is None for node in nodes)
+    assert any(node["stage"] == "stage_b" and node["sequence"] == "AYY" for node in nodes)
+    assert any(edge["stage"] == "stage_a" and edge["edits"] for edge in edges)
+    assert any(action["stage"] == "stage_b" and action["selected"] for action in actions)
+    assert any(event["source_stage"] == "stage_a" and event["target_stage"] == "stage_b" for event in handoff)
+
+    stage_b_ckpt_dir = artifact_dir / "checkpoints" / "stage_b" / "step_0001"
+    stage_b_meta = json.loads((stage_b_ckpt_dir / "step_0001_round_best_meta.json").read_text())
+    assert (stage_b_ckpt_dir / "step_0001_round_best.cif").exists()
+    assert stage_b_meta["binder_seq"] == "AYY"
+    assert stage_b_meta["total_loss"] == pytest.approx(0.10)
+    assert stage_b_meta["structure_format"] == "mmcif"
+    assert "mmcif" not in stage_b_meta["summary_confidence"]
     assert summary["best_sequence"] == "AYY"
     assert summary["best_loss"] == pytest.approx(0.10)

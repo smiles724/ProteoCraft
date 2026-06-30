@@ -79,7 +79,7 @@ class ESMFold2ProposalConfig:
     verifier_model_name: str = "biohub/ESMFold2"
     verifier_num_loops: int = 20
     verifier_num_sampling_steps: int = 200
-    soft_steps: int = 3
+    soft_steps: int = 5
     learning_rate: float = 0.1
     temperature_min: float = 1e-2
     temperature_max: float = 1.0

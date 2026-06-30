@@ -355,8 +355,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2 verifier 模型名（仅 --model_backend esmfold2 使用）")
     parser.add_argument("--esmfold2_experimental_model", type=str, default="biohub/ESMFold2-Experimental",
                        help="ESMFold2Experimental proposal 模型名（仅 --model_backend esmfold2 使用）")
-    parser.add_argument("--esmfold2_soft_steps", type=int, default=3,
-                       help="ESMFold2 proposal 每个 MCTS 节点的 soft gradient update 步数（默认：3）")
+    parser.add_argument("--esmfold2_soft_steps", type=int, default=5,
+                       help="ESMFold2 proposal 每个 MCTS 节点的 soft gradient update 步数（默认：5）")
     parser.add_argument("--esmfold2_lambda_esmc", type=str, default="auto",
                        help="ESMC sequence prior 权重；auto 按任务类型选择，或传入数值字符串")
     parser.add_argument("--esmfold2_task_type", type=str, default="denovo",

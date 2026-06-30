@@ -54,6 +54,21 @@ class _NoopArtifactRecorder:
     def write_candidate(self, **event: Any) -> None:
         return None
 
+    def write_mcts_node(self, **event: Any) -> None:
+        return None
+
+    def write_mcts_edge(self, **event: Any) -> None:
+        return None
+
+    def write_mcts_action(self, **event: Any) -> None:
+        return None
+
+    def write_mcts_handoff(self, **event: Any) -> None:
+        return None
+
+    def write_checkpoint(self, **event: Any) -> None:
+        return None
+
     def write_summary(self, **summary: Any) -> None:
         return None
 
@@ -66,15 +81,80 @@ class _ESMArtifactRecorder(_NoopArtifactRecorder):
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.trajectory_path = self.artifact_dir / "trajectory.jsonl"
         self.candidates_path = self.artifact_dir / "candidates.jsonl"
+        self.nodes_path = self.artifact_dir / "mcts_nodes.jsonl"
+        self.edges_path = self.artifact_dir / "mcts_edges.jsonl"
+        self.actions_path = self.artifact_dir / "mcts_actions.jsonl"
+        self.handoff_path = self.artifact_dir / "mcts_handoff.jsonl"
         self.summary_path = self.artifact_dir / "run_summary.json"
         self.trajectory_path.write_text("", encoding="utf-8")
         self.candidates_path.write_text("", encoding="utf-8")
+        self.nodes_path.write_text("", encoding="utf-8")
+        self.edges_path.write_text("", encoding="utf-8")
+        self.actions_path.write_text("", encoding="utf-8")
+        self.handoff_path.write_text("", encoding="utf-8")
 
     def write_step(self, **event: Any) -> None:
         self._append_jsonl(self.trajectory_path, event)
 
     def write_candidate(self, **event: Any) -> None:
         self._append_jsonl(self.candidates_path, event)
+
+    def write_mcts_node(self, **event: Any) -> None:
+        self._append_jsonl(self.nodes_path, event)
+
+    def write_mcts_edge(self, **event: Any) -> None:
+        self._append_jsonl(self.edges_path, event)
+
+    def write_mcts_action(self, **event: Any) -> None:
+        self._append_jsonl(self.actions_path, event)
+
+    def write_mcts_handoff(self, **event: Any) -> None:
+        self._append_jsonl(self.handoff_path, event)
+
+    def write_checkpoint(self, **event: Any) -> None:
+        stage = _safe_path_token(str(event.get("stage", "unknown")))
+        step = event.get("step")
+        label = _safe_path_token(str(event.get("label", "round_best")))
+        step_index = 0 if step is None else int(step)
+        step_name = f"step_{step_index:04d}"
+        step_dir = self.artifact_dir / "checkpoints" / stage / step_name
+        step_dir.mkdir(parents=True, exist_ok=True)
+
+        result = event.get("result")
+        if result is None:
+            return
+        sequence = str(getattr(result, "binder_seq", ""))
+        summary = dict(getattr(result, "summary_confidence", {}) or {})
+        mmcif = summary.get("mmcif")
+        structure_file = None
+        structure_status = "missing_mmcif"
+        if isinstance(mmcif, str) and mmcif.strip():
+            structure_file = f"{step_name}_{label}.cif"
+            (step_dir / structure_file).write_text(mmcif, encoding="utf-8")
+            structure_status = "ok"
+
+        metadata = {
+            "stage": event.get("stage"),
+            "step": step,
+            "label": label,
+            "binder_seq": sequence,
+            "binder_seq_hash": _sequence_hash(sequence),
+            "target_seq": getattr(result, "target_seq", None),
+            "total_loss": float(getattr(result, "total_loss")),
+            "loss_dict": _loss_dict_for_artifact(result),
+            "summary_confidence": _summary_without_structure(summary),
+            "structure_file": structure_file,
+            "structure_format": "mmcif" if structure_file else None,
+            "structure_status": structure_status,
+            "selected_sequence": event.get("selected_sequence"),
+            "parent_sequence": event.get("parent_sequence"),
+            "is_global_best": bool(event.get("is_global_best", False)),
+        }
+        meta_file = f"{step_name}_{label}_meta.json"
+        (step_dir / meta_file).write_text(
+            json.dumps(_json_ready(metadata), ensure_ascii=False, sort_keys=True, indent=2),
+            encoding="utf-8",
+        )
 
     def write_summary(self, **summary: Any) -> None:
         self.summary_path.write_text(
@@ -119,6 +199,30 @@ def _json_ready(value: Any) -> Any:
     return str(value)
 
 
+def _safe_path_token(text: str) -> str:
+    safe = []
+    for char in text:
+        if char.isalnum() or char in {"-", "_", "."}:
+            safe.append(char)
+        else:
+            safe.append("_")
+    return "".join(safe).strip("_") or "item"
+
+
+def _sequence_hash(sequence: Optional[str]) -> Optional[str]:
+    if sequence is None:
+        return None
+    return hashlib.sha256(str(sequence).encode("utf-8")).hexdigest()[:16]
+
+
+def _summary_without_structure(summary: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        str(key): value
+        for key, value in dict(summary or {}).items()
+        if str(key) not in {"mmcif"}
+    }
+
+
 def _loss_dict_for_artifact(result: Any) -> Dict[str, float]:
     return {
         str(key): float(scalar)
@@ -157,6 +261,124 @@ def _write_candidate_artifact(
         loss_dict=_loss_dict_for_artifact(result),
         summary_confidence=_summary_for_artifact(result),
     )
+
+
+def _mean_legacy_loss(node: Any) -> Optional[float]:
+    if not hasattr(node, "W") or not hasattr(node, "visit_count"):
+        return None
+    visits = max(int(getattr(node, "visit_count", 0)), 1)
+    return float(getattr(node, "W")) / visits
+
+
+def _mcts_node_artifact(
+    *,
+    stage: str,
+    node: Any,
+    step_created: Optional[int],
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    sequence = str(getattr(node, "sequence", ""))
+    parent = getattr(node, "parent", None)
+    payload: Dict[str, Any] = {
+        "stage": stage,
+        "step_created": step_created,
+        "node_id": int(getattr(node, "node_id")),
+        "node_uid": f"{stage}:{int(getattr(node, 'node_id'))}",
+        "parent_node_id": None if parent is None else int(getattr(parent, "node_id")),
+        "parent_node_uid": None if parent is None else f"{stage}:{int(getattr(parent, 'node_id'))}",
+        "depth": int(getattr(node, "depth", 0)),
+        "sequence": sequence,
+        "sequence_hash": _sequence_hash(sequence),
+        "parent_sequence_hash": _sequence_hash(getattr(parent, "sequence", None)) if parent is not None else None,
+        "edits": list(getattr(node, "edit_from_parent", []) or []),
+        "total_loss": float(getattr(node, "L_real")),
+        "visit_count": int(getattr(node, "visit_count", 0)),
+    }
+    if parent is not None and not payload["edits"]:
+        payload["edits"] = _sequence_edits(str(getattr(parent, "sequence", "")), sequence)
+    if hasattr(node, "W"):
+        payload["W"] = float(getattr(node, "W"))
+        payload["mean_loss"] = _mean_legacy_loss(node)
+    if hasattr(node, "tree_reward"):
+        payload["tree_reward"] = float(getattr(node, "tree_reward"))
+        payload["value_sum"] = float(getattr(node, "value_sum", 0.0))
+        payload["q_value"] = float(getattr(node, "q_value", 0.0))
+        payload["prior"] = float(getattr(node, "prior", 1.0))
+        payload["group_id"] = str(getattr(node, "group_id", "ungrouped"))
+        payload["loss_vector"] = dict(getattr(node, "loss_vector", {}) or {})
+        payload["status_flags"] = dict(getattr(node, "status_flags", {}) or {})
+        payload["structural_signature"] = dict(getattr(node, "structural_signature", {}) or {})
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _mcts_edge_artifact(
+    *,
+    stage: str,
+    parent: Any,
+    child: Any,
+    step_created: Optional[int],
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    parent_seq = str(getattr(parent, "sequence", ""))
+    child_seq = str(getattr(child, "sequence", ""))
+    payload: Dict[str, Any] = {
+        "stage": stage,
+        "step_created": step_created,
+        "parent_node_id": int(getattr(parent, "node_id")),
+        "child_node_id": int(getattr(child, "node_id")),
+        "parent_node_uid": f"{stage}:{int(getattr(parent, 'node_id'))}",
+        "child_node_uid": f"{stage}:{int(getattr(child, 'node_id'))}",
+        "parent_sequence_hash": _sequence_hash(parent_seq),
+        "child_sequence_hash": _sequence_hash(child_seq),
+        "edits": _sequence_edits(parent_seq, child_seq),
+        "num_mutations": sum(1 for a, b in zip(parent_seq, child_seq) if a != b),
+        "child_total_loss": float(getattr(child, "L_real")),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _mcts_action_artifact(
+    *,
+    stage: str,
+    step: Optional[int],
+    action: Any,
+    selected: bool,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    sequence = str(getattr(action, "sequence", ""))
+    payload: Dict[str, Any] = {
+        "stage": stage,
+        "step": step,
+        "action_id": int(getattr(action, "action_id")),
+        "parent_node_id": int(getattr(action, "parent_node_id")),
+        "parent_node_uid": f"{stage}:{int(getattr(action, 'parent_node_id'))}",
+        "child_node_id": getattr(action, "child_node_id", None),
+        "child_node_uid": (
+            None
+            if getattr(action, "child_node_id", None) is None
+            else f"{stage}:{int(getattr(action, 'child_node_id'))}"
+        ),
+        "sequence": sequence,
+        "sequence_hash": _sequence_hash(sequence),
+        "edits": list(getattr(action, "edits", []) or []),
+        "prior": float(getattr(action, "prior", 0.0)),
+        "benefit": float(getattr(action, "benefit", 0.0)),
+        "action_group": str(getattr(action, "action_group", "unrouted")),
+        "group_prior": float(getattr(action, "group_prior", 1.0)),
+        "visit_count": int(getattr(action, "visit_count", 0)),
+        "value_sum": float(getattr(action, "value_sum", 0.0)),
+        "q_value": float(getattr(action, "q_value", 0.0)),
+        "status": str(getattr(action, "status", "unknown")),
+        "selected": bool(selected),
+        "status_flags": dict(getattr(action, "status_flags", {}) or {}),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
 
 
 def _stable_seed(*parts: Any) -> int:
@@ -634,15 +856,25 @@ def run_esmfold2_mcts_hallucination(
 
     phase0_results.sort(key=lambda result: result.total_loss)
     proposal_logits_by_sequence: Dict[str, torch.Tensor] = {}
+    stagea_node_by_sequence: Dict[str, Any] = {}
     for result in phase0_results[: max(int(num_beams), 1)]:
         root_logits = _initial_proposal_logits(result.binder_seq, mutable_mask)
-        tree.add_root_node(
+        root_node = tree.add_root_node(
             sequence=result.binder_seq,
             logits=root_logits,
             L_real=result.total_loss,
             coordinate=result.coordinate,
         )
+        stagea_node_by_sequence[str(root_node.sequence)] = root_node
         proposal_logits_by_sequence[str(result.binder_seq)] = root_logits
+        artifact_recorder.write_mcts_node(
+            **_mcts_node_artifact(
+                stage="stage_a",
+                node=root_node,
+                step_created=None,
+                extra={"source": "phase0_root"},
+            )
+        )
 
     best_result = phase0_results[0]
     best_seq = str(best_result.binder_seq)
@@ -656,6 +888,13 @@ def run_esmfold2_mcts_hallucination(
         global_best_loss=best_loss,
         best_sequence=best_seq,
         selected_sequence=None,
+    )
+    artifact_recorder.write_checkpoint(
+        stage="phase0",
+        step=0,
+        label="round_best",
+        result=best_result,
+        is_global_best=True,
     )
     if strategy == "stage_a_only":
         stagea_steps = N_steps
@@ -729,7 +968,25 @@ def run_esmfold2_mcts_hallucination(
                 mutable_mask,
             )
             proposal_logits_by_sequence[str(node.sequence)] = node.logits
+            stagea_node_by_sequence[str(node.sequence)] = node
         tree.backpropagate(selected_node, [result.total_loss for result in round_results])
+        for node in new_nodes:
+            artifact_recorder.write_mcts_node(
+                **_mcts_node_artifact(
+                    stage="stage_a",
+                    node=node,
+                    step_created=step,
+                    extra={"source": "stage_a_expand"},
+                )
+            )
+            artifact_recorder.write_mcts_edge(
+                **_mcts_edge_artifact(
+                    stage="stage_a",
+                    parent=selected_node,
+                    child=node,
+                    step_created=step,
+                )
+            )
         tree.prune()
 
         round_best = min(round_results, key=lambda result: result.total_loss)
@@ -746,11 +1003,21 @@ def run_esmfold2_mcts_hallucination(
         artifact_recorder.write_step(
             stage="stage_a",
             step=step,
+            selected_node_id=int(selected_node.node_id),
             selected_sequence=current_seq,
             candidate_count=len(round_results),
             round_best_loss=float(round_best.total_loss),
             global_best_loss=best_loss,
             best_sequence=best_seq,
+        )
+        artifact_recorder.write_checkpoint(
+            stage="stage_a",
+            step=step,
+            label="round_best",
+            result=round_best,
+            selected_sequence=current_seq,
+            parent_sequence=current_seq,
+            is_global_best=(str(round_best.binder_seq) == best_seq),
         )
 
         logger.info(
@@ -798,7 +1065,7 @@ def run_esmfold2_mcts_hallucination(
     for idx, result in enumerate(handoff_results):
         strict_tree.store_verifier_result(result)
         handoff_logits = proposal_logits_by_sequence.get(str(result.binder_seq))
-        strict_tree.add_root_node(
+        root_node = strict_tree.add_root_node(
             sequence=result.binder_seq,
             logits=_anchor_proposal_logits(handoff_logits, result.binder_seq, mutable_mask),
             L_real=result.total_loss,
@@ -806,6 +1073,34 @@ def run_esmfold2_mcts_hallucination(
             loss_vector=result.loss_dict,
             prior=1.0 / max(len(handoff_results), 1),
             status_flags={"esm_stage": "handoff", "handoff_rank": idx + 1},
+        )
+        source_node = stagea_node_by_sequence.get(str(result.binder_seq))
+        artifact_recorder.write_mcts_node(
+            **_mcts_node_artifact(
+                stage="stage_b",
+                node=root_node,
+                step_created=len(losses_history),
+                extra={
+                    "source": "handoff_root",
+                    "handoff_rank": idx + 1,
+                    "source_stage": "stage_a",
+                    "source_node_id": None if source_node is None else int(source_node.node_id),
+                    "source_sequence_hash": _sequence_hash(str(result.binder_seq)),
+                },
+            )
+        )
+        artifact_recorder.write_mcts_handoff(
+            source_stage="stage_a",
+            target_stage="stage_b",
+            handoff_rank=idx + 1,
+            source_node_id=None if source_node is None else int(source_node.node_id),
+            target_node_id=int(root_node.node_id),
+            source_node_uid=None if source_node is None else f"stage_a:{int(source_node.node_id)}",
+            target_node_uid=f"stage_b:{int(root_node.node_id)}",
+            sequence=str(result.binder_seq),
+            sequence_hash=_sequence_hash(str(result.binder_seq)),
+            total_loss=float(result.total_loss),
+            prior=1.0 / max(len(handoff_results), 1),
         )
 
     preview_loss_cache: Dict[str, Dict[str, float]] = {}
@@ -905,6 +1200,10 @@ def run_esmfold2_mcts_hallucination(
         if not selected_actions:
             losses_history.append(best_loss)
             continue
+        action_by_sequence = {
+            str(action.sequence): action
+            for action in selected_actions
+        }
 
         expand_proposals: List[ESMFold2MutationProposal] = []
         expand_results: List[Any] = []
@@ -951,6 +1250,31 @@ def run_esmfold2_mcts_hallucination(
             )
             proposal_logits_by_sequence[str(node.sequence)] = node.logits
             reward_by_sequence[node.sequence] = node.tree_reward
+            action = action_by_sequence.get(str(node.sequence))
+            artifact_recorder.write_mcts_node(
+                **_mcts_node_artifact(
+                    stage="stage_b",
+                    node=node,
+                    step_created=step,
+                    extra={
+                        "source": "stage_b_expand",
+                        "action_id": None if action is None else int(action.action_id),
+                        "action_group": None if action is None else str(action.action_group),
+                    },
+                )
+            )
+            artifact_recorder.write_mcts_edge(
+                **_mcts_edge_artifact(
+                    stage="stage_b",
+                    parent=selected_node,
+                    child=node,
+                    step_created=step,
+                    extra={
+                        "action_id": None if action is None else int(action.action_id),
+                        "action_group": None if action is None else str(action.action_group),
+                    },
+                )
+            )
 
         for result in expand_results:
             reward_by_sequence.setdefault(
@@ -965,6 +1289,20 @@ def run_esmfold2_mcts_hallucination(
                     action,
                     reward_by_sequence[action.sequence],
                 )
+            artifact_recorder.write_mcts_action(
+                **_mcts_action_artifact(
+                    stage="stage_b",
+                    step=step,
+                    action=action,
+                    selected=True,
+                    extra={
+                        "selection_decision_type": selection.decision_type,
+                        "selection_best_action_score": selection.best_action_score,
+                        "selection_frontier_score": selection.frontier_score,
+                        "parent_sequence_hash": _sequence_hash(current_seq),
+                    },
+                )
+            )
 
         strict_tree.prune()
         round_results = expand_results
@@ -978,6 +1316,8 @@ def run_esmfold2_mcts_hallucination(
         artifact_recorder.write_step(
             stage="stage_b",
             step=step,
+            selected_node_id=int(selected_node.node_id),
+            selected_action_ids=[int(action.action_id) for action in selected_actions],
             selected_sequence=current_seq,
             candidate_count=len(round_results),
             round_best_loss=float(round_best.total_loss) if round_results else None,
@@ -992,6 +1332,16 @@ def run_esmfold2_mcts_hallucination(
             selected_action_count=len(selected_actions),
             loss_vector_keys=sorted(str(key) for key in selected_node.loss_vector.keys()),
         )
+        if round_results:
+            artifact_recorder.write_checkpoint(
+                stage="stage_b",
+                step=step,
+                label="round_best",
+                result=round_best,
+                selected_sequence=current_seq,
+                parent_sequence=current_seq,
+                is_global_best=(str(round_best.binder_seq) == best_seq),
+            )
 
         logger.info(
             "ESM StageB step %3d/%d | selected=%s primary_group=%s Pg=%.3f scores=%s priors=%s budgets=%s selected_groups=%s keys=%s actions=%d global_best=%.4f",
