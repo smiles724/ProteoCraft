@@ -317,6 +317,16 @@ def load_esmfold2_backend(args, device: str = "cuda"):
         lambda_esmc=args.esmfold2_lambda_esmc,
         num_loops=args.esmfold2_proposal_num_loops,
         num_sampling_steps=args.esmfold2_proposal_num_sampling_steps,
+        proposal_load_internal_esmc=args.esmfold2_proposal_load_internal_esmc,
+        proposal_lm_dropout=args.esmfold2_proposal_lm_dropout,
+        force_proposal_lm_dropout=args.esmfold2_force_proposal_lm_dropout,
+        track_proposal_confidence=args.esmfold2_track_proposal_confidence,
+        proposal_confidence_temperature=args.esmfold2_proposal_confidence_temperature,
+        proposal_confidence_interval=args.esmfold2_proposal_confidence_interval,
+        proposal_confidence_num_loops=args.esmfold2_proposal_confidence_num_loops,
+        proposal_confidence_num_sampling_steps=args.esmfold2_proposal_confidence_num_sampling_steps,
+        proposal_confidence_max_candidates=args.esmfold2_proposal_confidence_max_candidates,
+        proposal_confidence_tail_steps=args.esmfold2_proposal_confidence_tail_steps,
     )
     return ESMFold2RuntimeBackend(
         config=config,
@@ -362,6 +372,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--esmfold2_task_type", type=str, default="denovo",
                        choices=["denovo", "de_novo", "minibinder", "binder", "tcr", "cdr", "cdr_redesign", "antibody", "antibody_like"],
                        help="ESMFold2/ESMC 任务类型；用于解析 lambda_ESMC=auto（默认：denovo）")
+    parser.add_argument("--esmfold2_logit_init_mode", type=str, default="official_free",
+                       choices=["official_free", "official_exact", "legacy_anchor"],
+                       help="ESMFold2 root logits 初始化方式；official_exact 用官方 seed 直接生成诊断初始 logits")
     parser.add_argument("--esmfold2_mutable_mask", type=str, default=None,
                        help="ESMFold2 可变位点 mask；长度需等于 binder_length，支持 01101 或 0,1,1,true")
     parser.add_argument("--esmfold2_artifact_dir", type=str, default=None,
@@ -374,6 +387,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2 proposal distogram forward loop 数（默认：1）")
     parser.add_argument("--esmfold2_proposal_num_sampling_steps", type=int, default=1,
                        help="ESMFold2 proposal distogram forward diffusion steps（默认：1）")
+    parser.add_argument("--esmfold2_proposal_load_internal_esmc", type=lambda x: x.lower() == "true", default=True,
+                       help="是否为 ESMFold2Experimental proposal model 加载内部 ESMC（官方 binder design 为 true）")
+    parser.add_argument("--esmfold2_proposal_lm_dropout", type=float, default=None,
+                       help="ESMFold2Experimental proposal LM dropout；None 表示保持模型默认行为。官方 binder design inversion/proposal 使用 0.5")
+    parser.add_argument("--esmfold2_force_proposal_lm_dropout", type=lambda x: x.lower() == "true", default=False,
+                       help="是否在 eval/inference 状态强制启用 proposal LM dropout（官方 binder design 为 true）")
+    parser.add_argument("--esmfold2_track_proposal_confidence", type=lambda x: x.lower() == "true", default=False,
+                       help="ESMFold2 proposal 后期是否计算 confidence/iPTM 并加入候选（默认：false）")
+    parser.add_argument("--esmfold2_proposal_confidence_temperature", type=float, default=0.05,
+                       help="ESMFold2 proposal temperature 低于该值时记录 confidence/iPTM（默认：0.05）")
+    parser.add_argument("--esmfold2_proposal_confidence_interval", type=int, default=1,
+                       help="ESMFold2 proposal 后期每隔多少 local step 记录一次 confidence/iPTM（默认：1）")
+    parser.add_argument("--esmfold2_proposal_confidence_num_loops", type=int, default=1,
+                       help="ESMFold2 proposal confidence forward loop 数（默认：1）")
+    parser.add_argument("--esmfold2_proposal_confidence_num_sampling_steps", type=int, default=50,
+                       help="ESMFold2 proposal confidence forward sampling steps（默认：50）")
+    parser.add_argument("--esmfold2_proposal_confidence_max_candidates", type=int, default=8,
+                       help="每次 proposal 最多把多少个 late-confidence 序列加入 verifier 候选（默认：8）")
+    parser.add_argument("--esmfold2_proposal_confidence_tail_steps", type=int, default=0,
+                       help="ESMFold2 proposal 固定记录最后 N 个 local steps；0 表示使用 temperature 阈值（默认：0）")
+    parser.add_argument("--esmfold2_final_polish", type=lambda x: x.lower() == "true", default=False,
+                       help="ESMFold2 MCTS 搜索结束后是否从 best node logits 做 final continuous polish，并只在该阶段使用 late-confidence candidates（默认：false）")
     parser.add_argument("--checkpoint_dir", type=str, default=None,
                        help="Checkpoint 目录；默认依次读取 --checkpoint_dir、PROTENIX_CHECKPOINT_DIR、PROTENIX_ROOT_DIR/checkpoint")
     parser.add_argument("--save_checkpoint_dir", type=str, default=None,
@@ -433,8 +468,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcts_tau_fixed", type=float, default=4.0, help="MCTS 固定扩散 tau（默认：4.0）")
     parser.add_argument("--mcts_num_beams", type=int, default=8, help="MCTS Phase0 根节点数 / beam（默认：8）")
     parser.add_argument("--mcts_strategy", type=str, default="two_stage",
-                       choices=["legacy", "stage_a_only", "strict", "two_stage"],
-                       help="MCTS 策略：stage_a_only 只跑 StageA / legacy 兼容旧名 / strict 文档版 / two_stage 两阶段（默认：two_stage）")
+                       choices=["legacy", "stage_a_only", "strict", "two_stage", "continuous_stage_a"],
+                       help="MCTS 策略：stage_a_only 只跑 StageA / continuous_stage_a 连续 soft-logit 诊断 / legacy 兼容旧名 / strict 文档版 / two_stage 两阶段（默认：two_stage）")
     parser.add_argument("--mcts_bootstrap_steps", type=int, default=50,
                        help="two_stage: StageA 原版 MCTS 至少运行步数（默认：50）")
     parser.add_argument("--mcts_bootstrap_patience", type=int, default=10,
@@ -615,6 +650,8 @@ def main():
             mutable_mask=esmfold2_mutable_mask,
             artifact_dir=args.esmfold2_artifact_dir
             or os.path.join(args.output_dir, "esmfold2_artifacts"),
+            esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
+            esmfold2_final_polish=args.esmfold2_final_polish,
         )
     elif args.mode == "first_order":
         from bindcraft.hallucination.pipeline import run_hallucination
@@ -718,7 +755,19 @@ def main():
             f.write(f"ESMFold2 Soft Steps: {args.esmfold2_soft_steps}\n")
             f.write(f"ESMFold2 Lambda ESMC: {args.esmfold2_lambda_esmc}\n")
             f.write(f"ESMFold2 Task Type: {args.esmfold2_task_type}\n")
+            f.write(f"ESMFold2 Logit Init Mode: {args.esmfold2_logit_init_mode}\n")
             f.write(f"ESMFold2 Mutable Mask: {args.esmfold2_mutable_mask or 'ALL'}\n")
+            f.write(f"ESMFold2 Proposal Load Internal ESMC: {args.esmfold2_proposal_load_internal_esmc}\n")
+            f.write(f"ESMFold2 Proposal LM Dropout: {args.esmfold2_proposal_lm_dropout}\n")
+            f.write(f"ESMFold2 Force Proposal LM Dropout: {args.esmfold2_force_proposal_lm_dropout}\n")
+            f.write(f"ESMFold2 Track Proposal Confidence: {args.esmfold2_track_proposal_confidence}\n")
+            f.write(f"ESMFold2 Proposal Confidence Temperature: {args.esmfold2_proposal_confidence_temperature}\n")
+            f.write(f"ESMFold2 Proposal Confidence Interval: {args.esmfold2_proposal_confidence_interval}\n")
+            f.write(f"ESMFold2 Proposal Confidence Loops: {args.esmfold2_proposal_confidence_num_loops}\n")
+            f.write(f"ESMFold2 Proposal Confidence Sampling Steps: {args.esmfold2_proposal_confidence_num_sampling_steps}\n")
+            f.write(f"ESMFold2 Proposal Confidence Max Candidates: {args.esmfold2_proposal_confidence_max_candidates}\n")
+            f.write(f"ESMFold2 Proposal Confidence Tail Steps: {args.esmfold2_proposal_confidence_tail_steps}\n")
+            f.write(f"ESMFold2 Final Polish: {args.esmfold2_final_polish}\n")
         f.write(f"Optimization Steps: {args.n_steps}\n")
         f.write(f"Learning Rate: {args.learning_rate}\n")
         f.write(f"Tau Noise: {args.tau_noise}\n")

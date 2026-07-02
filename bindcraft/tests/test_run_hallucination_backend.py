@@ -66,6 +66,8 @@ def test_esmfold2_backend_exposes_separate_model_and_proposal_options():
             "0.2",
             "--esmfold2_task_type",
             "tcr",
+            "--esmfold2_logit_init_mode",
+            "legacy_anchor",
             "--esmfold2_mutable_mask",
             "0,1,1",
             "--esmfold2_verifier_num_loops",
@@ -76,6 +78,24 @@ def test_esmfold2_backend_exposes_separate_model_and_proposal_options():
             "1",
             "--esmfold2_proposal_num_sampling_steps",
             "3",
+            "--esmfold2_proposal_lm_dropout",
+            "0.5",
+            "--esmfold2_force_proposal_lm_dropout",
+            "true",
+            "--esmfold2_track_proposal_confidence",
+            "true",
+            "--esmfold2_proposal_confidence_temperature",
+            "0.07",
+            "--esmfold2_proposal_confidence_interval",
+            "2",
+            "--esmfold2_proposal_confidence_num_loops",
+            "1",
+            "--esmfold2_proposal_confidence_num_sampling_steps",
+            "50",
+            "--esmfold2_proposal_confidence_max_candidates",
+            "6",
+            "--esmfold2_proposal_confidence_tail_steps",
+            "20",
             "--stagea_max_mutations_per_seq",
             "9",
             "--stageb_max_mutations_per_seq",
@@ -89,11 +109,21 @@ def test_esmfold2_backend_exposes_separate_model_and_proposal_options():
     assert args.esmfold2_soft_steps == 2
     assert args.esmfold2_lambda_esmc == "0.2"
     assert args.esmfold2_task_type == "tcr"
+    assert args.esmfold2_logit_init_mode == "legacy_anchor"
     assert args.esmfold2_mutable_mask == "0,1,1"
     assert args.esmfold2_verifier_num_loops == 2
     assert args.esmfold2_verifier_num_sampling_steps == 12
     assert args.esmfold2_proposal_num_loops == 1
     assert args.esmfold2_proposal_num_sampling_steps == 3
+    assert args.esmfold2_proposal_lm_dropout == pytest.approx(0.5)
+    assert args.esmfold2_force_proposal_lm_dropout is True
+    assert args.esmfold2_track_proposal_confidence is True
+    assert args.esmfold2_proposal_confidence_temperature == pytest.approx(0.07)
+    assert args.esmfold2_proposal_confidence_interval == 2
+    assert args.esmfold2_proposal_confidence_num_loops == 1
+    assert args.esmfold2_proposal_confidence_num_sampling_steps == 50
+    assert args.esmfold2_proposal_confidence_max_candidates == 6
+    assert args.esmfold2_proposal_confidence_tail_steps == 20
     assert args.stagea_max_mutations_per_seq == 9
     assert args.stageb_max_mutations_per_seq == 1
 
@@ -189,6 +219,7 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     assert captured["stagea_max_mutations_per_seq"] == 7
     assert captured["stageb_max_mutations_per_seq"] == 1
     assert captured["mutable_mask"] == [False, True, True]
+    assert captured["esmfold2_logit_init_mode"] == "official_free"
     assert captured["task_type_arg"] == "tcr"
 
 

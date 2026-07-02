@@ -12,8 +12,10 @@ import logging
 import math
 import string
 import inspect
+import random
+from contextlib import contextmanager
 from functools import lru_cache
-from typing import Any, Callable, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -34,6 +36,7 @@ from bindcraft.hallucination.esmfold2_backend import (
     logit_delta_mutation_scores,
     propose_sequences_from_logit_delta,
     resolve_lambda_esmc,
+    sequence_from_logits_argmax,
 )
 
 
@@ -41,6 +44,29 @@ logger = logging.getLogger(__name__)
 
 CHAIN_IDS = string.ascii_uppercase + string.ascii_lowercase + string.digits
 ESMC_MASK_FRACTION = 0.15
+
+
+@contextmanager
+def _seed_context(seed: Optional[int]):
+    """Temporarily set Python/Torch RNG state like the official ESMFold2 flow."""
+
+    if seed is None:
+        yield
+        return
+    py_state = random.getstate()
+    torch_state = torch.random.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        random.seed(int(seed))
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+        yield
+    finally:
+        random.setstate(py_state)
+        torch.random.set_rng_state(torch_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state_all(cuda_state)
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -91,6 +117,14 @@ def _mean_target_to_binder_pair_iptm(
     if pair_chains_iptm is None:
         return None
     tensor = torch.as_tensor(pair_chains_iptm).detach().float()
+    if tensor.ndim == 3:
+        if tensor.shape[1] <= n_target_chains or tensor.shape[2] <= n_target_chains:
+            return None
+        binder_idx = n_target_chains
+        values = tensor[:, :n_target_chains, binder_idx]
+        if values.numel() == 0:
+            return None
+        return _as_float(values)
     if tensor.ndim != 2 or tensor.shape[0] <= n_target_chains or tensor.shape[1] <= n_target_chains:
         return None
     binder_idx = n_target_chains
@@ -283,8 +317,9 @@ class ESMFold2RuntimeBackend:
         mutable_mask: Optional[Sequence[bool]] = None,
         action_group: Optional[str] = None,
         proposal_logits: Optional[torch.Tensor] = None,
+        track_confidence_override: Optional[bool] = None,
     ) -> ESMFold2ProposalBatch:
-        logits_before, logits_after = self._run_soft_update(
+        logits_before, logits_after, confidence_candidates, soft_step_metrics = self._run_soft_update_with_tracking(
             current_seq=current_seq,
             target_seq=target_seq,
             global_step=global_step,
@@ -292,7 +327,9 @@ class ESMFold2RuntimeBackend:
             mutable_mask=mutable_mask,
             action_group=action_group,
             proposal_logits=proposal_logits,
+            track_confidence_override=track_confidence_override,
         )
+        confidence_sequences = self._top_confidence_sequences(confidence_candidates)
         candidates = propose_sequences_from_logit_delta(
             logits_before,
             logits_after,
@@ -302,11 +339,56 @@ class ESMFold2RuntimeBackend:
             B_candidates=B_candidates,
             T_sample=T_sample,
             max_mutations_per_seq=max_mutations_per_seq,
+            include_logit_candidates=(action_group is None),
         )
+        candidates = list(dict.fromkeys([*confidence_sequences, *candidates]))
         return ESMFold2ProposalBatch(
             sequences=candidates,
             logits_before=logits_before,
             logits_after=logits_after,
+            confidence_candidates=confidence_candidates,
+            soft_step_metrics=soft_step_metrics,
+        )
+
+    def continuous_design(
+        self,
+        *,
+        current_seq: str,
+        target_seq: Union[str, Sequence[str]],
+        global_step: int,
+        seed: Optional[int] = None,
+        mutable_mask: Optional[Sequence[bool]] = None,
+        proposal_logits: Optional[torch.Tensor] = None,
+        track_confidence_override: Optional[bool] = None,
+    ) -> ESMFold2ProposalBatch:
+        """Run one continuous ESMFold2 soft-logit trajectory and discretize it.
+
+        This diagnostic path is intentionally separate from ``propose`` so the
+        normal MCTS loop can keep its verify-and-branch behavior unchanged.
+        """
+
+        logits_before, logits_after, confidence_candidates, soft_step_metrics = self._run_soft_update_with_tracking(
+            current_seq=current_seq,
+            target_seq=target_seq,
+            global_step=global_step,
+            seed=seed,
+            mutable_mask=mutable_mask,
+            action_group=None,
+            proposal_logits=proposal_logits,
+            track_confidence_override=track_confidence_override,
+        )
+        sequence = sequence_from_logits_argmax(
+            logits_after,
+            current_seq=current_seq,
+            mutable_mask=mutable_mask,
+        )
+        confidence_sequences = self._top_confidence_sequences(confidence_candidates)
+        return ESMFold2ProposalBatch(
+            sequences=list(dict.fromkeys([*confidence_sequences, sequence])),
+            logits_before=logits_before,
+            logits_after=logits_after,
+            confidence_candidates=confidence_candidates,
+            soft_step_metrics=soft_step_metrics,
         )
 
     def preview_loss_dict(
@@ -376,15 +458,41 @@ class ESMFold2RuntimeBackend:
                 "Loading ESMFold2 experimental proposal model: %s",
                 self.config.experimental_model_name,
             )
-            self.experimental_model = ESMFold2ExperimentalModel.from_pretrained(
+            experimental_model = ESMFold2ExperimentalModel.from_pretrained(
                 self.config.experimental_model_name,
                 load_esmc=False,
-            ).to(self.device).eval().requires_grad_(False)
-            if hasattr(self.experimental_model, "set_kernel_backend"):
+            )
+            if bool(getattr(self.config, "proposal_load_internal_esmc", True)):
+                if not hasattr(experimental_model, "load_esmc"):
+                    raise AttributeError(
+                        "ESMFold2 experimental proposal model does not expose load_esmc"
+                    )
+                esmc_id = getattr(getattr(experimental_model, "config", None), "esmc_id", None)
+                if not esmc_id:
+                    raise ValueError(
+                        "ESMFold2 experimental proposal model config does not define esmc_id"
+                    )
+                logger.info("Loading ESMFold2 experimental internal ESMC: %s", esmc_id)
+                experimental_model.load_esmc(esmc_id)
+            proposal_lm_dropout = getattr(self.config, "proposal_lm_dropout", None)
+            if proposal_lm_dropout is not None:
+                if not hasattr(experimental_model, "configure_lm_dropout"):
+                    raise AttributeError(
+                        "ESMFold2 experimental proposal model does not expose "
+                        "configure_lm_dropout"
+                    )
+                experimental_model.configure_lm_dropout(
+                    float(proposal_lm_dropout),
+                    force_lm_dropout_during_inference=bool(
+                        getattr(self.config, "force_proposal_lm_dropout", False)
+                    ),
+                )
+            if hasattr(experimental_model, "set_kernel_backend"):
                 try:
-                    self.experimental_model.set_kernel_backend(None)
+                    experimental_model.set_kernel_backend(None)
                 except Exception as exc:  # pragma: no cover - optional kernel path
                     logger.warning("Could not set ESMFold2 kernel backend fallback: %s", exc)
+            self.experimental_model = experimental_model.to(self.device).eval().requires_grad_(False)
 
         lambda_esmc = resolve_lambda_esmc(self.config.lambda_esmc, task_type=self.task_type)
         if lambda_esmc != 0.0 and self.esmc_model is None:
@@ -441,6 +549,56 @@ class ESMFold2RuntimeBackend:
         action_group: Optional[str],
         proposal_logits: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        logits_before, logits_after, _, _ = self._run_soft_update_impl(
+            current_seq=current_seq,
+            target_seq=target_seq,
+            global_step=global_step,
+            seed=seed,
+            mutable_mask=mutable_mask,
+            action_group=action_group,
+            proposal_logits=proposal_logits,
+            track_confidence=False,
+        )
+        return logits_before, logits_after
+
+    def _run_soft_update_with_tracking(
+        self,
+        *,
+        current_seq: str,
+        target_seq: Union[str, Sequence[str]],
+        global_step: int,
+        seed: Optional[int],
+        mutable_mask: Optional[Sequence[bool]],
+        action_group: Optional[str],
+        proposal_logits: Optional[torch.Tensor],
+        track_confidence_override: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]], List[Dict[str, Any]]]:
+        track_confidence = bool(getattr(self.config, "track_proposal_confidence", False))
+        if track_confidence_override is not None:
+            track_confidence = bool(track_confidence_override)
+        return self._run_soft_update_impl(
+            current_seq=current_seq,
+            target_seq=target_seq,
+            global_step=global_step,
+            seed=seed,
+            mutable_mask=mutable_mask,
+            action_group=action_group,
+            proposal_logits=proposal_logits,
+            track_confidence=track_confidence,
+        )
+
+    def _run_soft_update_impl(
+        self,
+        *,
+        current_seq: str,
+        target_seq: Union[str, Sequence[str]],
+        global_step: int,
+        seed: Optional[int],
+        mutable_mask: Optional[Sequence[bool]],
+        action_group: Optional[str],
+        proposal_logits: Optional[torch.Tensor],
+        track_confidence: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]], List[Dict[str, Any]]]:
         if self.soft_update_fn is not None:
             kwargs = dict(
                 current_seq=current_seq,
@@ -452,7 +610,8 @@ class ESMFold2RuntimeBackend:
             )
             if _callable_accepts_argument(self.soft_update_fn, "proposal_logits"):
                 kwargs["proposal_logits"] = proposal_logits
-            return self.soft_update_fn(**kwargs)
+            logits_before, logits_after = self.soft_update_fn(**kwargs)
+            return logits_before, logits_after, [], []
 
         targets = _target_sequences(target_seq)
         if len(targets) != 1:
@@ -473,6 +632,8 @@ class ESMFold2RuntimeBackend:
         )
         optimizer = optim.SGD([logits], lr=float(self.config.learning_rate))
         lambda_esmc = resolve_lambda_esmc(self.config.lambda_esmc, task_type=self.task_type)
+        confidence_candidates: List[Dict[str, Any]] = []
+        soft_step_metrics: List[Dict[str, Any]] = []
 
         for local_step in range(int(self.config.soft_steps)):
             optimizer.zero_grad()
@@ -482,12 +643,40 @@ class ESMFold2RuntimeBackend:
                 temperature_min=float(self.config.temperature_min),
                 temperature_max=float(self.config.temperature_max),
             )
+            should_track_confidence = self._should_track_proposal_confidence(
+                track_confidence=track_confidence,
+                local_step=local_step,
+                temperature=temperature,
+            )
             design = F.softmax(logits / temperature, dim=-1)
             fold_result = self._fold_distogram(
                 target_seq=targets[0],
                 design=design,
                 seed=None if seed is None else int(seed) + int(global_step) + local_step,
+                calculate_confidence=should_track_confidence,
+                num_loops=(
+                    int(self.config.proposal_confidence_num_loops)
+                    if should_track_confidence
+                    else int(self.config.num_loops)
+                ),
+                num_sampling_steps=(
+                    int(self.config.proposal_confidence_num_sampling_steps)
+                    if should_track_confidence
+                    else int(self.config.num_sampling_steps)
+                ),
             )
+            if should_track_confidence:
+                record = self._proposal_confidence_record(
+                    fold_result,
+                    logits=logits,
+                    current_seq=current_seq,
+                    mutable_mask=mutable_mask,
+                    local_step=local_step,
+                    global_step=global_step,
+                    temperature=temperature,
+                )
+                if record is not None:
+                    confidence_candidates.append(record)
             losses = _structure_losses(fold_result["distogram_logits"], len(current_seq))
             structure_loss, _ = _stageb_structure_loss(
                 losses,
@@ -500,10 +689,11 @@ class ESMFold2RuntimeBackend:
             if lambda_esmc != 0.0:
                 design_for_esmc = F.softmax(logits / temperature, dim=-1)
                 score_mask = gradient_mask.sum(dim=-1) > 0
-                esmc_loss = self._compute_esmc_pseudoperplexity(
-                    design_for_esmc,
-                    score_mask=score_mask,
-                )
+                with _seed_context(None if seed is None else int(seed) + int(global_step) + local_step):
+                    esmc_loss = self._compute_esmc_pseudoperplexity(
+                        design_for_esmc,
+                        score_mask=score_mask,
+                    )
                 esmc_grad = torch.autograd.grad(esmc_loss.mean(), logits)[0]
 
             logits.grad = combine_normalized_gradients(
@@ -515,8 +705,109 @@ class ESMFold2RuntimeBackend:
             for group in optimizer.param_groups:
                 group["lr"] = float(self.config.learning_rate) * temperature
             optimizer.step()
+            structure_total = losses["total_loss"]
+            combined_total = structure_total + (esmc_loss if lambda_esmc != 0.0 else 0.0)
+            soft_step_metrics.append(
+                {
+                    "global_step": int(global_step),
+                    "local_step": int(local_step),
+                    "temperature": float(temperature),
+                    "proposal_loss_source": _stageb_structure_loss(
+                        losses,
+                        action_group,
+                        group_weight=getattr(self.config, "stageb_group_weight", 1.0),
+                    )[1],
+                    "intra_contact_loss": _as_float(losses.get("intra_contact_loss")),
+                    "inter_contact_loss": _as_float(losses.get("inter_contact_loss")),
+                    "glob_loss": _as_float(losses.get("glob_loss")),
+                    "structure_total_loss": _as_float(structure_total),
+                    "plm_loss": None if lambda_esmc == 0.0 else _as_float(esmc_loss),
+                    "total_loss": _as_float(combined_total),
+                    "backprop_loss": _as_float(structure_loss),
+                    "lambda_esmc": float(lambda_esmc),
+                    "confidence_tracked": bool(should_track_confidence),
+                }
+            )
 
-        return logits_before.detach().cpu(), logits.detach().clone()[0].cpu()
+        return (
+            logits_before.detach().cpu(),
+            logits.detach().clone()[0].cpu(),
+            confidence_candidates,
+            soft_step_metrics,
+        )
+
+    def _should_track_proposal_confidence(
+        self,
+        *,
+        track_confidence: bool,
+        local_step: int,
+        temperature: float,
+    ) -> bool:
+        if not track_confidence:
+            return False
+        last_step = int(self.config.soft_steps) - 1
+        tail_steps = int(getattr(self.config, "proposal_confidence_tail_steps", 0) or 0)
+        if tail_steps > 0:
+            first_tail_step = max(0, int(self.config.soft_steps) - tail_steps)
+            if int(local_step) < first_tail_step:
+                return False
+        elif float(temperature) > float(self.config.proposal_confidence_temperature):
+            return False
+        interval = max(int(self.config.proposal_confidence_interval), 1)
+        return int(local_step) == last_step or int(local_step) % interval == 0
+
+    def _proposal_confidence_record(
+        self,
+        fold_result: Dict[str, Any],
+        *,
+        logits: torch.Tensor,
+        current_seq: str,
+        mutable_mask: Optional[Sequence[bool]],
+        local_step: int,
+        global_step: int,
+        temperature: float,
+    ) -> Optional[Dict[str, Any]]:
+        iptm = _as_float(fold_result.get("iptm"))
+        pair_chain = _as_float(fold_result.get("pair_chain_iptm"))
+        score = pair_chain if pair_chain is not None else iptm
+        if score is None:
+            return None
+        sequence = sequence_from_logits_argmax(
+            logits.detach()[0],
+            current_seq=current_seq,
+            mutable_mask=mutable_mask,
+        )
+        record: Dict[str, Any] = {
+            "sequence": sequence,
+            "global_step": int(global_step),
+            "local_step": int(local_step),
+            "temperature": float(temperature),
+            "confidence_score": float(score),
+            "confidence_source": "pair_chain_iptm" if pair_chain is not None else "iptm",
+        }
+        if iptm is not None:
+            record["iptm"] = float(iptm)
+        if pair_chain is not None:
+            record["pair_chain_iptm"] = float(pair_chain)
+        ptm = _as_float(fold_result.get("ptm"))
+        plddt = _as_float(fold_result.get("plddt"))
+        if ptm is not None:
+            record["ptm"] = float(ptm)
+        if plddt is not None:
+            record["plddt"] = float(plddt)
+        return record
+
+    def _top_confidence_sequences(
+        self,
+        confidence_candidates: Sequence[Dict[str, Any]],
+    ) -> List[str]:
+        ordered = sorted(
+            [dict(item) for item in confidence_candidates if item.get("sequence")],
+            key=lambda item: float(item.get("confidence_score", float("-inf"))),
+            reverse=True,
+        )
+        max_candidates = max(int(self.config.proposal_confidence_max_candidates), 1)
+        return list(dict.fromkeys(str(item["sequence"]) for item in ordered))[:max_candidates]
 
     def _init_current_sequence_logits(
         self,
@@ -526,11 +817,22 @@ class ESMFold2RuntimeBackend:
         proposal_logits: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if proposal_logits is not None:
-            logits = anchor_binder_logits_to_sequence(
-                proposal_logits,
-                current_seq,
-                mutable_mask=mutable_mask,
-            ).to(device=self.device)
+            current_seq = str(current_seq)
+            if (
+                sequence_from_logits_argmax(
+                    proposal_logits,
+                    current_seq=current_seq,
+                    mutable_mask=mutable_mask,
+                )
+                == current_seq
+            ):
+                logits = proposal_logits.detach().clone().to(device=self.device)
+            else:
+                logits = anchor_binder_logits_to_sequence(
+                    proposal_logits,
+                    current_seq,
+                    mutable_mask=mutable_mask,
+                ).to(device=self.device)
             return logits.unsqueeze(0).detach().clone().requires_grad_(True)
 
         logits = init_binder_logits(
@@ -561,6 +863,9 @@ class ESMFold2RuntimeBackend:
         target_seq: str,
         design: torch.Tensor,
         seed: Optional[int],
+        calculate_confidence: bool = False,
+        num_loops: Optional[int] = None,
+        num_sampling_steps: Optional[int] = None,
     ) -> dict[str, Any]:
         from esm.models.esmfold2 import ProteinInput, StructurePredictionInput, prepare_esmfold2_input
 
@@ -575,23 +880,33 @@ class ESMFold2RuntimeBackend:
                 ProteinInput(id="B", sequence=designed_seq, msa=None),
             ]
         )
-        features, _ = prepare_esmfold2_input(input_raw, seed=seed)
-        inputs = {
-            key: value.unsqueeze(0).to(self.device)
-            for key, value in features.items()
-            if isinstance(value, torch.Tensor)
-        }
-        inputs["res_type_soft"] = torch.cat((target_one_hot, padded_design), dim=1)
+        with _seed_context(seed):
+            features, _ = prepare_esmfold2_input(input_raw, seed=seed)
+            inputs = {
+                key: value.unsqueeze(0).to(self.device)
+                for key, value in features.items()
+                if isinstance(value, torch.Tensor)
+            }
+            inputs["res_type_soft"] = torch.cat((target_one_hot, padded_design), dim=1)
 
-        output = self.experimental_model(
-            **inputs,
-            num_diffusion_samples=1,
-            num_sampling_steps=int(self.config.num_sampling_steps),
-            num_loops=int(self.config.num_loops),
-            calculate_confidence=False,
-            seed=seed,
-        )
-        return {"distogram_logits": output["distogram_logits"]}
+            output = self.experimental_model(
+                **inputs,
+                num_diffusion_samples=1,
+                num_sampling_steps=int(num_sampling_steps or self.config.num_sampling_steps),
+                num_loops=int(num_loops or self.config.num_loops),
+                calculate_confidence=bool(calculate_confidence),
+                seed=seed,
+            )
+        result: dict[str, Any] = {"distogram_logits": output["distogram_logits"]}
+        for key in ("iptm", "ptm", "plddt", "pair_chain_iptm"):
+            if key in output:
+                result[key] = output.get(key)
+        if "pair_chains_iptm" in output:
+            result["pair_chain_iptm"] = _mean_target_to_binder_pair_iptm(
+                output.get("pair_chains_iptm"),
+                n_target_chains=1,
+            )
+        return result
 
     @lru_cache(maxsize=1)
     def _folding_tokens(self) -> tuple[str, ...]:

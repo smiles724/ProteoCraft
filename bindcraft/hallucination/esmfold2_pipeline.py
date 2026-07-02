@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import random
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -27,6 +28,7 @@ from bindcraft.hallucination.esmfold2_backend import (
     anchor_binder_logits_to_sequence,
     init_binder_logits,
     select_esmfold2_action_group,
+    sequence_from_logits_argmax,
 )
 from bindcraft.hallucination.mcts_legacy import LegacyMCTSTree
 from bindcraft.hallucination.mcts_controller import MCTSTree
@@ -34,6 +36,7 @@ from bindcraft.hallucination.mcts_controller import MCTSTree
 
 logger = logging.getLogger(__name__)
 VALID_ESM_BINDER_AAS = ESM_AA_ORDER.replace("C", "")
+ESMFOLD2_LOGIT_INIT_MODES = {"legacy_anchor", "official_free", "official_exact"}
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,9 @@ class _NoopArtifactRecorder:
     def write_mcts_action(self, **event: Any) -> None:
         return None
 
+    def write_soft_step(self, **event: Any) -> None:
+        return None
+
     def write_mcts_handoff(self, **event: Any) -> None:
         return None
 
@@ -84,6 +90,7 @@ class _ESMArtifactRecorder(_NoopArtifactRecorder):
         self.nodes_path = self.artifact_dir / "mcts_nodes.jsonl"
         self.edges_path = self.artifact_dir / "mcts_edges.jsonl"
         self.actions_path = self.artifact_dir / "mcts_actions.jsonl"
+        self.soft_steps_path = self.artifact_dir / "soft_steps.jsonl"
         self.handoff_path = self.artifact_dir / "mcts_handoff.jsonl"
         self.summary_path = self.artifact_dir / "run_summary.json"
         self.trajectory_path.write_text("", encoding="utf-8")
@@ -91,6 +98,7 @@ class _ESMArtifactRecorder(_NoopArtifactRecorder):
         self.nodes_path.write_text("", encoding="utf-8")
         self.edges_path.write_text("", encoding="utf-8")
         self.actions_path.write_text("", encoding="utf-8")
+        self.soft_steps_path.write_text("", encoding="utf-8")
         self.handoff_path.write_text("", encoding="utf-8")
 
     def write_step(self, **event: Any) -> None:
@@ -107,6 +115,9 @@ class _ESMArtifactRecorder(_NoopArtifactRecorder):
 
     def write_mcts_action(self, **event: Any) -> None:
         self._append_jsonl(self.actions_path, event)
+
+    def write_soft_step(self, **event: Any) -> None:
+        self._append_jsonl(self.soft_steps_path, event)
 
     def write_mcts_handoff(self, **event: Any) -> None:
         self._append_jsonl(self.handoff_path, event)
@@ -261,6 +272,25 @@ def _write_candidate_artifact(
         loss_dict=_loss_dict_for_artifact(result),
         summary_confidence=_summary_for_artifact(result),
     )
+
+
+def _write_soft_step_artifacts(
+    recorder: _NoopArtifactRecorder,
+    *,
+    stage: str,
+    step: Optional[int],
+    selected_sequence: str,
+    batch: ESMFold2ProposalBatch,
+    action_group: Optional[str] = None,
+) -> None:
+    for metric in list(getattr(batch, "soft_step_metrics", []) or []):
+        recorder.write_soft_step(
+            stage=stage,
+            step=step,
+            selected_sequence=str(selected_sequence),
+            action_group=action_group,
+            **dict(metric),
+        )
 
 
 def _mean_legacy_loss(node: Any) -> Optional[float]:
@@ -440,10 +470,63 @@ def _normalize_proposal_batch(raw: Any) -> ESMFold2ProposalBatch:
     return ESMFold2ProposalBatch(sequences=[str(sequence) for sequence in raw])
 
 
+def _proposal_confidence_records(batch: ESMFold2ProposalBatch) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for item in list(getattr(batch, "confidence_candidates", []) or []):
+        if not isinstance(item, dict):
+            continue
+        sequence = str(item.get("sequence", "")).strip().upper()
+        if not sequence:
+            continue
+        record = dict(item)
+        record["sequence"] = sequence
+        records.append(record)
+    records.sort(key=_proposal_confidence_score, reverse=True)
+    return records
+
+
+def _proposal_confidence_score(record: Dict[str, Any]) -> float:
+    for key in ("confidence_score", "pair_chain_iptm", "iptm"):
+        scalar = _finite_float(record.get(key))
+        if scalar is not None:
+            return float(scalar)
+    return float("-inf")
+
+
+def _proposal_sequences_from_batch(
+    batch: ESMFold2ProposalBatch,
+    *,
+    include_confidence: bool = True,
+) -> List[str]:
+    confidence_sequences = []
+    if include_confidence:
+        confidence_sequences = [
+            str(record["sequence"])
+            for record in _proposal_confidence_records(batch)
+        ]
+    ordinary_sequences = [str(sequence) for sequence in list(batch.sequences or [])]
+    return list(dict.fromkeys([*confidence_sequences, *ordinary_sequences]))
+
+
+def _proposal_confidence_summary(batch: ESMFold2ProposalBatch) -> Dict[str, Any]:
+    records = _proposal_confidence_records(batch)
+    if not records:
+        return {
+            "proposal_confidence_candidate_count": 0,
+            "proposal_confidence_best": None,
+        }
+    return {
+        "proposal_confidence_candidate_count": len(records),
+        "proposal_confidence_best": records[0],
+        "proposal_confidence_candidates": records,
+    }
+
+
 def _call_backend_propose(
     backend: Any,
     *,
     proposal_logits: Optional[torch.Tensor],
+    track_confidence_override: Optional[bool] = None,
     **kwargs: Any,
 ) -> ESMFold2ProposalBatch:
     propose_kwargs = dict(kwargs)
@@ -451,7 +534,29 @@ def _call_backend_propose(
         propose_kwargs["proposal_logits"] = (
             proposal_logits.detach().clone() if proposal_logits is not None else None
         )
+    if _callable_accepts_argument(backend.propose, "track_confidence_override"):
+        propose_kwargs["track_confidence_override"] = track_confidence_override
     raw = backend.propose(**propose_kwargs)
+    return _normalize_proposal_batch(raw)
+
+
+def _call_backend_continuous_design(
+    backend: Any,
+    *,
+    proposal_logits: Optional[torch.Tensor],
+    track_confidence_override: Optional[bool] = None,
+    **kwargs: Any,
+) -> ESMFold2ProposalBatch:
+    if not hasattr(backend, "continuous_design"):
+        raise ValueError("ESMFold2 continuous_stage_a requires backend.continuous_design")
+    design_kwargs = dict(kwargs)
+    if _callable_accepts_argument(backend.continuous_design, "proposal_logits"):
+        design_kwargs["proposal_logits"] = (
+            proposal_logits.detach().clone() if proposal_logits is not None else None
+        )
+    if _callable_accepts_argument(backend.continuous_design, "track_confidence_override"):
+        design_kwargs["track_confidence_override"] = track_confidence_override
+    raw = backend.continuous_design(**design_kwargs)
     return _normalize_proposal_batch(raw)
 
 
@@ -561,6 +666,187 @@ def _make_phase0_seed_sequences(
         if candidate not in seeds:
             seeds.append(candidate)
     return seeds
+
+
+def _normalize_logit_init_mode(mode: Optional[str]) -> str:
+    normalized = str(mode or "legacy_anchor").strip().lower()
+    if normalized not in ESMFOLD2_LOGIT_INIT_MODES:
+        raise ValueError(
+            "esmfold2_logit_init_mode must be one of: "
+            + ", ".join(sorted(ESMFOLD2_LOGIT_INIT_MODES))
+        )
+    return normalized
+
+
+@contextmanager
+def _torch_seed_context(seed: Optional[int], device: Optional[Union[str, torch.device]] = None):
+    devices: List[int] = []
+    if device is not None:
+        torch_device = torch.device(device)
+        if torch_device.type == "cuda" and torch.cuda.is_available():
+            devices = [torch_device.index if torch_device.index is not None else torch.cuda.current_device()]
+    with torch.random.fork_rng(devices=devices):
+        if seed is not None:
+            torch.manual_seed(int(seed))
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(int(seed))
+        yield
+
+
+def _make_official_free_phase0_seed_states(
+    *,
+    num_beams: int,
+    L_binder: int,
+    seed: Optional[int],
+    mutable_mask: Sequence[bool],
+    base_sequence: Optional[str] = None,
+) -> List[Tuple[str, torch.Tensor]]:
+    """Create official-style free mutable logits and matching argmax roots.
+
+    Fixed scaffold positions come from ``base_sequence`` and are hard anchored
+    by ``init_binder_logits``.  Mutable positions stay near-uniform/free and
+    the initial discrete residue is selected by row-wise argmax, matching the
+    ESMFold2 binder-design style more closely than anchoring mutable residues to
+    an arbitrary starting sequence.
+    """
+
+    if base_sequence is not None:
+        base_sequence = str(base_sequence).strip().upper()
+        if len(base_sequence) != int(L_binder):
+            raise ValueError(
+                f"init_binder_seq length {len(base_sequence)} does not match L_binder {L_binder}"
+            )
+        invalid = sorted(set(base_sequence) - set(ESM_AA_ORDER))
+        if invalid:
+            raise ValueError(f"Invalid amino acid(s) in init_binder_seq: {invalid}")
+    elif not all(bool(item) for item in mutable_mask):
+        raise ValueError(
+            "official_free ESMFold2 root initialization without init_binder_seq "
+            "requires all binder positions to be mutable"
+        )
+
+    base_rng = random.Random(seed)
+    states: List[Tuple[str, torch.Tensor]] = []
+    seen: set[str] = set()
+    attempts = 0
+    max_attempts = max(int(num_beams), 1) * 100
+    while len(states) < max(int(num_beams), 1) and attempts < max_attempts:
+        attempts += 1
+        base_seq = base_sequence or "".join(
+            base_rng.choice(VALID_ESM_BINDER_AAS) for _ in range(L_binder)
+        )
+        generator = torch.Generator()
+        generator.manual_seed(_stable_seed(seed, "esm_phase0_free_logits", attempts))
+        logits = init_binder_logits(
+            base_seq,
+            mutable_mask=mutable_mask,
+            batch_size=1,
+            random_scale=0.01,
+            requires_grad=False,
+            generator=generator,
+        )[0].detach().cpu()
+        seq = sequence_from_logits_argmax(
+            logits,
+            current_seq=base_seq,
+            mutable_mask=mutable_mask,
+        )
+        if seq in seen:
+            continue
+        seen.add(seq)
+        states.append((seq, logits))
+    if len(states) < max(int(num_beams), 1):
+        raise RuntimeError("failed to generate unique official_free ESMFold2 phase0 roots")
+    return states
+
+
+def _make_official_exact_phase0_seed_states(
+    *,
+    num_beams: int,
+    L_binder: int,
+    seed: Optional[int],
+    mutable_mask: Sequence[bool],
+    base_sequence: Optional[str] = None,
+    device: Optional[Union[str, torch.device]] = None,
+) -> List[Tuple[str, torch.Tensor]]:
+    """Create official-seed logits for exact official-binder-design diagnosis."""
+
+    if base_sequence is not None:
+        base_sequence = str(base_sequence).strip().upper()
+        if len(base_sequence) != int(L_binder):
+            raise ValueError(
+                f"init_binder_seq length {len(base_sequence)} does not match L_binder {L_binder}"
+            )
+        invalid = sorted(set(base_sequence) - set(ESM_AA_ORDER))
+        if invalid:
+            raise ValueError(f"Invalid amino acid(s) in init_binder_seq: {invalid}")
+    elif not all(bool(item) for item in mutable_mask):
+        raise ValueError(
+            "official_exact ESMFold2 root initialization without init_binder_seq "
+            "requires all binder positions to be mutable"
+        )
+
+    template_seq = base_sequence or ("A" * int(L_binder))
+    batch_size = max(int(num_beams), 1)
+    torch_device = torch.device(device) if device is not None else torch.device("cpu")
+    with _torch_seed_context(seed, torch_device):
+        logits_batch = init_binder_logits(
+            template_seq,
+            mutable_mask=mutable_mask,
+            batch_size=batch_size,
+            random_scale=0.01,
+            requires_grad=False,
+            device=torch_device,
+        ).detach().cpu()
+    states: List[Tuple[str, torch.Tensor]] = []
+    for idx in range(batch_size):
+        logits = logits_batch[idx]
+        seq = sequence_from_logits_argmax(
+            logits,
+            current_seq=template_seq,
+            mutable_mask=mutable_mask,
+        )
+        states.append((seq, logits))
+    return states
+
+
+def _make_phase0_seed_states(
+    init_binder_seq: Optional[str],
+    *,
+    num_beams: int,
+    L_binder: int,
+    seed: Optional[int],
+    mutable_mask: Sequence[bool],
+    logit_init_mode: str,
+    device: Optional[Union[str, torch.device]] = None,
+) -> List[Tuple[str, Optional[torch.Tensor]]]:
+    mode = _normalize_logit_init_mode(logit_init_mode)
+    if mode == "official_free":
+        return _make_official_free_phase0_seed_states(
+            num_beams=num_beams,
+            L_binder=L_binder,
+            seed=seed,
+            mutable_mask=mutable_mask,
+            base_sequence=init_binder_seq,
+        )
+    if mode == "official_exact":
+        return _make_official_exact_phase0_seed_states(
+            num_beams=num_beams,
+            L_binder=L_binder,
+            seed=seed,
+            mutable_mask=mutable_mask,
+            base_sequence=init_binder_seq,
+            device=device,
+        )
+    return [
+        (seq, None)
+        for seq in _make_phase0_seed_sequences(
+            init_binder_seq,
+            num_beams=num_beams,
+            L_binder=L_binder,
+            seed=seed,
+            mutable_mask=mutable_mask,
+        )
+    ]
 
 
 def _normalize_mutable_mask(
@@ -761,6 +1047,8 @@ def run_esmfold2_mcts_hallucination(
     seed: Optional[int] = 42,
     mutable_mask: Optional[Sequence[bool]] = None,
     artifact_dir: Optional[Union[str, os.PathLike[str]]] = None,
+    esmfold2_logit_init_mode: str = "legacy_anchor",
+    esmfold2_final_polish: bool = False,
 ) -> Tuple[str, str, List[float]]:
     """
     Run the first ESMFold2 closed-loop path.
@@ -773,7 +1061,8 @@ def run_esmfold2_mcts_hallucination(
     steps.  ``legacy`` is kept as a backwards-compatible alias for that mode.
     ``two_stage`` uses Stage A as bootstrap, then hands verified candidates to
     the action-level strict MCTS tree and uses ESMFold2-native group routing for
-    Stage B.
+    Stage B.  ``continuous_stage_a`` is a diagnostic mode: run one continuous
+    soft-logit update from the best phase0 root, then verify the argmax sequence.
     """
 
     if backend is None:
@@ -798,10 +1087,14 @@ def run_esmfold2_mcts_hallucination(
         strategy = "two_stage"
     if strategy == "legacy":
         strategy = "stage_a_only"
-    if strategy not in {"stage_a_only", "two_stage"}:
-        raise ValueError("ESMFold2 backend supports mcts_strategy stage_a_only or two_stage")
+    if strategy not in {"stage_a_only", "two_stage", "continuous_stage_a"}:
+        raise ValueError(
+            "ESMFold2 backend supports mcts_strategy stage_a_only, "
+            "two_stage, or continuous_stage_a"
+        )
     target_key = _normalize_target_key(target_seq)
     mutable_mask = _normalize_mutable_mask(mutable_mask, L_binder)
+    logit_init_mode = _normalize_logit_init_mode(esmfold2_logit_init_mode)
     artifact_recorder = _make_artifact_recorder(artifact_dir)
 
     tree = LegacyMCTSTree(C=mcts_C, max_nodes=mcts_max_nodes)
@@ -819,18 +1112,31 @@ def run_esmfold2_mcts_hallucination(
         stagea_max_mutations,
         stageb_max_mutations,
     )
-    logger.info("strategy=%s bootstrap_steps=%d max=%d", strategy, mcts_bootstrap_steps, mcts_bootstrap_max_steps)
+    logger.info(
+        "strategy=%s bootstrap_steps=%d max=%d logit_init=%s",
+        strategy,
+        mcts_bootstrap_steps,
+        mcts_bootstrap_max_steps,
+        logit_init_mode,
+    )
     logger.info("=" * 70)
 
-    phase0_seqs = _make_phase0_seed_sequences(
+    phase0_states = _make_phase0_seed_states(
         init_binder_seq,
         num_beams=num_beams,
         L_binder=L_binder,
         seed=seed,
         mutable_mask=mutable_mask,
+        logit_init_mode=logit_init_mode,
+        device=getattr(backend, "device", None) if logit_init_mode == "official_exact" else None,
     )
+    phase0_logits_by_sequence = {
+        str(seq): logits.detach().cpu().clone()
+        for seq, logits in phase0_states
+        if logits is not None
+    }
     phase0_results = []
-    for idx, binder_seq in enumerate(phase0_seqs):
+    for idx, (binder_seq, _) in enumerate(phase0_states):
         result = _verify_with_cache(
             backend,
             verifier_cache,
@@ -849,7 +1155,7 @@ def run_esmfold2_mcts_hallucination(
         logger.info(
             "ESM Phase0 %d/%d | seq=%s L=%.4f",
             idx + 1,
-            len(phase0_seqs),
+            len(phase0_states),
             binder_seq[:20],
             result.total_loss,
         )
@@ -858,7 +1164,9 @@ def run_esmfold2_mcts_hallucination(
     proposal_logits_by_sequence: Dict[str, torch.Tensor] = {}
     stagea_node_by_sequence: Dict[str, Any] = {}
     for result in phase0_results[: max(int(num_beams), 1)]:
-        root_logits = _initial_proposal_logits(result.binder_seq, mutable_mask)
+        root_logits = phase0_logits_by_sequence.get(str(result.binder_seq))
+        if root_logits is None:
+            root_logits = _initial_proposal_logits(result.binder_seq, mutable_mask)
         root_node = tree.add_root_node(
             sequence=result.binder_seq,
             logits=root_logits,
@@ -879,7 +1187,30 @@ def run_esmfold2_mcts_hallucination(
     best_result = phase0_results[0]
     best_seq = str(best_result.binder_seq)
     best_loss = float(best_result.total_loss)
+    best_logits = _anchor_proposal_logits(
+        proposal_logits_by_sequence.get(best_seq),
+        best_seq,
+        mutable_mask,
+    ).detach().cpu().clone()
+    proposal_logits_by_sequence[best_seq] = best_logits
     losses_history: List[float] = []
+
+    def _remember_global_best(result: Any, logits: Optional[torch.Tensor] = None) -> None:
+        nonlocal best_result, best_seq, best_loss, best_logits
+        seq = str(result.binder_seq)
+        source_logits = logits
+        if source_logits is None:
+            source_logits = proposal_logits_by_sequence.get(seq)
+        best_result = result
+        best_seq = seq
+        best_loss = float(result.total_loss)
+        best_logits = _anchor_proposal_logits(
+            source_logits,
+            seq,
+            mutable_mask,
+        ).detach().cpu().clone()
+        proposal_logits_by_sequence[seq] = best_logits
+
     artifact_recorder.write_step(
         stage="phase0",
         step=None,
@@ -888,6 +1219,7 @@ def run_esmfold2_mcts_hallucination(
         global_best_loss=best_loss,
         best_sequence=best_seq,
         selected_sequence=None,
+        logit_init_mode=logit_init_mode,
     )
     artifact_recorder.write_checkpoint(
         stage="phase0",
@@ -896,6 +1228,237 @@ def run_esmfold2_mcts_hallucination(
         result=best_result,
         is_global_best=True,
     )
+
+    def _run_final_polish_if_enabled(
+        *,
+        current_best_result: Any,
+        current_best_seq: str,
+        current_best_loss: float,
+    ) -> Tuple[Any, str, str, float]:
+        if not bool(esmfold2_final_polish):
+            return current_best_result, current_best_seq, current_best_seq, current_best_loss
+
+        polish_step = len(losses_history)
+        polish_seed = _stable_seed(seed, "esm_final_polish", target_key, current_best_seq)
+        polish_logits = (
+            best_logits
+            if current_best_seq == best_seq
+            else proposal_logits_by_sequence.get(current_best_seq)
+        )
+        polish_logits = _anchor_proposal_logits(
+            polish_logits,
+            current_best_seq,
+            mutable_mask,
+        ).detach().cpu().clone()
+
+        proposal_batch = _call_backend_continuous_design(
+            backend,
+            current_seq=current_best_seq,
+            target_seq=target_seq,
+            global_step=polish_step,
+            seed=polish_seed,
+            mutable_mask=mutable_mask,
+            proposal_logits=polish_logits,
+            track_confidence_override=True,
+        )
+        _write_soft_step_artifacts(
+            artifact_recorder,
+            stage="final_polish",
+            step=polish_step,
+            selected_sequence=current_best_seq,
+            batch=proposal_batch,
+        )
+        if proposal_batch.logits_after is not None:
+            proposal_logits_by_sequence[current_best_seq] = proposal_batch.logits_after.detach().cpu().clone()
+
+        candidates = [
+            _clip_sequence_by_mutable_mask(str(seq), mutable_mask, current_best_seq)
+            for seq in _proposal_sequences_from_batch(proposal_batch, include_confidence=True)
+        ]
+        candidates = list(dict.fromkeys(seq for seq in candidates if seq))
+        if not candidates:
+            candidates = [current_best_seq]
+
+        candidate_results = []
+        for cand_seq in candidates:
+            result = _verify_with_cache(
+                backend,
+                verifier_cache,
+                binder_seq=cand_seq,
+                target_seq=target_seq,
+                seed=_stable_seed(seed, "esm_final_polish_verify", target_key, cand_seq),
+            )
+            candidate_results.append(result)
+            _write_candidate_artifact(
+                artifact_recorder,
+                stage="final_polish",
+                step=polish_step,
+                parent_sequence=current_best_seq,
+                result=result,
+            )
+
+        round_best = min(candidate_results, key=lambda result: float(result.total_loss))
+        final_best_result = current_best_result
+        final_best_seq = current_best_seq
+        final_best_loss = current_best_loss
+        polish_improved = float(round_best.total_loss) < current_best_loss
+        if polish_improved:
+            final_best_result = round_best
+            final_best_seq = str(round_best.binder_seq)
+            final_best_loss = float(round_best.total_loss)
+            _remember_global_best(round_best, proposal_batch.logits_after)
+
+        losses_history.append(final_best_loss)
+        artifact_recorder.write_step(
+            stage="final_polish",
+            step=polish_step,
+            selected_sequence=current_best_seq,
+            candidate_count=len(candidate_results),
+            round_best_loss=float(round_best.total_loss),
+            global_best_loss=final_best_loss,
+            best_sequence=final_best_seq,
+            polish_sequence=str(round_best.binder_seq),
+            polish_improved=polish_improved,
+            **_proposal_confidence_summary(proposal_batch),
+        )
+        artifact_recorder.write_checkpoint(
+            stage="final_polish",
+            step=polish_step,
+            label="round_best",
+            result=round_best,
+            selected_sequence=current_best_seq,
+            parent_sequence=current_best_seq,
+            is_global_best=(str(round_best.binder_seq) == final_best_seq),
+        )
+        logger.info(
+            "ESM final polish | selected=%s K=%d round_best=%.4f global_best=%.4f",
+            current_best_seq[:20],
+            len(candidate_results),
+            float(round_best.total_loss),
+            final_best_loss,
+        )
+        return final_best_result, final_best_seq, final_best_seq, final_best_loss
+
+    if strategy == "continuous_stage_a":
+        selected_node = stagea_node_by_sequence.get(best_seq) or tree.select()
+        current_seq = str(selected_node.sequence)
+        proposal_batch = _call_backend_continuous_design(
+            backend,
+            current_seq=current_seq,
+            target_seq=target_seq,
+            global_step=0,
+            seed=_stable_seed(seed, "esm_continuous_stage_a", target_key, current_seq),
+            mutable_mask=mutable_mask,
+            proposal_logits=selected_node.logits,
+            track_confidence_override=None,
+        )
+        _write_soft_step_artifacts(
+            artifact_recorder,
+            stage="continuous_stage_a",
+            step=0,
+            selected_sequence=current_seq,
+            batch=proposal_batch,
+        )
+        if proposal_batch.logits_after is not None:
+            selected_node.logits = proposal_batch.logits_after.detach().cpu().clone()
+            proposal_logits_by_sequence[current_seq] = selected_node.logits
+        candidates = [
+            _clip_sequence_by_mutable_mask(str(seq), mutable_mask, current_seq)
+            for seq in _proposal_sequences_from_batch(proposal_batch)
+        ]
+        candidates = list(dict.fromkeys(seq for seq in candidates if seq))
+        if not candidates:
+            candidates = [current_seq]
+
+        candidate_results = []
+        for cand_seq in candidates:
+            result = _verify_with_cache(
+                backend,
+                verifier_cache,
+                binder_seq=cand_seq,
+                target_seq=target_seq,
+                seed=_stable_seed(seed, "esm_continuous_verify", target_key, cand_seq),
+            )
+            candidate_results.append(result)
+            _write_candidate_artifact(
+                artifact_recorder,
+                stage="continuous_stage_a",
+                step=0,
+                parent_sequence=current_seq,
+                result=result,
+            )
+
+        round_best = min(candidate_results, key=lambda result: float(result.total_loss))
+        expandable_results = [
+            result for result in candidate_results
+            if str(result.binder_seq) != current_seq
+        ]
+        if expandable_results:
+            new_nodes = tree.expand(selected_node, expandable_results)
+            for node in new_nodes:
+                node.logits = _anchor_proposal_logits(
+                    proposal_batch.logits_after,
+                    node.sequence,
+                    mutable_mask,
+                )
+                proposal_logits_by_sequence[str(node.sequence)] = node.logits
+                artifact_recorder.write_mcts_node(
+                    **_mcts_node_artifact(
+                        stage="continuous_stage_a",
+                        node=node,
+                        step_created=0,
+                        extra={"source": "continuous_argmax"},
+                    )
+                )
+                artifact_recorder.write_mcts_edge(
+                    **_mcts_edge_artifact(
+                        stage="continuous_stage_a",
+                        parent=selected_node,
+                        child=node,
+                        step_created=0,
+                    )
+                )
+            tree.backpropagate(selected_node, [float(result.total_loss) for result in expandable_results])
+        if float(round_best.total_loss) < best_loss:
+            _remember_global_best(round_best, proposal_batch.logits_after)
+        losses_history.append(best_loss)
+        artifact_recorder.write_step(
+            stage="continuous_stage_a",
+            step=0,
+            selected_node_id=int(selected_node.node_id),
+            selected_sequence=current_seq,
+            candidate_count=len(candidate_results),
+            round_best_loss=float(round_best.total_loss),
+            global_best_loss=best_loss,
+            best_sequence=best_seq,
+            **_proposal_confidence_summary(proposal_batch),
+        )
+        artifact_recorder.write_checkpoint(
+            stage="continuous_stage_a",
+            step=0,
+            label="round_best",
+            result=round_best,
+            selected_sequence=current_seq,
+            parent_sequence=current_seq,
+            is_global_best=(str(round_best.binder_seq) == best_seq),
+        )
+        artifact_recorder.write_summary(
+            best_sequence=best_seq,
+            final_sequence=str(round_best.binder_seq),
+            best_loss=best_loss,
+            n_steps=len(losses_history),
+            strategy=strategy,
+            artifact_dir=str(artifact_dir) if artifact_dir is not None else None,
+        )
+        logger.info(
+            "ESM continuous StageA | selected=%s round_best=%s round_best_loss=%.4f best=%.4f",
+            current_seq[:20],
+            str(round_best.binder_seq)[:20],
+            float(round_best.total_loss),
+            best_loss,
+        )
+        return best_seq, str(round_best.binder_seq), losses_history
+
     if strategy == "stage_a_only":
         stagea_steps = N_steps
     else:
@@ -926,17 +1489,29 @@ def run_esmfold2_mcts_hallucination(
             action_group=None,
             mutable_mask=mutable_mask,
             proposal_logits=selected_node.logits,
+            track_confidence_override=False,
+        )
+        _write_soft_step_artifacts(
+            artifact_recorder,
+            stage="stage_a",
+            step=step,
+            selected_sequence=current_seq,
+            batch=proposal_batch,
         )
         if proposal_batch.logits_after is not None:
             selected_node.logits = proposal_batch.logits_after.detach().cpu().clone()
             proposal_logits_by_sequence[current_seq] = selected_node.logits
-        candidates = list(proposal_batch.sequences)
+        candidates = _proposal_sequences_from_batch(proposal_batch, include_confidence=False)
         candidates = [
             _clip_sequence_by_mutable_mask(str(seq), mutable_mask, current_seq)
             for seq in candidates
         ]
         candidates = [seq for seq in candidates if seq != current_seq]
-        candidates = list(dict.fromkeys(candidates))[:B_candidates]
+        candidate_limit = max(
+            int(B_candidates),
+            0,
+        )
+        candidates = list(dict.fromkeys(candidates))[:candidate_limit]
         if not candidates:
             logger.warning("ESM StageA step %d: no candidates from backend", step)
             losses_history.append(best_loss)
@@ -991,9 +1566,7 @@ def run_esmfold2_mcts_hallucination(
 
         round_best = min(round_results, key=lambda result: result.total_loss)
         if float(round_best.total_loss) < best_loss:
-            best_result = round_best
-            best_seq = str(round_best.binder_seq)
-            best_loss = float(round_best.total_loss)
+            _remember_global_best(round_best)
         if best_loss < stagea_best - float(mcts_bootstrap_min_delta):
             stagea_best = best_loss
             stagea_stale = 0
@@ -1009,6 +1582,7 @@ def run_esmfold2_mcts_hallucination(
             round_best_loss=float(round_best.total_loss),
             global_best_loss=best_loss,
             best_sequence=best_seq,
+            **_proposal_confidence_summary(proposal_batch),
         )
         artifact_recorder.write_checkpoint(
             stage="stage_a",
@@ -1038,15 +1612,20 @@ def run_esmfold2_mcts_hallucination(
             break
 
     if strategy == "stage_a_only" or len(losses_history) >= N_steps:
+        best_result, best_seq, final_seq, best_loss = _run_final_polish_if_enabled(
+            current_best_result=best_result,
+            current_best_seq=best_seq,
+            current_best_loss=best_loss,
+        )
         artifact_recorder.write_summary(
             best_sequence=best_seq,
-            final_sequence=best_seq,
+            final_sequence=final_seq,
             best_loss=best_loss,
             n_steps=len(losses_history),
             strategy=strategy,
             artifact_dir=str(artifact_dir) if artifact_dir is not None else None,
         )
-        return best_seq, best_seq, losses_history
+        return best_seq, final_seq, losses_history
 
     handoff_k = int(mcts_handoff_top_k or num_beams)
     handoff_results = _top_handoff_results(
@@ -1163,12 +1742,21 @@ def run_esmfold2_mcts_hallucination(
                 action_group=group_name,
                 mutable_mask=mutable_mask,
                 proposal_logits=selected_node.logits,
+                track_confidence_override=False,
+            )
+            _write_soft_step_artifacts(
+                artifact_recorder,
+                stage="stage_b",
+                step=step,
+                selected_sequence=current_seq,
+                batch=proposal_batch,
+                action_group=group_name,
             )
             if proposal_batch.logits_after is not None and (
                 selected_update_logits is None or group_name == action_group
             ):
                 selected_update_logits = proposal_batch.logits_after.detach().cpu().clone()
-            candidates = list(proposal_batch.sequences)
+            candidates = _proposal_sequences_from_batch(proposal_batch, include_confidence=False)
             candidates = [
                 _clip_sequence_by_mutable_mask(str(seq), mutable_mask, current_seq)
                 for seq in candidates
@@ -1309,9 +1897,7 @@ def run_esmfold2_mcts_hallucination(
         if round_results:
             round_best = min(round_results, key=lambda result: float(result.total_loss))
             if float(round_best.total_loss) < best_loss:
-                best_result = round_best
-                best_seq = str(round_best.binder_seq)
-                best_loss = float(round_best.total_loss)
+                _remember_global_best(round_best)
         losses_history.append(best_loss)
         artifact_recorder.write_step(
             stage="stage_b",
@@ -1359,12 +1945,17 @@ def run_esmfold2_mcts_hallucination(
             best_loss,
         )
 
+    best_result, best_seq, final_seq, best_loss = _run_final_polish_if_enabled(
+        current_best_result=best_result,
+        current_best_seq=best_seq,
+        current_best_loss=best_loss,
+    )
     artifact_recorder.write_summary(
         best_sequence=best_seq,
-        final_sequence=best_seq,
+        final_sequence=final_seq,
         best_loss=best_loss,
         n_steps=len(losses_history),
         strategy=strategy,
         artifact_dir=str(artifact_dir) if artifact_dir is not None else None,
     )
-    return best_seq, best_seq, losses_history
+    return best_seq, final_seq, losses_history

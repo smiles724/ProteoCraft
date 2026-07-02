@@ -12,6 +12,7 @@ from bindcraft.hallucination.esmfold2_backend import (
     esm_temperature,
     init_binder_logits,
     logit_delta_mutation_scores,
+    normalized_gradient_tensor,
     propose_sequences_from_logit_delta,
     resolve_esm_verifier_loss,
     resolve_lambda_esmc,
@@ -144,6 +145,23 @@ def test_combine_normalized_gradients_respects_mask_and_task_lambda():
     )
 
 
+def test_normalized_gradient_tensor_matches_official_eff_length_scaling():
+    mask = torch.zeros(1, 3, 20)
+    mask[0, 0, 0] = 1.0
+    mask[0, 2, 1] = 1.0
+    grad = torch.zeros_like(mask)
+    grad[0, 0, 0] = 3.0
+    grad[0, 2, 1] = 4.0
+
+    normalized = normalized_gradient_tensor(grad, mask)
+
+    expected_scale = (2.0 ** 0.5) / 5.0
+    assert normalized[0, 0, 0].item() == pytest.approx(3.0 * expected_scale)
+    assert normalized[0, 2, 1].item() == pytest.approx(4.0 * expected_scale)
+    assert torch.linalg.vector_norm(normalized).item() == pytest.approx(2.0 ** 0.5)
+    assert normalized[0, 1, :].sum().item() == pytest.approx(0.0)
+
+
 def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     default_config = ESMFold2ProposalConfig(lambda_esmc="auto")
     assert default_config.soft_steps == 5
@@ -178,6 +196,31 @@ def test_logit_delta_candidates_reuse_stage_a_topk_sampling_contract():
 
     assert len(candidates) == 3
     assert "AYD" in candidates
+    assert all(seq[0] == "A" for seq in candidates)
+
+
+def test_logit_delta_candidates_prepend_full_argmax_sequence():
+    aa_to_idx = {aa: idx for idx, aa in enumerate(ESM_AA_ORDER)}
+    before = torch.zeros(3, 20)
+    after = before.clone()
+    after[1, aa_to_idx["Y"]] = 3.0
+    after[2, aa_to_idx["F"]] = 2.5
+
+    torch.manual_seed(0)
+    candidates = propose_sequences_from_logit_delta(
+        before,
+        after,
+        current_seq="ALD",
+        mutable_mask=[False, True, True],
+        K_top=2,
+        B_candidates=3,
+        T_sample=0.01,
+        max_mutations_per_seq=1,
+        include_logit_candidates=True,
+    )
+
+    assert candidates[0] == "AYF"
+    assert len(candidates) == 3
     assert all(seq[0] == "A" for seq in candidates)
 
 
