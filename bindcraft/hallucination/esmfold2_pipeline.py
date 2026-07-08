@@ -527,6 +527,7 @@ def _call_backend_propose(
     *,
     proposal_logits: Optional[torch.Tensor],
     track_confidence_override: Optional[bool] = None,
+    soft_steps_override: Optional[int] = None,
     **kwargs: Any,
 ) -> ESMFold2ProposalBatch:
     propose_kwargs = dict(kwargs)
@@ -536,6 +537,8 @@ def _call_backend_propose(
         )
     if _callable_accepts_argument(backend.propose, "track_confidence_override"):
         propose_kwargs["track_confidence_override"] = track_confidence_override
+    if _callable_accepts_argument(backend.propose, "soft_steps_override"):
+        propose_kwargs["soft_steps_override"] = soft_steps_override
     raw = backend.propose(**propose_kwargs)
     return _normalize_proposal_batch(raw)
 
@@ -545,6 +548,7 @@ def _call_backend_continuous_design(
     *,
     proposal_logits: Optional[torch.Tensor],
     track_confidence_override: Optional[bool] = None,
+    soft_steps_override: Optional[int] = None,
     **kwargs: Any,
 ) -> ESMFold2ProposalBatch:
     if not hasattr(backend, "continuous_design"):
@@ -556,6 +560,8 @@ def _call_backend_continuous_design(
         )
     if _callable_accepts_argument(backend.continuous_design, "track_confidence_override"):
         design_kwargs["track_confidence_override"] = track_confidence_override
+    if _callable_accepts_argument(backend.continuous_design, "soft_steps_override"):
+        design_kwargs["soft_steps_override"] = soft_steps_override
     raw = backend.continuous_design(**design_kwargs)
     return _normalize_proposal_batch(raw)
 
@@ -1048,6 +1054,8 @@ def run_esmfold2_mcts_hallucination(
     mutable_mask: Optional[Sequence[bool]] = None,
     artifact_dir: Optional[Union[str, os.PathLike[str]]] = None,
     esmfold2_logit_init_mode: str = "legacy_anchor",
+    esmfold2_stagea_soft_steps: Optional[int] = None,
+    esmfold2_stageb_soft_steps: Optional[int] = None,
     esmfold2_final_polish: bool = False,
 ) -> Tuple[str, str, List[float]]:
     """
@@ -1095,6 +1103,20 @@ def run_esmfold2_mcts_hallucination(
     target_key = _normalize_target_key(target_seq)
     mutable_mask = _normalize_mutable_mask(mutable_mask, L_binder)
     logit_init_mode = _normalize_logit_init_mode(esmfold2_logit_init_mode)
+    stagea_soft_steps = (
+        int(esmfold2_stagea_soft_steps)
+        if esmfold2_stagea_soft_steps is not None
+        else None
+    )
+    stageb_soft_steps = (
+        int(esmfold2_stageb_soft_steps)
+        if esmfold2_stageb_soft_steps is not None
+        else stagea_soft_steps
+    )
+    if stagea_soft_steps is not None and stagea_soft_steps <= 0:
+        raise ValueError("esmfold2_stagea_soft_steps must be positive")
+    if stageb_soft_steps is not None and stageb_soft_steps <= 0:
+        raise ValueError("esmfold2_stageb_soft_steps must be positive")
     artifact_recorder = _make_artifact_recorder(artifact_dir)
 
     tree = LegacyMCTSTree(C=mcts_C, max_nodes=mcts_max_nodes)
@@ -1118,6 +1140,11 @@ def run_esmfold2_mcts_hallucination(
         mcts_bootstrap_steps,
         mcts_bootstrap_max_steps,
         logit_init_mode,
+    )
+    logger.info(
+        "ESMFold2 soft_steps: stage_a=%s stage_b=%s",
+        str(stagea_soft_steps or "backend_default"),
+        str(stageb_soft_steps or "backend_default"),
     )
     logger.info("=" * 70)
 
@@ -1260,6 +1287,7 @@ def run_esmfold2_mcts_hallucination(
             mutable_mask=mutable_mask,
             proposal_logits=polish_logits,
             track_confidence_override=True,
+            soft_steps_override=stagea_soft_steps,
         )
         _write_soft_step_artifacts(
             artifact_recorder,
@@ -1351,6 +1379,7 @@ def run_esmfold2_mcts_hallucination(
             mutable_mask=mutable_mask,
             proposal_logits=selected_node.logits,
             track_confidence_override=None,
+            soft_steps_override=stagea_soft_steps,
         )
         _write_soft_step_artifacts(
             artifact_recorder,
@@ -1490,6 +1519,7 @@ def run_esmfold2_mcts_hallucination(
             mutable_mask=mutable_mask,
             proposal_logits=selected_node.logits,
             track_confidence_override=False,
+            soft_steps_override=stagea_soft_steps,
         )
         _write_soft_step_artifacts(
             artifact_recorder,
@@ -1743,6 +1773,7 @@ def run_esmfold2_mcts_hallucination(
                 mutable_mask=mutable_mask,
                 proposal_logits=selected_node.logits,
                 track_confidence_override=False,
+                soft_steps_override=stageb_soft_steps,
             )
             _write_soft_step_artifacts(
                 artifact_recorder,

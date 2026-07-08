@@ -24,6 +24,13 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
 
     assert args.model_backend == "esmfold2"
     assert resolve_model_backend(args, parser) == "esmfold2"
+    assert args.esmfold2_soft_steps is None
+    assert args.esmfold2_stagea_soft_steps == 30
+    assert args.esmfold2_stageb_soft_steps == 5
+    assert args.esmfold2_logit_init_mode == "official_exact"
+    assert args.esmfold2_proposal_load_internal_esmc is True
+    assert args.esmfold2_proposal_lm_dropout == pytest.approx(0.5)
+    assert args.esmfold2_force_proposal_lm_dropout is True
 
 
 def test_esmfold2_backend_accepts_explicit_stage_a_only_strategy():
@@ -40,6 +47,23 @@ def test_esmfold2_backend_accepts_explicit_stage_a_only_strategy():
 
     assert resolve_model_backend(args, parser) == "esmfold2"
     assert args.mcts_strategy == "stage_a_only"
+
+
+def test_esmfold2_legacy_soft_steps_override_sets_both_stages():
+    args, parser = _parse(
+        [
+            "--model_backend",
+            "esmfold2",
+            "--mode",
+            "mcts",
+            "--esmfold2_soft_steps",
+            "2",
+        ]
+    )
+
+    assert resolve_model_backend(args, parser) == "esmfold2"
+    assert args.esmfold2_stagea_soft_steps == 2
+    assert args.esmfold2_stageb_soft_steps == 2
 
 
 def test_esmfold2_backend_rejects_non_mcts_modes_until_pipeline_exists():
@@ -62,6 +86,10 @@ def test_esmfold2_backend_exposes_separate_model_and_proposal_options():
             "biohub/ESMFold2-Experimental-Fast",
             "--esmfold2_soft_steps",
             "2",
+            "--esmfold2_stagea_soft_steps",
+            "30",
+            "--esmfold2_stageb_soft_steps",
+            "5",
             "--esmfold2_lambda_esmc",
             "0.2",
             "--esmfold2_task_type",
@@ -107,6 +135,8 @@ def test_esmfold2_backend_exposes_separate_model_and_proposal_options():
     assert args.esmfold2_verifier_model == "biohub/ESMFold2-Fast"
     assert args.esmfold2_experimental_model == "biohub/ESMFold2-Experimental-Fast"
     assert args.esmfold2_soft_steps == 2
+    assert args.esmfold2_stagea_soft_steps == 30
+    assert args.esmfold2_stageb_soft_steps == 5
     assert args.esmfold2_lambda_esmc == "0.2"
     assert args.esmfold2_task_type == "tcr"
     assert args.esmfold2_logit_init_mode == "legacy_anchor"
@@ -219,7 +249,9 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     assert captured["stagea_max_mutations_per_seq"] == 7
     assert captured["stageb_max_mutations_per_seq"] == 1
     assert captured["mutable_mask"] == [False, True, True]
-    assert captured["esmfold2_logit_init_mode"] == "official_free"
+    assert captured["esmfold2_logit_init_mode"] == "official_exact"
+    assert captured["esmfold2_stagea_soft_steps"] == 30
+    assert captured["esmfold2_stageb_soft_steps"] == 5
     assert captured["task_type_arg"] == "tcr"
 
 

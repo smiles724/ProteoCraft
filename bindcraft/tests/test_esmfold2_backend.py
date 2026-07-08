@@ -164,7 +164,9 @@ def test_normalized_gradient_tensor_matches_official_eff_length_scaling():
 
 def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     default_config = ESMFold2ProposalConfig(lambda_esmc="auto")
-    assert default_config.soft_steps == 5
+    assert default_config.soft_steps == 30
+    assert default_config.proposal_lm_dropout == pytest.approx(0.5)
+    assert default_config.force_proposal_lm_dropout is True
     assert default_config.experimental_model_name.endswith("ESMFold2-Experimental")
 
     config = ESMFold2ProposalConfig(soft_steps=3, lambda_esmc="auto")

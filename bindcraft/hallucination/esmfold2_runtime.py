@@ -318,6 +318,7 @@ class ESMFold2RuntimeBackend:
         action_group: Optional[str] = None,
         proposal_logits: Optional[torch.Tensor] = None,
         track_confidence_override: Optional[bool] = None,
+        soft_steps_override: Optional[int] = None,
     ) -> ESMFold2ProposalBatch:
         logits_before, logits_after, confidence_candidates, soft_step_metrics = self._run_soft_update_with_tracking(
             current_seq=current_seq,
@@ -328,6 +329,7 @@ class ESMFold2RuntimeBackend:
             action_group=action_group,
             proposal_logits=proposal_logits,
             track_confidence_override=track_confidence_override,
+            soft_steps_override=soft_steps_override,
         )
         confidence_sequences = self._top_confidence_sequences(confidence_candidates)
         candidates = propose_sequences_from_logit_delta(
@@ -360,6 +362,7 @@ class ESMFold2RuntimeBackend:
         mutable_mask: Optional[Sequence[bool]] = None,
         proposal_logits: Optional[torch.Tensor] = None,
         track_confidence_override: Optional[bool] = None,
+        soft_steps_override: Optional[int] = None,
     ) -> ESMFold2ProposalBatch:
         """Run one continuous ESMFold2 soft-logit trajectory and discretize it.
 
@@ -376,6 +379,7 @@ class ESMFold2RuntimeBackend:
             action_group=None,
             proposal_logits=proposal_logits,
             track_confidence_override=track_confidence_override,
+            soft_steps_override=soft_steps_override,
         )
         sequence = sequence_from_logits_argmax(
             logits_after,
@@ -406,13 +410,10 @@ class ESMFold2RuntimeBackend:
         replace the full ESMFold2 verifier score.
         """
 
-        targets = _target_sequences(target_seq)
-        if len(targets) != 1:
-            raise ValueError("ESMFold2 preview routing currently supports one target chain")
         self._ensure_proposal_models_loaded()
         design = self._sequence_to_design_one_hot(binder_seq)
         fold_result = self._fold_distogram(
-            target_seq=targets[0],
+            target_seq=target_seq,
             design=design,
             seed=seed,
         )
@@ -572,6 +573,7 @@ class ESMFold2RuntimeBackend:
         action_group: Optional[str],
         proposal_logits: Optional[torch.Tensor],
         track_confidence_override: Optional[bool] = None,
+        soft_steps_override: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]], List[Dict[str, Any]]]:
         track_confidence = bool(getattr(self.config, "track_proposal_confidence", False))
         if track_confidence_override is not None:
@@ -585,6 +587,7 @@ class ESMFold2RuntimeBackend:
             action_group=action_group,
             proposal_logits=proposal_logits,
             track_confidence=track_confidence,
+            soft_steps_override=soft_steps_override,
         )
 
     def _run_soft_update_impl(
@@ -598,6 +601,7 @@ class ESMFold2RuntimeBackend:
         action_group: Optional[str],
         proposal_logits: Optional[torch.Tensor],
         track_confidence: bool,
+        soft_steps_override: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]], List[Dict[str, Any]]]:
         if self.soft_update_fn is not None:
             kwargs = dict(
@@ -610,12 +614,12 @@ class ESMFold2RuntimeBackend:
             )
             if _callable_accepts_argument(self.soft_update_fn, "proposal_logits"):
                 kwargs["proposal_logits"] = proposal_logits
+            if _callable_accepts_argument(self.soft_update_fn, "soft_steps_override"):
+                kwargs["soft_steps_override"] = soft_steps_override
             logits_before, logits_after = self.soft_update_fn(**kwargs)
             return logits_before, logits_after, [], []
 
         targets = _target_sequences(target_seq)
-        if len(targets) != 1:
-            raise ValueError("ESMFold2 proposal-gradient first version supports one target chain")
         self._ensure_proposal_models_loaded()
 
         logits = self._init_current_sequence_logits(
@@ -634,12 +638,19 @@ class ESMFold2RuntimeBackend:
         lambda_esmc = resolve_lambda_esmc(self.config.lambda_esmc, task_type=self.task_type)
         confidence_candidates: List[Dict[str, Any]] = []
         soft_step_metrics: List[Dict[str, Any]] = []
+        soft_steps = (
+            int(soft_steps_override)
+            if soft_steps_override is not None
+            else int(self.config.soft_steps)
+        )
+        if soft_steps <= 0:
+            raise ValueError("ESMFold2 soft steps must be positive")
 
-        for local_step in range(int(self.config.soft_steps)):
+        for local_step in range(soft_steps):
             optimizer.zero_grad()
             temperature = esm_temperature(
                 local_step,
-                total_steps=int(self.config.soft_steps),
+                total_steps=soft_steps,
                 temperature_min=float(self.config.temperature_min),
                 temperature_max=float(self.config.temperature_max),
             )
@@ -647,10 +658,11 @@ class ESMFold2RuntimeBackend:
                 track_confidence=track_confidence,
                 local_step=local_step,
                 temperature=temperature,
+                soft_steps=soft_steps,
             )
             design = F.softmax(logits / temperature, dim=-1)
             fold_result = self._fold_distogram(
-                target_seq=targets[0],
+                target_seq=targets,
                 design=design,
                 seed=None if seed is None else int(seed) + int(global_step) + local_step,
                 calculate_confidence=should_track_confidence,
@@ -742,13 +754,15 @@ class ESMFold2RuntimeBackend:
         track_confidence: bool,
         local_step: int,
         temperature: float,
+        soft_steps: Optional[int] = None,
     ) -> bool:
         if not track_confidence:
             return False
-        last_step = int(self.config.soft_steps) - 1
+        total_soft_steps = int(soft_steps if soft_steps is not None else self.config.soft_steps)
+        last_step = total_soft_steps - 1
         tail_steps = int(getattr(self.config, "proposal_confidence_tail_steps", 0) or 0)
         if tail_steps > 0:
-            first_tail_step = max(0, int(self.config.soft_steps) - tail_steps)
+            first_tail_step = max(0, total_soft_steps - tail_steps)
             if int(local_step) < first_tail_step:
                 return False
         elif float(temperature) > float(self.config.proposal_confidence_temperature):
@@ -860,7 +874,7 @@ class ESMFold2RuntimeBackend:
     def _fold_distogram(
         self,
         *,
-        target_seq: str,
+        target_seq: Union[str, Sequence[str]],
         design: torch.Tensor,
         seed: Optional[int],
         calculate_confidence: bool = False,
@@ -869,15 +883,26 @@ class ESMFold2RuntimeBackend:
     ) -> dict[str, Any]:
         from esm.models.esmfold2 import ProteinInput, StructurePredictionInput, prepare_esmfold2_input
 
-        target_one_hot = self._sequence_to_folding_one_hot(target_seq)
+        targets = _target_sequences(target_seq)
+        if not targets:
+            raise ValueError("ESMFold2 target sequence is empty")
+        if len(targets) + 1 > len(CHAIN_IDS):
+            raise ValueError("Too many chains for first ESMFold2 backend")
+        target_one_hot = torch.cat(
+            [self._sequence_to_folding_one_hot(sequence) for sequence in targets],
+            dim=1,
+        )
         padded_design = F.pad(design, (2, 11), mode="constant", value=0.0)
         token_ids = torch.argmax(padded_design, dim=-1)
         token_to_aa = self._folding_tokens_to_aa()
         designed_seq = "".join(token_to_aa[int(token.item())] for token in token_ids[0])
         input_raw = StructurePredictionInput(
             sequences=[
-                ProteinInput(id="A", sequence=target_seq, msa=None),
-                ProteinInput(id="B", sequence=designed_seq, msa=None),
+                *(
+                    ProteinInput(id=CHAIN_IDS[idx], sequence=sequence, msa=None)
+                    for idx, sequence in enumerate(targets)
+                ),
+                ProteinInput(id=CHAIN_IDS[len(targets)], sequence=designed_seq, msa=None),
             ]
         )
         with _seed_context(seed):
@@ -904,7 +929,7 @@ class ESMFold2RuntimeBackend:
         if "pair_chains_iptm" in output:
             result["pair_chain_iptm"] = _mean_target_to_binder_pair_iptm(
                 output.get("pair_chains_iptm"),
-                n_target_chains=1,
+                n_target_chains=len(targets),
             )
         return result
 

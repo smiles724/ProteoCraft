@@ -79,7 +79,7 @@ class ESMFold2ProposalConfig:
     verifier_model_name: str = "biohub/ESMFold2"
     verifier_num_loops: int = 20
     verifier_num_sampling_steps: int = 200
-    soft_steps: int = 5
+    soft_steps: int = 30
     learning_rate: float = 0.1
     temperature_min: float = 1e-2
     temperature_max: float = 1.0
@@ -89,8 +89,8 @@ class ESMFold2ProposalConfig:
     num_loops: int = 1
     num_sampling_steps: int = 1
     proposal_load_internal_esmc: bool = True
-    proposal_lm_dropout: Optional[float] = None
-    force_proposal_lm_dropout: bool = False
+    proposal_lm_dropout: Optional[float] = 0.5
+    force_proposal_lm_dropout: bool = True
     stageb_group_weight: float = 1.0
     track_proposal_confidence: bool = False
     proposal_confidence_temperature: float = 0.05

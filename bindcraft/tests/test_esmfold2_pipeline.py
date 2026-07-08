@@ -66,6 +66,7 @@ class FakeESMFold2Backend:
         mutable_mask=None,
         proposal_logits=None,
         track_confidence_override=None,
+        soft_steps_override=None,
     ):
         self.propose_calls.append(
             {
@@ -78,6 +79,7 @@ class FakeESMFold2Backend:
                 "max_mutations_per_seq": max_mutations_per_seq,
                 "proposal_logits": proposal_logits.detach().clone() if proposal_logits is not None else None,
                 "track_confidence_override": track_confidence_override,
+                "soft_steps_override": soft_steps_override,
             }
         )
         if current_seq == "AAA":
@@ -96,6 +98,7 @@ class FakeESMFold2Backend:
         mutable_mask=None,
         proposal_logits=None,
         track_confidence_override=None,
+        soft_steps_override=None,
     ):
         self.continuous_calls.append(
             {
@@ -106,6 +109,7 @@ class FakeESMFold2Backend:
                 "mutable_mask": mutable_mask,
                 "proposal_logits": proposal_logits.detach().clone() if proposal_logits is not None else None,
                 "track_confidence_override": track_confidence_override,
+                "soft_steps_override": soft_steps_override,
             }
         )
         logits = (
@@ -734,6 +738,35 @@ def test_esmfold2_two_stage_uses_separate_stagea_and_stageb_mutation_budgets():
     assert backend.propose_calls[0]["max_mutations_per_seq"] == 6
     assert backend.propose_calls[1]["action_group"] == "interface_formation"
     assert backend.propose_calls[1]["max_mutations_per_seq"] == 1
+
+
+def test_esmfold2_two_stage_uses_separate_stagea_and_stageb_soft_steps():
+    backend = FakeESMFold2Backend()
+
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=3,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=2,
+        T_sample=1.0,
+        max_mutations_per_seq=3,
+        seed=7,
+        mcts_strategy="two_stage",
+        mcts_bootstrap_steps=1,
+        mcts_bootstrap_max_steps=1,
+        mcts_expand_actions_per_step=1,
+        esmfold2_stagea_soft_steps=30,
+        esmfold2_stageb_soft_steps=5,
+    )
+
+    assert backend.propose_calls[0]["action_group"] is None
+    assert backend.propose_calls[0]["soft_steps_override"] == 30
+    assert backend.propose_calls[1]["action_group"] == "interface_formation"
+    assert backend.propose_calls[1]["soft_steps_override"] == 5
 
 
 def test_esmfold2_pipeline_persists_node_local_logits_between_stagea_visits():

@@ -376,6 +376,73 @@ def test_runtime_continuous_design_records_soft_step_metrics(monkeypatch):
     assert "temperature" in batch.soft_step_metrics[0]
 
 
+def test_runtime_continuous_design_accepts_multiple_target_chains(monkeypatch):
+    captured = {}
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(
+            soft_steps=1,
+            lambda_esmc=0.0,
+            num_loops=1,
+            num_sampling_steps=1,
+        ),
+        device="cpu",
+        experimental_model=object(),
+    )
+    monkeypatch.setattr(backend, "_ensure_proposal_models_loaded", lambda: None)
+
+    def fake_fold_distogram(**kwargs):
+        captured["target_seq"] = kwargs["target_seq"]
+        targets = esmfold2_runtime_module._target_sequences(kwargs["target_seq"])
+        design = kwargs["design"]
+        full_len = sum(len(seq) for seq in targets) + design.shape[1]
+        bins = torch.arange(128, dtype=design.dtype, device=design.device)
+        signal = design[..., 0].sum()
+        distogram = signal * bins.reshape(1, 1, 1, -1).expand(1, full_len, full_len, 128)
+        return {"distogram_logits": distogram}
+
+    monkeypatch.setattr(backend, "_fold_distogram", fake_fold_distogram)
+
+    batch = backend.continuous_design(
+        current_seq="AAA",
+        target_seq=["TT", "GGG"],
+        global_step=0,
+        seed=5,
+        mutable_mask=[True, True, True],
+        proposal_logits=torch.zeros(3, 20),
+    )
+
+    assert captured["target_seq"] == ["TT", "GGG"]
+    assert batch.sequences
+    assert len(batch.soft_step_metrics) == 1
+
+
+def test_preview_loss_dict_accepts_multiple_target_chains(monkeypatch):
+    captured = {}
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(),
+        device="cpu",
+        experimental_model=object(),
+    )
+    monkeypatch.setattr(backend, "_ensure_proposal_models_loaded", lambda: None)
+
+    def fake_fold_distogram(**kwargs):
+        captured["target_seq"] = kwargs["target_seq"]
+        targets = esmfold2_runtime_module._target_sequences(kwargs["target_seq"])
+        full_len = sum(len(seq) for seq in targets) + len("AAA")
+        return {"distogram_logits": torch.zeros(1, full_len, full_len, 128)}
+
+    monkeypatch.setattr(backend, "_fold_distogram", fake_fold_distogram)
+
+    losses = backend.preview_loss_dict(
+        binder_seq="AAA",
+        target_seq=["TT", "GGG"],
+        seed=5,
+    )
+
+    assert captured["target_seq"] == ["TT", "GGG"]
+    assert set(losses) == {"intra_contact_loss", "inter_contact_loss", "glob_loss"}
+
+
 def test_fold_distogram_uses_seed_context(monkeypatch):
     entered = []
 
@@ -434,6 +501,66 @@ def test_fold_distogram_uses_seed_context(monkeypatch):
     )
 
     assert entered == [123]
+
+
+def test_fold_distogram_accepts_multiple_target_chains(monkeypatch):
+    captured = {}
+
+    class FakeProteinInput:
+        def __init__(self, *, id, sequence, msa=None):
+            self.id = id
+            self.sequence = sequence
+            self.msa = msa
+
+    class FakeStructurePredictionInput:
+        def __init__(self, *, sequences):
+            self.sequences = sequences
+
+    def fake_prepare(input_raw, seed=None):
+        captured["input_raw"] = input_raw
+        return {"dummy": torch.tensor([1.0])}, None
+
+    module = types.ModuleType("esm.models.esmfold2")
+    module.ProteinInput = FakeProteinInput
+    module.StructurePredictionInput = FakeStructurePredictionInput
+    module.prepare_esmfold2_input = fake_prepare
+    monkeypatch.setitem(sys.modules, "esm", types.ModuleType("esm"))
+    monkeypatch.setitem(sys.modules, "esm.models", types.ModuleType("esm.models"))
+    monkeypatch.setitem(sys.modules, "esm.models.esmfold2", module)
+
+    class FakeExperimentalModel:
+        def __call__(self, **kwargs):
+            captured["model_kwargs"] = kwargs
+            length = kwargs["res_type_soft"].shape[1]
+            return {"distogram_logits": torch.zeros(1, length, length, 128)}
+
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(),
+        device="cpu",
+        experimental_model=FakeExperimentalModel(),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_sequence_to_folding_one_hot",
+        lambda sequence: torch.zeros(1, len(sequence), 33),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_folding_tokens_to_aa",
+        lambda: {idx: "G" for idx in range(33)},
+    )
+
+    result = backend._fold_distogram(
+        target_seq=["AA", "TTT"],
+        design=torch.zeros(1, 3, 20),
+        seed=123,
+    )
+
+    input_sequences = captured["input_raw"].sequences
+    assert [seq.id for seq in input_sequences] == ["A", "B", "C"]
+    assert [seq.sequence for seq in input_sequences] == ["AA", "TTT", "GGG"]
+    assert captured["model_kwargs"]["res_type_soft"].shape == (1, 8, 33)
+    assert result["distogram_logits"].shape == (1, 8, 8, 128)
 
 
 def test_stageb_structure_loss_keeps_base_total_when_group_is_selected():

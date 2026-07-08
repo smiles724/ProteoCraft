@@ -308,12 +308,13 @@ def load_esmfold2_backend(args, device: str = "cuda"):
     from bindcraft.hallucination.esmfold2_backend import ESMFold2ProposalConfig
     from bindcraft.hallucination.esmfold2_runtime import ESMFold2RuntimeBackend
 
+    stagea_soft_steps, _ = resolve_esmfold2_stage_soft_steps(args)
     config = ESMFold2ProposalConfig(
         experimental_model_name=args.esmfold2_experimental_model,
         verifier_model_name=args.esmfold2_verifier_model,
         verifier_num_loops=args.esmfold2_verifier_num_loops,
         verifier_num_sampling_steps=args.esmfold2_verifier_num_sampling_steps,
-        soft_steps=args.esmfold2_soft_steps,
+        soft_steps=stagea_soft_steps,
         lambda_esmc=args.esmfold2_lambda_esmc,
         num_loops=args.esmfold2_proposal_num_loops,
         num_sampling_steps=args.esmfold2_proposal_num_sampling_steps,
@@ -365,14 +366,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2 verifier 模型名（仅 --model_backend esmfold2 使用）")
     parser.add_argument("--esmfold2_experimental_model", type=str, default="biohub/ESMFold2-Experimental",
                        help="ESMFold2Experimental proposal 模型名（仅 --model_backend esmfold2 使用）")
-    parser.add_argument("--esmfold2_soft_steps", type=int, default=5,
-                       help="ESMFold2 proposal 每个 MCTS 节点的 soft gradient update 步数（默认：5）")
+    parser.add_argument("--esmfold2_soft_steps", type=int, default=None,
+                       help="兼容旧脚本：同时设置 ESMFold2 Stage A / Stage B 的 soft gradient update 步数")
+    parser.add_argument("--esmfold2_stagea_soft_steps", type=int, default=None,
+                       help="ESMFold2 Stage A 每个 MCTS 节点的 soft gradient update 步数（默认：30）")
+    parser.add_argument("--esmfold2_stageb_soft_steps", type=int, default=None,
+                       help="ESMFold2 Stage B 每个 MCTS 节点的 soft gradient update 步数（默认：5）")
     parser.add_argument("--esmfold2_lambda_esmc", type=str, default="auto",
                        help="ESMC sequence prior 权重；auto 按任务类型选择，或传入数值字符串")
     parser.add_argument("--esmfold2_task_type", type=str, default="denovo",
                        choices=["denovo", "de_novo", "minibinder", "binder", "tcr", "cdr", "cdr_redesign", "antibody", "antibody_like"],
                        help="ESMFold2/ESMC 任务类型；用于解析 lambda_ESMC=auto（默认：denovo）")
-    parser.add_argument("--esmfold2_logit_init_mode", type=str, default="official_free",
+    parser.add_argument("--esmfold2_logit_init_mode", type=str, default="official_exact",
                        choices=["official_free", "official_exact", "legacy_anchor"],
                        help="ESMFold2 root logits 初始化方式；official_exact 用官方 seed 直接生成诊断初始 logits")
     parser.add_argument("--esmfold2_mutable_mask", type=str, default=None,
@@ -389,9 +394,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2 proposal distogram forward diffusion steps（默认：1）")
     parser.add_argument("--esmfold2_proposal_load_internal_esmc", type=lambda x: x.lower() == "true", default=True,
                        help="是否为 ESMFold2Experimental proposal model 加载内部 ESMC（官方 binder design 为 true）")
-    parser.add_argument("--esmfold2_proposal_lm_dropout", type=float, default=None,
-                       help="ESMFold2Experimental proposal LM dropout；None 表示保持模型默认行为。官方 binder design inversion/proposal 使用 0.5")
-    parser.add_argument("--esmfold2_force_proposal_lm_dropout", type=lambda x: x.lower() == "true", default=False,
+    parser.add_argument("--esmfold2_proposal_lm_dropout", type=float, default=0.5,
+                       help="ESMFold2Experimental proposal LM dropout；官方 binder design inversion/proposal 使用 0.5")
+    parser.add_argument("--esmfold2_force_proposal_lm_dropout", type=lambda x: x.lower() == "true", default=True,
                        help="是否在 eval/inference 状态强制启用 proposal LM dropout（官方 binder design 为 true）")
     parser.add_argument("--esmfold2_track_proposal_confidence", type=lambda x: x.lower() == "true", default=False,
                        help="ESMFold2 proposal 后期是否计算 confidence/iPTM 并加入候选（默认：false）")
@@ -518,6 +523,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_esmfold2_stage_soft_steps(args) -> tuple[int, int]:
+    """Resolve ESMFold2 Stage A/B soft-step defaults with legacy compatibility."""
+
+    legacy_soft_steps = getattr(args, "esmfold2_soft_steps", None)
+    stagea_soft_steps = getattr(args, "esmfold2_stagea_soft_steps", None)
+    stageb_soft_steps = getattr(args, "esmfold2_stageb_soft_steps", None)
+    if legacy_soft_steps is not None:
+        if stagea_soft_steps is None:
+            stagea_soft_steps = legacy_soft_steps
+        if stageb_soft_steps is None:
+            stageb_soft_steps = legacy_soft_steps
+    if stagea_soft_steps is None:
+        stagea_soft_steps = 30
+    if stageb_soft_steps is None:
+        stageb_soft_steps = 5
+    args.esmfold2_stagea_soft_steps = int(stagea_soft_steps)
+    args.esmfold2_stageb_soft_steps = int(stageb_soft_steps)
+    return args.esmfold2_stagea_soft_steps, args.esmfold2_stageb_soft_steps
+
+
 def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
     backend = str(getattr(args, "model_backend", "protenix") or "protenix").strip().lower()
     if backend not in {"protenix", "esmfold2"}:
@@ -530,11 +555,19 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
         if parser is not None:
             parser.error(message)
         raise ValueError(message)
-    if backend == "esmfold2" and int(getattr(args, "esmfold2_soft_steps", 0)) <= 0:
-        message = "--esmfold2_soft_steps must be positive"
-        if parser is not None:
-            parser.error(message)
-        raise ValueError(message)
+    if backend == "esmfold2":
+        try:
+            stagea_soft_steps, stageb_soft_steps = resolve_esmfold2_stage_soft_steps(args)
+        except (TypeError, ValueError) as exc:
+            message = f"ESMFold2 soft-step arguments must be positive integers: {exc}"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message) from exc
+        if stagea_soft_steps <= 0 or stageb_soft_steps <= 0:
+            message = "--esmfold2_stagea_soft_steps and --esmfold2_stageb_soft_steps must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
     return backend
 
 
@@ -651,6 +684,8 @@ def main():
             artifact_dir=args.esmfold2_artifact_dir
             or os.path.join(args.output_dir, "esmfold2_artifacts"),
             esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
+            esmfold2_stagea_soft_steps=args.esmfold2_stagea_soft_steps,
+            esmfold2_stageb_soft_steps=args.esmfold2_stageb_soft_steps,
             esmfold2_final_polish=args.esmfold2_final_polish,
         )
     elif args.mode == "first_order":
@@ -752,7 +787,9 @@ def main():
         f.write(f"Model Name: {args.model_name if model_backend == 'protenix' else args.esmfold2_verifier_model}\n")
         if model_backend == "esmfold2":
             f.write(f"ESMFold2 Experimental Model: {args.esmfold2_experimental_model}\n")
-            f.write(f"ESMFold2 Soft Steps: {args.esmfold2_soft_steps}\n")
+            f.write(f"ESMFold2 Soft Steps Legacy Override: {args.esmfold2_soft_steps}\n")
+            f.write(f"ESMFold2 Stage A Soft Steps: {args.esmfold2_stagea_soft_steps}\n")
+            f.write(f"ESMFold2 Stage B Soft Steps: {args.esmfold2_stageb_soft_steps}\n")
             f.write(f"ESMFold2 Lambda ESMC: {args.esmfold2_lambda_esmc}\n")
             f.write(f"ESMFold2 Task Type: {args.esmfold2_task_type}\n")
             f.write(f"ESMFold2 Logit Init Mode: {args.esmfold2_logit_init_mode}\n")
