@@ -10,8 +10,22 @@ BindCraft v2 - 基于 AlphaFold 3 的蛋白质序列逆向设计
 __version__ = "2.0.0"
 __author__ = "BindCraft Team"
 
-from . import hallucination
-from . import losses
-from . import utils
+# Lazy submodule access (PEP 562): importing ``bindcraft`` (or a light submodule
+# such as ``bindcraft.utils`` / ``bindcraft.hallucination.tcr_prior``) no longer
+# eagerly pulls in the heavy protenix/diffusion stack. The submodules are still
+# available as attributes on first access, preserving the public API.
+import importlib
 
 __all__ = ["hallucination", "losses", "utils"]
+
+
+def __getattr__(name):
+    if name in __all__:
+        module = importlib.import_module(f"{__name__}.{name}")
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(list(globals().keys()) + __all__)

@@ -19,6 +19,7 @@ from typing import Dict, Tuple, List, Union, Optional, Any
 import logging
 import os
 import math
+import hashlib
 from contextlib import nullcontext
 from dataclasses import replace
 
@@ -26,7 +27,7 @@ from bindcraft.hallucination.ste_bridge import (
     precompute_waa_embeddings,
     ste_bridge
 )
-from bindcraft.checkpoint import CheckpointManager
+from bindcraft.checkpoint import CheckpointManager, _rebuild_atom_array, write_pdb
 from bindcraft.utils import (
     build_single_chain_features,
     prepare_input_features as _prepare_input_features,
@@ -53,6 +54,11 @@ from bindcraft.hallucination.mutation_proposer import (
     should_use_gradient_prior,
 )
 from bindcraft.hallucination.zeroth_order import zeroth_order_eval
+from bindcraft.hallucination.tcr_prior import (
+    apply_tcr_verifier_score,
+    maybe_build_tcr_prior_scorer,
+    resolve_region_mask,
+)
 from bindcraft.hallucination.reproducibility import set_global_seed, stable_int_seed
 from bindcraft.losses.confidence import run_confidence_heads
 from bindcraft.losses.total_loss import compute_all_losses
@@ -60,6 +66,70 @@ from protenix.model import sample_confidence
 
 logger = logging.getLogger(__name__)
 VALID_BINDER_AAS = "ACDEFGHIKLMNPQRSTVWY"
+
+
+def _tcr_prior_backend_requires_structure(tcr_prior_scorer: Any) -> bool:
+    backend = getattr(tcr_prior_scorer, "backend", None)
+    return bool(getattr(backend, "requires_structure", False))
+
+
+def _metadata_pdb_path(metadata: Optional[Dict[str, Any]], result: Any = None) -> Optional[str]:
+    if metadata and metadata.get("pdb_path"):
+        return str(metadata["pdb_path"])
+    if result is None:
+        return None
+    for attr in ("pdb_path", "structure_path"):
+        value = getattr(result, attr, None)
+        if value:
+            return str(value)
+    summary = getattr(result, "summary_confidence", None) or {}
+    for key in ("pdb_path", "structure_path"):
+        value = summary.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _attach_tcr_prior_structure_metadata(
+    metadata: Optional[Dict[str, Any]],
+    result: Any,
+    tcr_prior_scorer: Any,
+    target_seq: Any,
+    checkpoint_dir: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Ensure structure-conditioned priors can see a candidate PDB path.
+
+    If the verifier/checkpoint path already put ``pdb_path`` on metadata or the
+    result, this only forwards it.  Otherwise, when checkpoint_dir is available,
+    dump the verifier coordinate to a small prior-only PDB and attach that path.
+    """
+    out = dict(metadata or {})
+    existing = _metadata_pdb_path(out, result)
+    if existing:
+        out["pdb_path"] = existing
+        return out
+    if not _tcr_prior_backend_requires_structure(tcr_prior_scorer):
+        return out
+    if checkpoint_dir is None or result is None or getattr(result, "coordinate", None) is None:
+        return out
+
+    try:
+        seq = getattr(result, "binder_seq", out.get("seq", "candidate"))
+        stage = str(out.get("stage", "candidate"))
+        step = str(out.get("step", "na"))
+        digest = hashlib.sha1(f"{stage}:{step}:{seq}".encode("utf-8")).hexdigest()[:12]
+        pdb_dir = os.path.join(checkpoint_dir, "tcr_prior_structures")
+        os.makedirs(pdb_dir, exist_ok=True)
+        pdb_path = os.path.join(pdb_dir, f"{stage}_{step}_{digest}.pdb")
+        if not os.path.exists(pdb_path):
+            coordinates = result.coordinate[0].detach().cpu().numpy()
+            atom_array = _rebuild_atom_array(seq, target_seq)
+            write_pdb(pdb_path, atom_array=atom_array, coordinates=coordinates)
+        out["pdb_path"] = pdb_path
+    except Exception as exc:
+        logger.warning("Could not attach TCR prior pdb_path metadata: %s", exc)
+    return out
 
 
 def _resolve_proposal_amp_dtype(model_name: Optional[str], proposal_amp: str = "auto"):
@@ -550,6 +620,7 @@ def run_hybrid_hallucination(
     seed: Optional[int] = 42,
     target_template_path: Optional[str] = None,
     target_chain_roles: Optional[Any] = None,
+    tcr_prior_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str, List[float]]:
     """
     混合优化循环：一阶梯度引导离散候选 + 零阶全链路验证 + 接受准则。
@@ -666,6 +737,35 @@ def run_hybrid_hallucination(
     logger.info("Step 0: 零阶全链路初始化，将在优化循环前执行完整 AF3 推断获取初始锚点骨架")
     logger.info("=" * 70)
 
+    # ── TCR prior setup ───────────────────────────────────────────────────
+    tcr_prior_scorer = maybe_build_tcr_prior_scorer(tcr_prior_config, device=device)
+    tcr_prior_region = (tcr_prior_config or {}).get("tcr_prior_region", "all")
+    if tcr_prior_scorer is not None:
+        logger.info(
+            "TCR sequence prior enabled: grad_weight=%.4f ver_weight=%.4f region=%s model=%s",
+            tcr_prior_scorer.gradient_weight,
+            tcr_prior_scorer.verifier_weight,
+            tcr_prior_region,
+            getattr(tcr_prior_scorer, "model_name", "dummy"),
+        )
+
+    def _apply_tcr_verifier(result, metadata=None):
+        if tcr_prior_scorer is None or tcr_prior_scorer.verifier_weight == 0.0:
+            return result
+        metadata = _attach_tcr_prior_structure_metadata(
+            metadata,
+            result,
+            tcr_prior_scorer,
+            target_seq,
+            checkpoint_dir,
+        )
+        return apply_tcr_verifier_score(
+            result,
+            tcr_prior_scorer,
+            region_mask=resolve_region_mask(tcr_prior_region, None, L_binder),
+            metadata=metadata,
+        )
+
     freeze_model(model)
 
     # ── 预计算 W_AAE ──────────────────────────────────────────────────────
@@ -731,6 +831,7 @@ def run_hybrid_hallucination(
         target_template_path=target_template_path,
         target_chain_roles=target_chain_roles,
     )
+    init_zeroth = _apply_tcr_verifier(init_zeroth, metadata={"stage": "init", "seq": init_binder})
     logger.info(
         f"  初始零阶 total_loss={init_zeroth.total_loss:.4f} | "
         f"pLDDT={init_zeroth.summary_confidence.get('plddt', 'N/A')} | "
@@ -873,6 +974,15 @@ def run_hybrid_hallucination(
                     target_chain_roles=target_chain_roles,
                 )
 
+                if tcr_prior_scorer is not None and tcr_prior_scorer.gradient_weight != 0.0:
+                    tcr_region_mask = resolve_region_mask(tcr_prior_region, None, L_binder)
+                    L_tcr_prior = tcr_prior_scorer.soft_prior_loss(
+                        sequence_logits=thetas[b],
+                        region_mask=tcr_region_mask,
+                        metadata={"step": step, "mode": "hybrid", "current_seq": current_seq},
+                    )
+                    first_order_loss = first_order_loss + L_tcr_prior
+
                 first_order_loss.backward()
                 grad_for_proposal = thetas[b].grad.clone() if thetas[b].grad is not None else None
                 torch.nn.utils.clip_grad_norm_([thetas[b]], 1.0)
@@ -930,6 +1040,10 @@ def run_hybrid_hallucination(
                 seed=_verifier_seed(seed, target_seq, cand_seq),
                 target_template_path=target_template_path,
                 target_chain_roles=target_chain_roles,
+            )
+            result = _apply_tcr_verifier(
+                result,
+                metadata={"stage": "candidate", "step": step, "candidate_idx": idx, "seq": cand_seq},
             )
             all_zeroth_results.append(result)
             beam_src = all_candidate_beams[idx]
@@ -1455,6 +1569,7 @@ def run_mcts_hallucination(
     target_template_path: Optional[str] = None,
     target_chain_roles: Optional[Any] = None,
     proposal_amp: str = "auto",
+    tcr_prior_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str, List[float]]:
     """
     MCTS 调度的混合优化：UCB 选点 + 一阶提议 + 零阶验证 + Expansion/Backprop/Prune。
@@ -1492,6 +1607,35 @@ def run_mcts_hallucination(
     target_sequences = _normalize_chain_sequences(target_seq)
     target_len_str = "+".join(str(len(s)) for s in target_sequences)
     target_total_len = sum(len(s) for s in target_sequences)
+
+    # ── TCR prior setup ───────────────────────────────────────────────────
+    tcr_prior_scorer = maybe_build_tcr_prior_scorer(tcr_prior_config, device=device)
+    tcr_prior_region = (tcr_prior_config or {}).get("tcr_prior_region", "all")
+    if tcr_prior_scorer is not None:
+        logger.info(
+            "TCR sequence prior enabled: grad_weight=%.4f ver_weight=%.4f region=%s model=%s",
+            tcr_prior_scorer.gradient_weight,
+            tcr_prior_scorer.verifier_weight,
+            tcr_prior_region,
+            getattr(tcr_prior_scorer, "model_name", "dummy"),
+        )
+
+    def _apply_tcr_verifier(result, metadata=None):
+        if tcr_prior_scorer is None or tcr_prior_scorer.verifier_weight == 0.0:
+            return result
+        metadata = _attach_tcr_prior_structure_metadata(
+            metadata,
+            result,
+            tcr_prior_scorer,
+            target_seq,
+            checkpoint_dir,
+        )
+        return apply_tcr_verifier_score(
+            result,
+            tcr_prior_scorer,
+            region_mask=resolve_region_mask(tcr_prior_region, None, L_binder),
+            metadata=metadata,
+        )
 
     annealer = AnnealingScheduler(T_init=T_init, T_min=T_min) if use_annealing else None
 
@@ -1651,6 +1795,7 @@ def run_mcts_hallucination(
             target_template_path=target_template_path,
             target_chain_roles=target_chain_roles,
         )
+        result = _apply_tcr_verifier(result, metadata={"stage": "phase0", "seq": tseq})
         phase0_results.append((tseq, result))
         verifier_cache[result.binder_seq] = result
         if mcts_tree is not None:
@@ -1830,6 +1975,14 @@ def run_mcts_hallucination(
                     target_chain_roles=target_chain_roles,
                 )
 
+            if tcr_prior_scorer is not None and tcr_prior_scorer.gradient_weight != 0.0:
+                L_tcr_prior = tcr_prior_scorer.soft_prior_loss(
+                    sequence_logits=theta_step2,
+                    region_mask=resolve_region_mask(tcr_prior_region, None, L_binder),
+                    metadata={"stage": "legacy_bootstrap", "step": legacy_step},
+                )
+                first_order_loss = first_order_loss + L_tcr_prior
+
             first_order_loss.backward()
             grad_for_proposal = theta_step2.grad.clone() if theta_step2.grad is not None else None
             torch.nn.utils.clip_grad_norm_([theta_step2], 1.0)
@@ -1875,6 +2028,9 @@ def run_mcts_hallucination(
                     seed=_verifier_seed(seed, target_seq, cand_seq),
                     target_template_path=target_template_path,
                     target_chain_roles=target_chain_roles,
+                )
+                result = _apply_tcr_verifier(
+                    result, metadata={"stage": "legacy_bootstrap", "step": legacy_step, "seq": cand_seq}
                 )
                 verifier_cache[result.binder_seq] = result
                 all_zeroth_results.append(result)
@@ -2169,6 +2325,12 @@ def run_mcts_hallucination(
                 action_group,
                 first_order_loss,
             )
+            if tcr_prior_scorer is not None and tcr_prior_scorer.gradient_weight != 0.0:
+                proposal_loss = proposal_loss + tcr_prior_scorer.soft_prior_loss(
+                    sequence_logits=theta_step2,
+                    region_mask=resolve_region_mask(tcr_prior_region, None, L_binder),
+                    metadata={"stage": "stageb", "step": global_step, "action_group": action_group},
+                )
 
         use_gradient_proposal = should_use_gradient_prior(mcts_prior_mode)
         if use_gradient_proposal:
@@ -2244,6 +2406,12 @@ def run_mcts_hallucination(
                     action_group,
                     first_order_loss,
                 )
+                if tcr_prior_scorer is not None and tcr_prior_scorer.gradient_weight != 0.0:
+                    proposal_loss = proposal_loss + tcr_prior_scorer.soft_prior_loss(
+                        sequence_logits=theta_step2,
+                        region_mask=resolve_region_mask(tcr_prior_region, None, L_binder),
+                        metadata={"stage": "stageb_truncated", "step": global_step, "action_group": action_group},
+                    )
             proposal_loss.backward()
             grad_for_proposal = theta_step2.grad.clone() if theta_step2.grad is not None else None
             torch.nn.utils.clip_grad_norm_([theta_step2], 1.0)
@@ -2395,6 +2563,9 @@ def run_mcts_hallucination(
                 seed=_verifier_seed(seed, target_seq, proposal.sequence),
                 target_template_path=target_template_path,
                 target_chain_roles=target_chain_roles,
+            )
+            result = _apply_tcr_verifier(
+                result, metadata={"stage": "stageb", "step": global_step, "seq": proposal.sequence}
             )
             mcts_tree.store_verifier_result(result)
             all_zeroth_results.append(result)

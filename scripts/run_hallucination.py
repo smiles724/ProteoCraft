@@ -379,6 +379,28 @@ def main():
                        help="MCTS：启用 BLOSUM62 先验（默认：true）")
     parser.add_argument("--prior_strength", type=float, default=0.1, help="MCTS：先验强度（默认：0.1）")
 
+    # === TCR 序列先验（可选，默认关闭；关闭时行为与之前完全一致） ===
+    parser.add_argument("--use_tcr_prior_gradient", type=lambda x: x.lower() == "true", default=False,
+                       help="启用梯度提议路径的 TCR 软先验损失（默认：false）")
+    parser.add_argument("--tcr_prior_gradient_weight", type=float, default=0.1,
+                       help="梯度路径 TCR 软先验损失权重（默认：0.1）")
+    parser.add_argument("--use_tcr_prior_verifier", type=lambda x: x.lower() == "true", default=False,
+                       help="启用 verifier 路径的 TCR 硬先验打分（默认：false）")
+    parser.add_argument("--tcr_prior_verifier_weight", type=float, default=0.1,
+                       help="verifier 路径 TCR 硬先验打分权重（默认：0.1）")
+    parser.add_argument("--tcr_prior_region", type=str, default="all",
+                       choices=["all", "cdr", "none"],
+                       help="TCR 先验作用区域：all 全序列 / cdr CDR区 / none 无（默认：all）")
+    parser.add_argument("--tcr_prior_model_name", type=str, default=None,
+                       help="TCR 先验后端选择：'tcrlm[:/repo]' / 'esmc[:model_id]' / "
+                            "'ligandmpnn[:/repo]'；留空/dummy/HF-id 使用占位实现（默认：None）")
+    parser.add_argument("--tcr_prior_checkpoint", type=str, default=None,
+                       help="tcrlm/ligandmpnn 后端的权重路径（也可用 TCRLM_CKPT / LIGANDMPNN_CKPT 环境变量）")
+    parser.add_argument("--tcr_prior_masked", type=lambda x: x.lower() == "true", default=False,
+                       help="ESM-C 使用 masked-marginal 伪对数似然（更精确但更慢，默认：false）")
+    parser.add_argument("--require_real_tcr_prior", type=lambda x: x.lower() == "true", default=False,
+                       help="严格模式：指定 tcrlm/esmc/ligandmpnn 后端但未真实加载/无真实输出/回退 no-op 时直接报错（默认：false）")
+
     # === 损失函数权重（key 必须与 DEFAULT_LOSS_WEIGHTS 一致） ===
     parser.add_argument("--loss_preset", type=str, default="tuned",
                        choices=sorted(LOSS_WEIGHT_PRESETS.keys()),
@@ -449,6 +471,18 @@ def main():
         if val is not None:
             loss_weights[key] = val
 
+    tcr_prior_config = {
+        "use_tcr_prior_gradient": args.use_tcr_prior_gradient,
+        "tcr_prior_gradient_weight": args.tcr_prior_gradient_weight,
+        "use_tcr_prior_verifier": args.use_tcr_prior_verifier,
+        "tcr_prior_verifier_weight": args.tcr_prior_verifier_weight,
+        "tcr_prior_region": args.tcr_prior_region,
+        "tcr_prior_model_name": args.tcr_prior_model_name,
+        "tcr_prior_checkpoint": args.tcr_prior_checkpoint,
+        "tcr_prior_masked": args.tcr_prior_masked,
+        "require_real_tcr_prior": args.require_real_tcr_prior,
+    }
+
     if args.mode == "first_order":
         best_seq, final_seq, losses_history = run_hallucination(
             model=model,
@@ -488,6 +522,7 @@ def main():
             hotspot_params=hotspot_params,
             seed=args.seed,
             target_template_path=args.target_template_path,
+            tcr_prior_config=tcr_prior_config,
         )
     else:
         best_seq, final_seq, losses_history = run_mcts_hallucination(
@@ -531,6 +566,7 @@ def main():
             seed=args.seed,
             target_template_path=args.target_template_path,
             proposal_amp=args.proposal_amp,
+            tcr_prior_config=tcr_prior_config,
         )
 
     output_file = os.path.join(args.output_dir, "hallucination_result.txt")
