@@ -71,6 +71,7 @@ from bindcraft.hallucination.pipeline import (
     MCTS_STAGE3_USE_REWARD_NORMALIZATION,
     MCTS_STAGE3_USE_STRUCTURAL_GROUPING,
     _allocate_action_group_budgets,
+    _attach_tcr_prior_structure_metadata,
     _apply_stageb_prior_mode_to_groups,
     _handoff_structural_key,
     _make_strict_mcts_tree,
@@ -542,6 +543,9 @@ def run_hybrid_hallucination_cdr(
     def _apply_tcr_verifier(result, metadata=None):
         if tcr_prior_scorer is None or tcr_prior_scorer.verifier_weight == 0.0:
             return result
+        metadata = _attach_tcr_prior_structure_metadata(
+            metadata, result, tcr_prior_scorer, target_seq, checkpoint_dir
+        )
         return apply_tcr_verifier_score(
             result, tcr_prior_scorer, region_mask=tcr_region_mask, metadata=metadata
         )
@@ -1363,6 +1367,9 @@ def run_mcts_hallucination_cdr(
     def _apply_tcr_verifier(result, metadata=None):
         if tcr_prior_scorer is None or tcr_prior_scorer.verifier_weight == 0.0:
             return result
+        metadata = _attach_tcr_prior_structure_metadata(
+            metadata, result, tcr_prior_scorer, target_seq, checkpoint_dir
+        )
         return apply_tcr_verifier_score(
             result, tcr_prior_scorer, region_mask=tcr_region_mask, metadata=metadata
         )
