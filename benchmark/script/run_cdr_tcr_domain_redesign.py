@@ -108,6 +108,52 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--chunk-size", dest="chunk_size", type=int, default=argparse.SUPPRESS)
     add_bool_argument(parser, "save-checkpoints")
+
+    # === TCR 序列先验（可选，默认关闭；关闭时行为与之前完全一致） ===
+    parser.add_argument(
+        "--use-tcr-prior-gradient", dest="use_tcr_prior_gradient",
+        type=lambda x: x.lower() == "true", default=argparse.SUPPRESS,
+        help="启用梯度提议路径的 TCR 软先验损失（默认：false）",
+    )
+    parser.add_argument(
+        "--tcr-prior-gradient-weight", dest="tcr_prior_gradient_weight",
+        type=float, default=argparse.SUPPRESS,
+        help="梯度路径 TCR 软先验损失权重（默认：0.1）",
+    )
+    parser.add_argument(
+        "--use-tcr-prior-verifier", dest="use_tcr_prior_verifier",
+        type=lambda x: x.lower() == "true", default=argparse.SUPPRESS,
+        help="启用 verifier 路径的 TCR 硬先验打分（默认：false）",
+    )
+    parser.add_argument(
+        "--tcr-prior-verifier-weight", dest="tcr_prior_verifier_weight",
+        type=float, default=argparse.SUPPRESS,
+        help="verifier 路径 TCR 硬先验打分权重（默认：0.1）",
+    )
+    parser.add_argument(
+        "--tcr-prior-region", dest="tcr_prior_region", default=argparse.SUPPRESS,
+        choices=("all", "cdr", "none"),
+        help="TCR 先验作用区域：all 全序列 / cdr CDR区 / none 无（默认：all）",
+    )
+    parser.add_argument(
+        "--tcr-prior-model-name", dest="tcr_prior_model_name", default=argparse.SUPPRESS,
+        help="TCR 先验后端选择：'tcrlm[:/repo]' / 'esmc[:model_id]' / "
+             "'ligandmpnn[:/repo]'；留空/dummy/HF-id 使用占位实现（默认：None）",
+    )
+    parser.add_argument(
+        "--tcr-prior-checkpoint", dest="tcr_prior_checkpoint", default=argparse.SUPPRESS,
+        help="tcrlm/ligandmpnn 后端的权重路径（也可用 TCRLM_CKPT / LIGANDMPNN_CKPT 环境变量）",
+    )
+    parser.add_argument(
+        "--tcr-prior-masked", dest="tcr_prior_masked",
+        type=lambda x: x.lower() == "true", default=argparse.SUPPRESS,
+        help="ESM-C 使用 masked-marginal 伪对数似然（更精确但更慢，默认：false）",
+    )
+    parser.add_argument(
+        "--require-real-tcr-prior", dest="require_real_tcr_prior",
+        type=lambda x: x.lower() == "true", default=argparse.SUPPRESS,
+        help="严格模式：指定 tcrlm/esmc/ligandmpnn 后端但未真实加载/无真实输出/回退 no-op 时直接报错（默认：false）",
+    )
     return parser.parse_args()
 
 
@@ -199,6 +245,20 @@ def resolve_loss_weights(config: Dict[str, Any]) -> Dict[str, float]:
         if value is not None:
             weights[key] = float(value)
     return weights
+
+
+def resolve_tcr_prior_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "use_tcr_prior_gradient": bool(config.get("use_tcr_prior_gradient", False)),
+        "tcr_prior_gradient_weight": float(config.get("tcr_prior_gradient_weight", 0.1)),
+        "use_tcr_prior_verifier": bool(config.get("use_tcr_prior_verifier", False)),
+        "tcr_prior_verifier_weight": float(config.get("tcr_prior_verifier_weight", 0.1)),
+        "tcr_prior_region": str(config.get("tcr_prior_region", "all")),
+        "tcr_prior_model_name": config.get("tcr_prior_model_name"),
+        "tcr_prior_checkpoint": config.get("tcr_prior_checkpoint"),
+        "tcr_prior_masked": bool(config.get("tcr_prior_masked", False)),
+        "require_real_tcr_prior": bool(config.get("require_real_tcr_prior", False)),
+    }
 
 
 def prepare_runtime(config: Dict[str, Any]) -> None:
@@ -356,6 +416,7 @@ def run_case(
     )
 
     loss_weights = resolve_loss_weights(config)
+    tcr_prior_config = resolve_tcr_prior_config(config)
     mode = str(config.get("mode", "hybrid"))
     t0 = time.time()
     try:
@@ -386,6 +447,7 @@ def run_case(
                 checkpoint_save_policy=str(config.get("checkpoint_save_policy", "all")),
                 target_template_path=case_info["template_path"],
                 chunk_size=config.get("chunk_size"),
+                tcr_prior_config=tcr_prior_config,
             )
         elif mode == "mcts":
             best_seq, final_seq, losses = run_mcts_hallucination_cdr(
@@ -428,6 +490,7 @@ def run_case(
                 mcts_adaptive_tau_end=float(config.get("mcts_adaptive_tau_end", 0.1)),
                 chunk_size=config.get("chunk_size"),
                 proposal_amp=str(config.get("proposal_amp", "auto")),
+                tcr_prior_config=tcr_prior_config,
             )
         else:
             raise ValueError(f"Unsupported mode for CDR TCR redesign: {mode}")
@@ -497,6 +560,7 @@ def run_case(
                 "checkpoint_save_policy": str(config.get("checkpoint_save_policy", "all")),
                 "model_name": config.get("model_name"),
                 "loss_weights": loss_weights,
+                "tcr_prior_config": tcr_prior_config,
             },
             "runtime": {
                 "device": str(device),
