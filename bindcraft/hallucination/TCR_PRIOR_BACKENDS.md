@@ -128,6 +128,28 @@ conda activate esmc
 pip install esm torch
 ```
 
+### Alternate loader: `transformers` (no `esm` package / offline-only sites)
+Some sites only have `transformers`' native ESM-C support installed (or a
+pre-cached HF mirror under a different org, e.g. `biohub/ESMC-6B`), with no
+network egress to `huggingface.co` to fetch the EvolutionaryScale-org weights
+the `esm` package expects. `ESMCBackend` auto-selects a second loader via
+`transformers.models.esmc.modeling_esmc.ESMCForMaskedLM` whenever
+`tcr_prior_model_name`'s model id contains a `/` (i.e. looks like a full HF
+repo id) instead of a short name:
+
+```yaml
+tcr_prior_model_name: esmc:biohub/ESMC-6B   # transformers loader (full repo id)
+# vs.
+tcr_prior_model_name: esmc:esmc_300m        # esm package loader (short name)
+```
+
+To force offline loading from an already-populated `HF_HOME` cache (no
+network calls at all), set `HF_HUB_OFFLINE=1` in the environment — without it,
+`from_pretrained` still tries a network freshness check first and only falls
+back to the local cache after retries/backoff time out. Both loaders share
+the same `per_position_logprobs` interface (single-pass and masked-marginal
+modes), so `tcr_prior_masked` behaves identically either way.
+
 ---
 
 ## 3. LigandMPNN (conditional CDR redesign prior) — priority 3, structure-based
