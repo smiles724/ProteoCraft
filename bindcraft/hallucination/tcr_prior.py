@@ -624,11 +624,17 @@ class TCRLMBackend(TCRPriorBackend):
 
 class ESMCBackend(TCRPriorBackend):
     """
-    EvolutionaryScale ESM-C backend for whole-TCR naturalness.
+    ESM-C backend for whole-TCR naturalness, via one of two loaders:
 
-    Package: ``esm`` (``pip install esm``); weights auto-download from the
-    HuggingFace hub on first use (e.g. ``esmc_300m``, ``esmc_600m``).
-    Model id via ``tcr_prior_model_name='esmc'`` or ``'esmc:esmc_600m'``.
+    - ``esm`` package (EvolutionaryScale SDK): ``model_id`` is a short name
+      (``esmc_300m``, ``esmc_600m``, ``esmc_6b``); weights auto-download from
+      the HuggingFace hub on first use. Selected via
+      ``tcr_prior_model_name='esmc'`` or ``'esmc:esmc_600m'``.
+    - ``transformers`` (``ESMCForMaskedLM``): ``model_id`` is a full HF repo
+      id containing ``/`` (e.g. ``biohub/ESMC-6B``), selected via
+      ``tcr_prior_model_name='esmc:biohub/ESMC-6B'``. Useful when a site only
+      has ``transformers``' ESM-C support installed/cached (no ``esm``
+      package, or a different repo mirror than the EvolutionaryScale one).
 
     By default a single forward pass yields per-position distributions
     p(a_i | full sequence) (fast, differentiable target for the soft prior).
@@ -650,11 +656,19 @@ class ESMCBackend(TCRPriorBackend):
         self.device = device or torch.device("cpu")
         self.masked = bool(masked)
         self.client = None
+        self._tokenizer = None
+        self._backend_kind: Optional[str] = None  # "esm" or "transformers"
         self._vocab: Dict[str, int] = {}
         self._canon_ids: Optional[List[int]] = None
         self._load()
 
     def _load(self) -> None:
+        if "/" in self.model_id:
+            self._load_via_transformers()
+        else:
+            self._load_via_esm_package()
+
+    def _load_via_esm_package(self) -> None:
         try:
             from esm.models.esmc import ESMC  # type: ignore
             from esm.tokenization import get_esmc_model_tokenizers  # type: ignore
@@ -667,26 +681,90 @@ class ESMCBackend(TCRPriorBackend):
         try:
             self.client = ESMC.from_pretrained(self.model_id).to(self.device)
             self.client.eval()
+            self._backend_kind = "esm"
             self._vocab = dict(get_esmc_model_tokenizers().get_vocab())
             self._canon_ids = [self._vocab.get(a, -1) for a in IDX_TO_AA1]
             self._available = True
             self._real_weights = True
-            logger.info("ESM-C backend ready (model=%s, device=%s).", self.model_id, self.device)
+            logger.info("ESM-C backend ready via 'esm' package (model=%s, device=%s).", self.model_id, self.device)
         except Exception as exc:  # pragma: no cover - network/weights dependent
             self._missing_items.append(
                 f"ESM-C weights failed to load for {self.model_id!r}: {exc}"
             )
             logger.warning("ESM-C load failed for %s: %s", self.model_id, exc)
 
-    def _sequence_logits(self, sequence: str) -> Optional[torch.Tensor]:
-        """Return raw per-position logits over the ESM-C vocab, shape [L, V]."""
+    def _load_via_transformers(self) -> None:
+        try:
+            from transformers.models.esmc.modeling_esmc import ESMCForMaskedLM  # type: ignore
+            from transformers.models.esmc.tokenization_esmc import ESMCTokenizer  # type: ignore
+        except Exception as exc:  # pragma: no cover - import env dependent
+            self._missing_items.append(
+                f"'transformers' ESM-C support not importable: {exc} "
+                "(needs a transformers build with ESM-C support)"
+            )
+            logger.warning("ESM-C backend (transformers) unavailable: %s", exc)
+            return
+        try:
+            self.client = ESMCForMaskedLM.from_pretrained(
+                self.model_id, dtype=torch.float32
+            ).to(self.device)
+            self.client.eval()
+            self._tokenizer = ESMCTokenizer()
+            self._backend_kind = "transformers"
+            self._vocab = dict(self._tokenizer.vocab)
+            self._canon_ids = [self._vocab.get(a, -1) for a in IDX_TO_AA1]
+            self._available = True
+            self._real_weights = True
+            logger.info(
+                "ESM-C backend ready via 'transformers' (model=%s, device=%s).",
+                self.model_id, self.device,
+            )
+        except Exception as exc:  # pragma: no cover - network/weights dependent
+            self._missing_items.append(
+                f"ESM-C (transformers) weights failed to load for {self.model_id!r}: {exc}"
+            )
+            logger.warning("ESM-C (transformers) load failed for %s: %s", self.model_id, exc)
+
+    def _sequence_logits(
+        self, sequence: str, mask_position: Optional[int] = None
+    ) -> Optional[torch.Tensor]:
+        """Return raw per-position logits over the ESM-C vocab, shape [L, V].
+
+        ``mask_position`` (0-indexed into ``sequence``) replaces that position's
+        token with the mask token before the forward pass (masked-marginal mode).
+        """
+        if self._backend_kind == "transformers":
+            return self._sequence_logits_transformers(sequence, mask_position)
+        return self._sequence_logits_esm(sequence, mask_position)
+
+    def _sequence_logits_esm(
+        self, sequence: str, mask_position: Optional[int] = None
+    ) -> Optional[torch.Tensor]:
         from esm.sdk.api import ESMProtein, LogitsConfig  # type: ignore
 
+        if mask_position is not None:
+            sequence = sequence[:mask_position] + "_" + sequence[mask_position + 1 :]
         with torch.no_grad():
             protein = ESMProtein(sequence=sequence)
             protein_tensor = self.client.encode(protein)
             out = self.client.logits(protein_tensor, LogitsConfig(sequence=True))
             logits = out.logits.sequence  # [1, L+2, V] (BOS/EOS)
+        return logits[0, 1 : 1 + len(sequence)].float().cpu()
+
+    def _sequence_logits_transformers(
+        self, sequence: str, mask_position: Optional[int] = None
+    ) -> Optional[torch.Tensor]:
+        with torch.no_grad():
+            enc = self._tokenizer(sequence, return_tensors="pt")
+            input_ids = enc["input_ids"]
+            if mask_position is not None:
+                input_ids = input_ids.clone()
+                input_ids[0, mask_position + 1] = self.client.config.mask_token_id  # +1 for leading <cls>
+            out = self.client(
+                input_ids=input_ids.to(self.device),
+                attention_mask=enc["attention_mask"].to(self.device),
+            )
+            logits = out.logits  # [1, L+2, V] (<cls>/<eos>)
         return logits[0, 1 : 1 + len(sequence)].float().cpu()
 
     def _canon_logprobs(self, vocab_logits: torch.Tensor) -> torch.Tensor:
@@ -714,11 +792,10 @@ class ESMCBackend(TCRPriorBackend):
             idx = torch.tensor(region_indices, dtype=torch.long)
             return logp_all.index_select(0, idx)
 
-        # Masked-marginal mode: replace each region position with mask token "_".
+        # Masked-marginal mode: replace each region position with the mask token.
         out = torch.zeros(len(region_indices), NUM_AMINO_ACIDS)
         for row, pos in enumerate(region_indices):
-            masked_seq = sequence[:pos] + "_" + sequence[pos + 1 :]
-            vocab_logits = self._sequence_logits(masked_seq)
+            vocab_logits = self._sequence_logits(sequence, mask_position=pos)
             if vocab_logits is None:
                 return None
             out[row] = self._canon_logprobs(vocab_logits[pos])
