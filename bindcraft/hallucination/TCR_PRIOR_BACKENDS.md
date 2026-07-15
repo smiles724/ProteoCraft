@@ -166,6 +166,15 @@ modes), so `tcr_prior_masked` behaves identically either way.
   `out_dict['log_probs']` `[L, 21]`, reorders LigandMPNN's alphabetical AA
   columns into bindcraft's `PROTEIN_RESIDUE_NAMES` order, drops `X`, and
   renormalizes over the 20 canonical AAs before selecting the region.
+- **In practice, only the verifier/hard path is usable.** The CDR pipeline's
+  `_apply_tcr_verifier` closure (called after `zeroth_order_eval` has produced
+  real structure coordinates) dumps that structure to a temp PDB and attaches
+  `metadata['pdb_path']` automatically (`_attach_tcr_prior_structure_metadata`
+  in `pipeline.py`) — no manual wiring needed. The gradient/soft path
+  (`soft_prior_loss`) runs *before* any structure exists for the candidate
+  being proposed, so there is nothing to dump yet; it always no-ops for this
+  backend. Set `use_tcr_prior_gradient: false` when using LigandMPNN —
+  otherwise `require_real_tcr_prior: true` will raise on every gradient step.
 
 ### Required files
 - Repo checkout: `LIGANDMPNN_HOME` or `tcr_prior_model_name='ligandmpnn:/path'`.
