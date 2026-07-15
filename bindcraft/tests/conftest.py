@@ -21,8 +21,10 @@ for _pkg in [
     "protenix",
     "protenix.model",
     "protenix.model.sample_confidence",
+    "protenix.model.utils",
     "protenix.data",
     "protenix.data.constants",
+    "protenix.data.utils",
 ]:
     if _pkg not in sys.modules:
         _make_stub(_pkg)
@@ -70,3 +72,35 @@ def _compute_contact_prob(distogram_logits, min_bin, max_bin, no_bins, thres=8.0
 
 
 sys.modules["protenix.model.sample_confidence"].compute_contact_prob = _compute_contact_prob
+
+
+def _checkpoint_blocks(blocks, args, blocks_per_ckpt=None):
+    del blocks_per_ckpt
+    output = args
+    for block in blocks:
+        if not isinstance(output, tuple):
+            output = (output,)
+        output = block(*output)
+    return output
+
+
+def _sample_msa_feature_dict_random_without_replacement(feat_dict, **kwargs):
+    del kwargs
+    return dict(feat_dict)
+
+
+sys.modules["protenix.model.utils"].checkpoint_blocks = _checkpoint_blocks
+sys.modules[
+    "protenix.model.utils"
+].sample_msa_feature_dict_random_without_replacement = (
+    _sample_msa_feature_dict_random_without_replacement
+)
+
+
+def _pdb_to_cif(pdb_path, cif_path):
+    del pdb_path
+    with open(cif_path, "w", encoding="utf-8") as handle:
+        handle.write("data_stub\n")
+
+
+sys.modules["protenix.data.utils"].pdb_to_cif = _pdb_to_cif
