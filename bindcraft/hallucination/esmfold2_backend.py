@@ -91,6 +91,7 @@ class ESMFold2ProposalConfig:
     proposal_load_internal_esmc: bool = True
     proposal_lm_dropout: Optional[float] = 0.5
     force_proposal_lm_dropout: bool = True
+    hotspot_weight: float = 0.0
     stageb_group_weight: float = 1.0
     track_proposal_confidence: bool = False
     proposal_confidence_temperature: float = 0.05
@@ -115,6 +116,8 @@ class ESMFold2ProposalConfig:
             raise ValueError("temperature_max must be >= temperature_min")
         if float(self.stageb_group_weight) < 0.0:
             raise ValueError("stageb_group_weight must be non-negative")
+        if float(self.hotspot_weight) < 0.0:
+            raise ValueError("hotspot_weight must be non-negative")
         if self.proposal_lm_dropout is not None:
             dropout = float(self.proposal_lm_dropout)
             if dropout < 0.0 or dropout >= 1.0:

@@ -130,9 +130,14 @@ def _parse_target_hotspots_1based(raw_hotspots, target_len: int, parser: argpars
 
 
 def _build_hotspot_params(args, parser: argparse.ArgumentParser):
+    target_length = sum(
+        len(chain.strip())
+        for chain in str(args.target).split("|")
+        if chain.strip()
+    )
     residues_1based, concat_indices = _parse_target_hotspots_1based(
         args.target_hotspots,
-        len(args.target),
+        target_length,
         parser,
     )
     if not concat_indices:
@@ -328,6 +333,7 @@ def load_esmfold2_backend(args, device: str = "cuda"):
         proposal_confidence_num_sampling_steps=args.esmfold2_proposal_confidence_num_sampling_steps,
         proposal_confidence_max_candidates=args.esmfold2_proposal_confidence_max_candidates,
         proposal_confidence_tail_steps=args.esmfold2_proposal_confidence_tail_steps,
+        hotspot_weight=args.esmfold2_hotspot_weight,
     )
     return ESMFold2RuntimeBackend(
         config=config,
@@ -414,6 +420,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2 proposal 固定记录最后 N 个 local steps；0 表示使用 temperature 阈值（默认：0）")
     parser.add_argument("--esmfold2_final_polish", type=lambda x: x.lower() == "true", default=False,
                        help="ESMFold2 MCTS 搜索结束后是否从 best node logits 做 final continuous polish，并只在该阶段使用 late-confidence candidates（默认：false）")
+    parser.add_argument("--esmfold2_hotspot_weight", type=float, default=0.0,
+                       help="ESMFold2 proposal hotspot contact loss 权重；0 保持旧行为（默认：0.0）")
     parser.add_argument("--checkpoint_dir", type=str, default=None,
                        help="Checkpoint 目录；默认依次读取 --checkpoint_dir、PROTENIX_CHECKPOINT_DIR、PROTENIX_ROOT_DIR/checkpoint")
     parser.add_argument("--save_checkpoint_dir", type=str, default=None,
@@ -599,6 +607,16 @@ def main():
         )
 
     hotspot_params = _build_hotspot_params(args, parser)
+    if args.esmfold2_hotspot_weight < 0.0:
+        parser.error("--esmfold2_hotspot_weight 必须大于等于 0")
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_hotspot_weight > 0.0
+        and hotspot_params is None
+    ):
+        parser.error(
+            "--esmfold2_hotspot_weight > 0 时必须同时提供 --target_hotspots"
+        )
 
     setup_logging(args.log_file, level=args.log_level)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -607,10 +625,12 @@ def main():
     if hotspot_params is not None:
         if model_backend == "esmfold2":
             logging.info(
-                "ESMFold2 backend received target_hotspots but does not use hotspot-aware routing yet: "
-                "target_hotspots_1based=%s target_concat_indices_0based=%s",
+                "ESMFold2 hotspot contact configured: target_hotspots_1based=%s "
+                "target_concat_indices_0based=%s weight=%.4f enabled=%s",
                 hotspot_params["target_hotspot_residues_1based"],
                 hotspot_params["target_hotspot_concat_indices"],
+                args.esmfold2_hotspot_weight,
+                args.esmfold2_hotspot_weight > 0.0,
             )
         else:
             logging.info(
@@ -681,6 +701,7 @@ def main():
             mcts_prior_mode=args.mcts_prior_mode,
             seed=args.seed,
             mutable_mask=esmfold2_mutable_mask,
+            hotspot_params=hotspot_params,
             artifact_dir=args.esmfold2_artifact_dir
             or os.path.join(args.output_dir, "esmfold2_artifacts"),
             esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
@@ -805,6 +826,7 @@ def main():
             f.write(f"ESMFold2 Proposal Confidence Max Candidates: {args.esmfold2_proposal_confidence_max_candidates}\n")
             f.write(f"ESMFold2 Proposal Confidence Tail Steps: {args.esmfold2_proposal_confidence_tail_steps}\n")
             f.write(f"ESMFold2 Final Polish: {args.esmfold2_final_polish}\n")
+            f.write(f"ESMFold2 Hotspot Weight: {args.esmfold2_hotspot_weight}\n")
         f.write(f"Optimization Steps: {args.n_steps}\n")
         f.write(f"Learning Rate: {args.learning_rate}\n")
         f.write(f"Tau Noise: {args.tau_noise}\n")

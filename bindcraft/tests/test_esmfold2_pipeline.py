@@ -43,13 +43,16 @@ class FakeESMFold2Backend:
             coordinate=torch.zeros(1, len(binder_seq) + len(str(target_seq)), 3),
         )
 
-    def preview_loss_dict(self, *, binder_seq, target_seq, seed=None):
-        self.preview_calls.append((binder_seq, target_seq, seed))
-        return {
+    def preview_loss_dict(self, *, binder_seq, target_seq, seed=None, hotspot_params=None):
+        self.preview_calls.append((binder_seq, target_seq, seed, hotspot_params))
+        losses = {
             "inter_contact_loss": 0.6,
             "intra_contact_loss": 0.1,
             "glob_loss": 0.05,
         }
+        if hotspot_params:
+            losses["hotspot_contact_loss"] = 0.4
+        return losses
 
     def propose(
         self,
@@ -65,6 +68,7 @@ class FakeESMFold2Backend:
         action_group=None,
         mutable_mask=None,
         proposal_logits=None,
+        hotspot_params=None,
         track_confidence_override=None,
         soft_steps_override=None,
     ):
@@ -78,6 +82,7 @@ class FakeESMFold2Backend:
                 "mutable_mask": mutable_mask,
                 "max_mutations_per_seq": max_mutations_per_seq,
                 "proposal_logits": proposal_logits.detach().clone() if proposal_logits is not None else None,
+                "hotspot_params": hotspot_params,
                 "track_confidence_override": track_confidence_override,
                 "soft_steps_override": soft_steps_override,
             }
@@ -97,6 +102,7 @@ class FakeESMFold2Backend:
         seed=None,
         mutable_mask=None,
         proposal_logits=None,
+        hotspot_params=None,
         track_confidence_override=None,
         soft_steps_override=None,
     ):
@@ -108,6 +114,7 @@ class FakeESMFold2Backend:
                 "seed": seed,
                 "mutable_mask": mutable_mask,
                 "proposal_logits": proposal_logits.detach().clone() if proposal_logits is not None else None,
+                "hotspot_params": hotspot_params,
                 "track_confidence_override": track_confidence_override,
                 "soft_steps_override": soft_steps_override,
             }
@@ -191,6 +198,86 @@ def test_esmfold2_continuous_stagea_designs_once_then_verifies_argmax_sequence()
     assert [call["current_seq"] for call in backend.continuous_calls] == ["AAA"]
     assert backend.propose_calls == []
     assert backend.preview_calls == []
+
+
+def test_esmfold2_pipeline_propagates_hotspot_to_stage_a_stage_b_and_preview():
+    backend = FakeESMFold2Backend()
+    hotspot_params = {"target_hotspot_concat_indices": [1, 2]}
+
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq=["TT", "GG"],
+        L_binder=3,
+        N_steps=2,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=1,
+        T_sample=1.0,
+        max_mutations_per_seq=1,
+        seed=7,
+        mcts_strategy="two_stage",
+        mcts_bootstrap_steps=1,
+        mcts_bootstrap_max_steps=1,
+        mcts_expand_actions_per_step=1,
+        hotspot_params=hotspot_params,
+    )
+
+    assert backend.propose_calls
+    assert all(call["hotspot_params"] == hotspot_params for call in backend.propose_calls)
+    assert backend.preview_calls
+    assert all(call[3] == hotspot_params for call in backend.preview_calls)
+
+
+def test_esmfold2_pipeline_propagates_hotspot_to_continuous_and_final_polish():
+    hotspot_params = {"target_hotspot_concat_indices": [0]}
+    continuous_backend = FakeESMFold2Backend()
+
+    run_esmfold2_mcts_hallucination(
+        backend=continuous_backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=1,
+        num_beams=1,
+        init_binder_seq="AAA",
+        B_candidates=1,
+        mcts_strategy="continuous_stage_a",
+        hotspot_params=hotspot_params,
+    )
+    assert continuous_backend.continuous_calls[0]["hotspot_params"] == hotspot_params
+
+    polish_backend = FakeESMFold2Backend()
+    run_esmfold2_mcts_hallucination(
+        backend=polish_backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=1,
+        num_beams=1,
+        init_binder_seq="AAA",
+        B_candidates=1,
+        mcts_strategy="stage_a_only",
+        esmfold2_final_polish=True,
+        hotspot_params=hotspot_params,
+    )
+    assert polish_backend.continuous_calls[0]["hotspot_params"] == hotspot_params
+
+
+def test_esmfold2_pipeline_rejects_positive_backend_weight_without_hotspots():
+    backend = FakeESMFold2Backend()
+    backend.config = type("Config", (), {"hotspot_weight": 0.5})()
+
+    with pytest.raises(
+        ValueError,
+        match="positive ESMFold2 hotspot_weight requires target hotspot indices",
+    ):
+        run_esmfold2_mcts_hallucination(
+            backend=backend,
+            target_seq="TTTT",
+            L_binder=3,
+            N_steps=1,
+            num_beams=1,
+            init_binder_seq="AAA",
+        )
 
 
 def test_esmfold2_official_free_roots_keep_unanchored_mutable_logits():
@@ -859,6 +946,7 @@ def test_esmfold2_pipeline_remains_compatible_with_list_only_proposal_backend():
         T_sample=1.0,
         max_mutations_per_seq=1,
         seed=7,
+        hotspot_params={"target_hotspot_concat_indices": [1]},
     )
 
     assert best_seq == final_seq == "AAY"

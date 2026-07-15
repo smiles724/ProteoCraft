@@ -182,9 +182,60 @@ def _contact_loss(
     return _masked_average(per_residue, mask=chain_mask)
 
 
-def _structure_losses(distogram_logits: torch.Tensor, binder_length: int) -> dict[str, torch.Tensor]:
+def _normalize_target_hotspot_indices(
+    hotspot_params: Optional[Dict[str, Any]],
+    *,
+    target_length: int,
+) -> list[int]:
+    """Validate target-relative concatenated hotspot indices."""
+
+    raw_indices: Any = (hotspot_params or {}).get("target_hotspot_concat_indices")
+    if raw_indices is None:
+        return []
+    if isinstance(raw_indices, torch.Tensor):
+        values = raw_indices.detach().cpu().flatten().tolist()
+    elif isinstance(raw_indices, (int, str)):
+        values = [raw_indices]
+    else:
+        values = list(raw_indices)
+
+    indices: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        if isinstance(value, bool):
+            raise ValueError("hotspot indices must be integers, not booleans")
+        try:
+            index = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid hotspot index: {value!r}") from exc
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError(f"invalid non-integer hotspot index: {value!r}")
+        if index < 0 or index >= int(target_length):
+            raise ValueError(
+                f"hotspot target concat index {index} is out of range for target_length={target_length}"
+            )
+        if index not in seen:
+            seen.add(index)
+            indices.append(index)
+    return indices
+
+
+def _structure_losses(
+    distogram_logits: torch.Tensor,
+    binder_length: int,
+    *,
+    hotspot_params: Optional[Dict[str, Any]] = None,
+    hotspot_weight: float = 0.0,
+) -> dict[str, torch.Tensor]:
     bin_distance = _midpoint_bins(distogram_logits.device)
     full_len = distogram_logits.shape[1]
+    target_length = int(full_len) - int(binder_length)
+    if target_length <= 0:
+        raise ValueError(
+            f"distogram length {full_len} must exceed binder_length {binder_length}"
+        )
+    if float(hotspot_weight) < 0.0:
+        raise ValueError("hotspot_weight must be non-negative")
     is_binder = torch.ones(full_len, device=distogram_logits.device)
     is_binder[:-binder_length] *= 0.0
 
@@ -217,13 +268,43 @@ def _structure_losses(distogram_logits: torch.Tensor, binder_length: int) -> dic
     rg_th = 2.38 * (n**0.365)
     glob = F.elu(rg_term - rg_th)
 
-    total = 0.5 * intra + 0.5 * inter + 0.2 * glob
-    return {
+    base_total = 0.5 * intra + 0.5 * inter + 0.2 * glob
+    losses = {
         "intra_contact_loss": intra,
         "inter_contact_loss": inter,
         "glob_loss": glob,
-        "total_loss": total,
+        "total_loss": base_total,
     }
+    hotspot_indices = _normalize_target_hotspot_indices(
+        hotspot_params,
+        target_length=target_length,
+    )
+    if float(hotspot_weight) > 0.0 and not hotspot_indices:
+        raise ValueError(
+            "positive hotspot_weight requires target_hotspot_concat_indices"
+        )
+    if hotspot_indices:
+        hotspot_mask = torch.zeros(full_len, device=distogram_logits.device)
+        hotspot_mask[torch.as_tensor(hotspot_indices, device=distogram_logits.device)] = 1.0
+        hotspot_contact = _contact_loss(
+            distogram_logits,
+            bin_distance,
+            num_contacts=1,
+            min_sep=0,
+            cutoff=22.0,
+            chain_mask=hotspot_mask,
+            binder_mask=is_binder,
+        )
+        weighted_hotspot = float(hotspot_weight) * hotspot_contact
+        losses.update(
+            {
+                "base_structure_loss": base_total,
+                "hotspot_contact_loss": hotspot_contact,
+                "hotspot_weighted_contribution": weighted_hotspot,
+                "total_loss": base_total + weighted_hotspot,
+            }
+        )
+    return losses
 
 
 def _stageb_structure_loss(
@@ -317,6 +398,7 @@ class ESMFold2RuntimeBackend:
         mutable_mask: Optional[Sequence[bool]] = None,
         action_group: Optional[str] = None,
         proposal_logits: Optional[torch.Tensor] = None,
+        hotspot_params: Optional[Dict[str, Any]] = None,
         track_confidence_override: Optional[bool] = None,
         soft_steps_override: Optional[int] = None,
     ) -> ESMFold2ProposalBatch:
@@ -328,6 +410,7 @@ class ESMFold2RuntimeBackend:
             mutable_mask=mutable_mask,
             action_group=action_group,
             proposal_logits=proposal_logits,
+            hotspot_params=hotspot_params,
             track_confidence_override=track_confidence_override,
             soft_steps_override=soft_steps_override,
         )
@@ -361,6 +444,7 @@ class ESMFold2RuntimeBackend:
         seed: Optional[int] = None,
         mutable_mask: Optional[Sequence[bool]] = None,
         proposal_logits: Optional[torch.Tensor] = None,
+        hotspot_params: Optional[Dict[str, Any]] = None,
         track_confidence_override: Optional[bool] = None,
         soft_steps_override: Optional[int] = None,
     ) -> ESMFold2ProposalBatch:
@@ -378,6 +462,7 @@ class ESMFold2RuntimeBackend:
             mutable_mask=mutable_mask,
             action_group=None,
             proposal_logits=proposal_logits,
+            hotspot_params=hotspot_params,
             track_confidence_override=track_confidence_override,
             soft_steps_override=soft_steps_override,
         )
@@ -401,6 +486,7 @@ class ESMFold2RuntimeBackend:
         binder_seq: str,
         target_seq: Union[str, Sequence[str]],
         seed: Optional[int] = None,
+        hotspot_params: Optional[Dict[str, Any]] = None,
     ) -> dict[str, float]:
         """Compute lightweight distogram losses for Stage-B routing diagnostics.
 
@@ -417,9 +503,19 @@ class ESMFold2RuntimeBackend:
             design=design,
             seed=seed,
         )
-        losses = _structure_losses(fold_result["distogram_logits"], len(binder_seq))
+        losses = _structure_losses(
+            fold_result["distogram_logits"],
+            len(binder_seq),
+            hotspot_params=hotspot_params,
+            hotspot_weight=float(self.config.hotspot_weight),
+        )
         output: dict[str, float] = {}
-        for key in ("intra_contact_loss", "inter_contact_loss", "glob_loss"):
+        for key in (
+            "intra_contact_loss",
+            "inter_contact_loss",
+            "glob_loss",
+            "hotspot_contact_loss",
+        ):
             value = losses.get(key)
             scalar = _as_float(value)
             if scalar is not None:
@@ -549,6 +645,7 @@ class ESMFold2RuntimeBackend:
         mutable_mask: Optional[Sequence[bool]],
         action_group: Optional[str],
         proposal_logits: Optional[torch.Tensor],
+        hotspot_params: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         logits_before, logits_after, _, _ = self._run_soft_update_impl(
             current_seq=current_seq,
@@ -558,6 +655,7 @@ class ESMFold2RuntimeBackend:
             mutable_mask=mutable_mask,
             action_group=action_group,
             proposal_logits=proposal_logits,
+            hotspot_params=hotspot_params,
             track_confidence=False,
         )
         return logits_before, logits_after
@@ -572,6 +670,7 @@ class ESMFold2RuntimeBackend:
         mutable_mask: Optional[Sequence[bool]],
         action_group: Optional[str],
         proposal_logits: Optional[torch.Tensor],
+        hotspot_params: Optional[Dict[str, Any]],
         track_confidence_override: Optional[bool] = None,
         soft_steps_override: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -586,6 +685,7 @@ class ESMFold2RuntimeBackend:
             mutable_mask=mutable_mask,
             action_group=action_group,
             proposal_logits=proposal_logits,
+            hotspot_params=hotspot_params,
             track_confidence=track_confidence,
             soft_steps_override=soft_steps_override,
         )
@@ -600,6 +700,7 @@ class ESMFold2RuntimeBackend:
         mutable_mask: Optional[Sequence[bool]],
         action_group: Optional[str],
         proposal_logits: Optional[torch.Tensor],
+        hotspot_params: Optional[Dict[str, Any]],
         track_confidence: bool,
         soft_steps_override: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -616,6 +717,8 @@ class ESMFold2RuntimeBackend:
                 kwargs["proposal_logits"] = proposal_logits
             if _callable_accepts_argument(self.soft_update_fn, "soft_steps_override"):
                 kwargs["soft_steps_override"] = soft_steps_override
+            if _callable_accepts_argument(self.soft_update_fn, "hotspot_params"):
+                kwargs["hotspot_params"] = hotspot_params
             logits_before, logits_after = self.soft_update_fn(**kwargs)
             return logits_before, logits_after, [], []
 
@@ -689,7 +792,12 @@ class ESMFold2RuntimeBackend:
                 )
                 if record is not None:
                     confidence_candidates.append(record)
-            losses = _structure_losses(fold_result["distogram_logits"], len(current_seq))
+            losses = _structure_losses(
+                fold_result["distogram_logits"],
+                len(current_seq),
+                hotspot_params=hotspot_params,
+                hotspot_weight=float(self.config.hotspot_weight),
+            )
             structure_loss, _ = _stageb_structure_loss(
                 losses,
                 action_group,
@@ -719,27 +827,37 @@ class ESMFold2RuntimeBackend:
             optimizer.step()
             structure_total = losses["total_loss"]
             combined_total = structure_total + (esmc_loss if lambda_esmc != 0.0 else 0.0)
-            soft_step_metrics.append(
-                {
-                    "global_step": int(global_step),
-                    "local_step": int(local_step),
-                    "temperature": float(temperature),
-                    "proposal_loss_source": _stageb_structure_loss(
-                        losses,
-                        action_group,
-                        group_weight=getattr(self.config, "stageb_group_weight", 1.0),
-                    )[1],
-                    "intra_contact_loss": _as_float(losses.get("intra_contact_loss")),
-                    "inter_contact_loss": _as_float(losses.get("inter_contact_loss")),
-                    "glob_loss": _as_float(losses.get("glob_loss")),
-                    "structure_total_loss": _as_float(structure_total),
-                    "plm_loss": None if lambda_esmc == 0.0 else _as_float(esmc_loss),
-                    "total_loss": _as_float(combined_total),
-                    "backprop_loss": _as_float(structure_loss),
-                    "lambda_esmc": float(lambda_esmc),
-                    "confidence_tracked": bool(should_track_confidence),
-                }
-            )
+            metrics = {
+                "global_step": int(global_step),
+                "local_step": int(local_step),
+                "temperature": float(temperature),
+                "proposal_loss_source": _stageb_structure_loss(
+                    losses,
+                    action_group,
+                    group_weight=getattr(self.config, "stageb_group_weight", 1.0),
+                )[1],
+                "intra_contact_loss": _as_float(losses.get("intra_contact_loss")),
+                "inter_contact_loss": _as_float(losses.get("inter_contact_loss")),
+                "glob_loss": _as_float(losses.get("glob_loss")),
+                "structure_total_loss": _as_float(structure_total),
+                "plm_loss": None if lambda_esmc == 0.0 else _as_float(esmc_loss),
+                "total_loss": _as_float(combined_total),
+                "backprop_loss": _as_float(structure_loss),
+                "lambda_esmc": float(lambda_esmc),
+                "confidence_tracked": bool(should_track_confidence),
+            }
+            if "hotspot_contact_loss" in losses:
+                metrics.update(
+                    {
+                        "base_structure_loss": _as_float(losses.get("base_structure_loss")),
+                        "hotspot_contact_loss": _as_float(losses.get("hotspot_contact_loss")),
+                        "hotspot_weight": float(self.config.hotspot_weight),
+                        "hotspot_weighted_contribution": _as_float(
+                            losses.get("hotspot_weighted_contribution")
+                        ),
+                    }
+                )
+            soft_step_metrics.append(metrics)
 
         return (
             logits_before.detach().cpu(),

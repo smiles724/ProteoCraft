@@ -168,6 +168,7 @@ def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     assert default_config.proposal_lm_dropout == pytest.approx(0.5)
     assert default_config.force_proposal_lm_dropout is True
     assert default_config.experimental_model_name.endswith("ESMFold2-Experimental")
+    assert default_config.hotspot_weight == pytest.approx(0.0)
 
     config = ESMFold2ProposalConfig(soft_steps=3, lambda_esmc="auto")
     assert config.soft_steps == 3
@@ -175,6 +176,11 @@ def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     last = esm_temperature(2, total_steps=3)
     assert first > last
     assert last >= 1e-2
+
+
+def test_proposal_config_rejects_negative_hotspot_weight():
+    with pytest.raises(ValueError, match="hotspot_weight must be non-negative"):
+        ESMFold2ProposalConfig(hotspot_weight=-0.1)
 
 
 def test_logit_delta_candidates_reuse_stage_a_topk_sampling_contract():

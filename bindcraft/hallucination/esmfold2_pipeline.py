@@ -526,6 +526,7 @@ def _call_backend_propose(
     backend: Any,
     *,
     proposal_logits: Optional[torch.Tensor],
+    hotspot_params: Optional[Dict[str, Any]] = None,
     track_confidence_override: Optional[bool] = None,
     soft_steps_override: Optional[int] = None,
     **kwargs: Any,
@@ -539,6 +540,10 @@ def _call_backend_propose(
         propose_kwargs["track_confidence_override"] = track_confidence_override
     if _callable_accepts_argument(backend.propose, "soft_steps_override"):
         propose_kwargs["soft_steps_override"] = soft_steps_override
+    if _callable_accepts_argument(backend.propose, "hotspot_params"):
+        propose_kwargs["hotspot_params"] = (
+            dict(hotspot_params) if hotspot_params is not None else None
+        )
     raw = backend.propose(**propose_kwargs)
     return _normalize_proposal_batch(raw)
 
@@ -547,6 +552,7 @@ def _call_backend_continuous_design(
     backend: Any,
     *,
     proposal_logits: Optional[torch.Tensor],
+    hotspot_params: Optional[Dict[str, Any]] = None,
     track_confidence_override: Optional[bool] = None,
     soft_steps_override: Optional[int] = None,
     **kwargs: Any,
@@ -562,6 +568,10 @@ def _call_backend_continuous_design(
         design_kwargs["track_confidence_override"] = track_confidence_override
     if _callable_accepts_argument(backend.continuous_design, "soft_steps_override"):
         design_kwargs["soft_steps_override"] = soft_steps_override
+    if _callable_accepts_argument(backend.continuous_design, "hotspot_params"):
+        design_kwargs["hotspot_params"] = (
+            dict(hotspot_params) if hotspot_params is not None else None
+        )
     raw = backend.continuous_design(**design_kwargs)
     return _normalize_proposal_batch(raw)
 
@@ -920,20 +930,27 @@ def _merge_preview_losses_for_routing(
     binder_seq: str,
     target_seq: Union[str, Sequence[str]],
     seed: Optional[int],
+    hotspot_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, float]:
     """Merge optional lightweight ESMFold2 preview losses into a node vector."""
 
     if not hasattr(backend, "preview_loss_dict"):
         return {}
-    if all(key in loss_vector for key in ("inter_contact_loss", "intra_contact_loss", "glob_loss")):
+    required_keys = ["inter_contact_loss", "intra_contact_loss", "glob_loss"]
+    if hotspot_params:
+        required_keys.append("hotspot_contact_loss")
+    if all(key in loss_vector for key in required_keys):
         return {}
     if binder_seq not in preview_cache:
         try:
-            preview = backend.preview_loss_dict(
+            preview_kwargs = dict(
                 binder_seq=binder_seq,
                 target_seq=target_seq,
                 seed=seed,
             )
+            if _callable_accepts_argument(backend.preview_loss_dict, "hotspot_params"):
+                preview_kwargs["hotspot_params"] = dict(hotspot_params) if hotspot_params else None
+            preview = backend.preview_loss_dict(**preview_kwargs)
         except Exception as exc:  # pragma: no cover - diagnostic fallback path
             logger.warning(
                 "ESM StageB preview routing loss failed for %s: %s",
@@ -1052,6 +1069,7 @@ def run_esmfold2_mcts_hallucination(
     mcts_prior_mode: str = "full",
     seed: Optional[int] = 42,
     mutable_mask: Optional[Sequence[bool]] = None,
+    hotspot_params: Optional[Dict[str, Any]] = None,
     artifact_dir: Optional[Union[str, os.PathLike[str]]] = None,
     esmfold2_logit_init_mode: str = "legacy_anchor",
     esmfold2_stagea_soft_steps: Optional[int] = None,
@@ -1102,6 +1120,22 @@ def run_esmfold2_mcts_hallucination(
         )
     target_key = _normalize_target_key(target_seq)
     mutable_mask = _normalize_mutable_mask(mutable_mask, L_binder)
+    hotspot_params = dict(hotspot_params) if hotspot_params else None
+    hotspot_indices = [
+        int(index)
+        for index in (hotspot_params or {}).get("target_hotspot_concat_indices", [])
+    ]
+    backend_config = getattr(backend, "config", None)
+    hotspot_weight = float(getattr(backend_config, "hotspot_weight", 0.0))
+    if hotspot_weight > 0.0 and not hotspot_indices:
+        raise ValueError(
+            "positive ESMFold2 hotspot_weight requires target hotspot indices"
+        )
+    hotspot_summary = {
+        "hotspot_indices_0based": hotspot_indices,
+        "hotspot_weight": hotspot_weight,
+        "hotspot_enabled": bool(hotspot_indices and hotspot_weight > 0.0),
+    }
     logit_init_mode = _normalize_logit_init_mode(esmfold2_logit_init_mode)
     stagea_soft_steps = (
         int(esmfold2_stagea_soft_steps)
@@ -1145,6 +1179,12 @@ def run_esmfold2_mcts_hallucination(
         "ESMFold2 soft_steps: stage_a=%s stage_b=%s",
         str(stagea_soft_steps or "backend_default"),
         str(stageb_soft_steps or "backend_default"),
+    )
+    logger.info(
+        "ESMFold2 hotspot: indices_0based=%s weight=%.4f enabled=%s",
+        hotspot_indices or "none",
+        hotspot_weight,
+        hotspot_summary["hotspot_enabled"],
     )
     logger.info("=" * 70)
 
@@ -1286,6 +1326,7 @@ def run_esmfold2_mcts_hallucination(
             seed=polish_seed,
             mutable_mask=mutable_mask,
             proposal_logits=polish_logits,
+            hotspot_params=hotspot_params,
             track_confidence_override=True,
             soft_steps_override=stagea_soft_steps,
         )
@@ -1378,6 +1419,7 @@ def run_esmfold2_mcts_hallucination(
             seed=_stable_seed(seed, "esm_continuous_stage_a", target_key, current_seq),
             mutable_mask=mutable_mask,
             proposal_logits=selected_node.logits,
+            hotspot_params=hotspot_params,
             track_confidence_override=None,
             soft_steps_override=stagea_soft_steps,
         )
@@ -1478,6 +1520,7 @@ def run_esmfold2_mcts_hallucination(
             n_steps=len(losses_history),
             strategy=strategy,
             artifact_dir=str(artifact_dir) if artifact_dir is not None else None,
+            **hotspot_summary,
         )
         logger.info(
             "ESM continuous StageA | selected=%s round_best=%s round_best_loss=%.4f best=%.4f",
@@ -1518,6 +1561,7 @@ def run_esmfold2_mcts_hallucination(
             action_group=None,
             mutable_mask=mutable_mask,
             proposal_logits=selected_node.logits,
+            hotspot_params=hotspot_params,
             track_confidence_override=False,
             soft_steps_override=stagea_soft_steps,
         )
@@ -1654,6 +1698,7 @@ def run_esmfold2_mcts_hallucination(
             n_steps=len(losses_history),
             strategy=strategy,
             artifact_dir=str(artifact_dir) if artifact_dir is not None else None,
+            **hotspot_summary,
         )
         return best_seq, final_seq, losses_history
 
@@ -1727,6 +1772,7 @@ def run_esmfold2_mcts_hallucination(
             binder_seq=current_seq,
             target_seq=target_seq,
             seed=_stable_seed(seed, "esm_stageb_preview", target_key, current_seq),
+            hotspot_params=hotspot_params,
         )
         routing = select_esmfold2_action_group(selected_node.loss_vector, temperature=1.0)
         action_group = str(routing["action_group"])
@@ -1772,6 +1818,7 @@ def run_esmfold2_mcts_hallucination(
                 action_group=group_name,
                 mutable_mask=mutable_mask,
                 proposal_logits=selected_node.logits,
+                hotspot_params=hotspot_params,
                 track_confidence_override=False,
                 soft_steps_override=stageb_soft_steps,
             )
@@ -1988,5 +2035,6 @@ def run_esmfold2_mcts_hallucination(
         n_steps=len(losses_history),
         strategy=strategy,
         artifact_dir=str(artifact_dir) if artifact_dir is not None else None,
+        **hotspot_summary,
     )
     return best_seq, final_seq, losses_history

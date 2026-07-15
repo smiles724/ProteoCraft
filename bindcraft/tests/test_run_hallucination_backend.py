@@ -31,6 +31,7 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_proposal_load_internal_esmc is True
     assert args.esmfold2_proposal_lm_dropout == pytest.approx(0.5)
     assert args.esmfold2_force_proposal_lm_dropout is True
+    assert args.esmfold2_hotspot_weight == pytest.approx(0.0)
 
 
 def test_esmfold2_backend_accepts_explicit_stage_a_only_strategy():
@@ -225,6 +226,8 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
             "0,1,1",
             "--target_hotspots",
             "2",
+            "--esmfold2_hotspot_weight",
+            "0.4",
             "--target_template_path",
             str(tmp_path / "target.cif"),
             "--output_dir",
@@ -240,7 +243,8 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     log_text = (tmp_path / "run.log").read_text()
     assert "Model Backend: esmfold2" in result_text
     assert "Best Sequence: AAY" in result_text
-    assert "ESMFold2 backend received target_hotspots but does not use hotspot-aware routing yet" in log_text
+    assert "ESMFold2 hotspot contact configured" in log_text
+    assert "ESMFold2 Hotspot Weight: 0.4" in result_text
     assert "ESMFold2 backend received target_template_path but does not use templates yet" in log_text
     assert captured["mcts_strategy"] == "two_stage"
     assert captured["mcts_bootstrap_steps"] == 50
@@ -249,10 +253,52 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     assert captured["stagea_max_mutations_per_seq"] == 7
     assert captured["stageb_max_mutations_per_seq"] == 1
     assert captured["mutable_mask"] == [False, True, True]
+    assert captured["hotspot_params"] == {
+        "target_hotspot_residues_1based": [2],
+        "target_hotspot_concat_indices": [1],
+    }
     assert captured["esmfold2_logit_init_mode"] == "official_exact"
     assert captured["esmfold2_stagea_soft_steps"] == 30
     assert captured["esmfold2_stageb_soft_steps"] == 5
     assert captured["task_type_arg"] == "tcr"
+
+
+def test_multichain_hotspot_parser_uses_residue_count_without_separator():
+    parser = build_arg_parser()
+    args = parser.parse_args(
+        ["--target", "AA|BBB", "--target_hotspots", "5"]
+    )
+
+    assert run_hallucination_script._build_hotspot_params(args, parser) == {
+        "target_hotspot_residues_1based": [5],
+        "target_hotspot_concat_indices": [4],
+    }
+
+    out_of_range = parser.parse_args(
+        ["--target", "AA|BBB", "--target_hotspots", "6"]
+    )
+    with pytest.raises(SystemExit):
+        run_hallucination_script._build_hotspot_params(out_of_range, parser)
+
+
+def test_main_rejects_positive_esmfold2_hotspot_weight_without_hotspots(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_hallucination.py",
+            "--target",
+            "TTTT",
+            "--model_backend",
+            "esmfold2",
+            "--mode",
+            "mcts",
+            "--esmfold2_hotspot_weight",
+            "0.4",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        run_hallucination_script.main()
 
 
 def test_esmfold2_mutable_mask_parser_accepts_compact_and_delimited_masks():

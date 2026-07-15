@@ -13,6 +13,7 @@ from bindcraft.hallucination.esmfold2_backend import (
 )
 from bindcraft.hallucination.esmfold2_runtime import (
     ESMFold2RuntimeBackend,
+    _structure_losses,
     _stageb_structure_loss,
 )
 import bindcraft.hallucination.esmfold2_runtime as esmfold2_runtime_module
@@ -374,6 +375,106 @@ def test_runtime_continuous_design_records_soft_step_metrics(monkeypatch):
     assert "structure_total_loss" in batch.soft_step_metrics[0]
     assert "backprop_loss" in batch.soft_step_metrics[0]
     assert "temperature" in batch.soft_step_metrics[0]
+
+
+def test_hotspot_structure_loss_is_additive_and_weight_zero_preserves_base_loss():
+    torch.manual_seed(3)
+    distogram = torch.randn(1, 7, 7, 128, requires_grad=True)
+    hotspot_params = {"target_hotspot_concat_indices": [1, 3, 1]}
+
+    baseline = _structure_losses(distogram, binder_length=3)
+    diagnostic = _structure_losses(
+        distogram,
+        binder_length=3,
+        hotspot_params=hotspot_params,
+        hotspot_weight=0.0,
+    )
+    weighted = _structure_losses(
+        distogram,
+        binder_length=3,
+        hotspot_params=hotspot_params,
+        hotspot_weight=0.4,
+    )
+
+    assert torch.allclose(diagnostic["total_loss"], baseline["total_loss"])
+    assert torch.allclose(diagnostic["base_structure_loss"], baseline["total_loss"])
+    assert torch.allclose(
+        weighted["total_loss"],
+        baseline["total_loss"] + 0.4 * weighted["hotspot_contact_loss"],
+    )
+    weighted["total_loss"].mean().backward()
+    assert distogram.grad is not None
+    assert torch.isfinite(distogram.grad).all()
+
+
+@pytest.mark.parametrize("indices", [[4], [-1], [1.5], [True]])
+def test_hotspot_structure_loss_rejects_invalid_target_indices(indices):
+    distogram = torch.zeros(1, 7, 7, 128)
+
+    with pytest.raises(ValueError):
+        _structure_losses(
+            distogram,
+            binder_length=3,
+            hotspot_params={"target_hotspot_concat_indices": indices},
+            hotspot_weight=0.2,
+        )
+
+
+def test_hotspot_structure_loss_rejects_positive_weight_without_hotspots():
+    with pytest.raises(
+        ValueError,
+        match="positive hotspot_weight requires target_hotspot_concat_indices",
+    ):
+        _structure_losses(
+            torch.zeros(1, 7, 7, 128),
+            binder_length=3,
+            hotspot_weight=0.2,
+        )
+
+
+def test_runtime_continuous_design_logs_multichain_hotspot_metrics(monkeypatch):
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(
+            soft_steps=1,
+            lambda_esmc=0.0,
+            num_loops=1,
+            num_sampling_steps=1,
+            hotspot_weight=0.3,
+        ),
+        device="cpu",
+        experimental_model=object(),
+    )
+    monkeypatch.setattr(backend, "_ensure_proposal_models_loaded", lambda: None)
+
+    def fake_fold_distogram(**kwargs):
+        targets = esmfold2_runtime_module._target_sequences(kwargs["target_seq"])
+        design = kwargs["design"]
+        full_len = sum(len(seq) for seq in targets) + design.shape[1]
+        bins = torch.arange(128, dtype=design.dtype, device=design.device)
+        signal = design[..., 0].sum()
+        return {
+            "distogram_logits": signal
+            * bins.reshape(1, 1, 1, -1).expand(1, full_len, full_len, 128)
+        }
+
+    monkeypatch.setattr(backend, "_fold_distogram", fake_fold_distogram)
+
+    batch = backend.continuous_design(
+        current_seq="AAA",
+        target_seq=["TT", "GGG"],
+        global_step=0,
+        seed=5,
+        mutable_mask=[True, True, True],
+        proposal_logits=torch.zeros(3, 20),
+        hotspot_params={"target_hotspot_concat_indices": [3, 4]},
+    )
+
+    metrics = batch.soft_step_metrics[0]
+    assert metrics["hotspot_weight"] == pytest.approx(0.3)
+    assert metrics["hotspot_contact_loss"] is not None
+    assert metrics["hotspot_weighted_contribution"] == pytest.approx(
+        0.3 * metrics["hotspot_contact_loss"]
+    )
 
 
 def test_runtime_continuous_design_accepts_multiple_target_chains(monkeypatch):
