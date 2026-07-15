@@ -409,8 +409,12 @@ class TCRPriorBackend(ABC):
                         and out.shape[1] == NUM_AMINO_ACIDS
                         and out.shape[0] > 0
                     )
-                except Exception:
+                except Exception as exc:
                     real_output = False
+                    logger.warning(
+                        "TCR prior backend '%s' probe call raised %s: %s",
+                        self.name, type(exc).__name__, exc,
+                    )
         return {
             "backend": self.name,
             "loaded": self._available,
@@ -605,8 +609,8 @@ class TCRLMBackend(TCRPriorBackend):
             )
             self._warned_len = True
         tokens, length = self._encode_padded(sequence)
-        length_t = torch.tensor([length], dtype=torch.long)
-        reorder = torch.tensor(self._reorder, dtype=torch.long)
+        length_t = torch.tensor([length], dtype=torch.long, device=self.device)
+        reorder = torch.tensor(self._reorder, dtype=torch.long, device=self.device)
         out = torch.zeros(len(region_indices), NUM_AMINO_ACIDS)
         with torch.no_grad():
             for row, pos in enumerate(region_indices):
