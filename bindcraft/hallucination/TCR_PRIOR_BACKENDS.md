@@ -75,6 +75,18 @@ the model returns nothing. Each backend also exposes `backend.status()`:
 - Scoring: masked-marginal pseudo-log-likelihood. Each region position is
   replaced with `TOKEN_MASK`; the model predicts a 20-way distribution; we
   read the true residue's log-prob. Supports both hard and soft paths.
+- **CDR3-only, `SEQ_MAX_LEN=20`.** The CDR pipeline passes the *full* binder
+  sequence (150-250 aa) plus the CDR's absolute region indices (e.g. 88-103),
+  not a pre-cut CDR3 substring — TCRLM was never designed to see the other
+  ~200 residues. `per_position_logprobs` extracts the `SEQ_MAX_LEN` window
+  that actually contains `region_indices` (centered on the region), instead
+  of always truncating from position 0. Before this fix, every CDR position
+  fell outside a from-the-start truncation, so every call silently returned
+  the uniform-distribution placeholder (NLL = log(20)) regardless of the
+  real CDR3 — real and scrambled sequences scored identically. Pass
+  `require_real_tcr_prior: true` to turn any remaining out-of-window case
+  (region wider than 20 residues) into a hard error instead of a silent
+  fallback.
 
 ### Required files
 - Repo checkout dir (contains `models/` and `source/`): `TCRLM_HOME` env or
