@@ -457,6 +457,7 @@ class TCRLMBackend(TCRPriorBackend):
         repo_path: Optional[str] = None,
         checkpoint: Optional[str] = None,
         device: Optional[torch.device] = None,
+        strict_window: bool = False,
     ):
         super().__init__()
         import os
@@ -464,6 +465,7 @@ class TCRLMBackend(TCRPriorBackend):
         self.repo_path = repo_path or os.environ.get("TCRLM_HOME")
         self.checkpoint = checkpoint or os.environ.get("TCRLM_CKPT")
         self.device = device or torch.device("cpu")
+        self.strict_window = bool(strict_window)
         self.model = None
         self._token_to_index: Dict[str, int] = {}
         self._mask_idx: Optional[int] = None
@@ -591,6 +593,38 @@ class TCRLMBackend(TCRPriorBackend):
             ids = ids + [self._pad_idx] * (self.SEQ_MAX_LEN - length)
         return torch.tensor(ids, dtype=torch.long, device=self.device), length
 
+    def _window_for_region(
+        self, sequence: str, region_indices: List[int]
+    ) -> "tuple[str, int]":
+        """Return (windowed_sequence, offset) so ``region_indices`` (absolute,
+        into ``sequence``) land inside ``SEQ_MAX_LEN`` after subtracting
+        ``offset``.
+
+        TCRLM is a CDR3-only model. Callers in the CDR pipeline pass the full
+        binder sequence plus CDR-region indices (e.g. positions 88-103 of a
+        197-residue binder), not a pre-cut CDR3 substring. Truncating from the
+        start of ``sequence`` (the naive behavior) would put every CDR
+        position outside the encoded window, silently degrading every score
+        to a uniform-distribution placeholder. Instead, extract the
+        ``SEQ_MAX_LEN``-sized window that actually contains the requested
+        region, centered on it when the region is shorter than the window.
+        """
+        if len(sequence) <= self.SEQ_MAX_LEN:
+            return sequence, 0
+        valid = [i for i in region_indices if 0 <= i < len(sequence)]
+        if not valid:
+            return sequence[: self.SEQ_MAX_LEN], 0
+        lo, hi = min(valid), max(valid)
+        span = hi - lo + 1
+        if span > self.SEQ_MAX_LEN:
+            # Region itself exceeds the model's window; anchor on its start.
+            start = lo
+        else:
+            pad = self.SEQ_MAX_LEN - span
+            start = lo - pad // 2
+            start = max(0, min(start, len(sequence) - self.SEQ_MAX_LEN))
+        return sequence[start : start + self.SEQ_MAX_LEN], start
+
     def per_position_logprobs(
         self,
         sequence: str,
@@ -601,21 +635,34 @@ class TCRLMBackend(TCRPriorBackend):
             return None
         if len(region_indices) == 0:
             return torch.zeros(0, NUM_AMINO_ACIDS)
+        windowed_seq, offset = self._window_for_region(sequence, region_indices)
         if len(sequence) > self.SEQ_MAX_LEN and not self._warned_len:
-            logger.warning(
-                "TCRLM is a CDR3 model with max length %d; input of length %d is "
-                "truncated. Pass the CDR3 region (tcr_prior_region='cdr').",
-                self.SEQ_MAX_LEN, len(sequence),
+            logger.info(
+                "TCRLM is a CDR3 model with max length %d; scoring the %d-residue "
+                "window [%d:%d) of the %d-residue input that covers the requested region.",
+                self.SEQ_MAX_LEN, len(windowed_seq), offset, offset + len(windowed_seq),
+                len(sequence),
             )
             self._warned_len = True
-        tokens, length = self._encode_padded(sequence)
+        tokens, length = self._encode_padded(windowed_seq)
         length_t = torch.tensor([length], dtype=torch.long, device=self.device)
         reorder = torch.tensor(self._reorder, dtype=torch.long, device=self.device)
         out = torch.zeros(len(region_indices), NUM_AMINO_ACIDS)
         with torch.no_grad():
-            for row, pos in enumerate(region_indices):
+            for row, abs_pos in enumerate(region_indices):
+                pos = abs_pos - offset
                 if pos < 0 or pos >= length:
-                    # Outside the model's window; leave as uniform log-probs.
+                    # Truly outside the window even after region-aware centering
+                    # (e.g. a region wider than SEQ_MAX_LEN). Surface this loudly
+                    # instead of silently degrading to a uniform placeholder.
+                    if self.strict_window:
+                        raise TCRPriorStrictError(
+                            f"TCRLM: region position {abs_pos} (sequence length "
+                            f"{len(sequence)}) falls outside the scoring window "
+                            f"[{offset}:{offset + length}) even after centering on the "
+                            "requested region; the region is likely wider than "
+                            f"SEQ_MAX_LEN={self.SEQ_MAX_LEN}."
+                        )
                     out[row] = torch.full((NUM_AMINO_ACIDS,), -float(np.log(NUM_AMINO_ACIDS)))
                     continue
                 masked = tokens.clone()
@@ -1116,7 +1163,10 @@ def _build_backend(
     """Instantiate a real prior backend, or None if the name is not recognized."""
     checkpoint = config.get("tcr_prior_checkpoint")
     if backend_name in _TCRLM_PREFIXES:
-        return TCRLMBackend(repo_path=arg, checkpoint=checkpoint, device=device)
+        strict_window = bool(config.get("require_real_tcr_prior", False))
+        return TCRLMBackend(
+            repo_path=arg, checkpoint=checkpoint, device=device, strict_window=strict_window
+        )
     if backend_name in _ESMC_PREFIXES:
         model_id = arg or "esmc_300m"
         masked = bool(config.get("tcr_prior_masked", False))
