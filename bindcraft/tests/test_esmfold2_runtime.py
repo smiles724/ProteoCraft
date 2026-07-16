@@ -13,6 +13,7 @@ from bindcraft.hallucination.esmfold2_backend import (
 )
 from bindcraft.hallucination.esmfold2_runtime import (
     ESMFold2RuntimeBackend,
+    _hotspot_structure_metrics,
     _structure_losses,
     _stageb_structure_loss,
 )
@@ -22,6 +23,24 @@ import bindcraft.hallucination.esmfold2_runtime as esmfold2_runtime_module
 class FakeComplex:
     def to_mmcif_string(self):
         return "data_fake\n"
+
+
+class FakeGeometryComplex(FakeComplex):
+    def __init__(self):
+        self.chain_boundaries = [(0, 4), (5, 8)]
+        self.atom37_positions = torch.zeros(8, 37, 3)
+        self.atom37_mask = torch.zeros(8, 37, dtype=torch.bool)
+        target_coordinates = [0.0, 10.0, 24.0, 30.0]
+        for residue_index, x_coord in enumerate(target_coordinates):
+            self.atom37_positions[residue_index, 0] = torch.tensor(
+                [x_coord, 0.0, 0.0]
+            )
+            self.atom37_mask[residue_index, 0] = True
+        for residue_index in range(5, 8):
+            self.atom37_positions[residue_index, 0] = torch.tensor(
+                [4.0, 0.0, 0.0]
+            )
+            self.atom37_mask[residue_index, 0] = True
 
 
 class FakeFoldResult:
@@ -36,6 +55,12 @@ class FakeFoldResult:
                 [0.41, 1.0],
             ]
         )
+
+
+class FakeGeometryFoldResult(FakeFoldResult):
+    def __init__(self):
+        super().__init__()
+        self.complex = FakeGeometryComplex()
 
 
 class FakeFoldResultBatchedPairIptm(FakeFoldResult):
@@ -64,6 +89,12 @@ class FakeBatchedPairInputBuilder(FakeInputBuilder):
     def fold(self, model, input_spec, **kwargs):
         self.calls.append((model, input_spec, kwargs))
         return FakeFoldResultBatchedPairIptm()
+
+
+class FakeGeometryInputBuilder(FakeInputBuilder):
+    def fold(self, model, input_spec, **kwargs):
+        self.calls.append((model, input_spec, kwargs))
+        return FakeGeometryFoldResult()
 
 
 class FakeProteinInput:
@@ -121,6 +152,68 @@ def test_runtime_verifier_extracts_batched_pair_chain_metrics():
     assert result.total_loss == pytest.approx(0.26)
     assert result.summary_confidence["pair_chain_iptm"] == pytest.approx(0.74)
     assert result.summary_confidence["esm_verify_source"] == "pair_chain_iptm"
+
+
+def test_runtime_hotspot_verifier_combines_full_structure_distance_with_global_loss():
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(
+            hotspot_verify_weight=0.2,
+            hotspot_verify_near_cutoff=5.0,
+            hotspot_verify_far_cutoff=20.0,
+        ),
+        device="cpu",
+        verifier_model=object(),
+        input_builder=FakeGeometryInputBuilder(),
+        protein_input_cls=FakeProteinInput,
+        structure_prediction_input_cls=FakeStructurePredictionInput,
+    )
+
+    result = backend.verify(
+        binder_seq="YYY",
+        target_seq="AAAA",
+        seed=7,
+        hotspot_params={"target_hotspot_concat_indices": [0, 2]},
+    )
+
+    assert result.loss_dict["esm_verify_global_loss"] == pytest.approx(0.17)
+    assert result.loss_dict["hotspot_verify_distance_loss"] == pytest.approx(0.5)
+    assert result.total_loss == pytest.approx(0.27)
+    assert result.summary_confidence["hotspot_mean_min_heavy_atom_distance"] == pytest.approx(12.0)
+    assert result.summary_confidence["hotspot_heavy_atom_coverage"] == pytest.approx(0.5)
+    assert result.summary_confidence["hotspot_heavy_atom_covered_count"] == 1
+
+
+def test_runtime_hotspot_verifier_requires_hotspot_indices_when_enabled():
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(hotspot_verify_weight=0.2),
+        device="cpu",
+        verifier_model=object(),
+        input_builder=FakeGeometryInputBuilder(),
+        protein_input_cls=FakeProteinInput,
+        structure_prediction_input_cls=FakeStructurePredictionInput,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="hotspot-aware verifier requires target_hotspot_concat_indices",
+    ):
+        backend.verify(binder_seq="YYY", target_seq="AAAA", seed=7)
+
+
+def test_hotspot_structure_metrics_map_concatenated_indices_across_target_chains():
+    complex_obj = FakeGeometryComplex()
+    complex_obj.chain_boundaries = [(0, 2), (2, 4), (5, 8)]
+
+    metrics = _hotspot_structure_metrics(
+        complex_obj,
+        target_sequences=["AA", "AA"],
+        hotspot_params={"target_hotspot_concat_indices": [2]},
+        near_cutoff=5.0,
+        far_cutoff=20.0,
+    )
+
+    assert metrics["hotspot_min_heavy_atom_distances"] == pytest.approx([20.0])
+    assert metrics["hotspot_verify_distance_loss"] == pytest.approx(1.0)
 
 
 def test_runtime_preserves_matching_free_proposal_logits_without_hard_anchor():

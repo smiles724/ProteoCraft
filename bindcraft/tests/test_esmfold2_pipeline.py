@@ -130,6 +130,20 @@ class FakeESMFold2Backend:
         )
 
 
+class FakeHotspotVerifyBackend(FakeESMFold2Backend):
+    def __init__(self):
+        super().__init__()
+        self.hotspot_verify_calls = []
+
+    def verify(self, *, binder_seq, target_seq, seed=None, hotspot_params=None):
+        self.hotspot_verify_calls.append(hotspot_params)
+        return super().verify(
+            binder_seq=binder_seq,
+            target_seq=target_seq,
+            seed=seed,
+        )
+
+
 def test_esmfold2_stagea_pipeline_uses_backend_for_verify_and_proposal():
     backend = FakeESMFold2Backend()
 
@@ -229,6 +243,30 @@ def test_esmfold2_pipeline_propagates_hotspot_to_stage_a_stage_b_and_preview():
     assert all(call[3] == hotspot_params for call in backend.preview_calls)
 
 
+def test_esmfold2_pipeline_propagates_hotspots_to_verify_when_supported():
+    backend = FakeHotspotVerifyBackend()
+    hotspot_params = {"target_hotspot_concat_indices": [1, 2]}
+
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=1,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=1,
+        T_sample=1.0,
+        max_mutations_per_seq=1,
+        seed=7,
+        mcts_strategy="stage_a_only",
+        hotspot_params=hotspot_params,
+    )
+
+    assert backend.hotspot_verify_calls
+    assert all(call == hotspot_params for call in backend.hotspot_verify_calls)
+
+
 def test_esmfold2_pipeline_propagates_hotspot_to_continuous_and_final_polish():
     hotspot_params = {"target_hotspot_concat_indices": [0]}
     continuous_backend = FakeESMFold2Backend()
@@ -269,6 +307,28 @@ def test_esmfold2_pipeline_rejects_positive_backend_weight_without_hotspots():
     with pytest.raises(
         ValueError,
         match="positive ESMFold2 hotspot_weight requires target hotspot indices",
+    ):
+        run_esmfold2_mcts_hallucination(
+            backend=backend,
+            target_seq="TTTT",
+            L_binder=3,
+            N_steps=1,
+            num_beams=1,
+            init_binder_seq="AAA",
+        )
+
+
+def test_esmfold2_pipeline_rejects_positive_hotspot_verify_weight_without_hotspots():
+    backend = FakeESMFold2Backend()
+    backend.config = type(
+        "Config",
+        (),
+        {"hotspot_weight": 0.0, "hotspot_verify_weight": 0.2},
+    )()
+
+    with pytest.raises(
+        ValueError,
+        match="positive ESMFold2 hotspot_verify_weight requires target hotspot indices",
     ):
         run_esmfold2_mcts_hallucination(
             backend=backend,

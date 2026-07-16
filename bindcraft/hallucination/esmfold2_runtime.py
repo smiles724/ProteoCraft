@@ -220,6 +220,101 @@ def _normalize_target_hotspot_indices(
     return indices
 
 
+def _hotspot_structure_metrics(
+    complex_obj: Any,
+    *,
+    target_sequences: Sequence[str],
+    hotspot_params: Optional[Dict[str, Any]],
+    near_cutoff: float,
+    far_cutoff: float,
+) -> dict[str, Any]:
+    """Measure hotspot-to-binder distances from an ESMFold2 full structure."""
+
+    if float(near_cutoff) < 0.0:
+        raise ValueError("hotspot verifier near cutoff must be non-negative")
+    if float(far_cutoff) <= float(near_cutoff):
+        raise ValueError("hotspot verifier far cutoff must exceed near cutoff")
+    required = ("chain_boundaries", "atom37_positions", "atom37_mask")
+    missing = [name for name in required if not hasattr(complex_obj, name)]
+    if missing:
+        raise ValueError(
+            "ESMFold2 verifier structure is missing hotspot geometry fields: "
+            + ", ".join(missing)
+        )
+
+    boundaries = [tuple(map(int, bounds)) for bounds in complex_obj.chain_boundaries]
+    n_target_chains = len(target_sequences)
+    if len(boundaries) <= n_target_chains:
+        raise ValueError(
+            "ESMFold2 verifier structure does not contain the expected binder chain"
+        )
+    observed_target_lengths = [
+        boundaries[index][1] - boundaries[index][0]
+        for index in range(n_target_chains)
+    ]
+    expected_target_lengths = [len(sequence) for sequence in target_sequences]
+    if observed_target_lengths != expected_target_lengths:
+        raise ValueError(
+            "ESMFold2 verifier target chain lengths do not match input: "
+            f"expected={expected_target_lengths}, observed={observed_target_lengths}"
+        )
+
+    target_residue_indices = [
+        residue_index
+        for chain_index in range(n_target_chains)
+        for residue_index in range(*boundaries[chain_index])
+    ]
+    hotspot_indices = _normalize_target_hotspot_indices(
+        hotspot_params,
+        target_length=len(target_residue_indices),
+    )
+    if not hotspot_indices:
+        raise ValueError(
+            "hotspot-aware verifier requires target_hotspot_concat_indices"
+        )
+
+    positions = torch.as_tensor(complex_obj.atom37_positions, dtype=torch.float32)
+    atom_mask = torch.as_tensor(complex_obj.atom37_mask, dtype=torch.bool)
+    binder_start, binder_end = boundaries[n_target_chains]
+    binder_positions = positions[binder_start:binder_end]
+    binder_mask = atom_mask[binder_start:binder_end]
+    binder_atoms = binder_positions[binder_mask]
+    if binder_atoms.numel() == 0:
+        raise ValueError("ESMFold2 verifier binder chain has no predicted atoms")
+
+    minimum_distances: list[float] = []
+    for hotspot_index in hotspot_indices:
+        residue_index = target_residue_indices[hotspot_index]
+        residue_atoms = positions[residue_index][atom_mask[residue_index]]
+        if residue_atoms.numel() == 0:
+            raise ValueError(
+                f"ESMFold2 verifier hotspot residue {hotspot_index} has no predicted atoms"
+            )
+        minimum_distances.append(
+            float(torch.cdist(residue_atoms, binder_atoms).min().item())
+        )
+
+    distance_tensor = torch.tensor(minimum_distances, dtype=torch.float32)
+    distance_loss = torch.clamp(
+        (distance_tensor - float(near_cutoff))
+        / (float(far_cutoff) - float(near_cutoff)),
+        min=0.0,
+        max=1.0,
+    ).mean()
+    covered_count = int((distance_tensor <= float(near_cutoff)).sum().item())
+    hotspot_count = len(hotspot_indices)
+    return {
+        "hotspot_verify_distance_loss": float(distance_loss.item()),
+        "hotspot_mean_min_heavy_atom_distance": float(distance_tensor.mean().item()),
+        "hotspot_heavy_atom_coverage": covered_count / hotspot_count,
+        "hotspot_heavy_atom_covered_count": covered_count,
+        "hotspot_count": hotspot_count,
+        "hotspot_verify_near_cutoff": float(near_cutoff),
+        "hotspot_verify_far_cutoff": float(far_cutoff),
+        "hotspot_min_heavy_atom_distances": minimum_distances,
+    }
+
+
 def _structure_losses(
     distogram_logits: torch.Tensor,
     binder_length: int,
@@ -367,6 +462,7 @@ class ESMFold2RuntimeBackend:
         binder_seq: str,
         target_seq: Union[str, Sequence[str]],
         seed: Optional[int] = None,
+        hotspot_params: Optional[Dict[str, Any]] = None,
     ):
         self._ensure_verifier_loaded()
         targets = _target_sequences(target_seq)
@@ -381,10 +477,28 @@ class ESMFold2RuntimeBackend:
             complex_id="esmfold2_verify",
         )
         summary = self._summary_from_fold_result(fold_result, n_target_chains=len(targets))
+        hotspot_verify_weight = float(self.config.hotspot_verify_weight)
+        hotspot_metrics: dict[str, Any] = {}
+        if hotspot_verify_weight > 0.0:
+            hotspot_metrics = _hotspot_structure_metrics(
+                fold_result.complex,
+                target_sequences=targets,
+                hotspot_params=hotspot_params,
+                near_cutoff=float(self.config.hotspot_verify_near_cutoff),
+                far_cutoff=float(self.config.hotspot_verify_far_cutoff),
+            )
+            summary.update(hotspot_metrics)
         return build_esm_verifier_result(
             binder_seq=binder_seq,
             target_seq=target_seq,
             summary_confidence=summary,
+            extra_loss_dict={
+                key: value
+                for key, value in hotspot_metrics.items()
+                if not isinstance(value, list)
+            },
+            hotspot_verify_loss=hotspot_metrics.get("hotspot_verify_distance_loss"),
+            hotspot_verify_weight=hotspot_verify_weight,
         )
 
     def propose(

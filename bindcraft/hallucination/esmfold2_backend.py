@@ -93,6 +93,9 @@ class ESMFold2ProposalConfig:
     force_proposal_lm_dropout: bool = True
     hotspot_weight: float = 0.0
     hotspot_cutoff: float = 8.0
+    hotspot_verify_weight: float = 0.0
+    hotspot_verify_near_cutoff: float = 5.0
+    hotspot_verify_far_cutoff: float = 20.0
     stageb_group_weight: float = 1.0
     track_proposal_confidence: bool = False
     proposal_confidence_temperature: float = 0.05
@@ -121,6 +124,17 @@ class ESMFold2ProposalConfig:
             raise ValueError("hotspot_weight must be non-negative")
         if float(self.hotspot_cutoff) <= 0.0:
             raise ValueError("hotspot_cutoff must be positive")
+        if float(self.hotspot_verify_weight) < 0.0:
+            raise ValueError("hotspot_verify_weight must be non-negative")
+        if float(self.hotspot_verify_near_cutoff) < 0.0:
+            raise ValueError("hotspot_verify_near_cutoff must be non-negative")
+        if float(self.hotspot_verify_far_cutoff) <= float(
+            self.hotspot_verify_near_cutoff
+        ):
+            raise ValueError(
+                "hotspot_verify_far_cutoff must be greater than "
+                "hotspot_verify_near_cutoff"
+            )
         if self.proposal_lm_dropout is not None:
             dropout = float(self.proposal_lm_dropout)
             if dropout < 0.0 or dropout >= 1.0:
@@ -253,18 +267,44 @@ def build_esm_verifier_result(
     coordinate: Optional[torch.Tensor] = None,
     plddt_logits: Optional[torch.Tensor] = None,
     extra_loss_dict: Optional[Mapping[str, float]] = None,
+    hotspot_verify_loss: Optional[float] = None,
+    hotspot_verify_weight: float = 0.0,
 ) -> ESMFold2VerifierResult:
     """Build a verifier result object accepted by the existing MCTS cache."""
 
-    total_loss, source = resolve_esm_verifier_loss(summary_confidence)
+    global_loss, source = resolve_esm_verifier_loss(summary_confidence)
+    total_loss = float(global_loss)
+    hotspot_loss = _finite_float(hotspot_verify_loss)
+    hotspot_weight = float(hotspot_verify_weight)
+    if hotspot_weight < 0.0:
+        raise ValueError("hotspot_verify_weight must be non-negative")
+    if hotspot_weight > 0.0 and hotspot_loss is None:
+        raise ValueError(
+            "positive hotspot_verify_weight requires hotspot_verify_loss"
+        )
+    hotspot_enabled = hotspot_loss is not None and hotspot_weight > 0.0
+    if hotspot_enabled:
+        if hotspot_loss < 0.0 or hotspot_loss > 1.0:
+            raise ValueError("hotspot_verify_loss must be in [0, 1]")
+        total_loss += hotspot_weight * hotspot_loss
     loss_dict: Dict[str, float] = {
         "total": float(total_loss),
         "esm_verify_loss": float(total_loss),
     }
     if source in PAIR_CHAIN_IPTM_KEYS:
-        loss_dict["pair_chain_iptm_loss"] = float(total_loss)
+        loss_dict["pair_chain_iptm_loss"] = float(global_loss)
     elif source in IPTM_KEYS:
-        loss_dict["iptm_loss"] = float(total_loss)
+        loss_dict["iptm_loss"] = float(global_loss)
+    if hotspot_enabled:
+        loss_dict.update(
+            {
+                "esm_verify_global_loss": float(global_loss),
+                "hotspot_verify_distance_loss": float(hotspot_loss),
+                "hotspot_verify_weight": hotspot_weight,
+                "hotspot_verify_weighted_contribution": hotspot_weight
+                * float(hotspot_loss),
+            }
+        )
     plddt = _finite_float(summary_confidence.get("plddt"))
     if plddt is not None:
         plddt_unit = plddt / 100.0 if plddt > 1.0 else plddt
@@ -280,6 +320,16 @@ def build_esm_verifier_result(
     summary = dict(summary_confidence)
     summary["esm_verify_loss"] = float(total_loss)
     summary["esm_verify_source"] = source
+    if hotspot_enabled:
+        summary.update(
+            {
+                "esm_verify_global_loss": float(global_loss),
+                "hotspot_verify_distance_loss": float(hotspot_loss),
+                "hotspot_verify_weight": hotspot_weight,
+                "hotspot_verify_weighted_contribution": hotspot_weight
+                * float(hotspot_loss),
+            }
+        )
     return ESMFold2VerifierResult(
         binder_seq=binder_seq,
         target_seq=target_seq,

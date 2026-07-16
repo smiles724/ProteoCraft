@@ -57,6 +57,54 @@ def test_verifier_result_is_compatible_with_mcts_cache_contract():
     assert cached.coordinate.shape == (1, 8, 3)
 
 
+def test_verifier_result_combines_global_and_hotspot_losses_without_overwriting_global_metric():
+    result = build_esm_verifier_result(
+        binder_seq="ALY",
+        target_seq="TARGET",
+        summary_confidence={"pair_chain_iptm": 0.75},
+        hotspot_verify_loss=0.6,
+        hotspot_verify_weight=0.2,
+        extra_loss_dict={"hotspot_mean_min_heavy_atom_distance": 14.0},
+    )
+
+    assert result.total_loss == pytest.approx(0.37)
+    assert result.loss_dict["pair_chain_iptm_loss"] == pytest.approx(0.25)
+    assert result.loss_dict["esm_verify_global_loss"] == pytest.approx(0.25)
+    assert result.loss_dict["hotspot_verify_distance_loss"] == pytest.approx(0.6)
+    assert result.loss_dict["hotspot_verify_weighted_contribution"] == pytest.approx(0.12)
+    assert result.loss_dict["hotspot_mean_min_heavy_atom_distance"] == pytest.approx(14.0)
+    assert result.summary_confidence["esm_verify_loss"] == pytest.approx(0.37)
+
+
+def test_zero_hotspot_verify_weight_preserves_legacy_verifier_result_shape():
+    result = build_esm_verifier_result(
+        binder_seq="ALY",
+        target_seq="TARGET",
+        summary_confidence={"pair_chain_iptm": 0.75},
+        hotspot_verify_loss=0.6,
+        hotspot_verify_weight=0.0,
+    )
+
+    assert result.total_loss == pytest.approx(0.25)
+    assert set(result.loss_dict) == {
+        "total",
+        "esm_verify_loss",
+        "pair_chain_iptm_loss",
+    }
+    assert "hotspot_verify_distance_loss" not in result.summary_confidence
+
+    with pytest.raises(
+        ValueError,
+        match="positive hotspot_verify_weight requires hotspot_verify_loss",
+    ):
+        build_esm_verifier_result(
+            binder_seq="ALY",
+            target_seq="TARGET",
+            summary_confidence={"pair_chain_iptm": 0.75},
+            hotspot_verify_weight=0.2,
+        )
+
+
 def test_init_logits_and_gradient_mask_keep_fixed_positions_out_of_optimization():
     logits = init_binder_logits(
         "ALD",
@@ -170,6 +218,9 @@ def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     assert default_config.experimental_model_name.endswith("ESMFold2-Experimental")
     assert default_config.hotspot_weight == pytest.approx(0.0)
     assert default_config.hotspot_cutoff == pytest.approx(8.0)
+    assert default_config.hotspot_verify_weight == pytest.approx(0.0)
+    assert default_config.hotspot_verify_near_cutoff == pytest.approx(5.0)
+    assert default_config.hotspot_verify_far_cutoff == pytest.approx(20.0)
 
     config = ESMFold2ProposalConfig(soft_steps=3, lambda_esmc="auto")
     assert config.soft_steps == 3
@@ -187,6 +238,19 @@ def test_proposal_config_rejects_negative_hotspot_weight():
 def test_proposal_config_rejects_nonpositive_hotspot_cutoff():
     with pytest.raises(ValueError, match="hotspot_cutoff must be positive"):
         ESMFold2ProposalConfig(hotspot_cutoff=0.0)
+
+
+def test_proposal_config_validates_hotspot_verifier_parameters():
+    with pytest.raises(ValueError, match="hotspot_verify_weight must be non-negative"):
+        ESMFold2ProposalConfig(hotspot_verify_weight=-0.1)
+    with pytest.raises(
+        ValueError,
+        match="hotspot_verify_far_cutoff must be greater",
+    ):
+        ESMFold2ProposalConfig(
+            hotspot_verify_near_cutoff=5.0,
+            hotspot_verify_far_cutoff=5.0,
+        )
 
 
 def test_logit_delta_candidates_reuse_stage_a_topk_sampling_contract():

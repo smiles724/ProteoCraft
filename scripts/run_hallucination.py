@@ -335,6 +335,9 @@ def load_esmfold2_backend(args, device: str = "cuda"):
         proposal_confidence_tail_steps=args.esmfold2_proposal_confidence_tail_steps,
         hotspot_weight=args.esmfold2_hotspot_weight,
         hotspot_cutoff=args.esmfold2_hotspot_cutoff,
+        hotspot_verify_weight=args.esmfold2_hotspot_verify_weight,
+        hotspot_verify_near_cutoff=args.esmfold2_hotspot_verify_near_cutoff,
+        hotspot_verify_far_cutoff=args.esmfold2_hotspot_verify_far_cutoff,
     )
     return ESMFold2RuntimeBackend(
         config=config,
@@ -425,6 +428,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2 proposal hotspot contact loss 权重；0 保持旧行为（默认：0.0）")
     parser.add_argument("--esmfold2_hotspot_cutoff", type=float, default=8.0,
                        help="ESMFold2 proposal hotspot contact 距离阈值，单位 Å（默认：8.0）")
+    parser.add_argument("--esmfold2_hotspot_verify_weight", type=float, default=0.0,
+                       help="ESMFold2 full verifier hotspot 距离 loss 权重；0 保持旧行为（默认：0.0）")
+    parser.add_argument("--esmfold2_hotspot_verify_near_cutoff", type=float, default=5.0,
+                       help="ESMFold2 hotspot verifier 满足接触的重原子距离，单位 Å（默认：5.0）")
+    parser.add_argument("--esmfold2_hotspot_verify_far_cutoff", type=float, default=20.0,
+                       help="ESMFold2 hotspot verifier 距离 loss 饱和上限，单位 Å（默认：20.0）")
     parser.add_argument("--checkpoint_dir", type=str, default=None,
                        help="Checkpoint 目录；默认依次读取 --checkpoint_dir、PROTENIX_CHECKPOINT_DIR、PROTENIX_ROOT_DIR/checkpoint")
     parser.add_argument("--save_checkpoint_dir", type=str, default=None,
@@ -614,6 +623,18 @@ def main():
         parser.error("--esmfold2_hotspot_weight 必须大于等于 0")
     if args.esmfold2_hotspot_cutoff <= 0.0:
         parser.error("--esmfold2_hotspot_cutoff 必须大于 0")
+    if args.esmfold2_hotspot_verify_weight < 0.0:
+        parser.error("--esmfold2_hotspot_verify_weight 必须大于等于 0")
+    if args.esmfold2_hotspot_verify_near_cutoff < 0.0:
+        parser.error("--esmfold2_hotspot_verify_near_cutoff 必须大于等于 0")
+    if (
+        args.esmfold2_hotspot_verify_far_cutoff
+        <= args.esmfold2_hotspot_verify_near_cutoff
+    ):
+        parser.error(
+            "--esmfold2_hotspot_verify_far_cutoff 必须大于 "
+            "--esmfold2_hotspot_verify_near_cutoff"
+        )
     if (
         model_backend == "esmfold2"
         and args.esmfold2_hotspot_weight > 0.0
@@ -621,6 +642,14 @@ def main():
     ):
         parser.error(
             "--esmfold2_hotspot_weight > 0 时必须同时提供 --target_hotspots"
+        )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_hotspot_verify_weight > 0.0
+        and hotspot_params is None
+    ):
+        parser.error(
+            "--esmfold2_hotspot_verify_weight > 0 时必须同时提供 --target_hotspots"
         )
 
     setup_logging(args.log_file, level=args.log_level)
@@ -644,6 +673,18 @@ def main():
                 hotspot_params["target_hotspot_residues_1based"],
                 hotspot_params["target_hotspot_concat_indices"],
             )
+    if model_backend == "esmfold2":
+        logging.info(
+            "ESMFold2 hotspot verifier configured: weight=%.4f near=%.2fA "
+            "far=%.2fA enabled=%s",
+            args.esmfold2_hotspot_verify_weight,
+            args.esmfold2_hotspot_verify_near_cutoff,
+            args.esmfold2_hotspot_verify_far_cutoff,
+            bool(
+                hotspot_params is not None
+                and args.esmfold2_hotspot_verify_weight > 0.0
+            ),
+        )
     if model_backend == "esmfold2" and args.target_template_path:
         logging.info(
             "ESMFold2 backend received target_template_path but does not use templates yet: %s",
@@ -834,6 +875,18 @@ def main():
             f.write(f"ESMFold2 Final Polish: {args.esmfold2_final_polish}\n")
             f.write(f"ESMFold2 Hotspot Weight: {args.esmfold2_hotspot_weight}\n")
             f.write(f"ESMFold2 Hotspot Cutoff: {args.esmfold2_hotspot_cutoff} A\n")
+            f.write(
+                "ESMFold2 Hotspot Verify Weight: "
+                f"{args.esmfold2_hotspot_verify_weight}\n"
+            )
+            f.write(
+                "ESMFold2 Hotspot Verify Near Cutoff: "
+                f"{args.esmfold2_hotspot_verify_near_cutoff} A\n"
+            )
+            f.write(
+                "ESMFold2 Hotspot Verify Far Cutoff: "
+                f"{args.esmfold2_hotspot_verify_far_cutoff} A\n"
+            )
         f.write(f"Optimization Steps: {args.n_steps}\n")
         f.write(f"Learning Rate: {args.learning_rate}\n")
         f.write(f"Tau Noise: {args.tau_noise}\n")

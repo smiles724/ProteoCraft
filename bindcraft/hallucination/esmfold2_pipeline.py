@@ -900,14 +900,20 @@ def _verify_with_cache(
     binder_seq: str,
     target_seq: Union[str, Sequence[str]],
     seed: Optional[int],
+    hotspot_params: Optional[Dict[str, Any]] = None,
 ) -> Any:
     if binder_seq in verifier_cache:
         return verifier_cache[binder_seq]
-    result = backend.verify(
+    verify_kwargs = dict(
         binder_seq=binder_seq,
         target_seq=target_seq,
         seed=seed,
     )
+    if _callable_accepts_argument(backend.verify, "hotspot_params"):
+        verify_kwargs["hotspot_params"] = (
+            dict(hotspot_params) if hotspot_params is not None else None
+        )
+    result = backend.verify(**verify_kwargs)
     verifier_cache[str(result.binder_seq)] = result
     return result
 
@@ -1128,15 +1134,34 @@ def run_esmfold2_mcts_hallucination(
     backend_config = getattr(backend, "config", None)
     hotspot_weight = float(getattr(backend_config, "hotspot_weight", 0.0))
     hotspot_cutoff = float(getattr(backend_config, "hotspot_cutoff", 8.0))
+    hotspot_verify_weight = float(
+        getattr(backend_config, "hotspot_verify_weight", 0.0)
+    )
+    hotspot_verify_near_cutoff = float(
+        getattr(backend_config, "hotspot_verify_near_cutoff", 5.0)
+    )
+    hotspot_verify_far_cutoff = float(
+        getattr(backend_config, "hotspot_verify_far_cutoff", 20.0)
+    )
     if hotspot_weight > 0.0 and not hotspot_indices:
         raise ValueError(
             "positive ESMFold2 hotspot_weight requires target hotspot indices"
+        )
+    if hotspot_verify_weight > 0.0 and not hotspot_indices:
+        raise ValueError(
+            "positive ESMFold2 hotspot_verify_weight requires target hotspot indices"
         )
     hotspot_summary = {
         "hotspot_indices_0based": hotspot_indices,
         "hotspot_weight": hotspot_weight,
         "hotspot_cutoff": hotspot_cutoff,
         "hotspot_enabled": bool(hotspot_indices and hotspot_weight > 0.0),
+        "hotspot_verify_weight": hotspot_verify_weight,
+        "hotspot_verify_near_cutoff": hotspot_verify_near_cutoff,
+        "hotspot_verify_far_cutoff": hotspot_verify_far_cutoff,
+        "hotspot_verify_enabled": bool(
+            hotspot_indices and hotspot_verify_weight > 0.0
+        ),
     }
     logit_init_mode = _normalize_logit_init_mode(esmfold2_logit_init_mode)
     stagea_soft_steps = (
@@ -1189,6 +1214,13 @@ def run_esmfold2_mcts_hallucination(
         hotspot_cutoff,
         hotspot_summary["hotspot_enabled"],
     )
+    logger.info(
+        "ESMFold2 hotspot verifier: weight=%.4f near=%.2fA far=%.2fA enabled=%s",
+        hotspot_verify_weight,
+        hotspot_verify_near_cutoff,
+        hotspot_verify_far_cutoff,
+        hotspot_summary["hotspot_verify_enabled"],
+    )
     logger.info("=" * 70)
 
     phase0_states = _make_phase0_seed_states(
@@ -1213,6 +1245,7 @@ def run_esmfold2_mcts_hallucination(
             binder_seq=binder_seq,
             target_seq=target_seq,
             seed=_stable_seed(seed, "esm_phase0", target_key, binder_seq),
+            hotspot_params=hotspot_params,
         )
         phase0_results.append(result)
         _write_candidate_artifact(
@@ -1359,6 +1392,7 @@ def run_esmfold2_mcts_hallucination(
                 binder_seq=cand_seq,
                 target_seq=target_seq,
                 seed=_stable_seed(seed, "esm_final_polish_verify", target_key, cand_seq),
+                hotspot_params=hotspot_params,
             )
             candidate_results.append(result)
             _write_candidate_artifact(
@@ -1452,6 +1486,7 @@ def run_esmfold2_mcts_hallucination(
                 binder_seq=cand_seq,
                 target_seq=target_seq,
                 seed=_stable_seed(seed, "esm_continuous_verify", target_key, cand_seq),
+                hotspot_params=hotspot_params,
             )
             candidate_results.append(result)
             _write_candidate_artifact(
@@ -1602,6 +1637,7 @@ def run_esmfold2_mcts_hallucination(
                 binder_seq=cand_seq,
                 target_seq=target_seq,
                 seed=_stable_seed(seed, "esm_verify", target_key, cand_seq),
+                hotspot_params=hotspot_params,
             )
             round_results.append(result)
             _write_candidate_artifact(
@@ -1892,6 +1928,7 @@ def run_esmfold2_mcts_hallucination(
                     binder_seq=action.sequence,
                     target_seq=target_seq,
                     seed=_stable_seed(seed, "esm_stageb_verify", target_key, action.sequence),
+                    hotspot_params=hotspot_params,
                 )
                 strict_tree.store_verifier_result(cached)
             _write_candidate_artifact(

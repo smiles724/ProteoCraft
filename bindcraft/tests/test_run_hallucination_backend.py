@@ -33,6 +33,9 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_force_proposal_lm_dropout is True
     assert args.esmfold2_hotspot_weight == pytest.approx(0.0)
     assert args.esmfold2_hotspot_cutoff == pytest.approx(8.0)
+    assert args.esmfold2_hotspot_verify_weight == pytest.approx(0.0)
+    assert args.esmfold2_hotspot_verify_near_cutoff == pytest.approx(5.0)
+    assert args.esmfold2_hotspot_verify_far_cutoff == pytest.approx(20.0)
 
 
 def test_esmfold2_backend_accepts_explicit_stage_a_only_strategy():
@@ -126,6 +129,12 @@ def test_esmfold2_backend_exposes_separate_model_and_proposal_options():
             "6",
             "--esmfold2_proposal_confidence_tail_steps",
             "20",
+            "--esmfold2_hotspot_verify_weight",
+            "0.2",
+            "--esmfold2_hotspot_verify_near_cutoff",
+            "5.0",
+            "--esmfold2_hotspot_verify_far_cutoff",
+            "20.0",
             "--stagea_max_mutations_per_seq",
             "9",
             "--stageb_max_mutations_per_seq",
@@ -156,6 +165,9 @@ def test_esmfold2_backend_exposes_separate_model_and_proposal_options():
     assert args.esmfold2_proposal_confidence_num_sampling_steps == 50
     assert args.esmfold2_proposal_confidence_max_candidates == 6
     assert args.esmfold2_proposal_confidence_tail_steps == 20
+    assert args.esmfold2_hotspot_verify_weight == pytest.approx(0.2)
+    assert args.esmfold2_hotspot_verify_near_cutoff == pytest.approx(5.0)
+    assert args.esmfold2_hotspot_verify_far_cutoff == pytest.approx(20.0)
     assert args.stagea_max_mutations_per_seq == 9
     assert args.stageb_max_mutations_per_seq == 1
 
@@ -231,6 +243,12 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
             "0.4",
             "--esmfold2_hotspot_cutoff",
             "8.0",
+            "--esmfold2_hotspot_verify_weight",
+            "0.2",
+            "--esmfold2_hotspot_verify_near_cutoff",
+            "5.0",
+            "--esmfold2_hotspot_verify_far_cutoff",
+            "20.0",
             "--target_template_path",
             str(tmp_path / "target.cif"),
             "--output_dir",
@@ -249,6 +267,10 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     assert "ESMFold2 hotspot contact configured" in log_text
     assert "ESMFold2 Hotspot Weight: 0.4" in result_text
     assert "ESMFold2 Hotspot Cutoff: 8.0 A" in result_text
+    assert "ESMFold2 Hotspot Verify Weight: 0.2" in result_text
+    assert "ESMFold2 Hotspot Verify Near Cutoff: 5.0 A" in result_text
+    assert "ESMFold2 Hotspot Verify Far Cutoff: 20.0 A" in result_text
+    assert "ESMFold2 hotspot verifier configured" in log_text
     assert "ESMFold2 backend received target_template_path but does not use templates yet" in log_text
     assert captured["mcts_strategy"] == "two_stage"
     assert captured["mcts_bootstrap_steps"] == 50
@@ -298,6 +320,26 @@ def test_main_rejects_positive_esmfold2_hotspot_weight_without_hotspots(monkeypa
             "mcts",
             "--esmfold2_hotspot_weight",
             "0.4",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        run_hallucination_script.main()
+
+
+def test_main_rejects_positive_esmfold2_hotspot_verify_weight_without_hotspots(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_hallucination.py",
+            "--target",
+            "TTTT",
+            "--model_backend",
+            "esmfold2",
+            "--mode",
+            "mcts",
+            "--esmfold2_hotspot_verify_weight",
+            "0.2",
         ],
     )
 
