@@ -43,6 +43,27 @@ class FakeGeometryComplex(FakeComplex):
             self.atom37_mask[residue_index, 0] = True
 
 
+class FakeMolecularComplex(FakeComplex):
+    def __init__(self):
+        self.sequence = ["ALA"] * 7
+        self.chain_id = torch.tensor([0, 0, 0, 0, 1, 1, 1])
+        self.atom_positions = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0],
+                [24.0, 0.0, 0.0],
+                [30.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+            ]
+        )
+        self.atom_elements = ["C"] * 7
+        self.token_to_atoms = torch.tensor(
+            [[index, index + 1] for index in range(7)]
+        )
+
+
 class FakeFoldResult:
     def __init__(self):
         self.complex = FakeComplex()
@@ -61,6 +82,12 @@ class FakeGeometryFoldResult(FakeFoldResult):
     def __init__(self):
         super().__init__()
         self.complex = FakeGeometryComplex()
+
+
+class FakeMolecularFoldResult(FakeFoldResult):
+    def __init__(self):
+        super().__init__()
+        self.complex = FakeMolecularComplex()
 
 
 class FakeFoldResultBatchedPairIptm(FakeFoldResult):
@@ -95,6 +122,12 @@ class FakeGeometryInputBuilder(FakeInputBuilder):
     def fold(self, model, input_spec, **kwargs):
         self.calls.append((model, input_spec, kwargs))
         return FakeGeometryFoldResult()
+
+
+class FakeMolecularInputBuilder(FakeInputBuilder):
+    def fold(self, model, input_spec, **kwargs):
+        self.calls.append((model, input_spec, kwargs))
+        return FakeMolecularFoldResult()
 
 
 class FakeProteinInput:
@@ -181,6 +214,28 @@ def test_runtime_hotspot_verifier_combines_full_structure_distance_with_global_l
     assert result.summary_confidence["hotspot_mean_min_heavy_atom_distance"] == pytest.approx(12.0)
     assert result.summary_confidence["hotspot_heavy_atom_coverage"] == pytest.approx(0.5)
     assert result.summary_confidence["hotspot_heavy_atom_covered_count"] == 1
+
+
+def test_runtime_hotspot_verifier_supports_current_molecular_complex_output():
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(hotspot_verify_weight=0.2),
+        device="cpu",
+        verifier_model=object(),
+        input_builder=FakeMolecularInputBuilder(),
+        protein_input_cls=FakeProteinInput,
+        structure_prediction_input_cls=FakeStructurePredictionInput,
+    )
+
+    result = backend.verify(
+        binder_seq="YYY",
+        target_seq="AAAA",
+        seed=7,
+        hotspot_params={"target_hotspot_concat_indices": [0, 2]},
+    )
+
+    assert result.total_loss == pytest.approx(0.27)
+    assert result.summary_confidence["hotspot_mean_min_heavy_atom_distance"] == pytest.approx(12.0)
+    assert result.summary_confidence["hotspot_heavy_atom_coverage"] == pytest.approx(0.5)
 
 
 def test_runtime_hotspot_verifier_requires_hotspot_indices_when_enabled():

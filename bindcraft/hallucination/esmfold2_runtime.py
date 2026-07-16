@@ -234,58 +234,133 @@ def _hotspot_structure_metrics(
         raise ValueError("hotspot verifier near cutoff must be non-negative")
     if float(far_cutoff) <= float(near_cutoff):
         raise ValueError("hotspot verifier far cutoff must exceed near cutoff")
-    required = ("chain_boundaries", "atom37_positions", "atom37_mask")
-    missing = [name for name in required if not hasattr(complex_obj, name)]
-    if missing:
-        raise ValueError(
-            "ESMFold2 verifier structure is missing hotspot geometry fields: "
-            + ", ".join(missing)
-        )
-
-    boundaries = [tuple(map(int, bounds)) for bounds in complex_obj.chain_boundaries]
     n_target_chains = len(target_sequences)
-    if len(boundaries) <= n_target_chains:
-        raise ValueError(
-            "ESMFold2 verifier structure does not contain the expected binder chain"
-        )
-    observed_target_lengths = [
-        boundaries[index][1] - boundaries[index][0]
-        for index in range(n_target_chains)
-    ]
     expected_target_lengths = [len(sequence) for sequence in target_sequences]
-    if observed_target_lengths != expected_target_lengths:
-        raise ValueError(
-            "ESMFold2 verifier target chain lengths do not match input: "
-            f"expected={expected_target_lengths}, observed={observed_target_lengths}"
-        )
-
-    target_residue_indices = [
-        residue_index
-        for chain_index in range(n_target_chains)
-        for residue_index in range(*boundaries[chain_index])
-    ]
+    expected_target_length = sum(expected_target_lengths)
     hotspot_indices = _normalize_target_hotspot_indices(
         hotspot_params,
-        target_length=len(target_residue_indices),
+        target_length=expected_target_length,
     )
     if not hotspot_indices:
         raise ValueError(
             "hotspot-aware verifier requires target_hotspot_concat_indices"
         )
 
-    positions = torch.as_tensor(complex_obj.atom37_positions, dtype=torch.float32)
-    atom_mask = torch.as_tensor(complex_obj.atom37_mask, dtype=torch.bool)
-    binder_start, binder_end = boundaries[n_target_chains]
-    binder_positions = positions[binder_start:binder_end]
-    binder_mask = atom_mask[binder_start:binder_end]
-    binder_atoms = binder_positions[binder_mask]
+    molecular_fields = (
+        "atom_positions",
+        "atom_elements",
+        "token_to_atoms",
+        "chain_id",
+        "sequence",
+    )
+    protein_fields = ("chain_boundaries", "atom37_positions", "atom37_mask")
+    if all(hasattr(complex_obj, name) for name in molecular_fields):
+        token_count = len(complex_obj.sequence)
+        chain_ids = list(complex_obj.chain_id)
+        if len(chain_ids) != token_count:
+            raise ValueError("ESMFold2 MolecularComplex chain_id length mismatch")
+        boundaries: list[tuple[int, int]] = []
+        if chain_ids:
+            chain_start = 0
+            for token_index in range(1, token_count):
+                if chain_ids[token_index] != chain_ids[token_index - 1]:
+                    boundaries.append((chain_start, token_index))
+                    chain_start = token_index
+            boundaries.append((chain_start, token_count))
+        if len(boundaries) <= n_target_chains:
+            raise ValueError(
+                "ESMFold2 MolecularComplex does not contain the expected binder chain"
+            )
+        observed_target_lengths = [
+            boundaries[index][1] - boundaries[index][0]
+            for index in range(n_target_chains)
+        ]
+        if observed_target_lengths != expected_target_lengths:
+            raise ValueError(
+                "ESMFold2 verifier target chain lengths do not match input: "
+                f"expected={expected_target_lengths}, observed={observed_target_lengths}"
+            )
+
+        positions = torch.as_tensor(complex_obj.atom_positions, dtype=torch.float32)
+        token_to_atoms = torch.as_tensor(complex_obj.token_to_atoms, dtype=torch.long)
+        elements = list(complex_obj.atom_elements)
+
+        def token_heavy_atoms(token_index: int) -> torch.Tensor:
+            atom_start, atom_end = map(int, token_to_atoms[token_index].tolist())
+            heavy_mask = []
+            for element in elements[atom_start:atom_end]:
+                if isinstance(element, bytes):
+                    element = element.decode(errors="ignore")
+                heavy_mask.append(str(element).strip().upper() != "H")
+            return positions[atom_start:atom_end][
+                torch.as_tensor(heavy_mask, dtype=torch.bool)
+            ]
+
+        target_residue_indices = [
+            residue_index
+            for chain_index in range(n_target_chains)
+            for residue_index in range(*boundaries[chain_index])
+        ]
+        binder_start, binder_end = boundaries[n_target_chains]
+        binder_atom_groups = [
+            token_heavy_atoms(token_index)
+            for token_index in range(binder_start, binder_end)
+        ]
+        nonempty_binder_atoms = [
+            atoms for atoms in binder_atom_groups if atoms.numel() > 0
+        ]
+        binder_atoms = (
+            torch.cat(nonempty_binder_atoms, dim=0)
+            if nonempty_binder_atoms
+            else torch.zeros((0, 3), dtype=torch.float32)
+        )
+
+        def hotspot_atoms(hotspot_index: int) -> torch.Tensor:
+            return token_heavy_atoms(target_residue_indices[hotspot_index])
+
+    elif all(hasattr(complex_obj, name) for name in protein_fields):
+        boundaries = [tuple(map(int, bounds)) for bounds in complex_obj.chain_boundaries]
+        if len(boundaries) <= n_target_chains:
+            raise ValueError(
+                "ESMFold2 ProteinComplex does not contain the expected binder chain"
+            )
+        observed_target_lengths = [
+            boundaries[index][1] - boundaries[index][0]
+            for index in range(n_target_chains)
+        ]
+        if observed_target_lengths != expected_target_lengths:
+            raise ValueError(
+                "ESMFold2 verifier target chain lengths do not match input: "
+                f"expected={expected_target_lengths}, observed={observed_target_lengths}"
+            )
+        target_residue_indices = [
+            residue_index
+            for chain_index in range(n_target_chains)
+            for residue_index in range(*boundaries[chain_index])
+        ]
+        positions = torch.as_tensor(complex_obj.atom37_positions, dtype=torch.float32)
+        atom_mask = torch.as_tensor(complex_obj.atom37_mask, dtype=torch.bool)
+        binder_start, binder_end = boundaries[n_target_chains]
+        binder_positions = positions[binder_start:binder_end]
+        binder_mask = atom_mask[binder_start:binder_end]
+        binder_atoms = binder_positions[binder_mask]
+
+        def hotspot_atoms(hotspot_index: int) -> torch.Tensor:
+            residue_index = target_residue_indices[hotspot_index]
+            return positions[residue_index][atom_mask[residue_index]]
+
+    else:
+        raise ValueError(
+            "ESMFold2 verifier structure is neither a supported MolecularComplex "
+            "nor ProteinComplex"
+        )
+
     if binder_atoms.numel() == 0:
         raise ValueError("ESMFold2 verifier binder chain has no predicted atoms")
 
     minimum_distances: list[float] = []
     for hotspot_index in hotspot_indices:
-        residue_index = target_residue_indices[hotspot_index]
-        residue_atoms = positions[residue_index][atom_mask[residue_index]]
+        residue_atoms = hotspot_atoms(hotspot_index)
         if residue_atoms.numel() == 0:
             raise ValueError(
                 f"ESMFold2 verifier hotspot residue {hotspot_index} has no predicted atoms"
