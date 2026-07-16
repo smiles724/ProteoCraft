@@ -226,6 +226,7 @@ def _structure_losses(
     *,
     hotspot_params: Optional[Dict[str, Any]] = None,
     hotspot_weight: float = 0.0,
+    hotspot_cutoff: float = 8.0,
 ) -> dict[str, torch.Tensor]:
     bin_distance = _midpoint_bins(distogram_logits.device)
     full_len = distogram_logits.shape[1]
@@ -236,6 +237,8 @@ def _structure_losses(
         )
     if float(hotspot_weight) < 0.0:
         raise ValueError("hotspot_weight must be non-negative")
+    if float(hotspot_cutoff) <= 0.0:
+        raise ValueError("hotspot_cutoff must be positive")
     is_binder = torch.ones(full_len, device=distogram_logits.device)
     is_binder[:-binder_length] *= 0.0
 
@@ -291,7 +294,7 @@ def _structure_losses(
             bin_distance,
             num_contacts=1,
             min_sep=0,
-            cutoff=22.0,
+            cutoff=float(hotspot_cutoff),
             chain_mask=hotspot_mask,
             binder_mask=is_binder,
         )
@@ -508,6 +511,7 @@ class ESMFold2RuntimeBackend:
             len(binder_seq),
             hotspot_params=hotspot_params,
             hotspot_weight=float(self.config.hotspot_weight),
+            hotspot_cutoff=float(self.config.hotspot_cutoff),
         )
         output: dict[str, float] = {}
         for key in (
@@ -797,6 +801,7 @@ class ESMFold2RuntimeBackend:
                 len(current_seq),
                 hotspot_params=hotspot_params,
                 hotspot_weight=float(self.config.hotspot_weight),
+                hotspot_cutoff=float(self.config.hotspot_cutoff),
             )
             structure_loss, _ = _stageb_structure_loss(
                 losses,
@@ -852,6 +857,7 @@ class ESMFold2RuntimeBackend:
                         "base_structure_loss": _as_float(losses.get("base_structure_loss")),
                         "hotspot_contact_loss": _as_float(losses.get("hotspot_contact_loss")),
                         "hotspot_weight": float(self.config.hotspot_weight),
+                        "hotspot_cutoff": float(self.config.hotspot_cutoff),
                         "hotspot_weighted_contribution": _as_float(
                             losses.get("hotspot_weighted_contribution")
                         ),

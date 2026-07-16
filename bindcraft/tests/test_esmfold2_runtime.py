@@ -407,6 +407,31 @@ def test_hotspot_structure_loss_is_additive_and_weight_zero_preserves_base_loss(
     assert torch.isfinite(distogram.grad).all()
 
 
+def test_hotspot_structure_loss_uses_independent_strict_cutoff():
+    distogram = torch.zeros(1, 7, 7, 128)
+    bin_distances = esmfold2_runtime_module._midpoint_bins(distogram.device)
+    twenty_angstrom_bin = int(torch.argmin(torch.abs(bin_distances - 20.0)).item())
+    distogram[0, 1, 4, twenty_angstrom_bin] = 12.0
+
+    broad = _structure_losses(
+        distogram,
+        binder_length=3,
+        hotspot_params={"target_hotspot_concat_indices": [1]},
+        hotspot_weight=0.4,
+        hotspot_cutoff=22.0,
+    )
+    strict = _structure_losses(
+        distogram,
+        binder_length=3,
+        hotspot_params={"target_hotspot_concat_indices": [1]},
+        hotspot_weight=0.4,
+        hotspot_cutoff=8.0,
+    )
+
+    assert strict["hotspot_contact_loss"] > broad["hotspot_contact_loss"]
+    assert torch.allclose(strict["base_structure_loss"], broad["base_structure_loss"])
+
+
 @pytest.mark.parametrize("indices", [[4], [-1], [1.5], [True]])
 def test_hotspot_structure_loss_rejects_invalid_target_indices(indices):
     distogram = torch.zeros(1, 7, 7, 128)
@@ -440,6 +465,7 @@ def test_runtime_continuous_design_logs_multichain_hotspot_metrics(monkeypatch):
             num_loops=1,
             num_sampling_steps=1,
             hotspot_weight=0.3,
+            hotspot_cutoff=8.0,
         ),
         device="cpu",
         experimental_model=object(),
@@ -471,6 +497,7 @@ def test_runtime_continuous_design_logs_multichain_hotspot_metrics(monkeypatch):
 
     metrics = batch.soft_step_metrics[0]
     assert metrics["hotspot_weight"] == pytest.approx(0.3)
+    assert metrics["hotspot_cutoff"] == pytest.approx(8.0)
     assert metrics["hotspot_contact_loss"] is not None
     assert metrics["hotspot_weighted_contribution"] == pytest.approx(
         0.3 * metrics["hotspot_contact_loss"]

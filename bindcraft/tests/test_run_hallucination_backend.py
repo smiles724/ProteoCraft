@@ -32,6 +32,7 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_proposal_lm_dropout == pytest.approx(0.5)
     assert args.esmfold2_force_proposal_lm_dropout is True
     assert args.esmfold2_hotspot_weight == pytest.approx(0.0)
+    assert args.esmfold2_hotspot_cutoff == pytest.approx(8.0)
 
 
 def test_esmfold2_backend_accepts_explicit_stage_a_only_strategy():
@@ -228,6 +229,8 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
             "2",
             "--esmfold2_hotspot_weight",
             "0.4",
+            "--esmfold2_hotspot_cutoff",
+            "8.0",
             "--target_template_path",
             str(tmp_path / "target.cif"),
             "--output_dir",
@@ -245,6 +248,7 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     assert "Best Sequence: AAY" in result_text
     assert "ESMFold2 hotspot contact configured" in log_text
     assert "ESMFold2 Hotspot Weight: 0.4" in result_text
+    assert "ESMFold2 Hotspot Cutoff: 8.0 A" in result_text
     assert "ESMFold2 backend received target_template_path but does not use templates yet" in log_text
     assert captured["mcts_strategy"] == "two_stage"
     assert captured["mcts_bootstrap_steps"] == 50

@@ -334,6 +334,7 @@ def load_esmfold2_backend(args, device: str = "cuda"):
         proposal_confidence_max_candidates=args.esmfold2_proposal_confidence_max_candidates,
         proposal_confidence_tail_steps=args.esmfold2_proposal_confidence_tail_steps,
         hotspot_weight=args.esmfold2_hotspot_weight,
+        hotspot_cutoff=args.esmfold2_hotspot_cutoff,
     )
     return ESMFold2RuntimeBackend(
         config=config,
@@ -422,6 +423,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2 MCTS 搜索结束后是否从 best node logits 做 final continuous polish，并只在该阶段使用 late-confidence candidates（默认：false）")
     parser.add_argument("--esmfold2_hotspot_weight", type=float, default=0.0,
                        help="ESMFold2 proposal hotspot contact loss 权重；0 保持旧行为（默认：0.0）")
+    parser.add_argument("--esmfold2_hotspot_cutoff", type=float, default=8.0,
+                       help="ESMFold2 proposal hotspot contact 距离阈值，单位 Å（默认：8.0）")
     parser.add_argument("--checkpoint_dir", type=str, default=None,
                        help="Checkpoint 目录；默认依次读取 --checkpoint_dir、PROTENIX_CHECKPOINT_DIR、PROTENIX_ROOT_DIR/checkpoint")
     parser.add_argument("--save_checkpoint_dir", type=str, default=None,
@@ -609,6 +612,8 @@ def main():
     hotspot_params = _build_hotspot_params(args, parser)
     if args.esmfold2_hotspot_weight < 0.0:
         parser.error("--esmfold2_hotspot_weight 必须大于等于 0")
+    if args.esmfold2_hotspot_cutoff <= 0.0:
+        parser.error("--esmfold2_hotspot_cutoff 必须大于 0")
     if (
         model_backend == "esmfold2"
         and args.esmfold2_hotspot_weight > 0.0
@@ -626,10 +631,11 @@ def main():
         if model_backend == "esmfold2":
             logging.info(
                 "ESMFold2 hotspot contact configured: target_hotspots_1based=%s "
-                "target_concat_indices_0based=%s weight=%.4f enabled=%s",
+                "target_concat_indices_0based=%s weight=%.4f cutoff=%.2fA enabled=%s",
                 hotspot_params["target_hotspot_residues_1based"],
                 hotspot_params["target_hotspot_concat_indices"],
                 args.esmfold2_hotspot_weight,
+                args.esmfold2_hotspot_cutoff,
                 args.esmfold2_hotspot_weight > 0.0,
             )
         else:
@@ -827,6 +833,7 @@ def main():
             f.write(f"ESMFold2 Proposal Confidence Tail Steps: {args.esmfold2_proposal_confidence_tail_steps}\n")
             f.write(f"ESMFold2 Final Polish: {args.esmfold2_final_polish}\n")
             f.write(f"ESMFold2 Hotspot Weight: {args.esmfold2_hotspot_weight}\n")
+            f.write(f"ESMFold2 Hotspot Cutoff: {args.esmfold2_hotspot_cutoff} A\n")
         f.write(f"Optimization Steps: {args.n_steps}\n")
         f.write(f"Learning Rate: {args.learning_rate}\n")
         f.write(f"Tau Noise: {args.tau_noise}\n")

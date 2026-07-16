@@ -1127,6 +1127,7 @@ def run_esmfold2_mcts_hallucination(
     ]
     backend_config = getattr(backend, "config", None)
     hotspot_weight = float(getattr(backend_config, "hotspot_weight", 0.0))
+    hotspot_cutoff = float(getattr(backend_config, "hotspot_cutoff", 8.0))
     if hotspot_weight > 0.0 and not hotspot_indices:
         raise ValueError(
             "positive ESMFold2 hotspot_weight requires target hotspot indices"
@@ -1134,6 +1135,7 @@ def run_esmfold2_mcts_hallucination(
     hotspot_summary = {
         "hotspot_indices_0based": hotspot_indices,
         "hotspot_weight": hotspot_weight,
+        "hotspot_cutoff": hotspot_cutoff,
         "hotspot_enabled": bool(hotspot_indices and hotspot_weight > 0.0),
     }
     logit_init_mode = _normalize_logit_init_mode(esmfold2_logit_init_mode)
@@ -1181,9 +1183,10 @@ def run_esmfold2_mcts_hallucination(
         str(stageb_soft_steps or "backend_default"),
     )
     logger.info(
-        "ESMFold2 hotspot: indices_0based=%s weight=%.4f enabled=%s",
+        "ESMFold2 hotspot: indices_0based=%s weight=%.4f cutoff=%.2fA enabled=%s",
         hotspot_indices or "none",
         hotspot_weight,
+        hotspot_cutoff,
         hotspot_summary["hotspot_enabled"],
     )
     logger.info("=" * 70)
