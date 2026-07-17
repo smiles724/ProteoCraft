@@ -397,6 +397,7 @@ def _structure_losses(
     hotspot_params: Optional[Dict[str, Any]] = None,
     hotspot_weight: float = 0.0,
     hotspot_cutoff: float = 8.0,
+    hotspot_interface_mode: str = "additive",
 ) -> dict[str, torch.Tensor]:
     bin_distance = _midpoint_bins(distogram_logits.device)
     full_len = distogram_logits.shape[1]
@@ -409,6 +410,15 @@ def _structure_losses(
         raise ValueError("hotspot_weight must be non-negative")
     if float(hotspot_cutoff) <= 0.0:
         raise ValueError("hotspot_cutoff must be positive")
+    hotspot_interface_mode = str(hotspot_interface_mode).strip().lower()
+    if hotspot_interface_mode not in {"additive", "localized"}:
+        raise ValueError(
+            "hotspot_interface_mode must be 'additive' or 'localized'"
+        )
+    if hotspot_interface_mode == "localized" and float(hotspot_weight) > 1.0:
+        raise ValueError(
+            "localized hotspot_interface_mode requires hotspot_weight in [0, 1]"
+        )
     is_binder = torch.ones(full_len, device=distogram_logits.device)
     is_binder[:-binder_length] *= 0.0
 
@@ -469,12 +479,23 @@ def _structure_losses(
             binder_mask=is_binder,
         )
         weighted_hotspot = float(hotspot_weight) * hotspot_contact
+        if hotspot_interface_mode == "localized":
+            effective_inter = (
+                (1.0 - float(hotspot_weight)) * inter
+                + float(hotspot_weight) * hotspot_contact
+            )
+            total_loss = 0.5 * intra + 0.5 * effective_inter + 0.2 * glob
+        else:
+            effective_inter = inter
+            total_loss = base_total + weighted_hotspot
         losses.update(
             {
                 "base_structure_loss": base_total,
                 "hotspot_contact_loss": hotspot_contact,
                 "hotspot_weighted_contribution": weighted_hotspot,
-                "total_loss": base_total + weighted_hotspot,
+                "hotspot_objective_adjustment": total_loss - base_total,
+                "effective_inter_contact_loss": effective_inter,
+                "total_loss": total_loss,
             }
         )
     return losses
@@ -491,11 +512,14 @@ def _stageb_structure_loss(
     selected = []
     proposal_loss = None
     for key, weight in weights.items():
-        if key not in losses:
+        loss_key = key
+        if key == "inter_contact_loss" and "effective_inter_contact_loss" in losses:
+            loss_key = "effective_inter_contact_loss"
+        if loss_key not in losses:
             continue
-        term = float(weight) * losses[key]
+        term = float(weight) * losses[loss_key]
         proposal_loss = term if proposal_loss is None else proposal_loss + term
-        selected.append(key)
+        selected.append(loss_key)
     if proposal_loss is None:
         return base_loss, "total_loss"
     return base_loss + float(group_weight) * proposal_loss, "total_loss+" + "+".join(selected)
@@ -701,11 +725,13 @@ class ESMFold2RuntimeBackend:
             hotspot_params=hotspot_params,
             hotspot_weight=float(self.config.hotspot_weight),
             hotspot_cutoff=float(self.config.hotspot_cutoff),
+            hotspot_interface_mode=str(self.config.hotspot_interface_mode),
         )
         output: dict[str, float] = {}
         for key in (
             "intra_contact_loss",
             "inter_contact_loss",
+            "effective_inter_contact_loss",
             "glob_loss",
             "hotspot_contact_loss",
         ):
@@ -991,6 +1017,7 @@ class ESMFold2RuntimeBackend:
                 hotspot_params=hotspot_params,
                 hotspot_weight=float(self.config.hotspot_weight),
                 hotspot_cutoff=float(self.config.hotspot_cutoff),
+                hotspot_interface_mode=str(self.config.hotspot_interface_mode),
             )
             structure_loss, _ = _stageb_structure_loss(
                 losses,
@@ -1047,8 +1074,17 @@ class ESMFold2RuntimeBackend:
                         "hotspot_contact_loss": _as_float(losses.get("hotspot_contact_loss")),
                         "hotspot_weight": float(self.config.hotspot_weight),
                         "hotspot_cutoff": float(self.config.hotspot_cutoff),
+                        "hotspot_interface_mode": str(
+                            self.config.hotspot_interface_mode
+                        ),
                         "hotspot_weighted_contribution": _as_float(
                             losses.get("hotspot_weighted_contribution")
+                        ),
+                        "hotspot_objective_adjustment": _as_float(
+                            losses.get("hotspot_objective_adjustment")
+                        ),
+                        "effective_inter_contact_loss": _as_float(
+                            losses.get("effective_inter_contact_loss")
                         ),
                     }
                 )

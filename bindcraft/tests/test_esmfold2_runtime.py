@@ -580,6 +580,41 @@ def test_hotspot_structure_loss_uses_independent_strict_cutoff():
     assert torch.allclose(strict["base_structure_loss"], broad["base_structure_loss"])
 
 
+def test_localized_hotspot_mode_replaces_global_inter_objective_by_interpolation():
+    distogram = torch.randn(1, 7, 7, 128)
+    losses = _structure_losses(
+        distogram,
+        binder_length=3,
+        hotspot_params={"target_hotspot_concat_indices": [1]},
+        hotspot_weight=1.0,
+        hotspot_cutoff=8.0,
+        hotspot_interface_mode="localized",
+    )
+
+    expected = (
+        0.5 * losses["intra_contact_loss"]
+        + 0.5 * losses["hotspot_contact_loss"]
+        + 0.2 * losses["glob_loss"]
+    )
+    assert torch.allclose(losses["effective_inter_contact_loss"], losses["hotspot_contact_loss"])
+    assert torch.allclose(losses["total_loss"], expected)
+    assert torch.allclose(
+        losses["hotspot_objective_adjustment"],
+        losses["total_loss"] - losses["base_structure_loss"],
+    )
+
+
+def test_localized_hotspot_mode_rejects_weight_above_one():
+    with pytest.raises(ValueError, match="hotspot_weight in"):
+        _structure_losses(
+            torch.randn(1, 7, 7, 128),
+            binder_length=3,
+            hotspot_params={"target_hotspot_concat_indices": [1]},
+            hotspot_weight=1.1,
+            hotspot_interface_mode="localized",
+        )
+
+
 @pytest.mark.parametrize("indices", [[4], [-1], [1.5], [True]])
 def test_hotspot_structure_loss_rejects_invalid_target_indices(indices):
     distogram = torch.zeros(1, 7, 7, 128)

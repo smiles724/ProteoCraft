@@ -218,6 +218,7 @@ def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     assert default_config.experimental_model_name.endswith("ESMFold2-Experimental")
     assert default_config.hotspot_weight == pytest.approx(0.0)
     assert default_config.hotspot_cutoff == pytest.approx(8.0)
+    assert default_config.hotspot_interface_mode == "additive"
     assert default_config.hotspot_verify_weight == pytest.approx(0.0)
     assert default_config.hotspot_verify_near_cutoff == pytest.approx(5.0)
     assert default_config.hotspot_verify_far_cutoff == pytest.approx(20.0)
@@ -238,6 +239,16 @@ def test_proposal_config_rejects_negative_hotspot_weight():
 def test_proposal_config_rejects_nonpositive_hotspot_cutoff():
     with pytest.raises(ValueError, match="hotspot_cutoff must be positive"):
         ESMFold2ProposalConfig(hotspot_cutoff=0.0)
+
+
+def test_proposal_config_validates_hotspot_interface_mode():
+    with pytest.raises(ValueError, match="hotspot_interface_mode"):
+        ESMFold2ProposalConfig(hotspot_interface_mode="unknown")
+    with pytest.raises(ValueError, match="hotspot_weight in"):
+        ESMFold2ProposalConfig(
+            hotspot_interface_mode="localized",
+            hotspot_weight=1.1,
+        )
 
 
 def test_proposal_config_validates_hotspot_verifier_parameters():

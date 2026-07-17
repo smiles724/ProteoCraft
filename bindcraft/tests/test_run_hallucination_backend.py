@@ -33,6 +33,7 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_force_proposal_lm_dropout is True
     assert args.esmfold2_hotspot_weight == pytest.approx(0.0)
     assert args.esmfold2_hotspot_cutoff == pytest.approx(8.0)
+    assert args.esmfold2_hotspot_interface_mode == "additive"
     assert args.esmfold2_hotspot_verify_weight == pytest.approx(0.0)
     assert args.esmfold2_hotspot_verify_near_cutoff == pytest.approx(5.0)
     assert args.esmfold2_hotspot_verify_far_cutoff == pytest.approx(20.0)

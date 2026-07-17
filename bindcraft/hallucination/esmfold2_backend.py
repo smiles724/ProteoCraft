@@ -93,6 +93,7 @@ class ESMFold2ProposalConfig:
     force_proposal_lm_dropout: bool = True
     hotspot_weight: float = 0.0
     hotspot_cutoff: float = 8.0
+    hotspot_interface_mode: str = "additive"
     hotspot_verify_weight: float = 0.0
     hotspot_verify_near_cutoff: float = 5.0
     hotspot_verify_far_cutoff: float = 20.0
@@ -124,6 +125,15 @@ class ESMFold2ProposalConfig:
             raise ValueError("hotspot_weight must be non-negative")
         if float(self.hotspot_cutoff) <= 0.0:
             raise ValueError("hotspot_cutoff must be positive")
+        hotspot_interface_mode = str(self.hotspot_interface_mode).strip().lower()
+        if hotspot_interface_mode not in {"additive", "localized"}:
+            raise ValueError(
+                "hotspot_interface_mode must be 'additive' or 'localized'"
+            )
+        if hotspot_interface_mode == "localized" and float(self.hotspot_weight) > 1.0:
+            raise ValueError(
+                "localized hotspot_interface_mode requires hotspot_weight in [0, 1]"
+            )
         if float(self.hotspot_verify_weight) < 0.0:
             raise ValueError("hotspot_verify_weight must be non-negative")
         if float(self.hotspot_verify_near_cutoff) < 0.0:
