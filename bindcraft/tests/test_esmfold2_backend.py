@@ -21,32 +21,35 @@ from bindcraft.hallucination.esmfold2_backend import (
 from bindcraft.hallucination.mcts_controller import MCTSTree
 
 
-def test_verifier_loss_prefers_pair_chain_iptm_and_falls_back_to_iptm():
+def test_verifier_loss_requires_pair_chain_iptm_without_global_fallback():
     loss, source = resolve_esm_verifier_loss(
         {"pair_chain_iptm": 0.82, "iptm": 0.10}
     )
     assert loss == pytest.approx(0.18)
     assert source == "pair_chain_iptm"
 
-    fallback_loss, fallback_source = resolve_esm_verifier_loss({"iptm": 0.73})
-    assert fallback_loss == pytest.approx(0.27)
-    assert fallback_source == "iptm"
-
-    with pytest.raises(ValueError):
-        resolve_esm_verifier_loss({"ptm": 0.8})
+    with pytest.raises(ValueError, match="pair-chain iPTM"):
+        resolve_esm_verifier_loss({"iptm": 0.73})
 
 
 def test_verifier_result_is_compatible_with_mcts_cache_contract():
     result = build_esm_verifier_result(
         binder_seq="ALY",
         target_seq="TARGET",
-        summary_confidence={"pair_chain_iptm": 0.75, "plddt": 0.91},
+        summary_confidence={
+            "pair_chain_iptm": 0.75,
+            "plddt": 0.91,
+            "binder_plddt": 0.88,
+            "binder_rg_excess": 0.12,
+        },
         coordinate=torch.zeros(1, 8, 3),
     )
 
     assert result.total_loss == pytest.approx(0.25)
     assert result.loss_dict["esm_verify_loss"] == pytest.approx(0.25)
     assert result.loss_dict["pair_chain_iptm_loss"] == pytest.approx(0.25)
+    assert result.loss_dict["binder_confidence_loss"] == pytest.approx(0.12)
+    assert result.loss_dict["binder_rg_excess_loss"] == pytest.approx(0.12)
     assert "interface_loss" not in result.loss_dict
     assert result.summary_confidence["esm_verify_source"] == "pair_chain_iptm"
 
@@ -317,9 +320,8 @@ def test_esmfold2_action_group_routing_uses_native_loss_terms():
     interface = select_esmfold2_action_group(
         {
             "pair_chain_iptm_loss": 0.7,
-            "inter_contact_loss": 0.6,
-            "intra_contact_loss": 0.1,
-            "glob_loss": 0.05,
+            "binder_confidence_loss": 0.1,
+            "binder_rg_excess_loss": 0.05,
         }
     )
     assert interface["action_group"] == "interface_formation"
@@ -330,29 +332,27 @@ def test_esmfold2_action_group_routing_uses_native_loss_terms():
     compact = select_esmfold2_action_group(
         {
             "pair_chain_iptm_loss": 0.1,
-            "inter_contact_loss": 0.1,
-            "intra_contact_loss": 0.1,
-            "glob_loss": 1.2,
+            "binder_confidence_loss": 0.1,
+            "binder_rg_excess_loss": 0.9,
         }
     )
     assert compact["action_group"] == "compactness_repair"
 
-    priors = compute_esmfold2_action_group_priors({}, temperature=1.0)
-    assert priors == {"unrouted": 1.0}
+    with pytest.raises(ValueError, match="full-verifier metrics"):
+        compute_esmfold2_action_group_priors({}, temperature=1.0)
 
 
-def test_esmfold2_routing_normalizes_large_contact_losses_before_group_mean():
+def test_esmfold2_routing_uses_only_bounded_full_verifier_residuals():
     routing = select_esmfold2_action_group(
         {
             "pair_chain_iptm_loss": 0.95,
-            "inter_contact_loss": 5.0,
             "binder_confidence_loss": 0.2,
-            "intra_contact_loss": 0.2,
-            "glob_loss": 0.2,
+            "binder_rg_excess_loss": 1.2,
         }
     )
 
     assert routing["group_scores"]["interface_formation"] <= 1.0
     assert routing["group_scores"]["core_stabilization"] <= 1.0
     assert routing["group_scores"]["compactness_repair"] <= 1.0
-    assert routing["group_terms"]["interface_formation"]["inter_contact_loss"]["normalized"] == pytest.approx(1.0)
+    assert routing["group_terms"]["interface_formation"]["pair_chain_iptm_loss"]["normalized"] == pytest.approx(0.95)
+    assert routing["group_terms"]["compactness_repair"]["binder_rg_excess_loss"]["normalized"] == pytest.approx(1.0)

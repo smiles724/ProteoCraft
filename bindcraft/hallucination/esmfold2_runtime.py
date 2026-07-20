@@ -25,7 +25,7 @@ from bindcraft.hallucination.esmfold2_backend import (
     AA_TO_ESM_IDX,
     ESMFold2ProposalBatch,
     ESMFold2ProposalConfig,
-    ESMFOLD2_ACTION_GROUP_LOSS_KEYS,
+    ESMFOLD2_ACTION_GROUP_PROPOSAL_LOSS_KEYS,
     ESM_AA_ORDER,
     anchor_binder_logits_to_sequence,
     build_esm_verifier_result,
@@ -218,6 +218,82 @@ def _normalize_target_hotspot_indices(
             seen.add(index)
             indices.append(index)
     return indices
+
+
+def _binder_structure_metrics(
+    fold_result: Any,
+    *,
+    binder_length: int,
+) -> dict[str, float]:
+    """Extract binder-local confidence and compactness from a full prediction."""
+
+    binder_length = int(binder_length)
+    if binder_length <= 0:
+        raise ValueError("binder_length must be positive")
+
+    metrics: dict[str, float] = {}
+    plddt = getattr(fold_result, "plddt", None)
+    if plddt is not None:
+        values = torch.as_tensor(plddt).detach().float().reshape(-1)
+        if values.numel() >= binder_length:
+            binder_values = values[-binder_length:]
+            binder_values = binder_values[torch.isfinite(binder_values)]
+            if binder_values.numel() == binder_length:
+                metrics["binder_plddt"] = float(binder_values.mean().item())
+
+    complex_obj = getattr(fold_result, "complex", None)
+    residue_centers: list[torch.Tensor] = []
+    if complex_obj is not None and all(
+        hasattr(complex_obj, name)
+        for name in ("sequence", "atom_positions", "atom_elements", "token_to_atoms")
+    ):
+        token_count = len(complex_obj.sequence)
+        if token_count >= binder_length:
+            positions = torch.as_tensor(complex_obj.atom_positions, dtype=torch.float32)
+            token_to_atoms = torch.as_tensor(complex_obj.token_to_atoms, dtype=torch.long)
+            elements = list(complex_obj.atom_elements)
+            for token_index in range(token_count - binder_length, token_count):
+                atom_start, atom_end = map(int, token_to_atoms[token_index].tolist())
+                heavy_mask = []
+                for element in elements[atom_start:atom_end]:
+                    if isinstance(element, bytes):
+                        element = element.decode(errors="ignore")
+                    heavy_mask.append(str(element).strip().upper() != "H")
+                token_positions = positions[atom_start:atom_end]
+                if heavy_mask:
+                    token_positions = token_positions[
+                        torch.as_tensor(heavy_mask, dtype=torch.bool)
+                    ]
+                if token_positions.numel() > 0:
+                    residue_centers.append(token_positions.mean(dim=0))
+    elif complex_obj is not None and all(
+        hasattr(complex_obj, name) for name in ("atom37_positions", "atom37_mask")
+    ):
+        positions = torch.as_tensor(complex_obj.atom37_positions, dtype=torch.float32)
+        atom_mask = torch.as_tensor(complex_obj.atom37_mask, dtype=torch.bool)
+        if positions.shape[0] >= binder_length:
+            for residue_positions, residue_mask in zip(
+                positions[-binder_length:], atom_mask[-binder_length:]
+            ):
+                if residue_mask.numel() > 1 and bool(residue_mask[1].item()):
+                    residue_centers.append(residue_positions[1])
+                elif residue_mask.any():
+                    residue_centers.append(residue_positions[residue_mask].mean(dim=0))
+
+    if len(residue_centers) == binder_length:
+        centers = torch.stack(residue_centers, dim=0)
+        centroid = centers.mean(dim=0)
+        rg = torch.sqrt(torch.square(centers - centroid).sum(dim=-1).mean())
+        rg_threshold = 2.38 * (binder_length**0.365)
+        rg_excess = max(float(rg.item()) / max(float(rg_threshold), 1.0e-8) - 1.0, 0.0)
+        metrics.update(
+            {
+                "binder_radius_gyration": float(rg.item()),
+                "binder_radius_gyration_threshold": float(rg_threshold),
+                "binder_rg_excess": float(rg_excess),
+            }
+        )
+    return metrics
 
 
 def _hotspot_structure_metrics(
@@ -506,14 +582,24 @@ def _stageb_structure_loss(
     action_group: Optional[str],
     *,
     group_weight: float = 1.0,
+    hotspot_interface_mode: str = "additive",
 ) -> tuple[torch.Tensor, str]:
     base_loss = losses["total_loss"]
-    weights = ESMFOLD2_ACTION_GROUP_LOSS_KEYS.get(str(action_group or ""), {})
+    if action_group is None:
+        return base_loss, "total_loss"
+
+    weights = ESMFOLD2_ACTION_GROUP_PROPOSAL_LOSS_KEYS.get(str(action_group), {})
+    if not weights:
+        return base_loss, "total_loss"
     selected = []
     proposal_loss = None
     for key, weight in weights.items():
         loss_key = key
-        if key == "inter_contact_loss" and "effective_inter_contact_loss" in losses:
+        if (
+            key == "inter_contact_loss"
+            and str(hotspot_interface_mode).strip().lower() == "localized"
+            and "effective_inter_contact_loss" in losses
+        ):
             loss_key = "effective_inter_contact_loss"
         if loss_key not in losses:
             continue
@@ -521,8 +607,17 @@ def _stageb_structure_loss(
         proposal_loss = term if proposal_loss is None else proposal_loss + term
         selected.append(loss_key)
     if proposal_loss is None:
-        return base_loss, "total_loss"
-    return base_loss + float(group_weight) * proposal_loss, "total_loss+" + "+".join(selected)
+        raise ValueError(f"No proposal loss is available for action group {action_group!r}")
+
+    proposal_loss = float(group_weight) * proposal_loss
+    hotspot_is_already_in_interface = (
+        str(action_group) == "interface_formation"
+        and str(hotspot_interface_mode).strip().lower() == "localized"
+    )
+    if not hotspot_is_already_in_interface and "hotspot_weighted_contribution" in losses:
+        proposal_loss = proposal_loss + losses["hotspot_weighted_contribution"]
+        selected.append("hotspot_weighted_contribution")
+    return proposal_loss, "+".join(selected)
 
 
 class ESMFold2RuntimeBackend:
@@ -576,6 +671,12 @@ class ESMFold2RuntimeBackend:
             complex_id="esmfold2_verify",
         )
         summary = self._summary_from_fold_result(fold_result, n_target_chains=len(targets))
+        summary.update(
+            _binder_structure_metrics(
+                fold_result,
+                binder_length=len(binder_seq),
+            )
+        )
         hotspot_verify_weight = float(self.config.hotspot_verify_weight)
         hotspot_metrics: dict[str, Any] = {}
         if hotspot_verify_weight > 0.0:
@@ -704,12 +805,10 @@ class ESMFold2RuntimeBackend:
         seed: Optional[int] = None,
         hotspot_params: Optional[Dict[str, Any]] = None,
     ) -> dict[str, float]:
-        """Compute lightweight distogram losses for Stage-B routing diagnostics.
+        """Compute optional lightweight distogram diagnostics for a binder.
 
-        This uses the same Experimental proposal trunk as the mutation-gradient
-        path, but with the current discrete binder as a one-hot design.  The
-        output is merged into the verified node only for routing; it does not
-        replace the full ESMFold2 verifier score.
+        Stage-B routing uses full-verifier metrics.  This method remains
+        available for explicit diagnostics and does not mutate verifier state.
         """
 
         self._ensure_proposal_models_loaded()
@@ -1023,6 +1122,7 @@ class ESMFold2RuntimeBackend:
                 losses,
                 action_group,
                 group_weight=getattr(self.config, "stageb_group_weight", 1.0),
+                hotspot_interface_mode=str(self.config.hotspot_interface_mode),
             )
             structure_grad = torch.autograd.grad(structure_loss.mean(), logits)[0]
 
@@ -1056,6 +1156,7 @@ class ESMFold2RuntimeBackend:
                     losses,
                     action_group,
                     group_weight=getattr(self.config, "stageb_group_weight", 1.0),
+                    hotspot_interface_mode=str(self.config.hotspot_interface_mode),
                 )[1],
                 "intra_contact_loss": _as_float(losses.get("intra_contact_loss")),
                 "inter_contact_loss": _as_float(losses.get("inter_contact_loss")),

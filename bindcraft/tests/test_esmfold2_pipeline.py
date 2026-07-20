@@ -10,7 +10,11 @@ from bindcraft.hallucination.esmfold2_backend import (
 )
 from bindcraft.hallucination.mcts_legacy import LegacyMCTSTree
 from bindcraft.hallucination.esmfold2_pipeline import run_esmfold2_mcts_hallucination
-from bindcraft.hallucination.esmfold2_pipeline import _make_phase0_seed_states
+from bindcraft.hallucination.esmfold2_pipeline import (
+    _allocate_group_budgets,
+    _make_phase0_seed_states,
+    _make_stageb_proposals,
+)
 
 
 class FakeESMFold2Backend:
@@ -37,6 +41,8 @@ class FakeESMFold2Backend:
             summary_confidence={
                 "pair_chain_iptm": score,
                 "iptm": score,
+                "binder_plddt": 0.8,
+                "binder_rg_excess": 0.1,
                 "mmcif": f"data_{binder_seq}\n#\n",
             },
             extra_loss_dict=extra,
@@ -144,6 +150,113 @@ class FakeHotspotVerifyBackend(FakeESMFold2Backend):
         )
 
 
+def test_stageb_group_budget_keeps_every_repair_group_represented():
+    budgets = _allocate_group_budgets(
+        {
+            "interface_formation": 0.8,
+            "core_stabilization": 0.15,
+            "compactness_repair": 0.05,
+        },
+        8,
+    )
+
+    assert sum(budgets.values()) == 8
+    assert all(budgets[group] >= 1 for group in budgets)
+    assert set(budgets) == {
+        "interface_formation",
+        "core_stabilization",
+        "compactness_repair",
+    }
+
+
+def test_stageb_proposals_are_strict_single_mutations_with_gradient_priors():
+    before = torch.zeros(3, 20)
+    after = before.clone()
+    after[1, AA_TO_ESM_IDX["Y"]] = 3.0
+    after[1, AA_TO_ESM_IDX["F"]] = 1.0
+
+    proposals = _make_stageb_proposals(
+        current_seq="AAA",
+        candidates=["AYA", "AFA", "AYY"],
+        action_group="interface_formation",
+        group_prior=0.6,
+        logits_before=before,
+        logits_after=after,
+        mutable_mask=[True, True, True],
+    )
+
+    assert [proposal.sequence for proposal in proposals] == ["AYA", "AFA"]
+    assert all(len(proposal.edits) == 1 for proposal in proposals)
+    assert proposals[0].benefit > proposals[1].benefit
+    assert proposals[0].gradient_prior > proposals[1].gradient_prior
+    assert sum(proposal.prior for proposal in proposals) == pytest.approx(0.6)
+
+    uniform = _make_stageb_proposals(
+        current_seq="AAA",
+        candidates=["AYA", "AFA"],
+        action_group="interface_formation",
+        group_prior=0.6,
+        logits_before=before,
+        logits_after=after,
+        mutable_mask=[True, True, True],
+        use_gradient_prior=False,
+    )
+    assert [proposal.gradient_prior for proposal in uniform] == pytest.approx([0.5, 0.5])
+
+
+def test_stageb_soft_updates_do_not_overwrite_parent_node_logits():
+    class StatefulStageBBackend(FakeESMFold2Backend):
+        def __init__(self):
+            super().__init__()
+            self.stageb_inputs = []
+            self.scores.update({"FAY": 0.01, "GAY": 0.01, "IAY": 0.01})
+
+        def propose(self, **kwargs):
+            if kwargs.get("action_group") is None:
+                return super().propose(**kwargs)
+            before = kwargs["proposal_logits"].detach().clone()
+            self.stageb_inputs.append(
+                (kwargs["global_step"], kwargs["action_group"], before.clone())
+            )
+            group_to_candidate = {
+                "interface_formation": ("FAY", "F"),
+                "core_stabilization": ("GAY", "G"),
+                "compactness_repair": ("IAY", "I"),
+            }
+            candidate, amino_acid = group_to_candidate[kwargs["action_group"]]
+            after = before.clone()
+            after[0, AA_TO_ESM_IDX[amino_acid]] += 5.0
+            return ESMFold2ProposalBatch(
+                sequences=[candidate],
+                logits_before=before,
+                logits_after=after,
+            )
+
+    backend = StatefulStageBBackend()
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=3,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=3,
+        T_sample=1.0,
+        max_mutations_per_seq=3,
+        seed=7,
+        mcts_strategy="two_stage",
+        mcts_bootstrap_steps=1,
+        mcts_bootstrap_max_steps=1,
+        mcts_expand_actions_per_step=1,
+    )
+
+    step_one = [entry[2] for entry in backend.stageb_inputs if entry[0] == 1]
+    step_two = [entry[2] for entry in backend.stageb_inputs if entry[0] == 2]
+    assert step_one and step_two
+    assert all(torch.equal(logits, step_one[0]) for logits in step_one + step_two)
+
+
 def test_esmfold2_stagea_pipeline_uses_backend_for_verify_and_proposal():
     backend = FakeESMFold2Backend()
 
@@ -214,7 +327,7 @@ def test_esmfold2_continuous_stagea_designs_once_then_verifies_argmax_sequence()
     assert backend.preview_calls == []
 
 
-def test_esmfold2_pipeline_propagates_hotspot_to_stage_a_stage_b_and_preview():
+def test_esmfold2_pipeline_propagates_hotspot_without_preview_routing():
     backend = FakeESMFold2Backend()
     hotspot_params = {"target_hotspot_concat_indices": [1, 2]}
 
@@ -239,8 +352,7 @@ def test_esmfold2_pipeline_propagates_hotspot_to_stage_a_stage_b_and_preview():
 
     assert backend.propose_calls
     assert all(call["hotspot_params"] == hotspot_params for call in backend.propose_calls)
-    assert backend.preview_calls
-    assert all(call[3] == hotspot_params for call in backend.preview_calls)
+    assert backend.preview_calls == []
 
 
 def test_esmfold2_pipeline_propagates_hotspots_to_verify_when_supported():
@@ -829,7 +941,7 @@ def test_esmfold2_two_stage_pipeline_routes_stageb_proposals_by_group():
     assert losses[-1] == pytest.approx(0.10)
     assert backend.propose_calls[0]["action_group"] is None
     assert backend.propose_calls[1]["action_group"] == "interface_formation"
-    assert backend.preview_calls
+    assert backend.preview_calls == []
 
 
 def test_esmfold2_two_stage_pipeline_passes_mutable_mask_to_stageb():

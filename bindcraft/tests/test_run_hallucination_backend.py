@@ -27,6 +27,7 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_soft_steps is None
     assert args.esmfold2_stagea_soft_steps == 30
     assert args.esmfold2_stageb_soft_steps == 5
+    assert args.stageb_max_mutations_per_seq == 1
     assert args.esmfold2_logit_init_mode == "official_exact"
     assert args.esmfold2_proposal_load_internal_esmc is True
     assert args.esmfold2_proposal_lm_dropout == pytest.approx(0.5)

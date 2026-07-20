@@ -632,6 +632,8 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
+        if getattr(args, "stageb_max_mutations_per_seq", None) is None:
+            args.stageb_max_mutations_per_seq = 1
     return backend
 
 
