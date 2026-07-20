@@ -27,16 +27,120 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_soft_steps is None
     assert args.esmfold2_stagea_soft_steps == 30
     assert args.esmfold2_stageb_soft_steps == 5
+    assert args.stageb_max_mutations_per_seq == 1
     assert args.esmfold2_logit_init_mode == "official_exact"
     assert args.esmfold2_proposal_load_internal_esmc is True
     assert args.esmfold2_proposal_lm_dropout == pytest.approx(0.5)
     assert args.esmfold2_force_proposal_lm_dropout is True
+    assert args.esmfold2_hotspot_weight is None
+    assert args.esmfold2_hotspot_interface_mode is None
+    assert args.esmfold2_hotspot_verify_weight is None
+    run_hallucination_script.resolve_esmfold2_hotspot_defaults(
+        args,
+        model_backend="esmfold2",
+        hotspot_params=None,
+    )
     assert args.esmfold2_hotspot_weight == pytest.approx(0.0)
     assert args.esmfold2_hotspot_cutoff == pytest.approx(8.0)
     assert args.esmfold2_hotspot_interface_mode == "additive"
     assert args.esmfold2_hotspot_verify_weight == pytest.approx(0.0)
     assert args.esmfold2_hotspot_verify_near_cutoff == pytest.approx(5.0)
     assert args.esmfold2_hotspot_verify_far_cutoff == pytest.approx(20.0)
+
+
+def test_esmfold2_hotspot_defaults_to_localized_half_weight():
+    args, parser = _parse(
+        [
+            "--model_backend",
+            "esmfold2",
+            "--mode",
+            "mcts",
+            "--target_hotspots",
+            "2-3",
+        ]
+    )
+    hotspot_params = run_hallucination_script._build_hotspot_params(args, parser)
+
+    run_hallucination_script.resolve_esmfold2_hotspot_defaults(
+        args,
+        model_backend="esmfold2",
+        hotspot_params=hotspot_params,
+    )
+
+    assert args.esmfold2_hotspot_weight == pytest.approx(0.5)
+    assert args.esmfold2_hotspot_interface_mode == "localized"
+    assert args.esmfold2_hotspot_verify_weight == pytest.approx(0.10)
+
+
+def test_explicit_esmfold2_hotspot_settings_override_conditional_defaults():
+    args, parser = _parse(
+        [
+            "--model_backend",
+            "esmfold2",
+            "--mode",
+            "mcts",
+            "--target_hotspots",
+            "2",
+            "--esmfold2_hotspot_weight",
+            "0.8",
+            "--esmfold2_hotspot_interface_mode",
+            "additive",
+            "--esmfold2_hotspot_verify_weight",
+            "0.3",
+        ]
+    )
+    hotspot_params = run_hallucination_script._build_hotspot_params(args, parser)
+
+    run_hallucination_script.resolve_esmfold2_hotspot_defaults(
+        args,
+        model_backend="esmfold2",
+        hotspot_params=hotspot_params,
+    )
+
+    assert args.esmfold2_hotspot_weight == pytest.approx(0.8)
+    assert args.esmfold2_hotspot_interface_mode == "additive"
+    assert args.esmfold2_hotspot_verify_weight == pytest.approx(0.3)
+
+
+def test_protenix_hotspots_do_not_enable_esmfold2_hotspot_defaults():
+    args, parser = _parse(["--target_hotspots", "2"])
+    hotspot_params = run_hallucination_script._build_hotspot_params(args, parser)
+
+    run_hallucination_script.resolve_esmfold2_hotspot_defaults(
+        args,
+        model_backend="protenix",
+        hotspot_params=hotspot_params,
+    )
+
+    assert args.esmfold2_hotspot_weight == pytest.approx(0.0)
+    assert args.esmfold2_hotspot_interface_mode == "additive"
+    assert args.esmfold2_hotspot_verify_weight == pytest.approx(0.0)
+
+
+def test_explicit_zero_disables_default_esmfold2_hotspot_verifier_weight():
+    args, parser = _parse(
+        [
+            "--model_backend",
+            "esmfold2",
+            "--mode",
+            "mcts",
+            "--target_hotspots",
+            "2",
+            "--esmfold2_hotspot_verify_weight",
+            "0",
+        ]
+    )
+    hotspot_params = run_hallucination_script._build_hotspot_params(args, parser)
+
+    run_hallucination_script.resolve_esmfold2_hotspot_defaults(
+        args,
+        model_backend="esmfold2",
+        hotspot_params=hotspot_params,
+    )
+
+    assert args.esmfold2_hotspot_weight == pytest.approx(0.5)
+    assert args.esmfold2_hotspot_interface_mode == "localized"
+    assert args.esmfold2_hotspot_verify_weight == pytest.approx(0.0)
 
 
 def test_esmfold2_backend_accepts_explicit_stage_a_only_strategy():
@@ -267,6 +371,7 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     assert "Best Sequence: AAY" in result_text
     assert "ESMFold2 hotspot contact configured" in log_text
     assert "ESMFold2 Hotspot Weight: 0.4" in result_text
+    assert "ESMFold2 Hotspot Interface Mode: localized" in result_text
     assert "ESMFold2 Hotspot Cutoff: 8.0 A" in result_text
     assert "ESMFold2 Hotspot Verify Weight: 0.2" in result_text
     assert "ESMFold2 Hotspot Verify Near Cutoff: 5.0 A" in result_text

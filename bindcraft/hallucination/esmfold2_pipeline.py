@@ -27,6 +27,7 @@ from bindcraft.hallucination.esmfold2_backend import (
     ESMFold2ProposalBatch,
     anchor_binder_logits_to_sequence,
     init_binder_logits,
+    logit_delta_mutation_scores,
     select_esmfold2_action_group,
     sequence_from_logits_argmax,
 )
@@ -47,6 +48,7 @@ class ESMFold2MutationProposal:
     benefit: float = 0.0
     action_group: str = "unrouted"
     group_prior: float = 1.0
+    gradient_prior: float = 1.0
     proposal_logits: Optional[torch.Tensor] = None
 
 
@@ -399,6 +401,9 @@ def _mcts_action_artifact(
         "benefit": float(getattr(action, "benefit", 0.0)),
         "action_group": str(getattr(action, "action_group", "unrouted")),
         "group_prior": float(getattr(action, "group_prior", 1.0)),
+        "gradient_prior": float(
+            getattr(getattr(action, "proposal", None), "gradient_prior", 1.0)
+        ),
         "visit_count": int(getattr(action, "visit_count", 0)),
         "value_sum": float(getattr(action, "value_sum", 0.0)),
         "q_value": float(getattr(action, "q_value", 0.0)),
@@ -610,8 +615,15 @@ def _allocate_group_budgets(group_priors: Dict[str, float], total_budget: int) -
     total_prior = sum(prior for _, prior in valid)
     if total_prior <= 0.0:
         return {}
-    scaled = [(group, total_budget * prior / total_prior) for group, prior in valid]
-    budgets = {group: int(math.floor(raw)) for group, raw in scaled}
+    valid.sort(key=lambda item: item[1], reverse=True)
+    if total_budget < len(valid):
+        return {group: 1 for group, _ in valid[:total_budget]}
+
+    budgets = {group: 1 for group, _ in valid}
+    remaining = total_budget - len(valid)
+    scaled = [(group, remaining * prior / total_prior) for group, prior in valid]
+    for group, raw in scaled:
+        budgets[group] += int(math.floor(raw))
     used = sum(budgets.values())
     remainders = sorted(
         ((raw - math.floor(raw), group) for group, raw in scaled),
@@ -1027,23 +1039,51 @@ def _make_stageb_proposals(
     candidates: Sequence[str],
     action_group: str,
     group_prior: float,
-    proposal_logits: Optional[torch.Tensor] = None,
+    logits_before: Optional[torch.Tensor] = None,
+    logits_after: Optional[torch.Tensor] = None,
+    mutable_mask: Optional[Sequence[bool]] = None,
+    use_gradient_prior: bool = True,
 ) -> List[ESMFold2MutationProposal]:
-    unique = [seq for seq in dict.fromkeys(str(item) for item in candidates) if seq != current_seq]
+    unique = []
+    edits_by_sequence: Dict[str, List[Tuple[int, str, str]]] = {}
+    for item in candidates:
+        sequence = str(item)
+        edits = _sequence_edits(current_seq, sequence)
+        if sequence == current_seq or len(edits) != 1 or sequence in edits_by_sequence:
+            continue
+        unique.append(sequence)
+        edits_by_sequence[sequence] = edits
     if not unique:
         return []
-    base_prior = max(float(group_prior), 1.0e-12) / max(len(unique), 1)
+
+    benefits = torch.zeros(len(unique), dtype=torch.float32)
+    if use_gradient_prior and logits_before is not None and logits_after is not None:
+        mutation_scores = logit_delta_mutation_scores(
+            logits_before,
+            logits_after,
+            current_seq=current_seq,
+            mutable_mask=mutable_mask,
+        ).detach().cpu()
+        for index, sequence in enumerate(unique):
+            pos, _, new_aa = edits_by_sequence[sequence][0]
+            score = mutation_scores[int(pos), ESM_AA_ORDER.index(str(new_aa))]
+            benefits[index] = score if torch.isfinite(score) else -1.0e9
+    gradient_priors = torch.softmax(benefits, dim=0)
+
     proposals: List[ESMFold2MutationProposal] = []
-    for seq in unique:
+    normalized_group_prior = max(float(group_prior), 1.0e-12)
+    for index, seq in enumerate(unique):
+        gradient_prior = float(gradient_priors[index].item())
         proposals.append(
             ESMFold2MutationProposal(
                 sequence=seq,
-                edits=_sequence_edits(current_seq, seq),
-                prior=base_prior,
-                benefit=0.0,
+                edits=edits_by_sequence[seq],
+                prior=normalized_group_prior * gradient_prior,
+                benefit=float(benefits[index].item()),
                 action_group=action_group,
-                group_prior=max(float(group_prior), 1.0e-12),
-                proposal_logits=proposal_logits.detach().clone() if proposal_logits is not None else None,
+                group_prior=normalized_group_prior,
+                gradient_prior=gradient_prior,
+                proposal_logits=logits_after.detach().clone() if logits_after is not None else None,
             )
         )
     return proposals
@@ -1112,7 +1152,7 @@ def run_esmfold2_mcts_hallucination(
     stageb_max_mutations = (
         max(int(stageb_max_mutations_per_seq), 1)
         if stageb_max_mutations_per_seq is not None
-        else max_mutations_per_seq
+        else 1
     )
     strategy = str(mcts_strategy or "legacy").strip().lower()
     if strategy == "strict":
@@ -1802,23 +1842,13 @@ def run_esmfold2_mcts_hallucination(
             prior=1.0 / max(len(handoff_results), 1),
         )
 
-    preview_loss_cache: Dict[str, Dict[str, float]] = {}
     for step in range(len(losses_history), N_steps):
         selection = strict_tree.select_decision()
         selected_node = selection.node
         current_seq = selected_node.sequence
 
         if selected_node.loss_vector is None:
-            selected_node.loss_vector = {}
-        _merge_preview_losses_for_routing(
-            backend,
-            preview_loss_cache,
-            selected_node.loss_vector,
-            binder_seq=current_seq,
-            target_seq=target_seq,
-            seed=_stable_seed(seed, "esm_stageb_preview", target_key, current_seq),
-            hotspot_params=hotspot_params,
-        )
+            raise ValueError("ESMFold2 Stage-B node is missing full-verifier loss metrics")
         routing = select_esmfold2_action_group(selected_node.loss_vector, temperature=1.0)
         action_group = str(routing["action_group"])
         group_priors = {
@@ -1830,6 +1860,10 @@ def run_esmfold2_mcts_hallucination(
             action_group,
             group_priors,
         )
+        use_gradient_prior = _normalize_prior_mode(mcts_prior_mode) not in {
+            "uniform",
+            "no_gradient",
+        }
         group_prior = float(
             group_priors.get(
                 action_group,
@@ -1848,7 +1882,6 @@ def run_esmfold2_mcts_hallucination(
         proposal_pool_budget = max(B_candidates, expand_budget)
         group_budgets = _allocate_group_budgets(group_priors, proposal_pool_budget)
         proposal_pool: List[ESMFold2MutationProposal] = []
-        selected_update_logits: Optional[torch.Tensor] = None
         for group_name, group_budget in group_budgets.items():
             proposal_batch = _call_backend_propose(
                 backend,
@@ -1875,10 +1908,6 @@ def run_esmfold2_mcts_hallucination(
                 batch=proposal_batch,
                 action_group=group_name,
             )
-            if proposal_batch.logits_after is not None and (
-                selected_update_logits is None or group_name == action_group
-            ):
-                selected_update_logits = proposal_batch.logits_after.detach().cpu().clone()
             candidates = _proposal_sequences_from_batch(proposal_batch, include_confidence=False)
             candidates = [
                 _clip_sequence_by_mutable_mask(str(seq), mutable_mask, current_seq)
@@ -1890,12 +1919,16 @@ def run_esmfold2_mcts_hallucination(
                     candidates=candidates,
                     action_group=group_name,
                     group_prior=group_priors.get(group_name, group_prior),
-                    proposal_logits=proposal_batch.logits_after,
+                    logits_before=proposal_batch.logits_before,
+                    logits_after=proposal_batch.logits_after,
+                    mutable_mask=mutable_mask,
+                    use_gradient_prior=use_gradient_prior,
                 )
             )
-        if selected_update_logits is not None:
-            selected_node.logits = selected_update_logits
-            proposal_logits_by_sequence[current_seq] = selected_node.logits
+
+        generated_group_counts = _count_items(
+            [str(proposal.action_group) for proposal in proposal_pool]
+        )
 
         if not proposal_pool:
             logger.warning("ESM StageB step %d: no candidates from backend", step)
@@ -1918,6 +1951,7 @@ def run_esmfold2_mcts_hallucination(
 
         expand_proposals: List[ESMFold2MutationProposal] = []
         expand_results: List[Any] = []
+        verified_action_groups: List[str] = []
         reward_by_sequence: Dict[str, float] = {}
         for action in selected_actions:
             if strict_tree.has_sequence(action.sequence):
@@ -1947,6 +1981,7 @@ def run_esmfold2_mcts_hallucination(
             )
             expand_proposals.append(action.proposal)
             expand_results.append(cached)
+            verified_action_groups.append(str(action.action_group))
 
         new_nodes = strict_tree.expand(selected_node, expand_proposals, expand_results)
         proposal_by_sequence = {
@@ -2023,6 +2058,21 @@ def run_esmfold2_mcts_hallucination(
             if float(round_best.total_loss) < best_loss:
                 _remember_global_best(round_best)
         losses_history.append(best_loss)
+        parent_pair_chain = 1.0 - float(
+            selected_node.loss_vector["pair_chain_iptm_loss"]
+        )
+        best_reward_gain = None
+        best_pair_chain_gain = None
+        if expand_results:
+            best_reward_gain = max(
+                strict_tree.result_reward(result) - float(selected_node.tree_reward)
+                for result in expand_results
+            )
+            child_pair_chain_scores = [
+                1.0 - float(result.loss_dict["pair_chain_iptm_loss"])
+                for result in expand_results
+            ]
+            best_pair_chain_gain = max(child_pair_chain_scores) - parent_pair_chain
         artifact_recorder.write_step(
             stage="stage_b",
             step=step,
@@ -2038,8 +2088,12 @@ def run_esmfold2_mcts_hallucination(
             group_scores=dict(routing.get("group_scores", {})),
             group_priors=group_priors,
             group_budgets=group_budgets,
+            generated_group_counts=generated_group_counts,
+            verified_group_counts=_count_items(verified_action_groups),
             selected_group_counts=_count_items([str(action.action_group) for action in selected_actions]),
             selected_action_count=len(selected_actions),
+            best_reward_gain=best_reward_gain,
+            best_pair_chain_iptm_gain=best_pair_chain_gain,
             loss_vector_keys=sorted(str(key) for key in selected_node.loss_vector.keys()),
         )
         if round_results:
@@ -2054,7 +2108,7 @@ def run_esmfold2_mcts_hallucination(
             )
 
         logger.info(
-            "ESM StageB step %3d/%d | selected=%s primary_group=%s Pg=%.3f scores=%s priors=%s budgets=%s selected_groups=%s keys=%s actions=%d global_best=%.4f",
+            "ESM StageB step %3d/%d | selected=%s primary_group=%s Pg=%.3f scores=%s priors=%s budgets=%s generated=%s verified=%s selected_groups=%s reward_gain=%s pair_iptm_gain=%s actions=%d global_best=%.4f",
             step,
             N_steps,
             current_seq[:20],
@@ -2063,8 +2117,11 @@ def run_esmfold2_mcts_hallucination(
             _format_float_map(dict(routing.get("group_scores", {}))),
             _format_float_map(group_priors),
             _format_count_map(group_budgets),
+            _format_count_map(generated_group_counts),
+            _format_count_map(_count_items(verified_action_groups)),
             _format_count_map(_count_items([str(action.action_group) for action in selected_actions])),
-            ",".join(sorted(str(key) for key in selected_node.loss_vector.keys())),
+            "n/a" if best_reward_gain is None else f"{best_reward_gain:.4f}",
+            "n/a" if best_pair_chain_gain is None else f"{best_pair_chain_gain:.4f}",
             len(selected_actions),
             best_loss,
         )

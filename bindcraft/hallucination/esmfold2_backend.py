@@ -29,34 +29,15 @@ PAIR_CHAIN_IPTM_KEYS = (
     "chain_pair_iptm",
     "binder_target_pair_iptm",
 )
-IPTM_KEYS = ("iptm", "i_ptm")
-ESMFOLD2_ACTION_GROUP_LOSS_KEYS = {
-    "interface_formation": {
-        "pair_chain_iptm_loss": 1.0,
-        "iptm_loss": 0.5,
-        "inter_contact_loss": 1.0,
-    },
-    "core_stabilization": {
-        "binder_confidence_loss": 1.0,
-        "intra_contact_loss": 1.0,
-        "global_confidence_loss": 0.5,
-    },
-    "compactness_repair": {
-        "glob_loss": 1.0,
-    },
+ESMFOLD2_ACTION_GROUP_ROUTING_KEYS = {
+    "interface_formation": "pair_chain_iptm_loss",
+    "core_stabilization": "binder_confidence_loss",
+    "compactness_repair": "binder_rg_excess_loss",
 }
-ESMFOLD2_ROUTING_LOSS_SCALES = {
-    "pair_chain_iptm_loss": 1.0,
-    "iptm_loss": 1.0,
-    "binder_confidence_loss": 1.0,
-    "global_confidence_loss": 1.0,
-    # Contact losses are distogram entropies in nats, roughly bounded by
-    # log(number_of_bins).  A scale of 5 maps the practical range to 0..1.
-    "inter_contact_loss": 5.0,
-    "intra_contact_loss": 5.0,
-    # Globularity is an ELU-shifted radius-of-gyration penalty.  Keep the same
-    # defensive scale so an outlier cannot dominate routing by itself.
-    "glob_loss": 5.0,
+ESMFOLD2_ACTION_GROUP_PROPOSAL_LOSS_KEYS = {
+    "interface_formation": {"inter_contact_loss": 1.0},
+    "core_stabilization": {"intra_contact_loss": 1.0},
+    "compactness_repair": {"glob_loss": 1.0},
 }
 AUTO_ESMC_LAMBDA_BY_TASK = {
     "denovo": 0.15,
@@ -253,17 +234,15 @@ def resolve_esm_verifier_loss(
 ) -> Tuple[float, str]:
     """Convert ESMFold2 confidence metrics to a scalar MCTS loss.
 
-    First version uses binder-target pair-chain iPTM when available, otherwise
-    falls back to global iPTM.  The value is turned into a minimization loss as
-    ``1 - score``.
+    The search value is strictly based on binder-target pair-chain iPTM.  A
+    missing value indicates a broken chain mapping or incomplete verifier output
+    and is therefore an error rather than a reason to silently change metrics.
     """
 
     score, source = _first_finite_metric(summary_confidence, PAIR_CHAIN_IPTM_KEYS)
-    if score is None:
-        score, source = _first_finite_metric(summary_confidence, IPTM_KEYS)
     if score is None or source is None:
         raise ValueError(
-            "ESMFold2 verifier summary must contain pair-chain iPTM or iPTM"
+            "ESMFold2 verifier summary must contain binder-target pair-chain iPTM"
         )
     score = min(max(score, 0.0), 1.0)
     return 1.0 - score, source
@@ -301,10 +280,7 @@ def build_esm_verifier_result(
         "total": float(total_loss),
         "esm_verify_loss": float(total_loss),
     }
-    if source in PAIR_CHAIN_IPTM_KEYS:
-        loss_dict["pair_chain_iptm_loss"] = float(global_loss)
-    elif source in IPTM_KEYS:
-        loss_dict["iptm_loss"] = float(global_loss)
+    loss_dict["pair_chain_iptm_loss"] = float(global_loss)
     if hotspot_enabled:
         loss_dict.update(
             {
@@ -315,10 +291,13 @@ def build_esm_verifier_result(
                 * float(hotspot_loss),
             }
         )
-    plddt = _finite_float(summary_confidence.get("plddt"))
+    plddt = _finite_float(summary_confidence.get("binder_plddt"))
     if plddt is not None:
         plddt_unit = plddt / 100.0 if plddt > 1.0 else plddt
         loss_dict["binder_confidence_loss"] = 1.0 - min(max(plddt_unit, 0.0), 1.0)
+    rg_excess = _finite_float(summary_confidence.get("binder_rg_excess"))
+    if rg_excess is not None:
+        loss_dict["binder_rg_excess_loss"] = min(max(rg_excess, 0.0), 1.0)
     ptm = _finite_float(summary_confidence.get("ptm"))
     if ptm is not None:
         loss_dict["global_confidence_loss"] = 1.0 - min(max(ptm, 0.0), 1.0)
@@ -351,43 +330,6 @@ def build_esm_verifier_result(
     )
 
 
-def _scaled_routing_value(key: str, value: float) -> Tuple[float, float]:
-    raw = max(float(value), 0.0)
-    scale = max(float(ESMFOLD2_ROUTING_LOSS_SCALES.get(key, 1.0)), 1.0e-8)
-    normalized = min(raw / scale, 1.0)
-    return raw, normalized
-
-
-def _weighted_group_score(
-    loss_vector: Mapping[str, Any],
-    weights: Mapping[str, float],
-) -> Tuple[Optional[float], Dict[str, Dict[str, float]]]:
-    values = []
-    weight_sum = 0.0
-    terms: Dict[str, Dict[str, float]] = {}
-    for key, weight in weights.items():
-        if key not in loss_vector:
-            continue
-        value = _finite_float(loss_vector.get(key))
-        if value is None:
-            continue
-        w = abs(float(weight))
-        if w <= 0.0:
-            continue
-        raw, normalized = _scaled_routing_value(key, float(value))
-        values.append(w * normalized)
-        weight_sum += w
-        terms[key] = {
-            "raw": raw,
-            "scale": float(ESMFOLD2_ROUTING_LOSS_SCALES.get(key, 1.0)),
-            "normalized": normalized,
-            "weight": w,
-        }
-    if not values or weight_sum <= 0.0:
-        return None, {}
-    return float(sum(values) / weight_sum), terms
-
-
 def compute_esmfold2_action_group_routing(
     loss_vector: Mapping[str, Any],
     *,
@@ -397,17 +339,27 @@ def compute_esmfold2_action_group_routing(
 
     raw_scores: Dict[str, float] = {}
     term_details: Dict[str, Dict[str, Dict[str, float]]] = {}
-    for group, weights in ESMFOLD2_ACTION_GROUP_LOSS_KEYS.items():
-        score, terms = _weighted_group_score(loss_vector, weights)
-        if score is not None:
-            raw_scores[group] = score
-            term_details[group] = terms
-    if not raw_scores:
-        return {
-            "group_priors": {"unrouted": 1.0},
-            "group_scores": {},
-            "group_terms": {},
+    missing = []
+    for group, key in ESMFOLD2_ACTION_GROUP_ROUTING_KEYS.items():
+        value = _finite_float(loss_vector.get(key))
+        if value is None:
+            missing.append(key)
+            continue
+        score = min(max(float(value), 0.0), 1.0)
+        raw_scores[group] = score
+        term_details[group] = {
+            key: {
+                "raw": float(value),
+                "scale": 1.0,
+                "normalized": score,
+                "weight": 1.0,
+            }
         }
+    if missing:
+        raise ValueError(
+            "ESMFold2 Stage-B routing requires full-verifier metrics: "
+            + ", ".join(missing)
+        )
 
     groups = list(raw_scores)
     scores = torch.tensor([raw_scores[group] for group in groups], dtype=torch.float32)

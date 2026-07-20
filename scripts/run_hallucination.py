@@ -148,6 +148,24 @@ def _build_hotspot_params(args, parser: argparse.ArgumentParser):
     }
 
 
+def resolve_esmfold2_hotspot_defaults(
+    args,
+    *,
+    model_backend: str,
+    hotspot_params,
+):
+    """Resolve hotspot defaults without overriding explicit CLI values."""
+    use_hotspot_defaults = model_backend == "esmfold2" and hotspot_params is not None
+    if args.esmfold2_hotspot_weight is None:
+        args.esmfold2_hotspot_weight = 0.5 if use_hotspot_defaults else 0.0
+    if args.esmfold2_hotspot_interface_mode is None:
+        args.esmfold2_hotspot_interface_mode = (
+            "localized" if use_hotspot_defaults else "additive"
+        )
+    if args.esmfold2_hotspot_verify_weight is None:
+        args.esmfold2_hotspot_verify_weight = 0.10 if use_hotspot_defaults else 0.0
+
+
 def parse_esmfold2_mutable_mask(raw_mask, binder_length: int, parser: argparse.ArgumentParser):
     if raw_mask is None:
         return None
@@ -425,22 +443,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2 proposal 固定记录最后 N 个 local steps；0 表示使用 temperature 阈值（默认：0）")
     parser.add_argument("--esmfold2_final_polish", type=lambda x: x.lower() == "true", default=False,
                        help="ESMFold2 MCTS 搜索结束后是否从 best node logits 做 final continuous polish，并只在该阶段使用 late-confidence candidates（默认：false）")
-    parser.add_argument("--esmfold2_hotspot_weight", type=float, default=0.0,
-                       help="ESMFold2 proposal hotspot contact loss 权重；0 保持旧行为（默认：0.0）")
+    parser.add_argument(
+        "--esmfold2_hotspot_weight",
+        type=float,
+        default=None,
+        help=(
+            "ESMFold2 proposal hotspot contact loss 权重；未显式设置时，"
+            "ESMFold2 有 hotspot 为 0.5，否则为 0.0"
+        ),
+    )
     parser.add_argument("--esmfold2_hotspot_cutoff", type=float, default=8.0,
                        help="ESMFold2 proposal hotspot contact 距离阈值，单位 Å（默认：8.0）")
     parser.add_argument(
         "--esmfold2_hotspot_interface_mode",
         type=str,
         choices=["additive", "localized"],
-        default="additive",
+        default=None,
         help=(
             "hotspot proposal 聚合方式：additive 保持旧版额外加权；"
-            "localized 用 hotspot_weight 在全局 inter 与 hotspot inter 之间插值（默认：additive）"
+            "localized 用 hotspot_weight 在全局 inter 与 hotspot inter 之间插值；"
+            "未显式设置时，ESMFold2 有 hotspot 为 localized，否则为 additive"
         ),
     )
-    parser.add_argument("--esmfold2_hotspot_verify_weight", type=float, default=0.0,
-                       help="ESMFold2 full verifier hotspot 距离 loss 权重；0 保持旧行为（默认：0.0）")
+    parser.add_argument(
+        "--esmfold2_hotspot_verify_weight",
+        type=float,
+        default=None,
+        help=(
+            "ESMFold2 full verifier hotspot 距离 loss 权重；未显式设置时，"
+            "ESMFold2 有 hotspot 为 0.10，否则为 0.0"
+        ),
+    )
     parser.add_argument("--esmfold2_hotspot_verify_near_cutoff", type=float, default=5.0,
                        help="ESMFold2 hotspot verifier 满足接触的重原子距离，单位 Å（默认：5.0）")
     parser.add_argument("--esmfold2_hotspot_verify_far_cutoff", type=float, default=20.0,
@@ -599,6 +632,8 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
+        if getattr(args, "stageb_max_mutations_per_seq", None) is None:
+            args.stageb_max_mutations_per_seq = 1
     return backend
 
 
@@ -630,6 +665,11 @@ def main():
         )
 
     hotspot_params = _build_hotspot_params(args, parser)
+    resolve_esmfold2_hotspot_defaults(
+        args,
+        model_backend=model_backend,
+        hotspot_params=hotspot_params,
+    )
     if args.esmfold2_hotspot_weight < 0.0:
         parser.error("--esmfold2_hotspot_weight 必须大于等于 0")
     if args.esmfold2_hotspot_cutoff <= 0.0:

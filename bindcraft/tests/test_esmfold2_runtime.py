@@ -21,6 +21,13 @@ import bindcraft.hallucination.esmfold2_runtime as esmfold2_runtime_module
 
 
 class FakeComplex:
+    def __init__(self):
+        self.atom37_positions = torch.zeros(7, 37, 3)
+        self.atom37_mask = torch.zeros(7, 37, dtype=torch.bool)
+        for residue_index, x_coord in enumerate([0.0, 1.0, 2.0, 3.0, 0.0, 4.0, 8.0]):
+            self.atom37_positions[residue_index, 1] = torch.tensor([x_coord, 0.0, 0.0])
+            self.atom37_mask[residue_index, 1] = True
+
     def to_mmcif_string(self):
         return "data_fake\n"
 
@@ -67,7 +74,7 @@ class FakeMolecularComplex(FakeComplex):
 class FakeFoldResult:
     def __init__(self):
         self.complex = FakeComplex()
-        self.plddt = torch.tensor([0.8, 0.9])
+        self.plddt = torch.tensor([0.8875, 0.8875, 0.8875, 0.8875, 0.7, 0.8, 0.9])
         self.ptm = 0.72
         self.iptm = 0.61
         self.pair_chains_iptm = torch.tensor(
@@ -160,6 +167,9 @@ def test_runtime_verifier_extracts_pair_chain_metrics_and_mmcif():
     assert result.summary_confidence["iptm"] == pytest.approx(0.61)
     assert result.summary_confidence["ptm"] == pytest.approx(0.72)
     assert result.summary_confidence["plddt"] == pytest.approx(0.85)
+    assert result.summary_confidence["binder_plddt"] == pytest.approx(0.8)
+    assert result.loss_dict["binder_confidence_loss"] == pytest.approx(0.2)
+    assert result.loss_dict["binder_rg_excess_loss"] == pytest.approx(0.0)
     assert result.summary_confidence["mmcif"] == "data_fake\n"
 
     _, input_spec, kwargs = builder.calls[0]
@@ -874,7 +884,7 @@ def test_fold_distogram_accepts_multiple_target_chains(monkeypatch):
     assert result["distogram_logits"].shape == (1, 8, 8, 128)
 
 
-def test_stageb_structure_loss_keeps_base_total_when_group_is_selected():
+def test_stageb_structure_loss_backpropagates_only_selected_group():
     losses = {
         "total_loss": torch.tensor(10.0),
         "inter_contact_loss": torch.tensor(3.0),
@@ -886,8 +896,50 @@ def test_stageb_structure_loss_keeps_base_total_when_group_is_selected():
         group_weight=1.0,
     )
 
-    assert proposal_loss.item() == pytest.approx(13.0)
-    assert source == "total_loss+inter_contact_loss"
+    assert proposal_loss.item() == pytest.approx(3.0)
+    assert source == "inter_contact_loss"
+
+
+def test_stageb_structure_loss_keeps_hotspot_constraint_for_every_group():
+    losses = {
+        "total_loss": torch.tensor(10.0),
+        "intra_contact_loss": torch.tensor(2.0),
+        "glob_loss": torch.tensor(1.0),
+        "hotspot_weighted_contribution": torch.tensor(0.4),
+    }
+
+    core_loss, core_source = _stageb_structure_loss(losses, "core_stabilization")
+    compact_loss, compact_source = _stageb_structure_loss(losses, "compactness_repair")
+
+    assert core_loss.item() == pytest.approx(2.4)
+    assert core_source == "intra_contact_loss+hotspot_weighted_contribution"
+    assert compact_loss.item() == pytest.approx(1.4)
+    assert compact_source == "glob_loss+hotspot_weighted_contribution"
+
+
+def test_stageb_interface_hotspot_is_counted_once_for_both_modes():
+    losses = {
+        "total_loss": torch.tensor(10.0),
+        "inter_contact_loss": torch.tensor(3.0),
+        "effective_inter_contact_loss": torch.tensor(2.2),
+        "hotspot_weighted_contribution": torch.tensor(0.4),
+    }
+
+    localized, localized_source = _stageb_structure_loss(
+        losses,
+        "interface_formation",
+        hotspot_interface_mode="localized",
+    )
+    additive, additive_source = _stageb_structure_loss(
+        losses,
+        "interface_formation",
+        hotspot_interface_mode="additive",
+    )
+
+    assert localized.item() == pytest.approx(2.2)
+    assert localized_source == "effective_inter_contact_loss"
+    assert additive.item() == pytest.approx(3.4)
+    assert additive_source == "inter_contact_loss+hotspot_weighted_contribution"
 
 
 def test_proposal_confidence_tail_steps_override_temperature_gate():
