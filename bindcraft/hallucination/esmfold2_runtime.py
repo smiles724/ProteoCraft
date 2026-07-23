@@ -732,17 +732,18 @@ class ESMFold2RuntimeBackend:
             soft_steps_override=soft_steps_override,
         )
         confidence_sequences = self._top_confidence_sequences(confidence_candidates)
-        candidates = propose_sequences_from_logit_delta(
-            logits_before,
-            logits_after,
-            current_seq=current_seq,
-            mutable_mask=mutable_mask,
-            K_top=K_top,
-            B_candidates=B_candidates,
-            T_sample=T_sample,
-            max_mutations_per_seq=max_mutations_per_seq,
-            include_logit_candidates=(action_group is None),
-        )
+        with _seed_context(seed):
+            candidates = propose_sequences_from_logit_delta(
+                logits_before,
+                logits_after,
+                current_seq=current_seq,
+                mutable_mask=mutable_mask,
+                K_top=K_top,
+                B_candidates=B_candidates,
+                T_sample=T_sample,
+                max_mutations_per_seq=max_mutations_per_seq,
+                include_logit_candidates=(action_group is None),
+            )
         candidates = list(dict.fromkeys([*confidence_sequences, *candidates]))
         return ESMFold2ProposalBatch(
             sequences=candidates,

@@ -18,13 +18,14 @@ import random
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 
 from bindcraft.hallucination.esmfold2_backend import (
     ESM_AA_ORDER,
     ESMFold2ProposalBatch,
+    ESMFold2VerifierResult,
     anchor_binder_logits_to_sequence,
     init_binder_logits,
     logit_delta_mutation_scores,
@@ -38,6 +39,16 @@ from bindcraft.hallucination.mcts_controller import MCTSTree
 logger = logging.getLogger(__name__)
 VALID_ESM_BINDER_AAS = ESM_AA_ORDER.replace("C", "")
 ESMFOLD2_LOGIT_INIT_MODES = {"legacy_anchor", "official_free", "official_exact"}
+ESMFOLD2_STAGEA_HANDOFF_SCHEMA_VERSION = 1
+ESMFOLD2_STAGEB_REWARD_KEYS = (
+    "pair_chain_iptm_loss",
+    "binder_confidence_loss",
+    "global_confidence_loss",
+    "binder_rg_excess_loss",
+)
+ESMFOLD2_STAGEB_HOTSPOT_DISTANCE_WEIGHT = 0.25
+ESMFOLD2_STAGEB_HOTSPOT_MISS_PENALTY = 2.0
+ESMFOLD2_STAGEB_PAIR_CHAIN_FLOOR_PENALTY = 2.0
 
 
 @dataclass(frozen=True)
@@ -49,6 +60,10 @@ class ESMFold2MutationProposal:
     action_group: str = "unrouted"
     group_prior: float = 1.0
     gradient_prior: float = 1.0
+    logit_delta_benefit: float = 0.0
+    rerank_benefit: Optional[float] = None
+    rerank_loss: Optional[float] = None
+    rerank_prior: Optional[float] = None
     proposal_logits: Optional[torch.Tensor] = None
 
 
@@ -404,6 +419,18 @@ def _mcts_action_artifact(
         "gradient_prior": float(
             getattr(getattr(action, "proposal", None), "gradient_prior", 1.0)
         ),
+        "logit_delta_benefit": float(
+            getattr(getattr(action, "proposal", None), "logit_delta_benefit", 0.0)
+        ),
+        "rerank_benefit": getattr(
+            getattr(action, "proposal", None), "rerank_benefit", None
+        ),
+        "rerank_loss": getattr(
+            getattr(action, "proposal", None), "rerank_loss", None
+        ),
+        "rerank_prior": getattr(
+            getattr(action, "proposal", None), "rerank_prior", None
+        ),
         "visit_count": int(getattr(action, "visit_count", 0)),
         "value_sum": float(getattr(action, "value_sum", 0.0)),
         "q_value": float(getattr(action, "q_value", 0.0)),
@@ -635,6 +662,185 @@ def _allocate_group_budgets(group_priors: Dict[str, float], total_budget: int) -
         budgets[group] += 1
         used += 1
     return {group: count for group, count in budgets.items() if count > 0}
+
+
+def _select_stageb_actions_by_group_quota(
+    tree: MCTSTree,
+    node: Any,
+    actions: Sequence[Any],
+    *,
+    group_priors: Dict[str, float],
+    max_actions: int,
+    exploration_actions: int = 0,
+    rng: Optional[random.Random] = None,
+) -> Tuple[List[Any], Dict[str, int]]:
+    """Select group-balanced exploit actions plus a small exploration budget."""
+
+    limit = min(
+        max(int(max_actions), 0),
+        int(tree.remaining_expansion_slots(node)),
+    )
+    if limit <= 0:
+        return [], {}
+
+    available = [
+        action
+        for action in actions
+        if action.status == "unexpanded" and action.child_node_id is None
+        and not tree.has_sequence(action.sequence)
+    ]
+    if not available:
+        return [], {}
+
+    actions_by_group: Dict[str, List[Any]] = {}
+    for action in available:
+        actions_by_group.setdefault(str(action.action_group), []).append(action)
+
+    available_priors = {
+        group: max(float(group_priors.get(group, 0.0)), 0.0)
+        for group in actions_by_group
+    }
+    if not any(prior > 0.0 for prior in available_priors.values()):
+        available_priors = {group: 1.0 for group in actions_by_group}
+    explore_limit = min(max(int(exploration_actions), 0), max(limit - 1, 0))
+    exploit_limit = limit - explore_limit
+    quotas = _allocate_group_budgets(available_priors, exploit_limit)
+
+    def exploit_score(action: Any) -> Tuple[int, float]:
+        rerank_benefit = getattr(getattr(action, "proposal", None), "rerank_benefit", None)
+        if rerank_benefit is not None and math.isfinite(float(rerank_benefit)):
+            return 1, float(rerank_benefit)
+        return 0, float(tree.action_puct_score(node, action))
+
+    selected: List[Any] = []
+    selected_ids = set()
+    for group, quota in quotas.items():
+        ranked = sorted(
+            actions_by_group.get(group, []),
+            key=exploit_score,
+            reverse=True,
+        )
+        for action in ranked[: int(quota)]:
+            selected.append(action)
+            selected_ids.add(int(action.action_id))
+
+    if len(selected) < exploit_limit:
+        remaining = sorted(
+            [action for action in available if int(action.action_id) not in selected_ids],
+            key=exploit_score,
+            reverse=True,
+        )
+        for action in remaining[: exploit_limit - len(selected)]:
+            selected.append(action)
+            selected_ids.add(int(action.action_id))
+
+    rng = rng or random.Random(0)
+    while len(selected) < limit:
+        remaining = [
+            action for action in available if int(action.action_id) not in selected_ids
+        ]
+        if not remaining:
+            break
+        weights = []
+        for action in remaining:
+            proposal = getattr(action, "proposal", None)
+            group_prior = max(float(getattr(action, "group_prior", 1.0)), 1.0e-12)
+            gradient_prior = max(float(getattr(proposal, "gradient_prior", 1.0)), 1.0e-12)
+            weights.append(group_prior * gradient_prior)
+        chosen = rng.choices(remaining, weights=weights, k=1)[0]
+        selected.append(chosen)
+        selected_ids.add(int(chosen.action_id))
+
+    actual_quotas = _count_items([str(action.action_group) for action in selected])
+    return selected, actual_quotas
+
+
+class _ESMFold2StageBMCTSTree(MCTSTree):
+    """MCTS tree with a fixed, ESMFold2-native Stage-B reward."""
+
+    def __init__(
+        self,
+        *args: Any,
+        hotspot_distance_weight: float = ESMFOLD2_STAGEB_HOTSPOT_DISTANCE_WEIGHT,
+        hotspot_miss_penalty: float = ESMFOLD2_STAGEB_HOTSPOT_MISS_PENALTY,
+        min_pair_chain_iptm: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.hotspot_distance_weight = max(float(hotspot_distance_weight), 0.0)
+        self.hotspot_miss_penalty = max(float(hotspot_miss_penalty), 0.0)
+        self.min_pair_chain_iptm = min(max(float(min_pair_chain_iptm), 0.0), 1.0)
+
+    def _compute_base_node_reward(
+        self,
+        total_loss: float,
+        loss_vector: Dict[str, float],
+        base_reward: Optional[float] = None,
+        observe: bool = False,
+    ) -> Tuple[float, Dict[str, Any]]:
+        del total_loss, base_reward, observe
+        losses = {str(key): float(value) for key, value in loss_vector.items()}
+        required = (
+            "pair_chain_iptm_loss",
+            "binder_confidence_loss",
+            "binder_rg_excess_loss",
+        )
+        missing = [key for key in required if key not in losses]
+        if missing:
+            raise ValueError(
+                "ESMFold2 Stage-B reward requires full-verifier metrics: "
+                + ", ".join(missing)
+            )
+
+        components = {
+            key: min(max(float(losses[key]), 0.0), 1.0)
+            for key in ESMFOLD2_STAGEB_REWARD_KEYS
+            if key in losses
+        }
+        base_loss = sum(components.values()) / len(components)
+        hotspot_distance_loss = min(
+            max(float(losses.get("hotspot_verify_distance_loss", 0.0)), 0.0),
+            1.0,
+        )
+        hotspot_coverage = losses.get("hotspot_heavy_atom_coverage")
+        hotspot_miss_penalty = 0.0
+        hotspot_hit = None
+        if hotspot_coverage is not None:
+            hotspot_hit = float(hotspot_coverage) > 0.0
+            if not hotspot_hit:
+                hotspot_miss_penalty = self.hotspot_miss_penalty
+
+        pair_chain_iptm = 1.0 - float(losses["pair_chain_iptm_loss"])
+        pair_chain_floor_violated = pair_chain_iptm < self.min_pair_chain_iptm
+        pair_chain_floor_penalty = (
+            ESMFOLD2_STAGEB_PAIR_CHAIN_FLOOR_PENALTY
+            if pair_chain_floor_violated
+            else 0.0
+        )
+
+        reward_loss = (
+            base_loss
+            + self.hotspot_distance_weight * hotspot_distance_loss
+            + hotspot_miss_penalty
+            + pair_chain_floor_penalty
+        )
+        return -float(reward_loss), {
+            "valid": True,
+            "hard_invalid": False,
+            "hard_penalty": 0.0,
+            "hard_violations": {},
+            "reward_mode": "esmfold2_stageb_fixed",
+            "normalized_loss": float(reward_loss),
+            "normalized_components": components,
+            "hotspot_hit": hotspot_hit,
+            "hotspot_distance_loss": hotspot_distance_loss,
+            "hotspot_distance_weight": self.hotspot_distance_weight,
+            "hotspot_miss_penalty": hotspot_miss_penalty,
+            "pair_chain_iptm": pair_chain_iptm,
+            "min_pair_chain_iptm": self.min_pair_chain_iptm,
+            "pair_chain_floor_violated": pair_chain_floor_violated,
+            "pair_chain_floor_penalty": pair_chain_floor_penalty,
+        }
 
 
 def _normalize_prior_mode(mode: Optional[str]) -> str:
@@ -987,6 +1193,115 @@ def _merge_preview_losses_for_routing(
     return preview_cache[binder_seq]
 
 
+def _stageb_preview_objective(
+    preview: Mapping[str, Any],
+    *,
+    action_group: str,
+    hotspot_weight: float,
+    hotspot_interface_mode: str,
+) -> float:
+    """Return the cheap discrete objective matching one Stage-B repair group."""
+
+    normalized_group = str(action_group)
+    localized = str(hotspot_interface_mode).strip().lower() == "localized"
+    if normalized_group == "interface_formation":
+        key = (
+            "effective_inter_contact_loss"
+            if localized and "effective_inter_contact_loss" in preview
+            else "inter_contact_loss"
+        )
+    elif normalized_group == "core_stabilization":
+        key = "intra_contact_loss"
+    elif normalized_group == "compactness_repair":
+        key = "glob_loss"
+    else:
+        raise ValueError(f"Unsupported ESMFold2 Stage-B action group: {action_group!r}")
+
+    value = _finite_float(preview.get(key))
+    if value is None:
+        raise ValueError(f"Preview output is missing {key!r} for {action_group!r}")
+
+    hotspot_contact = _finite_float(preview.get("hotspot_contact_loss"))
+    hotspot_already_localized = normalized_group == "interface_formation" and localized
+    if hotspot_contact is not None and not hotspot_already_localized:
+        value += max(float(hotspot_weight), 0.0) * hotspot_contact
+    return float(value)
+
+
+def _rerank_stageb_candidates_with_preview(
+    backend: Any,
+    preview_cache: Dict[str, Dict[str, float]],
+    *,
+    current_seq: str,
+    candidates: Sequence[str],
+    target_seq: Union[str, Sequence[str]],
+    action_group: str,
+    seed: Optional[int],
+    hotspot_params: Optional[Dict[str, Any]],
+) -> Dict[str, Dict[str, float]]:
+    """Score discrete single mutants with the cheap proposal-model preview.
+
+    The same seed is reused for the parent and every candidate so proposal LM
+    dropout is paired.  Any preview failure disables reranking for the whole
+    group instead of mixing incomparable score sources.
+    """
+
+    if not hasattr(backend, "preview_loss_dict"):
+        return {}
+
+    config = getattr(backend, "config", None)
+    hotspot_weight = float(getattr(config, "hotspot_weight", 0.0))
+    hotspot_interface_mode = str(
+        getattr(config, "hotspot_interface_mode", "additive")
+    )
+
+    def preview(sequence: str) -> Dict[str, float]:
+        if sequence not in preview_cache:
+            kwargs = {
+                "binder_seq": sequence,
+                "target_seq": target_seq,
+                "seed": seed,
+            }
+            if _callable_accepts_argument(backend.preview_loss_dict, "hotspot_params"):
+                kwargs["hotspot_params"] = dict(hotspot_params) if hotspot_params else None
+            raw = backend.preview_loss_dict(**kwargs)
+            preview_cache[sequence] = {
+                str(key): float(scalar)
+                for key, value in dict(raw or {}).items()
+                if (scalar := _finite_float(value)) is not None
+            }
+        return preview_cache[sequence]
+
+    try:
+        parent_loss = _stageb_preview_objective(
+            preview(current_seq),
+            action_group=action_group,
+            hotspot_weight=hotspot_weight,
+            hotspot_interface_mode=hotspot_interface_mode,
+        )
+        scores: Dict[str, Dict[str, float]] = {}
+        for sequence in dict.fromkeys(str(item) for item in candidates):
+            candidate_loss = _stageb_preview_objective(
+                preview(sequence),
+                action_group=action_group,
+                hotspot_weight=hotspot_weight,
+                hotspot_interface_mode=hotspot_interface_mode,
+            )
+            scores[sequence] = {
+                "parent_loss": float(parent_loss),
+                "loss": float(candidate_loss),
+                "benefit": float(parent_loss - candidate_loss),
+            }
+        return scores
+    except Exception as exc:  # pragma: no cover - defensive runtime fallback
+        logger.warning(
+            "ESM StageB discrete preview rerank failed for group %s: %s",
+            action_group,
+            exc,
+        )
+        return {}
+
+
 def _format_float_map(values: Dict[str, float], *, precision: int = 3) -> str:
     if not values:
         return "-"
@@ -1033,6 +1348,204 @@ def _top_handoff_results(
     return selected
 
 
+def _checkpoint_cpu_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {str(key): _checkpoint_cpu_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_checkpoint_cpu_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_checkpoint_cpu_value(item) for item in value)
+    return value
+
+
+def _serialize_handoff_result(result: Any) -> Dict[str, Any]:
+    return {
+        "binder_seq": str(result.binder_seq),
+        "target_seq": _checkpoint_cpu_value(result.target_seq),
+        "total_loss": float(result.total_loss),
+        "loss_dict": {
+            str(key): float(value)
+            for key, value in dict(result.loss_dict).items()
+        },
+        "summary_confidence": _checkpoint_cpu_value(
+            _summary_without_structure(dict(result.summary_confidence or {}))
+        ),
+        "coordinate": _checkpoint_cpu_value(result.coordinate),
+        "plddt_logits": _checkpoint_cpu_value(result.plddt_logits),
+    }
+
+
+def _deserialize_handoff_result(payload: Dict[str, Any]) -> ESMFold2VerifierResult:
+    return ESMFold2VerifierResult(
+        binder_seq=str(payload["binder_seq"]),
+        target_seq=payload["target_seq"],
+        total_loss=float(payload["total_loss"]),
+        loss_dict={
+            str(key): float(value)
+            for key, value in dict(payload["loss_dict"]).items()
+        },
+        summary_confidence=dict(payload.get("summary_confidence", {})),
+        coordinate=payload.get("coordinate"),
+        plddt_logits=payload.get("plddt_logits"),
+    )
+
+
+def _stagea_handoff_verifier_contract(backend_config: Any) -> Dict[str, Any]:
+    fields = (
+        "verifier_model_name",
+        "verifier_num_loops",
+        "verifier_num_sampling_steps",
+        "hotspot_verify_weight",
+        "hotspot_verify_near_cutoff",
+        "hotspot_verify_far_cutoff",
+    )
+    return {
+        field: _checkpoint_cpu_value(getattr(backend_config, field, None))
+        for field in fields
+    }
+
+
+def _save_stagea_handoff_checkpoint(
+    *,
+    artifact_dir: Optional[Union[str, os.PathLike[str]]],
+    completed_stagea_steps: int,
+    final: bool,
+    target_seq: Union[str, Sequence[str]],
+    L_binder: int,
+    mutable_mask: Sequence[bool],
+    hotspot_params: Optional[Dict[str, Any]],
+    seed: Optional[int],
+    handoff_top_k: int,
+    verifier_cache: Dict[str, Any],
+    proposal_logits_by_sequence: Dict[str, torch.Tensor],
+    losses_history: Sequence[float],
+    stagea_config: Dict[str, Any],
+    verifier_contract: Dict[str, Any],
+) -> Optional[Path]:
+    if artifact_dir is None:
+        return None
+    handoff_results = _top_handoff_results(
+        verifier_cache,
+        top_k=handoff_top_k,
+        min_distance=1,
+    )
+    if not handoff_results:
+        return None
+
+    entries = []
+    for result in handoff_results:
+        sequence = str(result.binder_seq)
+        logits = proposal_logits_by_sequence.get(sequence)
+        if logits is None:
+            logits = _initial_proposal_logits(sequence, mutable_mask)
+        entries.append(
+            {
+                "result": _serialize_handoff_result(result),
+                "proposal_logits": logits.detach().cpu().clone(),
+            }
+        )
+
+    checkpoint_dir = Path(artifact_dir) / "handoff_checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    filename = (
+        "stagea_handoff_final.pt"
+        if final
+        else f"stagea_handoff_step_{int(completed_stagea_steps):04d}.pt"
+    )
+    path = checkpoint_dir / filename
+    payload = {
+        "schema_version": ESMFOLD2_STAGEA_HANDOFF_SCHEMA_VERSION,
+        "checkpoint_type": "esmfold2_stagea_handoff",
+        "completed_stagea_steps": int(completed_stagea_steps),
+        "target_seq": _checkpoint_cpu_value(target_seq),
+        "target_key": _normalize_target_key(target_seq),
+        "binder_length": int(L_binder),
+        "mutable_mask": [bool(value) for value in mutable_mask],
+        "hotspot_params": _checkpoint_cpu_value(hotspot_params),
+        "seed": seed,
+        "handoff_top_k": int(handoff_top_k),
+        "losses_history": [float(value) for value in losses_history],
+        "stagea_config": _checkpoint_cpu_value(stagea_config),
+        "verifier_contract": _checkpoint_cpu_value(verifier_contract),
+        "handoff_entries": entries,
+    }
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary_path)
+    os.replace(temporary_path, path)
+    logger.info(
+        "Saved ESMFold2 StageA handoff checkpoint: %s (step=%d roots=%d)",
+        path,
+        completed_stagea_steps,
+        len(entries),
+    )
+    return path
+
+
+def _load_stagea_handoff_checkpoint(
+    checkpoint_path: Union[str, os.PathLike[str]],
+    *,
+    target_seq: Union[str, Sequence[str]],
+    L_binder: int,
+    mutable_mask: Sequence[bool],
+    hotspot_params: Optional[Dict[str, Any]],
+    verifier_contract: Dict[str, Any],
+    allow_verifier_mismatch: bool = False,
+) -> Dict[str, Any]:
+    path = Path(checkpoint_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"ESMFold2 StageA handoff checkpoint not found: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"invalid ESMFold2 StageA handoff checkpoint: {path}")
+    if int(payload.get("schema_version", -1)) != ESMFOLD2_STAGEA_HANDOFF_SCHEMA_VERSION:
+        raise ValueError(
+            "unsupported ESMFold2 StageA handoff checkpoint schema: "
+            f"{payload.get('schema_version')!r}"
+        )
+    if payload.get("checkpoint_type") != "esmfold2_stagea_handoff":
+        raise ValueError(f"not an ESMFold2 StageA handoff checkpoint: {path}")
+    if str(payload.get("target_key")) != _normalize_target_key(target_seq):
+        raise ValueError("StageA handoff checkpoint target does not match current target")
+    if int(payload.get("binder_length", -1)) != int(L_binder):
+        raise ValueError("StageA handoff checkpoint binder length does not match")
+    if list(payload.get("mutable_mask", [])) != [bool(value) for value in mutable_mask]:
+        raise ValueError("StageA handoff checkpoint mutable mask does not match")
+    expected_hotspots = json.dumps(_json_ready(hotspot_params), sort_keys=True)
+    saved_hotspots = json.dumps(_json_ready(payload.get("hotspot_params")), sort_keys=True)
+    if saved_hotspots != expected_hotspots:
+        raise ValueError("StageA handoff checkpoint hotspot parameters do not match")
+    expected_verifier = json.dumps(_json_ready(verifier_contract), sort_keys=True)
+    saved_verifier = json.dumps(
+        _json_ready(payload.get("verifier_contract")),
+        sort_keys=True,
+    )
+    verifier_contract_matches = saved_verifier == expected_verifier
+    if not verifier_contract_matches and not allow_verifier_mismatch:
+        raise ValueError("StageA handoff checkpoint verifier configuration does not match")
+    entries = list(payload.get("handoff_entries", []))
+    if not entries:
+        raise ValueError("StageA handoff checkpoint contains no handoff roots")
+    completed_steps = int(payload.get("completed_stagea_steps", -1))
+    if completed_steps < 0 or len(payload.get("losses_history", [])) != completed_steps:
+        raise ValueError("StageA handoff checkpoint has an inconsistent loss history")
+    for entry in entries:
+        result_payload = dict(entry.get("result", {}))
+        sequence = str(result_payload.get("binder_seq", ""))
+        logits = entry.get("proposal_logits")
+        if len(sequence) != int(L_binder):
+            raise ValueError("StageA handoff checkpoint contains an invalid binder sequence")
+        if not isinstance(logits, torch.Tensor) or tuple(logits.shape) != (
+            int(L_binder),
+            len(ESM_AA_ORDER),
+        ):
+            raise ValueError("StageA handoff checkpoint contains invalid proposal logits")
+    payload["checkpoint_path"] = str(path)
+    payload["verifier_contract_matches"] = verifier_contract_matches
+    return payload
+
+
 def _make_stageb_proposals(
     *,
     current_seq: str,
@@ -1043,6 +1556,7 @@ def _make_stageb_proposals(
     logits_after: Optional[torch.Tensor] = None,
     mutable_mask: Optional[Sequence[bool]] = None,
     use_gradient_prior: bool = True,
+    rerank_scores: Optional[Mapping[str, Mapping[str, float]]] = None,
 ) -> List[ESMFold2MutationProposal]:
     unique = []
     edits_by_sequence: Dict[str, List[Tuple[int, str, str]]] = {}
@@ -1056,7 +1570,7 @@ def _make_stageb_proposals(
     if not unique:
         return []
 
-    benefits = torch.zeros(len(unique), dtype=torch.float32)
+    logit_benefits = torch.zeros(len(unique), dtype=torch.float32)
     if use_gradient_prior and logits_before is not None and logits_after is not None:
         mutation_scores = logit_delta_mutation_scores(
             logits_before,
@@ -1067,22 +1581,44 @@ def _make_stageb_proposals(
         for index, sequence in enumerate(unique):
             pos, _, new_aa = edits_by_sequence[sequence][0]
             score = mutation_scores[int(pos), ESM_AA_ORDER.index(str(new_aa))]
-            benefits[index] = score if torch.isfinite(score) else -1.0e9
-    gradient_priors = torch.softmax(benefits, dim=0)
+            logit_benefits[index] = score if torch.isfinite(score) else -1.0e9
+    gradient_priors = torch.softmax(logit_benefits, dim=0)
+
+    rerank_scores = dict(rerank_scores or {})
+    rerank_enabled = bool(rerank_scores) and all(seq in rerank_scores for seq in unique)
+    if rerank_enabled:
+        ranking_benefits = torch.tensor(
+            [float(rerank_scores[seq]["benefit"]) for seq in unique],
+            dtype=torch.float32,
+        )
+        ranking_priors = torch.softmax(ranking_benefits, dim=0)
+    else:
+        ranking_benefits = logit_benefits
+        ranking_priors = gradient_priors
 
     proposals: List[ESMFold2MutationProposal] = []
     normalized_group_prior = max(float(group_prior), 1.0e-12)
     for index, seq in enumerate(unique):
         gradient_prior = float(gradient_priors[index].item())
+        ranking_prior = float(ranking_priors[index].item())
+        rerank_record = rerank_scores.get(seq) if rerank_enabled else None
         proposals.append(
             ESMFold2MutationProposal(
                 sequence=seq,
                 edits=edits_by_sequence[seq],
-                prior=normalized_group_prior * gradient_prior,
-                benefit=float(benefits[index].item()),
+                prior=normalized_group_prior * ranking_prior,
+                benefit=float(ranking_benefits[index].item()),
                 action_group=action_group,
                 group_prior=normalized_group_prior,
                 gradient_prior=gradient_prior,
+                logit_delta_benefit=float(logit_benefits[index].item()),
+                rerank_benefit=(
+                    None if rerank_record is None else float(rerank_record["benefit"])
+                ),
+                rerank_loss=(
+                    None if rerank_record is None else float(rerank_record["loss"])
+                ),
+                rerank_prior=ranking_prior if rerank_record is not None else None,
                 proposal_logits=logits_after.detach().clone() if logits_after is not None else None,
             )
         )
@@ -1111,7 +1647,7 @@ def run_esmfold2_mcts_hallucination(
     mcts_bootstrap_min_delta: float = 0.02,
     mcts_bootstrap_max_steps: int = 80,
     mcts_handoff_top_k: Optional[int] = None,
-    mcts_expand_actions_per_step: int = 2,
+    mcts_expand_actions_per_step: int = 4,
     mcts_prior_mode: str = "full",
     seed: Optional[int] = 42,
     mutable_mask: Optional[Sequence[bool]] = None,
@@ -1120,7 +1656,16 @@ def run_esmfold2_mcts_hallucination(
     esmfold2_logit_init_mode: str = "legacy_anchor",
     esmfold2_stagea_soft_steps: Optional[int] = None,
     esmfold2_stageb_soft_steps: Optional[int] = None,
+    esmfold2_stageb_discrete_rerank: bool = True,
+    esmfold2_stageb_rerank_pool_size: int = 20,
+    esmfold2_stageb_exploration_actions: int = 1,
+    esmfold2_stageb_hotspot_distance_weight: float = ESMFOLD2_STAGEB_HOTSPOT_DISTANCE_WEIGHT,
+    esmfold2_stageb_hotspot_miss_penalty: float = ESMFOLD2_STAGEB_HOTSPOT_MISS_PENALTY,
+    esmfold2_stageb_min_pair_chain_iptm: float = 0.0,
     esmfold2_final_polish: bool = False,
+    esmfold2_stagea_handoff_checkpoint_interval: int = 10,
+    esmfold2_resume_handoff_checkpoint: Optional[Union[str, os.PathLike[str]]] = None,
+    esmfold2_resume_reverify_roots: bool = False,
 ) -> Tuple[str, str, List[float]]:
     """
     Run the first ESMFold2 closed-loop path.
@@ -1222,10 +1767,67 @@ def run_esmfold2_mcts_hallucination(
         raise ValueError("esmfold2_stagea_soft_steps must be positive")
     if stageb_soft_steps is not None and stageb_soft_steps <= 0:
         raise ValueError("esmfold2_stageb_soft_steps must be positive")
+    stageb_rerank_pool_size = max(int(esmfold2_stageb_rerank_pool_size), 1)
+    stageb_exploration_actions = max(int(esmfold2_stageb_exploration_actions), 0)
+    stageb_discrete_rerank = bool(esmfold2_stageb_discrete_rerank)
+    stageb_hotspot_distance_weight = float(esmfold2_stageb_hotspot_distance_weight)
+    stageb_hotspot_miss_penalty = float(esmfold2_stageb_hotspot_miss_penalty)
+    stageb_min_pair_chain_iptm = float(esmfold2_stageb_min_pair_chain_iptm)
+    if stageb_hotspot_distance_weight < 0.0:
+        raise ValueError("esmfold2_stageb_hotspot_distance_weight must be non-negative")
+    if stageb_hotspot_miss_penalty < 0.0:
+        raise ValueError("esmfold2_stageb_hotspot_miss_penalty must be non-negative")
+    if not 0.0 <= stageb_min_pair_chain_iptm <= 1.0:
+        raise ValueError("esmfold2_stageb_min_pair_chain_iptm must be within [0, 1]")
+    hotspot_summary.update(
+        {
+            "stageb_hotspot_distance_weight": stageb_hotspot_distance_weight,
+            "stageb_hotspot_miss_penalty": stageb_hotspot_miss_penalty,
+            "stageb_min_pair_chain_iptm": stageb_min_pair_chain_iptm,
+        }
+    )
+    resolved_handoff_top_k = max(
+        int(
+            mcts_handoff_top_k
+            if mcts_handoff_top_k is not None
+            else min(int(num_beams), 4)
+        ),
+        1,
+    )
+    checkpoint_interval = int(esmfold2_stagea_handoff_checkpoint_interval)
+    if checkpoint_interval < 0:
+        raise ValueError("esmfold2_stagea_handoff_checkpoint_interval must be non-negative")
+    if esmfold2_resume_handoff_checkpoint is not None and strategy != "two_stage":
+        raise ValueError("StageA handoff checkpoints can only resume into two_stage MCTS")
+    if esmfold2_resume_reverify_roots and esmfold2_resume_handoff_checkpoint is None:
+        raise ValueError(
+            "esmfold2_resume_reverify_roots requires a StageA handoff checkpoint"
+        )
     artifact_recorder = _make_artifact_recorder(artifact_dir)
 
     tree = LegacyMCTSTree(C=mcts_C, max_nodes=mcts_max_nodes)
     verifier_cache: Dict[str, Any] = {}
+    resume_state = None
+    if esmfold2_resume_handoff_checkpoint is not None:
+        resume_state = _load_stagea_handoff_checkpoint(
+            esmfold2_resume_handoff_checkpoint,
+            target_seq=target_seq,
+            L_binder=L_binder,
+            mutable_mask=mutable_mask,
+            hotspot_params=hotspot_params,
+            verifier_contract=_stagea_handoff_verifier_contract(backend_config),
+            allow_verifier_mismatch=bool(esmfold2_resume_reverify_roots),
+        )
+        completed_steps = int(resume_state["completed_stagea_steps"])
+        if completed_steps >= N_steps:
+            raise ValueError(
+                "N_steps must exceed the checkpoint's completed StageA steps "
+                f"({completed_steps}) so StageB has at least one step"
+            )
+        if not esmfold2_resume_reverify_roots:
+            for entry in resume_state["handoff_entries"]:
+                result = _deserialize_handoff_result(dict(entry["result"]))
+                verifier_cache[str(result.binder_seq)] = result
 
     logger.info("=" * 70)
     logger.info("ESMFold2 MCTS closed loop")
@@ -1251,6 +1853,15 @@ def run_esmfold2_mcts_hallucination(
         str(stagea_soft_steps or "backend_default"),
         str(stageb_soft_steps or "backend_default"),
     )
+    if resume_state is not None:
+        logger.info(
+            "Resuming StageB from StageA handoff checkpoint: %s "
+            "(completed_stagea_steps=%d reverify_roots=%s verifier_contract_matches=%s)",
+            resume_state["checkpoint_path"],
+            int(resume_state["completed_stagea_steps"]),
+            bool(esmfold2_resume_reverify_roots),
+            bool(resume_state["verifier_contract_matches"]),
+        )
     logger.info(
         "ESMFold2 hotspot: indices_0based=%s weight=%.4f cutoff=%.2fA "
         "interface_mode=%s enabled=%s",
@@ -1269,21 +1880,31 @@ def run_esmfold2_mcts_hallucination(
     )
     logger.info("=" * 70)
 
-    phase0_states = _make_phase0_seed_states(
-        init_binder_seq,
-        num_beams=num_beams,
-        L_binder=L_binder,
-        seed=seed,
-        mutable_mask=mutable_mask,
-        logit_init_mode=logit_init_mode,
-        device=getattr(backend, "device", None) if logit_init_mode == "official_exact" else None,
-    )
+    if resume_state is None:
+        phase0_states = _make_phase0_seed_states(
+            init_binder_seq,
+            num_beams=num_beams,
+            L_binder=L_binder,
+            seed=seed,
+            mutable_mask=mutable_mask,
+            logit_init_mode=logit_init_mode,
+            device=getattr(backend, "device", None) if logit_init_mode == "official_exact" else None,
+        )
+    else:
+        phase0_states = [
+            (
+                str(entry["result"]["binder_seq"]),
+                entry["proposal_logits"].detach().cpu().clone(),
+            )
+            for entry in resume_state["handoff_entries"]
+        ]
     phase0_logits_by_sequence = {
         str(seq): logits.detach().cpu().clone()
         for seq, logits in phase0_states
         if logits is not None
     }
     phase0_results = []
+    phase0_artifact_stage = "handoff_resume" if resume_state is not None else "phase0"
     for idx, (binder_seq, _) in enumerate(phase0_states):
         result = _verify_with_cache(
             backend,
@@ -1296,13 +1917,14 @@ def run_esmfold2_mcts_hallucination(
         phase0_results.append(result)
         _write_candidate_artifact(
             artifact_recorder,
-            stage="phase0",
+            stage=phase0_artifact_stage,
             step=None,
             parent_sequence=None,
             result=result,
         )
         logger.info(
-            "ESM Phase0 %d/%d | seq=%s L=%.4f",
+            "%s %d/%d | seq=%s L=%.4f",
+            "ESM Handoff root" if resume_state is not None else "ESM Phase0",
             idx + 1,
             len(phase0_states),
             binder_seq[:20],
@@ -1329,20 +1951,75 @@ def run_esmfold2_mcts_hallucination(
                 stage="stage_a",
                 node=root_node,
                 step_created=None,
-                extra={"source": "phase0_root"},
+                extra={
+                    "source": (
+                        "handoff_checkpoint_root" if resume_state is not None else "phase0_root"
+                    )
+                },
             )
         )
 
     best_result = phase0_results[0]
     best_seq = str(best_result.binder_seq)
     best_loss = float(best_result.total_loss)
-    best_logits = _anchor_proposal_logits(
-        proposal_logits_by_sequence.get(best_seq),
-        best_seq,
-        mutable_mask,
-    ).detach().cpu().clone()
+    if resume_state is None:
+        best_logits = _anchor_proposal_logits(
+            proposal_logits_by_sequence.get(best_seq),
+            best_seq,
+            mutable_mask,
+        ).detach().cpu().clone()
+    else:
+        best_logits = proposal_logits_by_sequence[best_seq].detach().cpu().clone()
     proposal_logits_by_sequence[best_seq] = best_logits
-    losses_history: List[float] = []
+    losses_history: List[float] = (
+        [float(value) for value in resume_state["losses_history"]]
+        if resume_state is not None
+        else []
+    )
+    latest_handoff_checkpoint: Optional[Path] = None
+
+    def _save_handoff_state(*, final: bool = False) -> Optional[Path]:
+        nonlocal latest_handoff_checkpoint
+        if resume_state is not None:
+            return None
+        completed_steps = len(losses_history)
+        if not final and (
+            checkpoint_interval == 0
+            or completed_steps == 0
+            or completed_steps % checkpoint_interval != 0
+        ):
+            return None
+        latest_handoff_checkpoint = _save_stagea_handoff_checkpoint(
+            artifact_dir=artifact_dir,
+            completed_stagea_steps=completed_steps,
+            final=final,
+            target_seq=target_seq,
+            L_binder=L_binder,
+            mutable_mask=mutable_mask,
+            hotspot_params=hotspot_params,
+            seed=seed,
+            handoff_top_k=resolved_handoff_top_k,
+            verifier_cache=verifier_cache,
+            proposal_logits_by_sequence=proposal_logits_by_sequence,
+            losses_history=losses_history,
+            stagea_config={
+                "K_top": K_top,
+                "B_candidates": B_candidates,
+                "T_sample": T_sample,
+                "stagea_max_mutations_per_seq": stagea_max_mutations,
+                "num_beams": num_beams,
+                "mcts_C": mcts_C,
+                "mcts_max_nodes": mcts_max_nodes,
+                "mcts_bootstrap_steps": mcts_bootstrap_steps,
+                "mcts_bootstrap_patience": mcts_bootstrap_patience,
+                "mcts_bootstrap_min_delta": mcts_bootstrap_min_delta,
+                "mcts_bootstrap_max_steps": mcts_bootstrap_max_steps,
+                "esmfold2_logit_init_mode": logit_init_mode,
+                "esmfold2_stagea_soft_steps": stagea_soft_steps,
+            },
+            verifier_contract=_stagea_handoff_verifier_contract(backend_config),
+        )
+        return latest_handoff_checkpoint
 
     def _remember_global_best(result: Any, logits: Optional[torch.Tensor] = None) -> None:
         nonlocal best_result, best_seq, best_loss, best_logits
@@ -1361,7 +2038,7 @@ def run_esmfold2_mcts_hallucination(
         proposal_logits_by_sequence[seq] = best_logits
 
     artifact_recorder.write_step(
-        stage="phase0",
+        stage=phase0_artifact_stage,
         step=None,
         candidate_count=len(phase0_results),
         round_best_loss=float(best_result.total_loss),
@@ -1371,7 +2048,7 @@ def run_esmfold2_mcts_hallucination(
         logit_init_mode=logit_init_mode,
     )
     artifact_recorder.write_checkpoint(
-        stage="phase0",
+        stage=phase0_artifact_stage,
         step=0,
         label="round_best",
         result=best_result,
@@ -1615,7 +2292,9 @@ def run_esmfold2_mcts_hallucination(
         )
         return best_seq, str(round_best.binder_seq), losses_history
 
-    if strategy == "stage_a_only":
+    if resume_state is not None:
+        stagea_steps = 0
+    elif strategy == "stage_a_only":
         stagea_steps = N_steps
     else:
         min_bootstrap = max(int(mcts_bootstrap_steps), 0)
@@ -1673,6 +2352,7 @@ def run_esmfold2_mcts_hallucination(
         if not candidates:
             logger.warning("ESM StageA step %d: no candidates from backend", step)
             losses_history.append(best_loss)
+            _save_handoff_state()
             continue
 
         round_results = []
@@ -1732,6 +2412,7 @@ def run_esmfold2_mcts_hallucination(
         else:
             stagea_stale += 1
         losses_history.append(best_loss)
+        _save_handoff_state()
         artifact_recorder.write_step(
             stage="stage_a",
             step=step,
@@ -1770,6 +2451,8 @@ def run_esmfold2_mcts_hallucination(
             logger.info("ESM StageA bootstrap stopped by patience at step %d", step)
             break
 
+    _save_handoff_state(final=True)
+
     if strategy == "stage_a_only" or len(losses_history) >= N_steps:
         best_result, best_seq, final_seq, best_loss = _run_final_polish_if_enabled(
             current_best_result=best_result,
@@ -1783,23 +2466,30 @@ def run_esmfold2_mcts_hallucination(
             n_steps=len(losses_history),
             strategy=strategy,
             artifact_dir=str(artifact_dir) if artifact_dir is not None else None,
+            stagea_handoff_checkpoint=(
+                str(latest_handoff_checkpoint) if latest_handoff_checkpoint is not None else None
+            ),
             **hotspot_summary,
         )
         return best_seq, final_seq, losses_history
 
-    handoff_k = int(mcts_handoff_top_k or num_beams)
+    handoff_k = resolved_handoff_top_k
     handoff_results = _top_handoff_results(
         verifier_cache,
         top_k=handoff_k,
         min_distance=1,
     )
-    strict_tree = MCTSTree(
+    strict_tree = _ESMFold2StageBMCTSTree(
         C=mcts_C,
         max_nodes=mcts_max_nodes,
         max_children_per_node=max(int(B_candidates), 1),
         expand_actions_per_step=max(int(mcts_expand_actions_per_step), 1),
+        use_pareto_pruning=False,
         use_diversity_bonus=False,
         use_structural_grouping=False,
+        hotspot_distance_weight=stageb_hotspot_distance_weight,
+        hotspot_miss_penalty=stageb_hotspot_miss_penalty,
+        min_pair_chain_iptm=stageb_min_pair_chain_iptm,
     )
     for idx, result in enumerate(handoff_results):
         strict_tree.store_verifier_result(result)
@@ -1879,9 +2569,21 @@ def run_esmfold2_mcts_hallucination(
             losses_history.append(best_loss)
             continue
 
-        proposal_pool_budget = max(B_candidates, expand_budget)
+        proposal_pool_budget = max(
+            B_candidates,
+            expand_budget,
+            stageb_rerank_pool_size if stageb_discrete_rerank else 0,
+        )
         group_budgets = _allocate_group_budgets(group_priors, proposal_pool_budget)
         proposal_pool: List[ESMFold2MutationProposal] = []
+        rerank_preview_cache: Dict[str, Dict[str, float]] = {}
+        rerank_seed = _stable_seed(
+            seed,
+            "esm_stageb_discrete_rerank",
+            target_key,
+            current_seq,
+            step,
+        )
         for group_name, group_budget in group_budgets.items():
             proposal_batch = _call_backend_propose(
                 backend,
@@ -1913,6 +2615,20 @@ def run_esmfold2_mcts_hallucination(
                 _clip_sequence_by_mutable_mask(str(seq), mutable_mask, current_seq)
                 for seq in candidates
             ]
+            rerank_scores = (
+                _rerank_stageb_candidates_with_preview(
+                    backend,
+                    rerank_preview_cache,
+                    current_seq=current_seq,
+                    candidates=candidates,
+                    target_seq=target_seq,
+                    action_group=group_name,
+                    seed=rerank_seed,
+                    hotspot_params=hotspot_params,
+                )
+                if stageb_discrete_rerank
+                else {}
+            )
             proposal_pool.extend(
                 _make_stageb_proposals(
                     current_seq=current_seq,
@@ -1923,6 +2639,7 @@ def run_esmfold2_mcts_hallucination(
                     logits_after=proposal_batch.logits_after,
                     mutable_mask=mutable_mask,
                     use_gradient_prior=use_gradient_prior,
+                    rerank_scores=rerank_scores,
                 )
             )
 
@@ -1936,10 +2653,24 @@ def run_esmfold2_mcts_hallucination(
             continue
 
         registered_actions = strict_tree.register_action_proposals(selected_node, proposal_pool)
-        selected_actions = strict_tree.select_unexpanded_actions(
+        selected_actions, verifier_group_quotas = _select_stageb_actions_by_group_quota(
+            strict_tree,
             selected_node,
+            registered_actions,
+            group_priors=group_priors,
             max_actions=expand_budget,
-            candidates=registered_actions,
+            exploration_actions=(
+                stageb_exploration_actions if stageb_discrete_rerank else 0
+            ),
+            rng=random.Random(
+                _stable_seed(
+                    seed,
+                    "esm_stageb_exploration",
+                    target_key,
+                    current_seq,
+                    step,
+                )
+            ),
         )
         if not selected_actions:
             losses_history.append(best_loss)
@@ -2054,8 +2785,8 @@ def run_esmfold2_mcts_hallucination(
         strict_tree.prune()
         round_results = expand_results
         if round_results:
-            round_best = min(round_results, key=lambda result: float(result.total_loss))
-            if float(round_best.total_loss) < best_loss:
+            round_best = max(round_results, key=strict_tree.result_reward)
+            if strict_tree.result_reward(round_best) > strict_tree.result_reward(best_result):
                 _remember_global_best(round_best)
         losses_history.append(best_loss)
         parent_pair_chain = 1.0 - float(
@@ -2088,10 +2819,18 @@ def run_esmfold2_mcts_hallucination(
             group_scores=dict(routing.get("group_scores", {})),
             group_priors=group_priors,
             group_budgets=group_budgets,
+            verifier_group_quotas=verifier_group_quotas,
             generated_group_counts=generated_group_counts,
             verified_group_counts=_count_items(verified_action_groups),
             selected_group_counts=_count_items([str(action.action_group) for action in selected_actions]),
             selected_action_count=len(selected_actions),
+            discrete_rerank_enabled=stageb_discrete_rerank,
+            discrete_rerank_pool_size=proposal_pool_budget,
+            exploration_action_count=(
+                min(stageb_exploration_actions, max(len(selected_actions) - 1, 0))
+                if stageb_discrete_rerank
+                else 0
+            ),
             best_reward_gain=best_reward_gain,
             best_pair_chain_iptm_gain=best_pair_chain_gain,
             loss_vector_keys=sorted(str(key) for key in selected_node.loss_vector.keys()),
@@ -2138,6 +2877,18 @@ def run_esmfold2_mcts_hallucination(
         n_steps=len(losses_history),
         strategy=strategy,
         artifact_dir=str(artifact_dir) if artifact_dir is not None else None,
+        stagea_handoff_checkpoint=(
+            str(latest_handoff_checkpoint) if latest_handoff_checkpoint is not None else None
+        ),
+        resumed_from_stagea_handoff=(
+            None if resume_state is None else str(resume_state["checkpoint_path"])
+        ),
+        resumed_handoff_roots_reverified=(
+            bool(esmfold2_resume_reverify_roots) if resume_state is not None else False
+        ),
+        resumed_handoff_verifier_contract_matches=(
+            None if resume_state is None else bool(resume_state["verifier_contract_matches"])
+        ),
         **hotspot_summary,
     )
     return best_seq, final_seq, losses_history

@@ -442,6 +442,45 @@ def test_runtime_propose_uses_injected_soft_update_and_logit_delta_candidates():
     assert seen["proposal_logits"] is None
 
 
+def test_runtime_propose_candidate_sampling_is_reproducible_for_fixed_seed():
+    def fake_soft_update(**kwargs):
+        current_seq = kwargs["current_seq"]
+        before = torch.zeros(len(current_seq), 20)
+        after = before.clone()
+        for position in range(len(current_seq)):
+            after[position, (position + 1) % 20] = 3.0 - 0.1 * position
+            after[position, (position + 2) % 20] = 2.0 - 0.1 * position
+        return before, after
+
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(),
+        device="cpu",
+        verifier_model=object(),
+        input_builder=FakeInputBuilder(),
+        protein_input_cls=FakeProteinInput,
+        structure_prediction_input_cls=FakeStructurePredictionInput,
+        soft_update_fn=fake_soft_update,
+    )
+    kwargs = {
+        "current_seq": "AAAAAA",
+        "target_seq": "TTTT",
+        "global_step": 3,
+        "K_top": 8,
+        "B_candidates": 6,
+        "T_sample": 1.0,
+        "max_mutations_per_seq": 3,
+        "seed": 17,
+        "action_group": "interface_formation",
+    }
+
+    torch.manual_seed(1)
+    first = list(backend.propose(**kwargs).sequences)
+    torch.manual_seed(999)
+    second = list(backend.propose(**kwargs).sequences)
+
+    assert first == second
+
+
 def test_runtime_propose_can_continue_from_saved_proposal_logits():
     aa_to_idx = {aa: idx for idx, aa in enumerate("ARNDCQEGHILKMFPSTWYV")}
     saved_logits = torch.zeros(3, 20)

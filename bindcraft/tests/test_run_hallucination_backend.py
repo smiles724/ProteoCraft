@@ -17,6 +17,7 @@ def test_default_model_backend_preserves_protenix_path():
 
     assert args.model_backend == "protenix"
     assert resolve_model_backend(args, parser) == "protenix"
+    assert args.mcts_expand_actions_per_step == 2
 
 
 def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
@@ -26,12 +27,23 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert resolve_model_backend(args, parser) == "esmfold2"
     assert args.esmfold2_soft_steps is None
     assert args.esmfold2_stagea_soft_steps == 30
-    assert args.esmfold2_stageb_soft_steps == 5
+    assert args.esmfold2_stageb_soft_steps == 10
+    assert args.mcts_expand_actions_per_step == 4
+    assert args.mcts_handoff_top_k == 4
+    assert args.esmfold2_stageb_discrete_rerank is True
+    assert args.esmfold2_stageb_rerank_pool_size == 20
+    assert args.esmfold2_stageb_exploration_actions == 1
+    assert args.esmfold2_stageb_hotspot_distance_weight == pytest.approx(0.25)
+    assert args.esmfold2_stageb_hotspot_miss_penalty == pytest.approx(2.0)
+    assert args.esmfold2_stageb_min_pair_chain_iptm == pytest.approx(0.0)
     assert args.stageb_max_mutations_per_seq == 1
     assert args.esmfold2_logit_init_mode == "official_exact"
     assert args.esmfold2_proposal_load_internal_esmc is True
     assert args.esmfold2_proposal_lm_dropout == pytest.approx(0.5)
     assert args.esmfold2_force_proposal_lm_dropout is True
+    assert args.esmfold2_stagea_handoff_checkpoint_interval == 10
+    assert args.esmfold2_resume_handoff_checkpoint is None
+    assert args.esmfold2_resume_reverify_roots is False
     assert args.esmfold2_hotspot_weight is None
     assert args.esmfold2_hotspot_interface_mode is None
     assert args.esmfold2_hotspot_verify_weight is None
@@ -69,7 +81,7 @@ def test_esmfold2_hotspot_defaults_to_localized_half_weight():
 
     assert args.esmfold2_hotspot_weight == pytest.approx(0.5)
     assert args.esmfold2_hotspot_interface_mode == "localized"
-    assert args.esmfold2_hotspot_verify_weight == pytest.approx(0.10)
+    assert args.esmfold2_hotspot_verify_weight == pytest.approx(0.25)
 
 
 def test_explicit_esmfold2_hotspot_settings_override_conditional_defaults():
@@ -240,6 +252,12 @@ def test_esmfold2_backend_exposes_separate_model_and_proposal_options():
             "5.0",
             "--esmfold2_hotspot_verify_far_cutoff",
             "20.0",
+            "--esmfold2_stageb_hotspot_distance_weight",
+            "0.1",
+            "--esmfold2_stageb_hotspot_miss_penalty",
+            "0.25",
+            "--esmfold2_stageb_min_pair_chain_iptm",
+            "0.25",
             "--stagea_max_mutations_per_seq",
             "9",
             "--stageb_max_mutations_per_seq",
@@ -253,6 +271,7 @@ def test_esmfold2_backend_exposes_separate_model_and_proposal_options():
     assert args.esmfold2_soft_steps == 2
     assert args.esmfold2_stagea_soft_steps == 30
     assert args.esmfold2_stageb_soft_steps == 5
+    assert args.mcts_expand_actions_per_step == 4
     assert args.esmfold2_lambda_esmc == "0.2"
     assert args.esmfold2_task_type == "tcr"
     assert args.esmfold2_logit_init_mode == "legacy_anchor"
@@ -354,6 +373,12 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
             "5.0",
             "--esmfold2_hotspot_verify_far_cutoff",
             "20.0",
+            "--esmfold2_stageb_hotspot_distance_weight",
+            "0.1",
+            "--esmfold2_stageb_hotspot_miss_penalty",
+            "0.25",
+            "--esmfold2_stageb_min_pair_chain_iptm",
+            "0.25",
             "--target_template_path",
             str(tmp_path / "target.cif"),
             "--output_dir",
@@ -380,7 +405,8 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     assert "ESMFold2 backend received target_template_path but does not use templates yet" in log_text
     assert captured["mcts_strategy"] == "two_stage"
     assert captured["mcts_bootstrap_steps"] == 50
-    assert captured["mcts_expand_actions_per_step"] == 2
+    assert captured["mcts_expand_actions_per_step"] == 4
+    assert captured["mcts_handoff_top_k"] == 4
     assert captured["mcts_prior_mode"] == "full"
     assert captured["stagea_max_mutations_per_seq"] == 7
     assert captured["stageb_max_mutations_per_seq"] == 1
@@ -391,7 +417,16 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     }
     assert captured["esmfold2_logit_init_mode"] == "official_exact"
     assert captured["esmfold2_stagea_soft_steps"] == 30
-    assert captured["esmfold2_stageb_soft_steps"] == 5
+    assert captured["esmfold2_stageb_soft_steps"] == 10
+    assert captured["esmfold2_stageb_discrete_rerank"] is True
+    assert captured["esmfold2_stageb_rerank_pool_size"] == 20
+    assert captured["esmfold2_stageb_exploration_actions"] == 1
+    assert captured["esmfold2_stageb_hotspot_distance_weight"] == pytest.approx(0.1)
+    assert captured["esmfold2_stageb_hotspot_miss_penalty"] == pytest.approx(0.25)
+    assert captured["esmfold2_stageb_min_pair_chain_iptm"] == pytest.approx(0.25)
+    assert captured["esmfold2_stagea_handoff_checkpoint_interval"] == 10
+    assert captured["esmfold2_resume_handoff_checkpoint"] is None
+    assert captured["esmfold2_resume_reverify_roots"] is False
     assert captured["task_type_arg"] == "tcr"
 
 

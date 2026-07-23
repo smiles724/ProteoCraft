@@ -1,19 +1,26 @@
 import torch
 import pytest
 import json
+import random
+from types import SimpleNamespace
 
 from bindcraft.hallucination.esmfold2_backend import (
     AA_TO_ESM_IDX,
     ESM_AA_ORDER,
     ESMFold2ProposalBatch,
+    anchor_binder_logits_to_sequence,
     build_esm_verifier_result,
 )
 from bindcraft.hallucination.mcts_legacy import LegacyMCTSTree
 from bindcraft.hallucination.esmfold2_pipeline import run_esmfold2_mcts_hallucination
 from bindcraft.hallucination.esmfold2_pipeline import (
+    _ESMFold2StageBMCTSTree,
     _allocate_group_budgets,
     _make_phase0_seed_states,
     _make_stageb_proposals,
+    _rerank_stageb_candidates_with_preview,
+    _select_stageb_actions_by_group_quota,
+    _stageb_preview_objective,
 )
 
 
@@ -169,6 +176,299 @@ def test_stageb_group_budget_keeps_every_repair_group_represented():
     }
 
 
+def test_stageb_verifier_selection_applies_group_quotas_before_action_ranking():
+    class FakeTree:
+        @staticmethod
+        def remaining_expansion_slots(node):
+            return 8
+
+        @staticmethod
+        def has_sequence(sequence):
+            return False
+
+        @staticmethod
+        def action_puct_score(node, action):
+            return float(action.prior)
+
+    action_id = 0
+
+    def action(group, prior):
+        nonlocal action_id
+        result = SimpleNamespace(
+            action_id=action_id,
+            sequence=f"candidate_{action_id}",
+            action_group=group,
+            prior=prior,
+            status="unexpanded",
+            child_node_id=None,
+        )
+        action_id += 1
+        return result
+
+    actions = [
+        action("interface_formation", 0.10),
+        action("interface_formation", 0.09),
+        action("interface_formation", 0.08),
+        action("core_stabilization", 0.30),
+        action("core_stabilization", 0.20),
+        action("compactness_repair", 0.60),
+        action("compactness_repair", 0.50),
+    ]
+    selected, quotas = _select_stageb_actions_by_group_quota(
+        FakeTree(),
+        SimpleNamespace(),
+        actions,
+        group_priors={
+            "interface_formation": 0.40,
+            "core_stabilization": 0.35,
+            "compactness_repair": 0.25,
+        },
+        max_actions=4,
+    )
+
+    assert len(selected) == 4
+    assert quotas == {
+        "interface_formation": 2,
+        "core_stabilization": 1,
+        "compactness_repair": 1,
+    }
+
+
+def test_stageb_rerank_selection_keeps_three_exploit_and_one_exploration():
+    class FakeTree:
+        @staticmethod
+        def remaining_expansion_slots(node):
+            return 8
+
+        @staticmethod
+        def has_sequence(sequence):
+            return False
+
+        @staticmethod
+        def action_puct_score(node, action):
+            return float(action.prior)
+
+    def action(action_id, group, benefit, gradient_prior):
+        proposal = SimpleNamespace(
+            rerank_benefit=benefit,
+            gradient_prior=gradient_prior,
+        )
+        return SimpleNamespace(
+            action_id=action_id,
+            sequence=f"candidate_{action_id}",
+            action_group=group,
+            group_prior=1.0,
+            prior=gradient_prior,
+            proposal=proposal,
+            status="unexpanded",
+            child_node_id=None,
+        )
+
+    actions = [
+        action(0, "interface_formation", 0.30, 0.7),
+        action(1, "interface_formation", 0.10, 0.3),
+        action(2, "core_stabilization", 0.20, 0.8),
+        action(3, "core_stabilization", 0.05, 0.2),
+        action(4, "compactness_repair", 0.15, 0.9),
+        action(5, "compactness_repair", 0.01, 0.1),
+    ]
+    selected, quotas = _select_stageb_actions_by_group_quota(
+        FakeTree(),
+        SimpleNamespace(),
+        actions,
+        group_priors={
+            "interface_formation": 1.0,
+            "core_stabilization": 1.0,
+            "compactness_repair": 1.0,
+        },
+        max_actions=4,
+        exploration_actions=1,
+        rng=random.Random(7),
+    )
+
+    assert len(selected) == 4
+    assert {action.action_id for action in selected[:3]} == {0, 2, 4}
+    assert sum(quotas.values()) == 4
+    assert set(quotas) == {
+        "interface_formation",
+        "core_stabilization",
+        "compactness_repair",
+    }
+
+
+def test_stageb_selection_filters_existing_tree_sequences_before_using_budget():
+    class FakeTree:
+        @staticmethod
+        def remaining_expansion_slots(node):
+            return 4
+
+        @staticmethod
+        def has_sequence(sequence):
+            return sequence == "existing"
+
+        @staticmethod
+        def action_puct_score(node, action):
+            return float(action.prior)
+
+    def action(action_id, sequence, prior):
+        return SimpleNamespace(
+            action_id=action_id,
+            sequence=sequence,
+            action_group="interface_formation",
+            group_prior=1.0,
+            prior=prior,
+            proposal=SimpleNamespace(rerank_benefit=prior, gradient_prior=prior),
+            status="unexpanded",
+            child_node_id=None,
+        )
+
+    selected, _ = _select_stageb_actions_by_group_quota(
+        FakeTree(),
+        SimpleNamespace(),
+        [
+            action(0, "existing", 1.0),
+            action(1, "new_a", 0.8),
+            action(2, "new_b", 0.7),
+            action(3, "new_c", 0.6),
+            action(4, "new_d", 0.5),
+        ],
+        group_priors={"interface_formation": 1.0},
+        max_actions=4,
+    )
+
+    assert [item.sequence for item in selected] == ["new_a", "new_b", "new_c", "new_d"]
+
+
+def test_stageb_preview_objective_matches_group_and_localized_hotspot():
+    preview = {
+        "inter_contact_loss": 0.7,
+        "effective_inter_contact_loss": 0.4,
+        "intra_contact_loss": 0.2,
+        "glob_loss": 0.3,
+        "hotspot_contact_loss": 0.5,
+    }
+
+    assert _stageb_preview_objective(
+        preview,
+        action_group="interface_formation",
+        hotspot_weight=0.5,
+        hotspot_interface_mode="localized",
+    ) == pytest.approx(0.4)
+    assert _stageb_preview_objective(
+        preview,
+        action_group="core_stabilization",
+        hotspot_weight=0.5,
+        hotspot_interface_mode="localized",
+    ) == pytest.approx(0.45)
+    assert _stageb_preview_objective(
+        preview,
+        action_group="compactness_repair",
+        hotspot_weight=0.5,
+        hotspot_interface_mode="localized",
+    ) == pytest.approx(0.55)
+
+
+def test_stageb_discrete_rerank_uses_paired_seed_and_parent_delta():
+    class PreviewBackend:
+        config = SimpleNamespace(
+            hotspot_weight=0.5,
+            hotspot_interface_mode="localized",
+        )
+
+        def __init__(self):
+            self.calls = []
+
+        def preview_loss_dict(
+            self, *, binder_seq, target_seq, seed=None, hotspot_params=None
+        ):
+            self.calls.append((binder_seq, seed, hotspot_params))
+            value = {"AAA": 0.8, "AYA": 0.5, "AFA": 0.7}[binder_seq]
+            return {
+                "inter_contact_loss": value,
+                "effective_inter_contact_loss": value,
+                "hotspot_contact_loss": value,
+            }
+
+    backend = PreviewBackend()
+    scores = _rerank_stageb_candidates_with_preview(
+        backend,
+        {},
+        current_seq="AAA",
+        candidates=["AYA", "AFA"],
+        target_seq="TTTT",
+        action_group="interface_formation",
+        seed=123,
+        hotspot_params={"target_hotspot_concat_indices": [1]},
+    )
+
+    assert scores["AYA"]["benefit"] == pytest.approx(0.3)
+    assert scores["AFA"]["benefit"] == pytest.approx(0.1)
+    assert {call[1] for call in backend.calls} == {123}
+    assert [call[0] for call in backend.calls] == ["AAA", "AYA", "AFA"]
+
+
+def test_esmfold2_stageb_reward_uses_native_metrics_and_hotspot_hit_gate():
+    tree = _ESMFold2StageBMCTSTree(use_pareto_pruning=False)
+    base = {
+        "pair_chain_iptm_loss": 0.3,
+        "binder_confidence_loss": 0.2,
+        "global_confidence_loss": 0.1,
+        "binder_rg_excess_loss": 0.2,
+        "hotspot_verify_distance_loss": 0.4,
+    }
+    hit_reward, hit_status = tree.compute_node_reward(
+        0.4,
+        {**base, "hotspot_heavy_atom_coverage": 0.5},
+    )
+    miss_reward, miss_status = tree.compute_node_reward(
+        0.4,
+        {**base, "hotspot_heavy_atom_coverage": 0.0},
+    )
+
+    assert hit_status["reward_mode"] == "esmfold2_stageb_fixed"
+    assert hit_status["hotspot_miss_penalty"] == pytest.approx(0.0)
+    assert miss_status["hotspot_miss_penalty"] == pytest.approx(2.0)
+    assert hit_reward > miss_reward
+
+
+def test_esmfold2_stageb_reward_guardrail_rejects_low_quality_hotspot_hit():
+    tree = _ESMFold2StageBMCTSTree(
+        use_pareto_pruning=False,
+        hotspot_distance_weight=0.1,
+        hotspot_miss_penalty=0.25,
+        min_pair_chain_iptm=0.25,
+    )
+    shared = {
+        "binder_confidence_loss": 0.3,
+        "global_confidence_loss": 0.2,
+        "binder_rg_excess_loss": 0.2,
+    }
+    low_quality_hit_reward, low_quality_hit_status = tree.compute_node_reward(
+        0.9,
+        {
+            **shared,
+            "pair_chain_iptm_loss": 0.9,
+            "hotspot_verify_distance_loss": 0.0,
+            "hotspot_heavy_atom_coverage": 1.0,
+        },
+    )
+    acceptable_miss_reward, acceptable_miss_status = tree.compute_node_reward(
+        0.7,
+        {
+            **shared,
+            "pair_chain_iptm_loss": 0.7,
+            "hotspot_verify_distance_loss": 1.0,
+            "hotspot_heavy_atom_coverage": 0.0,
+        },
+    )
+
+    assert low_quality_hit_status["pair_chain_floor_violated"] is True
+    assert low_quality_hit_status["pair_chain_floor_penalty"] == pytest.approx(2.0)
+    assert acceptable_miss_status["pair_chain_floor_violated"] is False
+    assert acceptable_miss_status["hotspot_miss_penalty"] == pytest.approx(0.25)
+    assert acceptable_miss_reward > low_quality_hit_reward
+
+
 def test_stageb_proposals_are_strict_single_mutations_with_gradient_priors():
     before = torch.zeros(3, 20)
     after = before.clone()
@@ -204,6 +504,33 @@ def test_stageb_proposals_are_strict_single_mutations_with_gradient_priors():
     assert [proposal.gradient_prior for proposal in uniform] == pytest.approx([0.5, 0.5])
 
 
+def test_stageb_proposals_use_discrete_rerank_but_keep_logit_delta_metadata():
+    before = torch.zeros(3, 20)
+    after = before.clone()
+    after[1, AA_TO_ESM_IDX["Y"]] = 3.0
+    after[1, AA_TO_ESM_IDX["F"]] = 1.0
+
+    proposals = _make_stageb_proposals(
+        current_seq="AAA",
+        candidates=["AYA", "AFA"],
+        action_group="interface_formation",
+        group_prior=0.6,
+        logits_before=before,
+        logits_after=after,
+        mutable_mask=[True, True, True],
+        rerank_scores={
+            "AYA": {"loss": 0.8, "benefit": 0.1},
+            "AFA": {"loss": 0.4, "benefit": 0.5},
+        },
+    )
+
+    assert proposals[0].logit_delta_benefit > proposals[1].logit_delta_benefit
+    assert proposals[0].rerank_benefit == pytest.approx(0.1)
+    assert proposals[1].rerank_benefit == pytest.approx(0.5)
+    assert proposals[1].rerank_prior > proposals[0].rerank_prior
+    assert proposals[1].benefit > proposals[0].benefit
+
+
 def test_stageb_soft_updates_do_not_overwrite_parent_node_logits():
     class StatefulStageBBackend(FakeESMFold2Backend):
         def __init__(self):
@@ -216,7 +543,12 @@ def test_stageb_soft_updates_do_not_overwrite_parent_node_logits():
                 return super().propose(**kwargs)
             before = kwargs["proposal_logits"].detach().clone()
             self.stageb_inputs.append(
-                (kwargs["global_step"], kwargs["action_group"], before.clone())
+                (
+                    kwargs["global_step"],
+                    kwargs["action_group"],
+                    kwargs["current_seq"],
+                    before.clone(),
+                )
             )
             group_to_candidate = {
                 "interface_formation": ("FAY", "F"),
@@ -251,10 +583,18 @@ def test_stageb_soft_updates_do_not_overwrite_parent_node_logits():
         mcts_expand_actions_per_step=1,
     )
 
-    step_one = [entry[2] for entry in backend.stageb_inputs if entry[0] == 1]
-    step_two = [entry[2] for entry in backend.stageb_inputs if entry[0] == 2]
+    step_one = [entry[3] for entry in backend.stageb_inputs if entry[0] == 1]
+    step_two = [entry[3] for entry in backend.stageb_inputs if entry[0] == 2]
     assert step_one and step_two
-    assert all(torch.equal(logits, step_one[0]) for logits in step_one + step_two)
+    assert all(torch.equal(logits, step_one[0]) for logits in step_one)
+    assert all(torch.equal(logits, step_two[0]) for logits in step_two)
+
+    logits_by_sequence = {}
+    for _, _, sequence, logits in backend.stageb_inputs:
+        if sequence in logits_by_sequence:
+            assert torch.equal(logits, logits_by_sequence[sequence])
+        else:
+            logits_by_sequence[sequence] = logits
 
 
 def test_esmfold2_stagea_pipeline_uses_backend_for_verify_and_proposal():
@@ -327,7 +667,7 @@ def test_esmfold2_continuous_stagea_designs_once_then_verifies_argmax_sequence()
     assert backend.preview_calls == []
 
 
-def test_esmfold2_pipeline_propagates_hotspot_without_preview_routing():
+def test_esmfold2_pipeline_propagates_hotspot_to_proposal_and_preview_rerank():
     backend = FakeESMFold2Backend()
     hotspot_params = {"target_hotspot_concat_indices": [1, 2]}
 
@@ -352,7 +692,8 @@ def test_esmfold2_pipeline_propagates_hotspot_without_preview_routing():
 
     assert backend.propose_calls
     assert all(call["hotspot_params"] == hotspot_params for call in backend.propose_calls)
-    assert backend.preview_calls == []
+    assert backend.preview_calls
+    assert all(call[3] == hotspot_params for call in backend.preview_calls)
 
 
 def test_esmfold2_pipeline_propagates_hotspots_to_verify_when_supported():
@@ -941,7 +1282,7 @@ def test_esmfold2_two_stage_pipeline_routes_stageb_proposals_by_group():
     assert losses[-1] == pytest.approx(0.10)
     assert backend.propose_calls[0]["action_group"] is None
     assert backend.propose_calls[1]["action_group"] == "interface_formation"
-    assert backend.preview_calls == []
+    assert backend.preview_calls
 
 
 def test_esmfold2_two_stage_pipeline_passes_mutable_mask_to_stageb():
@@ -1199,3 +1540,191 @@ def test_esmfold2_pipeline_writes_structured_step_artifacts(tmp_path):
     assert "mmcif" not in stage_b_meta["summary_confidence"]
     assert summary["best_sequence"] == "AYY"
     assert summary["best_loss"] == pytest.approx(0.10)
+
+
+def test_stagea_handoff_checkpoint_is_saved_and_resumes_directly_into_stageb(tmp_path):
+    stagea_backend = FakeESMFold2Backend()
+    source_artifacts = tmp_path / "stagea_source"
+
+    run_esmfold2_mcts_hallucination(
+        backend=stagea_backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=2,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=2,
+        seed=7,
+        mcts_strategy="stage_a_only",
+        artifact_dir=source_artifacts,
+        esmfold2_stagea_handoff_checkpoint_interval=1,
+    )
+
+    checkpoint_dir = source_artifacts / "handoff_checkpoints"
+    checkpoint_path = checkpoint_dir / "stagea_handoff_final.pt"
+    assert (checkpoint_dir / "stagea_handoff_step_0001.pt").exists()
+    assert (checkpoint_dir / "stagea_handoff_step_0002.pt").exists()
+    assert checkpoint_path.exists()
+
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    assert payload["completed_stagea_steps"] == 2
+    assert payload["losses_history"] == pytest.approx([0.2, 0.1])
+    assert payload["handoff_entries"][0]["result"]["binder_seq"] == "AYY"
+    saved_logits = payload["handoff_entries"][0]["proposal_logits"].clone()
+
+    resumed_backend = FakeESMFold2Backend()
+    best_seq, final_seq, losses = run_esmfold2_mcts_hallucination(
+        backend=resumed_backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=4,
+        num_beams=1,
+        K_top=4,
+        B_candidates=2,
+        seed=999,
+        mcts_strategy="two_stage",
+        mcts_expand_actions_per_step=1,
+        artifact_dir=tmp_path / "stageb_resume",
+        esmfold2_resume_handoff_checkpoint=checkpoint_path,
+    )
+
+    assert best_seq == final_seq == "AYY"
+    assert losses[:2] == pytest.approx([0.2, 0.1])
+    assert len(losses) == 4
+    assert resumed_backend.verify_calls == []
+    assert resumed_backend.propose_calls
+    assert all(call["action_group"] is not None for call in resumed_backend.propose_calls)
+    expected_logits = anchor_binder_logits_to_sequence(saved_logits, "AYY")
+    assert torch.equal(
+        resumed_backend.propose_calls[0]["proposal_logits"],
+        expected_logits,
+    )
+
+    summary = json.loads((tmp_path / "stageb_resume" / "run_summary.json").read_text())
+    assert summary["resumed_from_stagea_handoff"] == str(checkpoint_path.resolve())
+
+
+def test_stagea_handoff_checkpoint_rejects_mismatched_target(tmp_path):
+    backend = FakeESMFold2Backend()
+    artifact_dir = tmp_path / "source"
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=1,
+        num_beams=1,
+        init_binder_seq="AAA",
+        B_candidates=1,
+        mcts_strategy="stage_a_only",
+        artifact_dir=artifact_dir,
+    )
+
+    with pytest.raises(ValueError, match="target does not match"):
+        run_esmfold2_mcts_hallucination(
+            backend=FakeESMFold2Backend(),
+            target_seq="VVVV",
+            L_binder=3,
+            N_steps=2,
+            num_beams=1,
+            B_candidates=1,
+            mcts_strategy="two_stage",
+            artifact_dir=tmp_path / "resume",
+            esmfold2_resume_handoff_checkpoint=(
+                artifact_dir / "handoff_checkpoints" / "stagea_handoff_final.pt"
+            ),
+        )
+
+
+def test_stagea_handoff_can_reverify_roots_after_verifier_config_change(tmp_path):
+    hotspot_params = {
+        "target_hotspot_residues_1based": [2],
+        "target_hotspot_concat_indices": [1],
+    }
+    stagea_backend = FakeESMFold2Backend()
+    stagea_backend.config = SimpleNamespace(
+        verifier_model_name="biohub/ESMFold2",
+        verifier_num_loops=4,
+        verifier_num_sampling_steps=50,
+        hotspot_verify_weight=0.10,
+        hotspot_verify_near_cutoff=5.0,
+        hotspot_verify_far_cutoff=20.0,
+    )
+    source_artifacts = tmp_path / "source"
+    run_esmfold2_mcts_hallucination(
+        backend=stagea_backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=1,
+        num_beams=1,
+        init_binder_seq="AAA",
+        B_candidates=1,
+        mcts_strategy="stage_a_only",
+        hotspot_params=hotspot_params,
+        artifact_dir=source_artifacts,
+    )
+    checkpoint_path = source_artifacts / "handoff_checkpoints" / "stagea_handoff_final.pt"
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    handoff_sequences = [
+        str(entry["result"]["binder_seq"])
+        for entry in payload["handoff_entries"]
+    ]
+
+    resumed_backend = FakeESMFold2Backend()
+    resumed_backend.config = SimpleNamespace(
+        verifier_model_name="biohub/ESMFold2",
+        verifier_num_loops=20,
+        verifier_num_sampling_steps=200,
+        hotspot_verify_weight=0.25,
+        hotspot_verify_near_cutoff=5.0,
+        hotspot_verify_far_cutoff=20.0,
+    )
+    with pytest.raises(ValueError, match="verifier configuration does not match"):
+        run_esmfold2_mcts_hallucination(
+            backend=resumed_backend,
+            target_seq="TTTT",
+            L_binder=3,
+            N_steps=2,
+            num_beams=1,
+            B_candidates=1,
+            mcts_strategy="two_stage",
+            hotspot_params=hotspot_params,
+            artifact_dir=tmp_path / "rejected",
+            esmfold2_resume_handoff_checkpoint=checkpoint_path,
+        )
+
+    resumed_backend.verify_calls.clear()
+    run_esmfold2_mcts_hallucination(
+        backend=resumed_backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=2,
+        num_beams=1,
+        B_candidates=1,
+        mcts_strategy="two_stage",
+        hotspot_params=hotspot_params,
+        artifact_dir=tmp_path / "reverified",
+        esmfold2_resume_handoff_checkpoint=checkpoint_path,
+        esmfold2_resume_reverify_roots=True,
+    )
+
+    assert [call[0] for call in resumed_backend.verify_calls[: len(handoff_sequences)]] == (
+        handoff_sequences
+    )
+    summary = json.loads((tmp_path / "reverified" / "run_summary.json").read_text())
+    assert summary["resumed_handoff_roots_reverified"] is True
+    assert summary["resumed_handoff_verifier_contract_matches"] is False
+
+
+def test_reverify_roots_requires_handoff_checkpoint():
+    with pytest.raises(ValueError, match="requires a StageA handoff checkpoint"):
+        run_esmfold2_mcts_hallucination(
+            backend=FakeESMFold2Backend(),
+            target_seq="TTTT",
+            L_binder=3,
+            N_steps=1,
+            num_beams=1,
+            B_candidates=1,
+            mcts_strategy="two_stage",
+            esmfold2_resume_reverify_roots=True,
+        )

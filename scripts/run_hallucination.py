@@ -163,7 +163,7 @@ def resolve_esmfold2_hotspot_defaults(
             "localized" if use_hotspot_defaults else "additive"
         )
     if args.esmfold2_hotspot_verify_weight is None:
-        args.esmfold2_hotspot_verify_weight = 0.10 if use_hotspot_defaults else 0.0
+        args.esmfold2_hotspot_verify_weight = 0.25 if use_hotspot_defaults else 0.0
 
 
 def parse_esmfold2_mutable_mask(raw_mask, binder_length: int, parser: argparse.ArgumentParser):
@@ -400,7 +400,43 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--esmfold2_stagea_soft_steps", type=int, default=None,
                        help="ESMFold2 Stage A 每个 MCTS 节点的 soft gradient update 步数（默认：30）")
     parser.add_argument("--esmfold2_stageb_soft_steps", type=int, default=None,
-                       help="ESMFold2 Stage B 每个 MCTS 节点的 soft gradient update 步数（默认：5）")
+                       help="ESMFold2 Stage B 每个 MCTS 节点的 soft gradient update 步数（默认：10）")
+    parser.add_argument(
+        "--esmfold2_stageb_discrete_rerank",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help="Stage B 是否用轻量 proposal forward 重排离散单点候选（默认：true）",
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_rerank_pool_size",
+        type=int,
+        default=20,
+        help="Stage B 每步进入轻量重排序的候选池大小（默认：20）",
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_exploration_actions",
+        type=int,
+        default=1,
+        help="Stage B 每步 full verifier 保留的探索候选数（默认：1）",
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_hotspot_distance_weight",
+        type=float,
+        default=0.25,
+        help="Stage B reward 中 hotspot 距离 loss 的权重（默认：0.25）",
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_hotspot_miss_penalty",
+        type=float,
+        default=2.0,
+        help="Stage B reward 中未命中 hotspot 的惩罚（默认：2.0，V4 实验显式降低）",
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_min_pair_chain_iptm",
+        type=float,
+        default=0.0,
+        help="Stage B reward 的 pair-chain iPTM 最低门槛；0 表示关闭（默认：0）",
+    )
     parser.add_argument("--esmfold2_lambda_esmc", type=str, default="auto",
                        help="ESMC sequence prior 权重；auto 按任务类型选择，或传入数值字符串")
     parser.add_argument("--esmfold2_task_type", type=str, default="denovo",
@@ -413,6 +449,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2 可变位点 mask；长度需等于 binder_length，支持 01101 或 0,1,1,true")
     parser.add_argument("--esmfold2_artifact_dir", type=str, default=None,
                        help="ESMFold2 每步结构化记录目录；默认写入 output_dir/esmfold2_artifacts")
+    parser.add_argument("--esmfold2_stagea_handoff_checkpoint_interval", type=int, default=10,
+                       help="Stage A handoff checkpoint 保存间隔；默认每 10 step，0 表示仅保存最终 handoff")
+    parser.add_argument("--esmfold2_resume_handoff_checkpoint", type=str, default=None,
+                       help="跳过 Phase0/Stage A，从指定 Stage A handoff checkpoint 直接运行 Stage B")
+    parser.add_argument(
+        "--esmfold2_resume_reverify_roots",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help="恢复 handoff 时用当前 verifier 配置重新验证 root；verifier 配置改变时必须启用",
+    )
     parser.add_argument("--esmfold2_verifier_num_loops", type=int, default=20,
                        help="ESMFold2 verifier full fold loop 数（默认：20；smoke test 可显式调小）")
     parser.add_argument("--esmfold2_verifier_num_sampling_steps", type=int, default=200,
@@ -471,7 +517,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "ESMFold2 full verifier hotspot 距离 loss 权重；未显式设置时，"
-            "ESMFold2 有 hotspot 为 0.10，否则为 0.0"
+            "ESMFold2 有 hotspot 为 0.25，否则为 0.0"
         ),
     )
     parser.add_argument("--esmfold2_hotspot_verify_near_cutoff", type=float, default=5.0,
@@ -548,9 +594,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcts_bootstrap_max_steps", type=int, default=80,
                        help="two_stage: StageA 最大运行步数（默认：80）")
     parser.add_argument("--mcts_handoff_top_k", type=int, default=None,
-                       help="two_stage: 交给 StageB 的 top 序列数（默认：mcts_num_beams）")
-    parser.add_argument("--mcts_expand_actions_per_step", type=int, default=2,
-                       help="MCTS StageB 每步最多扩展并验证的 action 数（默认：2）")
+                       help="two_stage: 交给 StageB 的 top 序列数（Protenix 默认 mcts_num_beams；ESMFold2 默认 4）")
+    parser.add_argument("--mcts_expand_actions_per_step", type=int, default=None,
+                       help="MCTS StageB 每步最多扩展并验证的 action 数（Protenix 默认 2；ESMFold2 默认 4）")
     parser.add_argument("--mcts_prior_mode", type=str, default="full",
                        choices=["full", "uniform", "no_gradient", "no_group", "no_sequence"],
                        help="MCTS StageB prior 消融模式（默认：full，保持当前完整逻辑）")
@@ -601,7 +647,7 @@ def resolve_esmfold2_stage_soft_steps(args) -> tuple[int, int]:
     if stagea_soft_steps is None:
         stagea_soft_steps = 30
     if stageb_soft_steps is None:
-        stageb_soft_steps = 5
+        stageb_soft_steps = 10
     args.esmfold2_stagea_soft_steps = int(stagea_soft_steps)
     args.esmfold2_stageb_soft_steps = int(stageb_soft_steps)
     return args.esmfold2_stagea_soft_steps, args.esmfold2_stageb_soft_steps
@@ -634,6 +680,53 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             raise ValueError(message)
         if getattr(args, "stageb_max_mutations_per_seq", None) is None:
             args.stageb_max_mutations_per_seq = 1
+        if getattr(args, "mcts_handoff_top_k", None) is None:
+            args.mcts_handoff_top_k = 4
+        if args.esmfold2_stageb_rerank_pool_size <= 0:
+            message = "--esmfold2_stageb_rerank_pool_size must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_stageb_exploration_actions < 0:
+            message = "--esmfold2_stageb_exploration_actions must be non-negative"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_stageb_hotspot_distance_weight < 0.0:
+            message = "--esmfold2_stageb_hotspot_distance_weight must be non-negative"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_stageb_hotspot_miss_penalty < 0.0:
+            message = "--esmfold2_stageb_hotspot_miss_penalty must be non-negative"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if not 0.0 <= args.esmfold2_stageb_min_pair_chain_iptm <= 1.0:
+            message = "--esmfold2_stageb_min_pair_chain_iptm must be within [0, 1]"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_stagea_handoff_checkpoint_interval < 0:
+            message = "--esmfold2_stagea_handoff_checkpoint_interval must be non-negative"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_resume_handoff_checkpoint and args.mcts_strategy not in {"two_stage", "strict"}:
+            message = "--esmfold2_resume_handoff_checkpoint requires --mcts_strategy two_stage"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_resume_reverify_roots and not args.esmfold2_resume_handoff_checkpoint:
+            message = (
+                "--esmfold2_resume_reverify_roots requires "
+                "--esmfold2_resume_handoff_checkpoint"
+            )
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+    if getattr(args, "mcts_expand_actions_per_step", None) is None:
+        args.mcts_expand_actions_per_step = 4 if backend == "esmfold2" else 2
     return backend
 
 
@@ -815,7 +908,16 @@ def main():
             esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
             esmfold2_stagea_soft_steps=args.esmfold2_stagea_soft_steps,
             esmfold2_stageb_soft_steps=args.esmfold2_stageb_soft_steps,
+            esmfold2_stageb_discrete_rerank=args.esmfold2_stageb_discrete_rerank,
+            esmfold2_stageb_rerank_pool_size=args.esmfold2_stageb_rerank_pool_size,
+            esmfold2_stageb_exploration_actions=args.esmfold2_stageb_exploration_actions,
+            esmfold2_stageb_hotspot_distance_weight=args.esmfold2_stageb_hotspot_distance_weight,
+            esmfold2_stageb_hotspot_miss_penalty=args.esmfold2_stageb_hotspot_miss_penalty,
+            esmfold2_stageb_min_pair_chain_iptm=args.esmfold2_stageb_min_pair_chain_iptm,
             esmfold2_final_polish=args.esmfold2_final_polish,
+            esmfold2_stagea_handoff_checkpoint_interval=args.esmfold2_stagea_handoff_checkpoint_interval,
+            esmfold2_resume_handoff_checkpoint=args.esmfold2_resume_handoff_checkpoint,
+            esmfold2_resume_reverify_roots=args.esmfold2_resume_reverify_roots,
         )
     elif args.mode == "first_order":
         from bindcraft.hallucination.pipeline import run_hallucination
@@ -919,10 +1021,28 @@ def main():
             f.write(f"ESMFold2 Soft Steps Legacy Override: {args.esmfold2_soft_steps}\n")
             f.write(f"ESMFold2 Stage A Soft Steps: {args.esmfold2_stagea_soft_steps}\n")
             f.write(f"ESMFold2 Stage B Soft Steps: {args.esmfold2_stageb_soft_steps}\n")
+            f.write(f"ESMFold2 Stage B Discrete Rerank: {args.esmfold2_stageb_discrete_rerank}\n")
+            f.write(f"ESMFold2 Stage B Rerank Pool Size: {args.esmfold2_stageb_rerank_pool_size}\n")
+            f.write(f"ESMFold2 Stage B Exploration Actions: {args.esmfold2_stageb_exploration_actions}\n")
+            f.write(
+                "ESMFold2 Stage B Hotspot Distance Weight: "
+                f"{args.esmfold2_stageb_hotspot_distance_weight}\n"
+            )
+            f.write(
+                "ESMFold2 Stage B Hotspot Miss Penalty: "
+                f"{args.esmfold2_stageb_hotspot_miss_penalty}\n"
+            )
+            f.write(
+                "ESMFold2 Stage B Min Pair-chain iPTM: "
+                f"{args.esmfold2_stageb_min_pair_chain_iptm}\n"
+            )
             f.write(f"ESMFold2 Lambda ESMC: {args.esmfold2_lambda_esmc}\n")
             f.write(f"ESMFold2 Task Type: {args.esmfold2_task_type}\n")
             f.write(f"ESMFold2 Logit Init Mode: {args.esmfold2_logit_init_mode}\n")
             f.write(f"ESMFold2 Mutable Mask: {args.esmfold2_mutable_mask or 'ALL'}\n")
+            f.write(f"ESMFold2 Stage A Handoff Checkpoint Interval: {args.esmfold2_stagea_handoff_checkpoint_interval}\n")
+            f.write(f"ESMFold2 Resume Handoff Checkpoint: {args.esmfold2_resume_handoff_checkpoint or 'NONE'}\n")
+            f.write(f"ESMFold2 Resume Reverify Roots: {args.esmfold2_resume_reverify_roots}\n")
             f.write(f"ESMFold2 Proposal Load Internal ESMC: {args.esmfold2_proposal_load_internal_esmc}\n")
             f.write(f"ESMFold2 Proposal LM Dropout: {args.esmfold2_proposal_lm_dropout}\n")
             f.write(f"ESMFold2 Force Proposal LM Dropout: {args.esmfold2_force_proposal_lm_dropout}\n")
@@ -959,6 +1079,7 @@ def main():
         f.write(f"Save Checkpoint Dir: {args.save_checkpoint_dir or 'DISABLED'}\n")
         f.write(f"Checkpoint Save Policy: {args.checkpoint_save_policy}\n")
         f.write(f"MCTS Strategy: {args.mcts_strategy}\n")
+        f.write(f"MCTS Handoff Top K: {args.mcts_handoff_top_k}\n")
         f.write(f"MCTS Bootstrap Steps: {args.mcts_bootstrap_steps}\n")
         f.write(f"MCTS Bootstrap Max Steps: {args.mcts_bootstrap_max_steps}\n")
         f.write(f"MCTS Expand Actions Per Step: {args.mcts_expand_actions_per_step}\n")
