@@ -453,12 +453,15 @@ def _hotspot_structure_metrics(
         max=1.0,
     ).mean()
     covered_count = int((distance_tensor <= float(near_cutoff)).sum().item())
+    strict_covered_count = int((distance_tensor <= 5.0).sum().item())
     hotspot_count = len(hotspot_indices)
     return {
         "hotspot_verify_distance_loss": float(distance_loss.item()),
         "hotspot_mean_min_heavy_atom_distance": float(distance_tensor.mean().item()),
         "hotspot_heavy_atom_coverage": covered_count / hotspot_count,
         "hotspot_heavy_atom_covered_count": covered_count,
+        "hotspot_heavy_atom_coverage_5a": strict_covered_count / hotspot_count,
+        "hotspot_heavy_atom_covered_count_5a": strict_covered_count,
         "hotspot_count": hotspot_count,
         "hotspot_verify_near_cutoff": float(near_cutoff),
         "hotspot_verify_far_cutoff": float(far_cutoff),

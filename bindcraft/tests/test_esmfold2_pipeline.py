@@ -20,6 +20,8 @@ from bindcraft.hallucination.esmfold2_pipeline import (
     _make_stageb_proposals,
     _rerank_stageb_candidates_with_preview,
     _select_stageb_actions_by_group_quota,
+    _select_stageb_tree_expansions,
+    _stageb_guarded_rank,
     _stageb_preview_objective,
 )
 
@@ -407,7 +409,7 @@ def test_stageb_discrete_rerank_uses_paired_seed_and_parent_delta():
     assert [call[0] for call in backend.calls] == ["AAA", "AYA", "AFA"]
 
 
-def test_esmfold2_stageb_reward_uses_native_metrics_and_hotspot_hit_gate():
+def test_esmfold2_stageb_reward_uses_continuous_hotspot_coverage_loss():
     tree = _ESMFold2StageBMCTSTree(use_pareto_pruning=False)
     base = {
         "pair_chain_iptm_loss": 0.3,
@@ -426,8 +428,11 @@ def test_esmfold2_stageb_reward_uses_native_metrics_and_hotspot_hit_gate():
     )
 
     assert hit_status["reward_mode"] == "esmfold2_stageb_fixed"
+    assert hit_status["hotspot_hit"] is False
+    assert hit_status["hotspot_coverage_loss"] == pytest.approx(0.5)
     assert hit_status["hotspot_miss_penalty"] == pytest.approx(0.0)
-    assert miss_status["hotspot_miss_penalty"] == pytest.approx(2.0)
+    assert miss_status["hotspot_coverage_loss"] == pytest.approx(1.0)
+    assert miss_status["hotspot_miss_penalty"] == pytest.approx(0.0)
     assert hit_reward > miss_reward
 
 
@@ -467,6 +472,60 @@ def test_esmfold2_stageb_reward_guardrail_rejects_low_quality_hotspot_hit():
     assert acceptable_miss_status["pair_chain_floor_violated"] is False
     assert acceptable_miss_status["hotspot_miss_penalty"] == pytest.approx(0.25)
     assert acceptable_miss_reward > low_quality_hit_reward
+
+
+def test_stageb_tree_expansion_prefers_quality_guarded_hotspot_coverage():
+    tree = _ESMFold2StageBMCTSTree(
+        use_pareto_pruning=False,
+        hotspot_distance_weight=0.25,
+        hotspot_coverage_weight=0.25,
+    )
+
+    def result(sequence, pair_chain_iptm, coverage, distance, total_loss):
+        floor = 0.60
+        return SimpleNamespace(
+            binder_seq=sequence,
+            total_loss=total_loss,
+            loss_dict={
+                "pair_chain_iptm_loss": 1.0 - pair_chain_iptm,
+                "binder_confidence_loss": 0.2,
+                "global_confidence_loss": 0.2,
+                "binder_rg_excess_loss": 0.1,
+                "hotspot_verify_distance_loss": min(distance / 20.0, 1.0),
+                "hotspot_heavy_atom_coverage": coverage,
+                "stageb_pair_chain_quality_floor": floor,
+            },
+            summary_confidence={
+                "hotspot_heavy_atom_coverage": coverage,
+                "hotspot_mean_min_heavy_atom_distance": distance,
+            },
+        )
+
+    actions = [
+        SimpleNamespace(action_id=0, sequence="low_quality_hit"),
+        SimpleNamespace(action_id=1, sequence="partial"),
+        SimpleNamespace(action_id=2, sequence="full"),
+    ]
+    results = [
+        result("low_quality_hit", 0.40, 1.0, 3.0, 0.1),
+        result("partial", 0.65, 0.5, 7.0, 0.3),
+        result("full", 0.62, 1.0, 5.0, 0.4),
+    ]
+
+    selected_actions, selected_results = _select_stageb_tree_expansions(
+        actions,
+        results,
+        tree=tree,
+        max_children=2,
+    )
+
+    assert [action.sequence for action in selected_actions] == ["full", "partial"]
+    assert [item.binder_seq for item in selected_results] == ["full", "partial"]
+    assert (
+        _stageb_guarded_rank(results[2], tree)
+        > _stageb_guarded_rank(results[1], tree)
+        > _stageb_guarded_rank(results[0], tree)
+    )
 
 
 def test_stageb_proposals_are_strict_single_mutations_with_gradient_priors():
@@ -1587,6 +1646,7 @@ def test_stagea_handoff_checkpoint_is_saved_and_resumes_directly_into_stageb(tmp
         mcts_expand_actions_per_step=1,
         artifact_dir=tmp_path / "stageb_resume",
         esmfold2_resume_handoff_checkpoint=checkpoint_path,
+        esmfold2_stageb_paired_verifier_seed=False,
     )
 
     assert best_seq == final_seq == "AYY"

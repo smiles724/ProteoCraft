@@ -223,7 +223,7 @@ def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     assert default_config.hotspot_cutoff == pytest.approx(8.0)
     assert default_config.hotspot_interface_mode == "additive"
     assert default_config.hotspot_verify_weight == pytest.approx(0.0)
-    assert default_config.hotspot_verify_near_cutoff == pytest.approx(5.0)
+    assert default_config.hotspot_verify_near_cutoff == pytest.approx(8.0)
     assert default_config.hotspot_verify_far_cutoff == pytest.approx(20.0)
 
     config = ESMFold2ProposalConfig(soft_steps=3, lambda_esmc="auto")

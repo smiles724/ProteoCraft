@@ -47,8 +47,10 @@ ESMFOLD2_STAGEB_REWARD_KEYS = (
     "binder_rg_excess_loss",
 )
 ESMFOLD2_STAGEB_HOTSPOT_DISTANCE_WEIGHT = 0.25
-ESMFOLD2_STAGEB_HOTSPOT_MISS_PENALTY = 2.0
+ESMFOLD2_STAGEB_HOTSPOT_COVERAGE_WEIGHT = 0.25
+ESMFOLD2_STAGEB_HOTSPOT_MISS_PENALTY = 0.0
 ESMFOLD2_STAGEB_PAIR_CHAIN_FLOOR_PENALTY = 2.0
+ESMFOLD2_STAGEB_QUALITY_FLOOR_KEY = "stageb_pair_chain_quality_floor"
 
 
 @dataclass(frozen=True)
@@ -673,13 +675,13 @@ def _select_stageb_actions_by_group_quota(
     max_actions: int,
     exploration_actions: int = 0,
     rng: Optional[random.Random] = None,
+    limit_to_tree_slots: bool = True,
 ) -> Tuple[List[Any], Dict[str, int]]:
     """Select group-balanced exploit actions plus a small exploration budget."""
 
-    limit = min(
-        max(int(max_actions), 0),
-        int(tree.remaining_expansion_slots(node)),
-    )
+    limit = max(int(max_actions), 0)
+    if limit_to_tree_slots:
+        limit = min(limit, int(tree.remaining_expansion_slots(node)))
     if limit <= 0:
         return [], {}
 
@@ -762,12 +764,14 @@ class _ESMFold2StageBMCTSTree(MCTSTree):
         self,
         *args: Any,
         hotspot_distance_weight: float = ESMFOLD2_STAGEB_HOTSPOT_DISTANCE_WEIGHT,
+        hotspot_coverage_weight: float = ESMFOLD2_STAGEB_HOTSPOT_COVERAGE_WEIGHT,
         hotspot_miss_penalty: float = ESMFOLD2_STAGEB_HOTSPOT_MISS_PENALTY,
         min_pair_chain_iptm: float = 0.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.hotspot_distance_weight = max(float(hotspot_distance_weight), 0.0)
+        self.hotspot_coverage_weight = max(float(hotspot_coverage_weight), 0.0)
         self.hotspot_miss_penalty = max(float(hotspot_miss_penalty), 0.0)
         self.min_pair_chain_iptm = min(max(float(min_pair_chain_iptm), 0.0), 1.0)
 
@@ -803,15 +807,25 @@ class _ESMFold2StageBMCTSTree(MCTSTree):
             1.0,
         )
         hotspot_coverage = losses.get("hotspot_heavy_atom_coverage")
+        hotspot_coverage_loss = 0.0
         hotspot_miss_penalty = 0.0
         hotspot_hit = None
         if hotspot_coverage is not None:
-            hotspot_hit = float(hotspot_coverage) > 0.0
-            if not hotspot_hit:
+            hotspot_coverage = min(max(float(hotspot_coverage), 0.0), 1.0)
+            hotspot_coverage_loss = 1.0 - hotspot_coverage
+            hotspot_hit = hotspot_coverage >= 1.0 - 1.0e-8
+            if hotspot_coverage <= 0.0:
                 hotspot_miss_penalty = self.hotspot_miss_penalty
 
         pair_chain_iptm = 1.0 - float(losses["pair_chain_iptm_loss"])
-        pair_chain_floor_violated = pair_chain_iptm < self.min_pair_chain_iptm
+        pair_chain_floor = max(
+            self.min_pair_chain_iptm,
+            min(
+                max(float(losses.get(ESMFOLD2_STAGEB_QUALITY_FLOOR_KEY, 0.0)), 0.0),
+                1.0,
+            ),
+        )
+        pair_chain_floor_violated = pair_chain_iptm < pair_chain_floor
         pair_chain_floor_penalty = (
             ESMFOLD2_STAGEB_PAIR_CHAIN_FLOOR_PENALTY
             if pair_chain_floor_violated
@@ -821,6 +835,7 @@ class _ESMFold2StageBMCTSTree(MCTSTree):
         reward_loss = (
             base_loss
             + self.hotspot_distance_weight * hotspot_distance_loss
+            + self.hotspot_coverage_weight * hotspot_coverage_loss
             + hotspot_miss_penalty
             + pair_chain_floor_penalty
         )
@@ -833,11 +848,14 @@ class _ESMFold2StageBMCTSTree(MCTSTree):
             "normalized_loss": float(reward_loss),
             "normalized_components": components,
             "hotspot_hit": hotspot_hit,
+            "hotspot_coverage": hotspot_coverage,
+            "hotspot_coverage_loss": hotspot_coverage_loss,
+            "hotspot_coverage_weight": self.hotspot_coverage_weight,
             "hotspot_distance_loss": hotspot_distance_loss,
             "hotspot_distance_weight": self.hotspot_distance_weight,
             "hotspot_miss_penalty": hotspot_miss_penalty,
             "pair_chain_iptm": pair_chain_iptm,
-            "min_pair_chain_iptm": self.min_pair_chain_iptm,
+            "min_pair_chain_iptm": pair_chain_floor,
             "pair_chain_floor_violated": pair_chain_floor_violated,
             "pair_chain_floor_penalty": pair_chain_floor_penalty,
         }
@@ -859,6 +877,134 @@ def _apply_stageb_group_prior_mode(
     if prior_mode in {"uniform", "no_group"}:
         return "unrouted", {"unrouted": 1.0}
     return action_group, group_priors or {action_group: 1.0}
+
+
+def _stageb_result_pair_chain_iptm(result: Any) -> float:
+    loss_dict = dict(getattr(result, "loss_dict", {}) or {})
+    value = _finite_float(loss_dict.get("pair_chain_iptm_loss"))
+    if value is None:
+        raise ValueError("Stage-B result is missing pair_chain_iptm_loss")
+    return 1.0 - min(max(float(value), 0.0), 1.0)
+
+
+def _stageb_result_quality_floor(result: Any) -> float:
+    loss_dict = dict(getattr(result, "loss_dict", {}) or {})
+    return min(
+        max(float(loss_dict.get(ESMFOLD2_STAGEB_QUALITY_FLOOR_KEY, 0.0)), 0.0),
+        1.0,
+    )
+
+
+def _stageb_result_quality_ok(result: Any) -> bool:
+    return _stageb_result_pair_chain_iptm(result) >= _stageb_result_quality_floor(result)
+
+
+def _stageb_result_hotspot_coverage(result: Any) -> Optional[float]:
+    summary = dict(getattr(result, "summary_confidence", {}) or {})
+    value = _finite_float(summary.get("hotspot_heavy_atom_coverage"))
+    if value is None:
+        value = _finite_float(
+            dict(getattr(result, "loss_dict", {}) or {}).get(
+                "hotspot_heavy_atom_coverage"
+            )
+        )
+    if value is None:
+        return None
+    return min(max(float(value), 0.0), 1.0)
+
+
+def _stageb_result_hotspot_distance(result: Any) -> Optional[float]:
+    summary = dict(getattr(result, "summary_confidence", {}) or {})
+    value = _finite_float(summary.get("hotspot_mean_min_heavy_atom_distance"))
+    return None if value is None else float(value)
+
+
+def _annotate_stageb_quality_floor(result: Any, quality_floor: float) -> None:
+    floor = min(max(float(quality_floor), 0.0), 1.0)
+    result.loss_dict[ESMFOLD2_STAGEB_QUALITY_FLOOR_KEY] = floor
+    result.summary_confidence[ESMFOLD2_STAGEB_QUALITY_FLOOR_KEY] = floor
+    result.summary_confidence["stageb_pair_chain_quality_ok"] = (
+        _stageb_result_pair_chain_iptm(result) >= floor
+    )
+
+
+def _stageb_guarded_rank(
+    result: Any,
+    tree: "_ESMFold2StageBMCTSTree",
+) -> Tuple[float, ...]:
+    quality_ok = 1.0 if _stageb_result_quality_ok(result) else 0.0
+    coverage = _stageb_result_hotspot_coverage(result)
+    distance = _stageb_result_hotspot_distance(result)
+    reward = float(tree.result_reward(result))
+    if coverage is None:
+        return quality_ok, reward, -float(result.total_loss)
+    fully_covered = 1.0 if coverage >= 1.0 - 1.0e-8 else 0.0
+    finite_distance = distance if distance is not None else float("inf")
+    return (
+        quality_ok,
+        fully_covered,
+        float(coverage),
+        -float(finite_distance),
+        reward,
+        -float(result.total_loss),
+    )
+
+
+def _select_stageb_tree_expansions(
+    actions: Sequence[Any],
+    results: Sequence[Any],
+    *,
+    tree: "_ESMFold2StageBMCTSTree",
+    max_children: int,
+    allow_one_quality_exploration: bool = True,
+) -> Tuple[List[Any], List[Any]]:
+    """Select a small, quality-guarded subset of verified candidates for the tree."""
+
+    pairs = list(zip(actions, results))
+    if not pairs or max_children <= 0:
+        return [], []
+    eligible = [pair for pair in pairs if _stageb_result_quality_ok(pair[1])]
+    eligible.sort(key=lambda pair: _stageb_guarded_rank(pair[1], tree), reverse=True)
+    selected = eligible[: int(max_children)]
+    selected_ids = {id(action) for action, _ in selected}
+    if allow_one_quality_exploration and len(selected) < int(max_children):
+        ineligible = [
+            pair for pair in pairs if id(pair[0]) not in selected_ids
+        ]
+        ineligible.sort(
+            key=lambda pair: (
+                _stageb_result_pair_chain_iptm(pair[1])
+                - _stageb_result_quality_floor(pair[1]),
+                float(tree.result_reward(pair[1])),
+            ),
+            reverse=True,
+        )
+        if ineligible:
+            selected.append(ineligible[0])
+    return (
+        [action for action, _ in selected],
+        [result for _, result in selected],
+    )
+
+
+def _stageb_selection_surface(
+    result: Any,
+    tree: "_ESMFold2StageBMCTSTree",
+) -> Dict[str, Any]:
+    summary = dict(getattr(result, "summary_confidence", {}) or {})
+    return {
+        "sequence": str(result.binder_seq),
+        "total_loss": float(result.total_loss),
+        "tree_reward": float(tree.result_reward(result)),
+        "pair_chain_iptm": _stageb_result_pair_chain_iptm(result),
+        "quality_floor": _stageb_result_quality_floor(result),
+        "quality_ok": _stageb_result_quality_ok(result),
+        "hotspot_coverage": _stageb_result_hotspot_coverage(result),
+        "hotspot_coverage_5a": _finite_float(
+            summary.get("hotspot_heavy_atom_coverage_5a")
+        ),
+        "hotspot_mean_distance": _stageb_result_hotspot_distance(result),
+    }
 
 
 def _make_phase0_seed_sequences(
@@ -1647,7 +1793,7 @@ def run_esmfold2_mcts_hallucination(
     mcts_bootstrap_min_delta: float = 0.02,
     mcts_bootstrap_max_steps: int = 80,
     mcts_handoff_top_k: Optional[int] = None,
-    mcts_expand_actions_per_step: int = 4,
+    mcts_expand_actions_per_step: int = 2,
     mcts_prior_mode: str = "full",
     seed: Optional[int] = 42,
     mutable_mask: Optional[Sequence[bool]] = None,
@@ -1659,9 +1805,13 @@ def run_esmfold2_mcts_hallucination(
     esmfold2_stageb_discrete_rerank: bool = True,
     esmfold2_stageb_rerank_pool_size: int = 20,
     esmfold2_stageb_exploration_actions: int = 1,
+    esmfold2_stageb_verifier_candidates: int = 8,
+    esmfold2_stageb_hotspot_coverage_weight: float = ESMFOLD2_STAGEB_HOTSPOT_COVERAGE_WEIGHT,
     esmfold2_stageb_hotspot_distance_weight: float = ESMFOLD2_STAGEB_HOTSPOT_DISTANCE_WEIGHT,
     esmfold2_stageb_hotspot_miss_penalty: float = ESMFOLD2_STAGEB_HOTSPOT_MISS_PENALTY,
     esmfold2_stageb_min_pair_chain_iptm: float = 0.0,
+    esmfold2_stageb_handoff_quality_tolerance: float = 0.05,
+    esmfold2_stageb_paired_verifier_seed: bool = True,
     esmfold2_final_polish: bool = False,
     esmfold2_stagea_handoff_checkpoint_interval: int = 10,
     esmfold2_resume_handoff_checkpoint: Optional[Union[str, os.PathLike[str]]] = None,
@@ -1710,6 +1860,11 @@ def run_esmfold2_mcts_hallucination(
             "two_stage, or continuous_stage_a"
         )
     target_key = _normalize_target_key(target_seq)
+    stageb_shared_verify_seed = (
+        _stable_seed(seed, "esm_stageb_paired_verify", target_key)
+        if bool(esmfold2_stageb_paired_verifier_seed)
+        else None
+    )
     mutable_mask = _normalize_mutable_mask(mutable_mask, L_binder)
     hotspot_params = dict(hotspot_params) if hotspot_params else None
     hotspot_indices = [
@@ -1726,7 +1881,7 @@ def run_esmfold2_mcts_hallucination(
         getattr(backend_config, "hotspot_verify_weight", 0.0)
     )
     hotspot_verify_near_cutoff = float(
-        getattr(backend_config, "hotspot_verify_near_cutoff", 5.0)
+        getattr(backend_config, "hotspot_verify_near_cutoff", 8.0)
     )
     hotspot_verify_far_cutoff = float(
         getattr(backend_config, "hotspot_verify_far_cutoff", 20.0)
@@ -1769,28 +1924,49 @@ def run_esmfold2_mcts_hallucination(
         raise ValueError("esmfold2_stageb_soft_steps must be positive")
     stageb_rerank_pool_size = max(int(esmfold2_stageb_rerank_pool_size), 1)
     stageb_exploration_actions = max(int(esmfold2_stageb_exploration_actions), 0)
+    stageb_verifier_candidates = max(int(esmfold2_stageb_verifier_candidates), 1)
     stageb_discrete_rerank = bool(esmfold2_stageb_discrete_rerank)
+    stageb_hotspot_coverage_weight = float(
+        esmfold2_stageb_hotspot_coverage_weight
+    )
     stageb_hotspot_distance_weight = float(esmfold2_stageb_hotspot_distance_weight)
     stageb_hotspot_miss_penalty = float(esmfold2_stageb_hotspot_miss_penalty)
     stageb_min_pair_chain_iptm = float(esmfold2_stageb_min_pair_chain_iptm)
+    stageb_handoff_quality_tolerance = float(
+        esmfold2_stageb_handoff_quality_tolerance
+    )
+    stageb_paired_verifier_seed = bool(esmfold2_stageb_paired_verifier_seed)
+    if stageb_hotspot_coverage_weight < 0.0:
+        raise ValueError("esmfold2_stageb_hotspot_coverage_weight must be non-negative")
     if stageb_hotspot_distance_weight < 0.0:
         raise ValueError("esmfold2_stageb_hotspot_distance_weight must be non-negative")
     if stageb_hotspot_miss_penalty < 0.0:
         raise ValueError("esmfold2_stageb_hotspot_miss_penalty must be non-negative")
     if not 0.0 <= stageb_min_pair_chain_iptm <= 1.0:
         raise ValueError("esmfold2_stageb_min_pair_chain_iptm must be within [0, 1]")
+    if not 0.0 <= stageb_handoff_quality_tolerance <= 1.0:
+        raise ValueError(
+            "esmfold2_stageb_handoff_quality_tolerance must be within [0, 1]"
+        )
     hotspot_summary.update(
         {
             "stageb_hotspot_distance_weight": stageb_hotspot_distance_weight,
+            "stageb_hotspot_coverage_weight": stageb_hotspot_coverage_weight,
             "stageb_hotspot_miss_penalty": stageb_hotspot_miss_penalty,
             "stageb_min_pair_chain_iptm": stageb_min_pair_chain_iptm,
+            "stageb_handoff_quality_tolerance": stageb_handoff_quality_tolerance,
+            "stageb_paired_verifier_seed": stageb_paired_verifier_seed,
+            "stageb_verifier_candidates": stageb_verifier_candidates,
+            "stageb_tree_children_per_step": max(
+                int(mcts_expand_actions_per_step), 1
+            ),
         }
     )
     resolved_handoff_top_k = max(
         int(
             mcts_handoff_top_k
             if mcts_handoff_top_k is not None
-            else min(int(num_beams), 4)
+            else min(int(num_beams), 2)
         ),
         1,
     )
@@ -1878,6 +2054,21 @@ def run_esmfold2_mcts_hallucination(
         hotspot_verify_far_cutoff,
         hotspot_summary["hotspot_verify_enabled"],
     )
+    logger.info(
+        "ESMFold2 StageB V5: verify_candidates=%d tree_children=%d "
+        "handoff_roots=%d paired_verify_seed=%s quality_tolerance=%.3f "
+        "coverage_weight=%.3f",
+        stageb_verifier_candidates,
+        max(int(mcts_expand_actions_per_step), 1),
+        resolved_handoff_top_k,
+        str(
+            stageb_shared_verify_seed
+            if stageb_paired_verifier_seed
+            else "sequence_specific"
+        ),
+        stageb_handoff_quality_tolerance,
+        stageb_hotspot_coverage_weight,
+    )
     logger.info("=" * 70)
 
     if resume_state is None:
@@ -1906,12 +2097,17 @@ def run_esmfold2_mcts_hallucination(
     phase0_results = []
     phase0_artifact_stage = "handoff_resume" if resume_state is not None else "phase0"
     for idx, (binder_seq, _) in enumerate(phase0_states):
+        phase0_verify_seed = (
+            stageb_shared_verify_seed
+            if resume_state is not None and stageb_paired_verifier_seed
+            else _stable_seed(seed, "esm_phase0", target_key, binder_seq)
+        )
         result = _verify_with_cache(
             backend,
             verifier_cache,
             binder_seq=binder_seq,
             target_seq=target_seq,
-            seed=_stable_seed(seed, "esm_phase0", target_key, binder_seq),
+            seed=phase0_verify_seed,
             hotspot_params=hotspot_params,
         )
         phase0_results.append(result)
@@ -2479,6 +2675,38 @@ def run_esmfold2_mcts_hallucination(
         top_k=handoff_k,
         min_distance=1,
     )
+    stageb_verifier_cache: Dict[str, Any] = (
+        {} if stageb_paired_verifier_seed else verifier_cache
+    )
+    if stageb_paired_verifier_seed:
+        if resume_state is not None and esmfold2_resume_reverify_roots:
+            stageb_verifier_cache.update(
+                {
+                    str(result.binder_seq): result
+                    for result in handoff_results
+                }
+            )
+        else:
+            reverified_handoff_results = []
+            for source_result in handoff_results:
+                reverified = _verify_with_cache(
+                    backend,
+                    stageb_verifier_cache,
+                    binder_seq=str(source_result.binder_seq),
+                    target_seq=target_seq,
+                    seed=stageb_shared_verify_seed,
+                    hotspot_params=hotspot_params,
+                )
+                reverified_handoff_results.append(reverified)
+                _write_candidate_artifact(
+                    artifact_recorder,
+                    stage="stage_b_handoff_reverify",
+                    step=len(losses_history),
+                    parent_sequence=None,
+                    result=reverified,
+                )
+            handoff_results = reverified_handoff_results
+
     strict_tree = _ESMFold2StageBMCTSTree(
         C=mcts_C,
         max_nodes=mcts_max_nodes,
@@ -2488,10 +2716,17 @@ def run_esmfold2_mcts_hallucination(
         use_diversity_bonus=False,
         use_structural_grouping=False,
         hotspot_distance_weight=stageb_hotspot_distance_weight,
+        hotspot_coverage_weight=stageb_hotspot_coverage_weight,
         hotspot_miss_penalty=stageb_hotspot_miss_penalty,
         min_pair_chain_iptm=stageb_min_pair_chain_iptm,
     )
     for idx, result in enumerate(handoff_results):
+        branch_quality_floor = max(
+            stageb_min_pair_chain_iptm,
+            _stageb_result_pair_chain_iptm(result)
+            - stageb_handoff_quality_tolerance,
+        )
+        _annotate_stageb_quality_floor(result, branch_quality_floor)
         strict_tree.store_verifier_result(result)
         handoff_logits = proposal_logits_by_sequence.get(str(result.binder_seq))
         root_node = strict_tree.add_root_node(
@@ -2501,7 +2736,11 @@ def run_esmfold2_mcts_hallucination(
             coordinate=result.coordinate,
             loss_vector=result.loss_dict,
             prior=1.0 / max(len(handoff_results), 1),
-            status_flags={"esm_stage": "handoff", "handoff_rank": idx + 1},
+            status_flags={
+                "esm_stage": "handoff",
+                "handoff_rank": idx + 1,
+                ESMFOLD2_STAGEB_QUALITY_FLOOR_KEY: branch_quality_floor,
+            },
         )
         source_node = stagea_node_by_sequence.get(str(result.binder_seq))
         artifact_recorder.write_mcts_node(
@@ -2532,6 +2771,20 @@ def run_esmfold2_mcts_hallucination(
             prior=1.0 / max(len(handoff_results), 1),
         )
 
+    best_by_total_loss = min(
+        handoff_results,
+        key=lambda result: float(result.total_loss),
+    )
+    best_by_composite = max(
+        handoff_results,
+        key=strict_tree.result_reward,
+    )
+    best_by_guarded = max(
+        handoff_results,
+        key=lambda result: _stageb_guarded_rank(result, strict_tree),
+    )
+    _remember_global_best(best_by_guarded)
+
     for step in range(len(losses_history), N_steps):
         selection = strict_tree.select_decision()
         selected_node = selection.node
@@ -2561,17 +2814,17 @@ def run_esmfold2_mcts_hallucination(
             )
         )
 
-        expand_budget = min(
+        tree_child_budget = min(
             max(int(mcts_expand_actions_per_step), 1),
             strict_tree.remaining_expansion_slots(selected_node),
         )
-        if expand_budget <= 0:
+        if tree_child_budget <= 0:
             losses_history.append(best_loss)
             continue
 
         proposal_pool_budget = max(
             B_candidates,
-            expand_budget,
+            stageb_verifier_candidates,
             stageb_rerank_pool_size if stageb_discrete_rerank else 0,
         )
         group_budgets = _allocate_group_budgets(group_priors, proposal_pool_budget)
@@ -2653,12 +2906,12 @@ def run_esmfold2_mcts_hallucination(
             continue
 
         registered_actions = strict_tree.register_action_proposals(selected_node, proposal_pool)
-        selected_actions, verifier_group_quotas = _select_stageb_actions_by_group_quota(
+        verifier_actions, verifier_group_quotas = _select_stageb_actions_by_group_quota(
             strict_tree,
             selected_node,
             registered_actions,
             group_priors=group_priors,
-            max_actions=expand_budget,
+            max_actions=stageb_verifier_candidates,
             exploration_actions=(
                 stageb_exploration_actions if stageb_discrete_rerank else 0
             ),
@@ -2671,37 +2924,48 @@ def run_esmfold2_mcts_hallucination(
                     step,
                 )
             ),
+            limit_to_tree_slots=False,
         )
-        if not selected_actions:
+        if not verifier_actions:
             losses_history.append(best_loss)
             continue
-        action_by_sequence = {
-            str(action.sequence): action
-            for action in selected_actions
-        }
 
-        expand_proposals: List[ESMFold2MutationProposal] = []
-        expand_results: List[Any] = []
+        verified_actions: List[Any] = []
+        verified_results: List[Any] = []
         verified_action_groups: List[str] = []
-        reward_by_sequence: Dict[str, float] = {}
-        for action in selected_actions:
-            if strict_tree.has_sequence(action.sequence):
-                existing = strict_tree.get_node_by_sequence(action.sequence)
-                if existing is not None:
-                    reward_by_sequence[action.sequence] = existing.tree_reward
-                    action.status = "duplicate"
-                continue
+        branch_quality_floor = float(
+            selected_node.loss_vector.get(
+                ESMFOLD2_STAGEB_QUALITY_FLOOR_KEY,
+                max(
+                    stageb_min_pair_chain_iptm,
+                    1.0
+                    - float(selected_node.loss_vector["pair_chain_iptm_loss"])
+                    - stageb_handoff_quality_tolerance,
+                ),
+            )
+        )
+        for action in verifier_actions:
             cached = strict_tree.get_cached_verifier_result(action.sequence)
             if cached is None:
                 cached = _verify_with_cache(
                     backend,
-                    verifier_cache,
+                    stageb_verifier_cache,
                     binder_seq=action.sequence,
                     target_seq=target_seq,
-                    seed=_stable_seed(seed, "esm_stageb_verify", target_key, action.sequence),
+                    seed=(
+                        stageb_shared_verify_seed
+                        if stageb_paired_verifier_seed
+                        else _stable_seed(
+                            seed,
+                            "esm_stageb_verify",
+                            target_key,
+                            action.sequence,
+                        )
+                    ),
                     hotspot_params=hotspot_params,
                 )
-                strict_tree.store_verifier_result(cached)
+            _annotate_stageb_quality_floor(cached, branch_quality_floor)
+            strict_tree.store_verifier_result(cached)
             _write_candidate_artifact(
                 artifact_recorder,
                 stage="stage_b",
@@ -2710,10 +2974,28 @@ def run_esmfold2_mcts_hallucination(
                 result=cached,
                 action_group=str(action.action_group),
             )
-            expand_proposals.append(action.proposal)
-            expand_results.append(cached)
+            verified_actions.append(action)
+            verified_results.append(cached)
             verified_action_groups.append(str(action.action_group))
 
+        tree_actions, expand_results = _select_stageb_tree_expansions(
+            verified_actions,
+            verified_results,
+            tree=strict_tree,
+            max_children=tree_child_budget,
+            allow_one_quality_exploration=True,
+        )
+        tree_action_ids = {int(action.action_id) for action in tree_actions}
+        for action in verified_actions:
+            if int(action.action_id) not in tree_action_ids:
+                action.status = "evaluated_pruned"
+
+        expand_proposals = [action.proposal for action in tree_actions]
+        action_by_sequence = {
+            str(action.sequence): action
+            for action in tree_actions
+        }
+        reward_by_sequence: Dict[str, float] = {}
         new_nodes = strict_tree.expand(selected_node, expand_proposals, expand_results)
         proposal_by_sequence = {
             str(proposal.sequence): proposal
@@ -2760,8 +3042,9 @@ def run_esmfold2_mcts_hallucination(
                 strict_tree.result_reward(result),
             )
 
-        for action in selected_actions:
-            if action.sequence in reward_by_sequence:
+        for action in verified_actions:
+            expanded_into_tree = int(action.action_id) in tree_action_ids
+            if expanded_into_tree and action.sequence in reward_by_sequence:
                 strict_tree.backpropagate_action(
                     selection,
                     action,
@@ -2772,8 +3055,10 @@ def run_esmfold2_mcts_hallucination(
                     stage="stage_b",
                     step=step,
                     action=action,
-                    selected=True,
+                    selected=expanded_into_tree,
                     extra={
+                        "full_verified": True,
+                        "expanded_into_tree": expanded_into_tree,
                         "selection_decision_type": selection.decision_type,
                         "selection_best_action_score": selection.best_action_score,
                         "selection_frontier_score": selection.frontier_score,
@@ -2783,34 +3068,80 @@ def run_esmfold2_mcts_hallucination(
             )
 
         strict_tree.prune()
-        round_results = expand_results
+        round_results = verified_results
         if round_results:
-            round_best = max(round_results, key=strict_tree.result_reward)
-            if strict_tree.result_reward(round_best) > strict_tree.result_reward(best_result):
-                _remember_global_best(round_best)
+            round_best = max(
+                round_results,
+                key=lambda result: _stageb_guarded_rank(result, strict_tree),
+            )
+
+            round_total_best = min(
+                round_results,
+                key=lambda result: float(result.total_loss),
+            )
+            if float(round_total_best.total_loss) < float(best_by_total_loss.total_loss):
+                best_by_total_loss = round_total_best
+
+            round_composite_best = max(
+                round_results,
+                key=strict_tree.result_reward,
+            )
+            if (
+                strict_tree.result_reward(round_composite_best)
+                > strict_tree.result_reward(best_by_composite)
+            ):
+                best_by_composite = round_composite_best
+
+            if (
+                _stageb_guarded_rank(round_best, strict_tree)
+                > _stageb_guarded_rank(best_by_guarded, strict_tree)
+            ):
+                best_by_guarded = round_best
+                guarded_action = next(
+                    (
+                        action
+                        for action, result in zip(verified_actions, verified_results)
+                        if str(result.binder_seq) == str(round_best.binder_seq)
+                    ),
+                    None,
+                )
+                guarded_logits = (
+                    None
+                    if guarded_action is None
+                    else getattr(guarded_action.proposal, "proposal_logits", None)
+                )
+                _remember_global_best(best_by_guarded, logits=guarded_logits)
         losses_history.append(best_loss)
         parent_pair_chain = 1.0 - float(
             selected_node.loss_vector["pair_chain_iptm_loss"]
         )
         best_reward_gain = None
         best_pair_chain_gain = None
-        if expand_results:
+        if verified_results:
             best_reward_gain = max(
                 strict_tree.result_reward(result) - float(selected_node.tree_reward)
-                for result in expand_results
+                for result in verified_results
             )
             child_pair_chain_scores = [
                 1.0 - float(result.loss_dict["pair_chain_iptm_loss"])
-                for result in expand_results
+                for result in verified_results
             ]
             best_pair_chain_gain = max(child_pair_chain_scores) - parent_pair_chain
         artifact_recorder.write_step(
             stage="stage_b",
             step=step,
             selected_node_id=int(selected_node.node_id),
-            selected_action_ids=[int(action.action_id) for action in selected_actions],
+            selected_action_ids=[int(action.action_id) for action in tree_actions],
+            full_verified_action_ids=[
+                int(action.action_id) for action in verified_actions
+            ],
+            tree_expanded_action_ids=[
+                int(action.action_id) for action in tree_actions
+            ],
             selected_sequence=current_seq,
             candidate_count=len(round_results),
+            full_verified_candidate_count=len(verified_results),
+            tree_child_count=len(tree_actions),
             round_best_loss=float(round_best.total_loss) if round_results else None,
             global_best_loss=best_loss,
             best_sequence=best_seq,
@@ -2822,12 +3153,14 @@ def run_esmfold2_mcts_hallucination(
             verifier_group_quotas=verifier_group_quotas,
             generated_group_counts=generated_group_counts,
             verified_group_counts=_count_items(verified_action_groups),
-            selected_group_counts=_count_items([str(action.action_group) for action in selected_actions]),
-            selected_action_count=len(selected_actions),
+            selected_group_counts=_count_items(
+                [str(action.action_group) for action in tree_actions]
+            ),
+            selected_action_count=len(tree_actions),
             discrete_rerank_enabled=stageb_discrete_rerank,
             discrete_rerank_pool_size=proposal_pool_budget,
             exploration_action_count=(
-                min(stageb_exploration_actions, max(len(selected_actions) - 1, 0))
+                min(stageb_exploration_actions, max(len(verifier_actions) - 1, 0))
                 if stageb_discrete_rerank
                 else 0
             ),
@@ -2858,10 +3191,12 @@ def run_esmfold2_mcts_hallucination(
             _format_count_map(group_budgets),
             _format_count_map(generated_group_counts),
             _format_count_map(_count_items(verified_action_groups)),
-            _format_count_map(_count_items([str(action.action_group) for action in selected_actions])),
+            _format_count_map(
+                _count_items([str(action.action_group) for action in tree_actions])
+            ),
             "n/a" if best_reward_gain is None else f"{best_reward_gain:.4f}",
             "n/a" if best_pair_chain_gain is None else f"{best_pair_chain_gain:.4f}",
-            len(selected_actions),
+            len(tree_actions),
             best_loss,
         )
 
@@ -2889,6 +3224,23 @@ def run_esmfold2_mcts_hallucination(
         resumed_handoff_verifier_contract_matches=(
             None if resume_state is None else bool(resume_state["verifier_contract_matches"])
         ),
+        stageb_shared_verifier_seed=(
+            stageb_shared_verify_seed if stageb_paired_verifier_seed else None
+        ),
+        stageb_selection_surfaces={
+            "best_by_total_loss": _stageb_selection_surface(
+                best_by_total_loss,
+                strict_tree,
+            ),
+            "best_by_composite_reward": _stageb_selection_surface(
+                best_by_composite,
+                strict_tree,
+            ),
+            "best_by_hotspot_guarded_quality": _stageb_selection_surface(
+                best_by_guarded,
+                strict_tree,
+            ),
+        },
         **hotspot_summary,
     )
     return best_seq, final_seq, losses_history

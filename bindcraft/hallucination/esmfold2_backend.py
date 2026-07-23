@@ -76,7 +76,7 @@ class ESMFold2ProposalConfig:
     hotspot_cutoff: float = 8.0
     hotspot_interface_mode: str = "additive"
     hotspot_verify_weight: float = 0.0
-    hotspot_verify_near_cutoff: float = 5.0
+    hotspot_verify_near_cutoff: float = 8.0
     hotspot_verify_far_cutoff: float = 20.0
     stageb_group_weight: float = 1.0
     track_proposal_confidence: bool = False

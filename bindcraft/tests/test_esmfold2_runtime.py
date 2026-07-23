@@ -224,11 +224,16 @@ def test_runtime_hotspot_verifier_combines_full_structure_distance_with_global_l
     assert result.summary_confidence["hotspot_mean_min_heavy_atom_distance"] == pytest.approx(12.0)
     assert result.summary_confidence["hotspot_heavy_atom_coverage"] == pytest.approx(0.5)
     assert result.summary_confidence["hotspot_heavy_atom_covered_count"] == 1
+    assert result.summary_confidence["hotspot_heavy_atom_coverage_5a"] == pytest.approx(0.5)
+    assert result.summary_confidence["hotspot_heavy_atom_covered_count_5a"] == 1
 
 
 def test_runtime_hotspot_verifier_supports_current_molecular_complex_output():
     backend = ESMFold2RuntimeBackend(
-        config=ESMFold2ProposalConfig(hotspot_verify_weight=0.2),
+        config=ESMFold2ProposalConfig(
+            hotspot_verify_weight=0.2,
+            hotspot_verify_near_cutoff=5.0,
+        ),
         device="cpu",
         verifier_model=object(),
         input_builder=FakeMolecularInputBuilder(),

@@ -400,7 +400,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--esmfold2_stagea_soft_steps", type=int, default=None,
                        help="ESMFold2 Stage A 每个 MCTS 节点的 soft gradient update 步数（默认：30）")
     parser.add_argument("--esmfold2_stageb_soft_steps", type=int, default=None,
-                       help="ESMFold2 Stage B 每个 MCTS 节点的 soft gradient update 步数（默认：10）")
+                       help="ESMFold2 Stage B 每个 MCTS 节点的 soft gradient update 步数（默认：20）")
     parser.add_argument(
         "--esmfold2_stageb_discrete_rerank",
         type=lambda x: x.lower() == "true",
@@ -420,6 +420,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Stage B 每步 full verifier 保留的探索候选数（默认：1）",
     )
     parser.add_argument(
+        "--esmfold2_stageb_verifier_candidates",
+        type=int,
+        default=8,
+        help="Stage B 每步送入 full verifier 的候选数（默认：8）",
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_hotspot_coverage_weight",
+        type=float,
+        default=0.25,
+        help="Stage B reward 中连续 hotspot coverage loss 的权重（默认：0.25）",
+    )
+    parser.add_argument(
         "--esmfold2_stageb_hotspot_distance_weight",
         type=float,
         default=0.25,
@@ -428,14 +440,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--esmfold2_stageb_hotspot_miss_penalty",
         type=float,
-        default=2.0,
-        help="Stage B reward 中未命中 hotspot 的惩罚（默认：2.0，V4 实验显式降低）",
+        default=0.0,
+        help="兼容旧实验的固定 hotspot miss penalty；V5 默认 0，改用连续 coverage loss",
     )
     parser.add_argument(
         "--esmfold2_stageb_min_pair_chain_iptm",
         type=float,
         default=0.0,
         help="Stage B reward 的 pair-chain iPTM 最低门槛；0 表示关闭（默认：0）",
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_handoff_quality_tolerance",
+        type=float,
+        default=0.05,
+        help="Stage B branch 相对 handoff pair-chain iPTM 的最大允许下降（默认：0.05）",
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_paired_verifier_seed",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help="Stage B 是否让所有 sequence 使用同一个 run-level verifier seed（默认：true）",
     )
     parser.add_argument("--esmfold2_lambda_esmc", type=str, default="auto",
                        help="ESMC sequence prior 权重；auto 按任务类型选择，或传入数值字符串")
@@ -520,8 +544,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "ESMFold2 有 hotspot 为 0.25，否则为 0.0"
         ),
     )
-    parser.add_argument("--esmfold2_hotspot_verify_near_cutoff", type=float, default=5.0,
-                       help="ESMFold2 hotspot verifier 满足接触的重原子距离，单位 Å（默认：5.0）")
+    parser.add_argument("--esmfold2_hotspot_verify_near_cutoff", type=float, default=8.0,
+                       help="ESMFold2 hotspot verifier 满足接触的重原子距离，单位 Å（默认：8.0；同时记录严格 5 Å coverage）")
     parser.add_argument("--esmfold2_hotspot_verify_far_cutoff", type=float, default=20.0,
                        help="ESMFold2 hotspot verifier 距离 loss 饱和上限，单位 Å（默认：20.0）")
     parser.add_argument("--checkpoint_dir", type=str, default=None,
@@ -647,7 +671,7 @@ def resolve_esmfold2_stage_soft_steps(args) -> tuple[int, int]:
     if stagea_soft_steps is None:
         stagea_soft_steps = 30
     if stageb_soft_steps is None:
-        stageb_soft_steps = 10
+        stageb_soft_steps = 20
     args.esmfold2_stagea_soft_steps = int(stagea_soft_steps)
     args.esmfold2_stageb_soft_steps = int(stageb_soft_steps)
     return args.esmfold2_stagea_soft_steps, args.esmfold2_stageb_soft_steps
@@ -681,7 +705,7 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
         if getattr(args, "stageb_max_mutations_per_seq", None) is None:
             args.stageb_max_mutations_per_seq = 1
         if getattr(args, "mcts_handoff_top_k", None) is None:
-            args.mcts_handoff_top_k = 4
+            args.mcts_handoff_top_k = 2
         if args.esmfold2_stageb_rerank_pool_size <= 0:
             message = "--esmfold2_stageb_rerank_pool_size must be positive"
             if parser is not None:
@@ -689,6 +713,16 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             raise ValueError(message)
         if args.esmfold2_stageb_exploration_actions < 0:
             message = "--esmfold2_stageb_exploration_actions must be non-negative"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_stageb_verifier_candidates <= 0:
+            message = "--esmfold2_stageb_verifier_candidates must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_stageb_hotspot_coverage_weight < 0.0:
+            message = "--esmfold2_stageb_hotspot_coverage_weight must be non-negative"
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
@@ -704,6 +738,11 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             raise ValueError(message)
         if not 0.0 <= args.esmfold2_stageb_min_pair_chain_iptm <= 1.0:
             message = "--esmfold2_stageb_min_pair_chain_iptm must be within [0, 1]"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if not 0.0 <= args.esmfold2_stageb_handoff_quality_tolerance <= 1.0:
+            message = "--esmfold2_stageb_handoff_quality_tolerance must be within [0, 1]"
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
@@ -726,7 +765,7 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
                 parser.error(message)
             raise ValueError(message)
     if getattr(args, "mcts_expand_actions_per_step", None) is None:
-        args.mcts_expand_actions_per_step = 4 if backend == "esmfold2" else 2
+        args.mcts_expand_actions_per_step = 2
     return backend
 
 
@@ -911,9 +950,13 @@ def main():
             esmfold2_stageb_discrete_rerank=args.esmfold2_stageb_discrete_rerank,
             esmfold2_stageb_rerank_pool_size=args.esmfold2_stageb_rerank_pool_size,
             esmfold2_stageb_exploration_actions=args.esmfold2_stageb_exploration_actions,
+            esmfold2_stageb_verifier_candidates=args.esmfold2_stageb_verifier_candidates,
+            esmfold2_stageb_hotspot_coverage_weight=args.esmfold2_stageb_hotspot_coverage_weight,
             esmfold2_stageb_hotspot_distance_weight=args.esmfold2_stageb_hotspot_distance_weight,
             esmfold2_stageb_hotspot_miss_penalty=args.esmfold2_stageb_hotspot_miss_penalty,
             esmfold2_stageb_min_pair_chain_iptm=args.esmfold2_stageb_min_pair_chain_iptm,
+            esmfold2_stageb_handoff_quality_tolerance=args.esmfold2_stageb_handoff_quality_tolerance,
+            esmfold2_stageb_paired_verifier_seed=args.esmfold2_stageb_paired_verifier_seed,
             esmfold2_final_polish=args.esmfold2_final_polish,
             esmfold2_stagea_handoff_checkpoint_interval=args.esmfold2_stagea_handoff_checkpoint_interval,
             esmfold2_resume_handoff_checkpoint=args.esmfold2_resume_handoff_checkpoint,
@@ -1024,6 +1067,11 @@ def main():
             f.write(f"ESMFold2 Stage B Discrete Rerank: {args.esmfold2_stageb_discrete_rerank}\n")
             f.write(f"ESMFold2 Stage B Rerank Pool Size: {args.esmfold2_stageb_rerank_pool_size}\n")
             f.write(f"ESMFold2 Stage B Exploration Actions: {args.esmfold2_stageb_exploration_actions}\n")
+            f.write(f"ESMFold2 Stage B Verifier Candidates: {args.esmfold2_stageb_verifier_candidates}\n")
+            f.write(
+                "ESMFold2 Stage B Hotspot Coverage Weight: "
+                f"{args.esmfold2_stageb_hotspot_coverage_weight}\n"
+            )
             f.write(
                 "ESMFold2 Stage B Hotspot Distance Weight: "
                 f"{args.esmfold2_stageb_hotspot_distance_weight}\n"
@@ -1035,6 +1083,14 @@ def main():
             f.write(
                 "ESMFold2 Stage B Min Pair-chain iPTM: "
                 f"{args.esmfold2_stageb_min_pair_chain_iptm}\n"
+            )
+            f.write(
+                "ESMFold2 Stage B Handoff Quality Tolerance: "
+                f"{args.esmfold2_stageb_handoff_quality_tolerance}\n"
+            )
+            f.write(
+                "ESMFold2 Stage B Paired Verifier Seed: "
+                f"{args.esmfold2_stageb_paired_verifier_seed}\n"
             )
             f.write(f"ESMFold2 Lambda ESMC: {args.esmfold2_lambda_esmc}\n")
             f.write(f"ESMFold2 Task Type: {args.esmfold2_task_type}\n")
