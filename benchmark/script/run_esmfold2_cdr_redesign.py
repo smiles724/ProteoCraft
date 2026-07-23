@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument("--case", default=None)
     parser.add_argument("--case-index", type=int, default=None)
+    parser.add_argument("--input-dir", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--prepare-only", action="store_true")
@@ -51,6 +52,8 @@ def load_config(args: argparse.Namespace) -> Dict[str, Any]:
     if not isinstance(config, dict):
         raise ValueError(f"YAML config must be a mapping: {config_path}")
     config["config_path"] = str(config_path)
+    if args.input_dir is not None:
+        config["input_dir"] = args.input_dir
     if args.output_dir is not None:
         config["output_dir"] = args.output_dir
     if args.device is not None:
