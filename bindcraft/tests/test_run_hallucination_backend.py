@@ -514,6 +514,31 @@ def test_esmfold2_mutable_mask_parser_accepts_compact_and_delimited_masks():
         run_hallucination_script.parse_esmfold2_mutable_mask("01", 3, parser)
 
 
+def test_esmfold2_target_chain_roles_parser_is_explicit_and_validated():
+    parser = build_arg_parser()
+
+    assert run_hallucination_script.parse_esmfold2_target_chain_roles(
+        "target,scaffold,scaffold",
+        n_target_chains=3,
+        parser=parser,
+    ) == ("target", "scaffold", "scaffold")
+    assert (
+        run_hallucination_script.parse_esmfold2_target_chain_roles(
+            None,
+            n_target_chains=2,
+            parser=parser,
+        )
+        is None
+    )
+
+    with pytest.raises(SystemExit):
+        run_hallucination_script.parse_esmfold2_target_chain_roles(
+            "target,scaffold",
+            n_target_chains=3,
+            parser=parser,
+        )
+
+
 def test_esmfold2_helper_import_does_not_require_protenix_package():
     code = """
 import importlib.abc

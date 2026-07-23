@@ -14,6 +14,7 @@ from bindcraft.hallucination.esmfold2_backend import (
 from bindcraft.hallucination.esmfold2_runtime import (
     ESMFold2RuntimeBackend,
     _hotspot_structure_metrics,
+    _mean_target_to_binder_pair_iptm,
     _structure_losses,
     _stageb_structure_loss,
 )
@@ -108,6 +109,68 @@ class FakeFoldResultBatchedPairIptm(FakeFoldResult):
                 ]
             ]
         )
+
+
+def test_role_aware_pair_chain_iptm_excludes_scaffold_chain():
+    pair_chains_iptm = torch.tensor(
+        [
+            [1.0, 0.2, 0.8],
+            [0.2, 1.0, 0.1],
+            [0.8, 0.1, 1.0],
+        ]
+    )
+
+    target_score = _mean_target_to_binder_pair_iptm(
+        pair_chains_iptm,
+        n_target_chains=2,
+        target_chain_roles=("target", "scaffold"),
+    )
+    scaffold_score = _mean_target_to_binder_pair_iptm(
+        pair_chains_iptm,
+        n_target_chains=2,
+        target_chain_roles=("target", "scaffold"),
+        selected_role="scaffold",
+    )
+
+    assert target_score == pytest.approx(0.8)
+    assert scaffold_score == pytest.approx(0.1)
+
+
+def test_cdr_structure_loss_uses_true_target_and_mutable_cdr_only(monkeypatch):
+    captured_masks = []
+
+    def fake_contact_loss(
+        distogram_logits,
+        bin_distance,
+        *,
+        chain_mask,
+        binder_mask,
+        **kwargs,
+    ):
+        captured_masks.append(
+            (
+                chain_mask.detach().cpu().tolist(),
+                binder_mask.detach().cpu().tolist(),
+            )
+        )
+        return torch.tensor([0.1], dtype=distogram_logits.dtype)
+
+    monkeypatch.setattr(
+        esmfold2_runtime_module,
+        "_contact_loss",
+        fake_contact_loss,
+    )
+    _structure_losses(
+        torch.zeros(1, 7, 7, 128),
+        binder_length=3,
+        target_chain_lengths=(2, 2),
+        target_chain_roles=("target", "scaffold"),
+        binder_mutable_mask=(False, True, False),
+    )
+
+    inter_chain_mask, inter_binder_mask = captured_masks[1]
+    assert inter_chain_mask == [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    assert inter_binder_mask == [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 
 
 class FakeInputBuilder:

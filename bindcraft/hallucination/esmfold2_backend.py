@@ -86,6 +86,8 @@ class ESMFold2ProposalConfig:
     proposal_confidence_num_sampling_steps: int = 50
     proposal_confidence_max_candidates: int = 8
     proposal_confidence_tail_steps: int = 0
+    target_chain_roles: Optional[Tuple[str, ...]] = None
+    binder_mutable_mask: Optional[Tuple[bool, ...]] = None
 
     def __post_init__(self) -> None:
         if int(self.verifier_num_loops) <= 0:
@@ -142,6 +144,26 @@ class ESMFold2ProposalConfig:
             raise ValueError("proposal_confidence_max_candidates must be positive")
         if int(self.proposal_confidence_tail_steps) < 0:
             raise ValueError("proposal_confidence_tail_steps must be non-negative")
+        if self.target_chain_roles is not None:
+            roles = tuple(
+                str(role).strip().lower() for role in self.target_chain_roles
+            )
+            if not roles:
+                raise ValueError("target_chain_roles cannot be empty")
+            invalid_roles = sorted(set(roles) - {"target", "scaffold"})
+            if invalid_roles:
+                raise ValueError(
+                    "target_chain_roles only supports target/scaffold; "
+                    f"got {invalid_roles}"
+                )
+            if "target" not in roles:
+                raise ValueError("target_chain_roles must contain at least one target")
+        if self.binder_mutable_mask is not None:
+            mutable_mask = tuple(bool(value) for value in self.binder_mutable_mask)
+            if not mutable_mask:
+                raise ValueError("binder_mutable_mask cannot be empty")
+            if not any(mutable_mask):
+                raise ValueError("binder_mutable_mask must select at least one residue")
 
 
 @dataclass

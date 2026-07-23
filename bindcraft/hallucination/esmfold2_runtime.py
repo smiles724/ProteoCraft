@@ -109,26 +109,63 @@ def _target_sequences(target_seq: Union[str, Sequence[str]]) -> list[str]:
     return [str(seq).strip() for seq in target_seq if str(seq).strip()]
 
 
+def _normalize_target_chain_roles(
+    target_chain_roles: Optional[Sequence[str]],
+    *,
+    n_target_chains: int,
+) -> tuple[str, ...]:
+    if n_target_chains <= 0:
+        raise ValueError("ESMFold2 requires at least one target chain")
+    if target_chain_roles is None:
+        return ("target",) * int(n_target_chains)
+    roles = tuple(str(role).strip().lower() for role in target_chain_roles)
+    if len(roles) != int(n_target_chains):
+        raise ValueError(
+            "target_chain_roles length must match the number of non-binder chains: "
+            f"{len(roles)} != {n_target_chains}"
+        )
+    invalid_roles = sorted(set(roles) - {"target", "scaffold"})
+    if invalid_roles:
+        raise ValueError(
+            "target_chain_roles only supports target/scaffold; "
+            f"got {invalid_roles}"
+        )
+    if "target" not in roles:
+        raise ValueError("target_chain_roles must contain at least one target")
+    return roles
+
+
 def _mean_target_to_binder_pair_iptm(
     pair_chains_iptm: Any,
     *,
     n_target_chains: int,
+    target_chain_roles: Optional[Sequence[str]] = None,
+    selected_role: str = "target",
 ) -> Optional[float]:
     if pair_chains_iptm is None:
+        return None
+    roles = _normalize_target_chain_roles(
+        target_chain_roles,
+        n_target_chains=n_target_chains,
+    )
+    selected_indices = [
+        index for index, role in enumerate(roles) if role == str(selected_role)
+    ]
+    if not selected_indices:
         return None
     tensor = torch.as_tensor(pair_chains_iptm).detach().float()
     if tensor.ndim == 3:
         if tensor.shape[1] <= n_target_chains or tensor.shape[2] <= n_target_chains:
             return None
         binder_idx = n_target_chains
-        values = tensor[:, :n_target_chains, binder_idx]
+        values = tensor[:, selected_indices, binder_idx]
         if values.numel() == 0:
             return None
         return _as_float(values)
     if tensor.ndim != 2 or tensor.shape[0] <= n_target_chains or tensor.shape[1] <= n_target_chains:
         return None
     binder_idx = n_target_chains
-    values = tensor[:n_target_chains, binder_idx]
+    values = tensor[selected_indices, binder_idx]
     if values.numel() == 0:
         return None
     return _as_float(values)
@@ -473,6 +510,9 @@ def _structure_losses(
     distogram_logits: torch.Tensor,
     binder_length: int,
     *,
+    target_chain_lengths: Optional[Sequence[int]] = None,
+    target_chain_roles: Optional[Sequence[str]] = None,
+    binder_mutable_mask: Optional[Sequence[bool]] = None,
     hotspot_params: Optional[Dict[str, Any]] = None,
     hotspot_weight: float = 0.0,
     hotspot_cutoff: float = 8.0,
@@ -498,8 +538,45 @@ def _structure_losses(
         raise ValueError(
             "localized hotspot_interface_mode requires hotspot_weight in [0, 1]"
         )
-    is_binder = torch.ones(full_len, device=distogram_logits.device)
-    is_binder[:-binder_length] *= 0.0
+    if target_chain_lengths is None:
+        target_chain_lengths = (target_length,)
+    chain_lengths = tuple(int(length) for length in target_chain_lengths)
+    if any(length <= 0 for length in chain_lengths):
+        raise ValueError("target_chain_lengths must contain positive lengths")
+    if sum(chain_lengths) != target_length:
+        raise ValueError(
+            "target_chain_lengths must sum to the non-binder residue count: "
+            f"{sum(chain_lengths)} != {target_length}"
+        )
+    roles = _normalize_target_chain_roles(
+        target_chain_roles,
+        n_target_chains=len(chain_lengths),
+    )
+
+    is_binder = torch.zeros(full_len, device=distogram_logits.device)
+    is_binder[-binder_length:] = 1.0
+    is_design = is_binder.clone()
+    if binder_mutable_mask is not None:
+        mutable = torch.as_tensor(
+            binder_mutable_mask,
+            dtype=torch.bool,
+            device=distogram_logits.device,
+        ).reshape(-1)
+        if mutable.numel() != int(binder_length):
+            raise ValueError(
+                "binder_mutable_mask length must match binder_length: "
+                f"{mutable.numel()} != {binder_length}"
+            )
+        if not bool(mutable.any().item()):
+            raise ValueError("binder_mutable_mask must select at least one residue")
+        is_design[-binder_length:] = mutable.to(dtype=is_design.dtype)
+
+    is_true_target = torch.zeros(full_len, device=distogram_logits.device)
+    offset = 0
+    for chain_length, role in zip(chain_lengths, roles):
+        if role == "target":
+            is_true_target[offset : offset + chain_length] = 1.0
+        offset += chain_length
 
     intra = _contact_loss(
         distogram_logits,
@@ -516,8 +593,8 @@ def _structure_losses(
         num_contacts=1,
         min_sep=0,
         cutoff=22.0,
-        chain_mask=1 - is_binder,
-        binder_mask=is_binder,
+        chain_mask=is_true_target,
+        binder_mask=is_design,
     )
 
     binder_disto = distogram_logits[:, -binder_length:, -binder_length:, :]
@@ -546,6 +623,16 @@ def _structure_losses(
             "positive hotspot_weight requires target_hotspot_concat_indices"
         )
     if hotspot_indices:
+        invalid_hotspots = [
+            index
+            for index in hotspot_indices
+            if not bool(is_true_target[index].item())
+        ]
+        if invalid_hotspots:
+            raise ValueError(
+                "hotspot indices must belong to chains with role=target; "
+                f"invalid indices={invalid_hotspots}"
+            )
         hotspot_mask = torch.zeros(full_len, device=distogram_logits.device)
         hotspot_mask[torch.as_tensor(hotspot_indices, device=distogram_logits.device)] = 1.0
         hotspot_contact = _contact_loss(
@@ -555,7 +642,7 @@ def _structure_losses(
             min_sep=0,
             cutoff=float(hotspot_cutoff),
             chain_mask=hotspot_mask,
-            binder_mask=is_binder,
+            binder_mask=is_design,
         )
         weighted_hotspot = float(hotspot_weight) * hotspot_contact
         if hotspot_interface_mode == "localized":
@@ -663,6 +750,10 @@ class ESMFold2RuntimeBackend:
     ):
         self._ensure_verifier_loaded()
         targets = _target_sequences(target_seq)
+        target_chain_roles = _normalize_target_chain_roles(
+            self.config.target_chain_roles,
+            n_target_chains=len(targets),
+        )
         input_spec = self._build_structure_input(targets, binder_seq)
         fold_result = self.input_builder.fold(
             self.verifier_model,
@@ -673,7 +764,11 @@ class ESMFold2RuntimeBackend:
             seed=seed,
             complex_id="esmfold2_verify",
         )
-        summary = self._summary_from_fold_result(fold_result, n_target_chains=len(targets))
+        summary = self._summary_from_fold_result(
+            fold_result,
+            n_target_chains=len(targets),
+            target_chain_roles=target_chain_roles,
+        )
         summary.update(
             _binder_structure_metrics(
                 fold_result,
@@ -816,6 +911,8 @@ class ESMFold2RuntimeBackend:
         """
 
         self._ensure_proposal_models_loaded()
+        targets = _target_sequences(target_seq)
+        explicit_target_chain_roles = self.config.target_chain_roles
         design = self._sequence_to_design_one_hot(binder_seq)
         fold_result = self._fold_distogram(
             target_seq=target_seq,
@@ -825,6 +922,17 @@ class ESMFold2RuntimeBackend:
         losses = _structure_losses(
             fold_result["distogram_logits"],
             len(binder_seq),
+            target_chain_lengths=(
+                [len(sequence) for sequence in targets]
+                if explicit_target_chain_roles is not None
+                else None
+            ),
+            target_chain_roles=explicit_target_chain_roles,
+            binder_mutable_mask=(
+                self.config.binder_mutable_mask
+                if explicit_target_chain_roles is not None
+                else None
+            ),
             hotspot_params=hotspot_params,
             hotspot_weight=float(self.config.hotspot_weight),
             hotspot_cutoff=float(self.config.hotspot_cutoff),
@@ -935,14 +1043,31 @@ class ESMFold2RuntimeBackend:
         )
         return self.structure_prediction_input_cls(sequences=proteins)
 
-    def _summary_from_fold_result(self, fold_result: Any, *, n_target_chains: int) -> dict[str, Any]:
+    def _summary_from_fold_result(
+        self,
+        fold_result: Any,
+        *,
+        n_target_chains: int,
+        target_chain_roles: Optional[Sequence[str]] = None,
+    ) -> dict[str, Any]:
         summary: dict[str, Any] = {}
+        roles = _normalize_target_chain_roles(
+            target_chain_roles,
+            n_target_chains=n_target_chains,
+        )
         plddt = _as_float(getattr(fold_result, "plddt", None))
         ptm = _as_float(getattr(fold_result, "ptm", None))
         iptm = _as_float(getattr(fold_result, "iptm", None))
         pair_chain = _mean_target_to_binder_pair_iptm(
             getattr(fold_result, "pair_chains_iptm", None),
             n_target_chains=n_target_chains,
+            target_chain_roles=roles,
+        )
+        scaffold_pair_chain = _mean_target_to_binder_pair_iptm(
+            getattr(fold_result, "pair_chains_iptm", None),
+            n_target_chains=n_target_chains,
+            target_chain_roles=roles,
+            selected_role="scaffold",
         )
         if plddt is not None:
             summary["plddt"] = plddt
@@ -952,6 +1077,9 @@ class ESMFold2RuntimeBackend:
             summary["iptm"] = iptm
         if pair_chain is not None:
             summary["pair_chain_iptm"] = pair_chain
+        if scaffold_pair_chain is not None:
+            summary["scaffold_binder_pair_chain_iptm"] = scaffold_pair_chain
+        summary["target_chain_roles"] = list(roles)
         complex_obj = getattr(fold_result, "complex", None)
         if complex_obj is not None and hasattr(complex_obj, "to_mmcif_string"):
             summary["mmcif"] = complex_obj.to_mmcif_string()
@@ -1045,6 +1173,26 @@ class ESMFold2RuntimeBackend:
             return logits_before, logits_after, [], []
 
         targets = _target_sequences(target_seq)
+        explicit_target_chain_roles = self.config.target_chain_roles
+        target_chain_roles = _normalize_target_chain_roles(
+            explicit_target_chain_roles,
+            n_target_chains=len(targets),
+        )
+        configured_mutable_mask = self.config.binder_mutable_mask
+        if configured_mutable_mask is not None:
+            configured_mutable_mask = tuple(
+                bool(value) for value in configured_mutable_mask
+            )
+            if len(configured_mutable_mask) != len(current_seq):
+                raise ValueError(
+                    "configured binder_mutable_mask length does not match current sequence"
+                )
+            if mutable_mask is None:
+                mutable_mask = configured_mutable_mask
+            elif tuple(bool(value) for value in mutable_mask) != configured_mutable_mask:
+                raise ValueError(
+                    "runtime mutable_mask does not match configured binder_mutable_mask"
+                )
         self._ensure_proposal_models_loaded()
 
         logits = self._init_current_sequence_logits(
@@ -1117,6 +1265,17 @@ class ESMFold2RuntimeBackend:
             losses = _structure_losses(
                 fold_result["distogram_logits"],
                 len(current_seq),
+                target_chain_lengths=(
+                    [len(sequence) for sequence in targets]
+                    if explicit_target_chain_roles is not None
+                    else None
+                ),
+                target_chain_roles=explicit_target_chain_roles,
+                binder_mutable_mask=(
+                    mutable_mask
+                    if explicit_target_chain_roles is not None
+                    else None
+                ),
                 hotspot_params=hotspot_params,
                 hotspot_weight=float(self.config.hotspot_weight),
                 hotspot_cutoff=float(self.config.hotspot_cutoff),
@@ -1342,6 +1501,10 @@ class ESMFold2RuntimeBackend:
             raise ValueError("ESMFold2 target sequence is empty")
         if len(targets) + 1 > len(CHAIN_IDS):
             raise ValueError("Too many chains for first ESMFold2 backend")
+        target_chain_roles = _normalize_target_chain_roles(
+            self.config.target_chain_roles,
+            n_target_chains=len(targets),
+        )
         target_one_hot = torch.cat(
             [self._sequence_to_folding_one_hot(sequence) for sequence in targets],
             dim=1,
@@ -1384,7 +1547,16 @@ class ESMFold2RuntimeBackend:
             result["pair_chain_iptm"] = _mean_target_to_binder_pair_iptm(
                 output.get("pair_chains_iptm"),
                 n_target_chains=len(targets),
+                target_chain_roles=target_chain_roles,
             )
+            scaffold_pair_chain = _mean_target_to_binder_pair_iptm(
+                output.get("pair_chains_iptm"),
+                n_target_chains=len(targets),
+                target_chain_roles=target_chain_roles,
+                selected_role="scaffold",
+            )
+            if scaffold_pair_chain is not None:
+                result["scaffold_binder_pair_chain_iptm"] = scaffold_pair_chain
         return result
 
     @lru_cache(maxsize=1)

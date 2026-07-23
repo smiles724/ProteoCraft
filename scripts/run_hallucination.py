@@ -203,6 +203,40 @@ def parse_esmfold2_mutable_mask(raw_mask, binder_length: int, parser: argparse.A
     return mask
 
 
+def parse_esmfold2_target_chain_roles(
+    raw_roles,
+    *,
+    n_target_chains: int,
+    parser: argparse.ArgumentParser = None,
+):
+    if raw_roles is None or not str(raw_roles).strip():
+        return None
+    roles = tuple(
+        token.strip().lower()
+        for token in str(raw_roles).replace(";", ",").replace(" ", ",").split(",")
+        if token.strip()
+    )
+    error = None
+    if len(roles) != int(n_target_chains):
+        error = (
+            "--esmfold2_target_chain_roles 数量必须与 --target 中的非 binder 链数一致；"
+            f"检测到 {len(roles)} 个 role、{n_target_chains} 条链"
+        )
+    invalid = sorted(set(roles) - {"target", "scaffold"})
+    if invalid:
+        error = (
+            "--esmfold2_target_chain_roles 只能包含 target/scaffold；"
+            f"检测到: {','.join(invalid)}"
+        )
+    if "target" not in roles:
+        error = "--esmfold2_target_chain_roles 至少需要一条 target 链"
+    if error is not None:
+        if parser is not None:
+            parser.error(error)
+        raise ValueError(error)
+    return roles
+
+
 
 def _cuequivariance_backend_available() -> bool:
     try:
@@ -326,7 +360,13 @@ def load_protenix_model(
     return model, configs
 
 
-def load_esmfold2_backend(args, device: str = "cuda"):
+def load_esmfold2_backend(
+    args,
+    device: str = "cuda",
+    *,
+    mutable_mask=None,
+    target_chain_roles=None,
+):
     """Lazy-load the real ESMFold2 backend only when explicitly requested."""
     from bindcraft.hallucination.esmfold2_backend import ESMFold2ProposalConfig
     from bindcraft.hallucination.esmfold2_runtime import ESMFold2RuntimeBackend
@@ -357,6 +397,12 @@ def load_esmfold2_backend(args, device: str = "cuda"):
         hotspot_verify_weight=args.esmfold2_hotspot_verify_weight,
         hotspot_verify_near_cutoff=args.esmfold2_hotspot_verify_near_cutoff,
         hotspot_verify_far_cutoff=args.esmfold2_hotspot_verify_far_cutoff,
+        target_chain_roles=target_chain_roles,
+        binder_mutable_mask=(
+            None
+            if mutable_mask is None
+            else tuple(bool(value) for value in mutable_mask)
+        ),
     )
     return ESMFold2RuntimeBackend(
         config=config,
@@ -471,6 +517,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2 root logits 初始化方式；official_exact 用官方 seed 直接生成诊断初始 logits")
     parser.add_argument("--esmfold2_mutable_mask", type=str, default=None,
                        help="ESMFold2 可变位点 mask；长度需等于 binder_length，支持 01101 或 0,1,1,true")
+    parser.add_argument(
+        "--esmfold2_target_chain_roles",
+        type=str,
+        default=None,
+        help=(
+            "ESMFold2 非 binder 链角色，按 --target 的链顺序填写 target/scaffold；"
+            "例如 target,scaffold,scaffold。缺省时所有链均视为 target"
+        ),
+    )
     parser.add_argument("--esmfold2_artifact_dir", type=str, default=None,
                        help="ESMFold2 每步结构化记录目录；默认写入 output_dir/esmfold2_artifacts")
     parser.add_argument("--esmfold2_stagea_handoff_checkpoint_interval", type=int, default=10,
@@ -789,11 +844,19 @@ def main():
                 f"检测到非法字符: {','.join(invalid)}"
             )
     esmfold2_mutable_mask = None
+    esmfold2_target_chain_roles = None
     if model_backend == "esmfold2":
         esmfold2_mutable_mask = parse_esmfold2_mutable_mask(
             args.esmfold2_mutable_mask,
             args.binder_length,
             parser,
+        )
+        esmfold2_target_chain_roles = parse_esmfold2_target_chain_roles(
+            args.esmfold2_target_chain_roles,
+            n_target_chains=len(
+                [part for part in str(args.target).split("|") if part.strip()]
+            ),
+            parser=parser,
         )
 
     hotspot_params = _build_hotspot_params(args, parser)
@@ -895,7 +958,12 @@ def main():
             model_dtype=args.dtype,
         )
     else:
-        esmfold2_backend = load_esmfold2_backend(args, device=args.device)
+        esmfold2_backend = load_esmfold2_backend(
+            args,
+            device=args.device,
+            mutable_mask=esmfold2_mutable_mask,
+            target_chain_roles=esmfold2_target_chain_roles,
+        )
 
     # 组装 loss_weights: default 不覆盖；非 default preset 覆盖整套权重。
     # 单独的 --w_* 参数始终具有最高优先级。
@@ -1096,6 +1164,10 @@ def main():
             f.write(f"ESMFold2 Task Type: {args.esmfold2_task_type}\n")
             f.write(f"ESMFold2 Logit Init Mode: {args.esmfold2_logit_init_mode}\n")
             f.write(f"ESMFold2 Mutable Mask: {args.esmfold2_mutable_mask or 'ALL'}\n")
+            f.write(
+                "ESMFold2 Target Chain Roles: "
+                f"{args.esmfold2_target_chain_roles or 'ALL_TARGET'}\n"
+            )
             f.write(f"ESMFold2 Stage A Handoff Checkpoint Interval: {args.esmfold2_stagea_handoff_checkpoint_interval}\n")
             f.write(f"ESMFold2 Resume Handoff Checkpoint: {args.esmfold2_resume_handoff_checkpoint or 'NONE'}\n")
             f.write(f"ESMFold2 Resume Reverify Roots: {args.esmfold2_resume_reverify_roots}\n")

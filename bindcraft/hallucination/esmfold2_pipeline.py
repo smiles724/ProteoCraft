@@ -1546,6 +1546,8 @@ def _stagea_handoff_verifier_contract(backend_config: Any) -> Dict[str, Any]:
         "hotspot_verify_weight",
         "hotspot_verify_near_cutoff",
         "hotspot_verify_far_cutoff",
+        "target_chain_roles",
+        "binder_mutable_mask",
     )
     return {
         field: _checkpoint_cpu_value(getattr(backend_config, field, None))
