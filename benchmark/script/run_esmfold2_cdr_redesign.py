@@ -137,6 +137,8 @@ def build_hallucination_command(
         "mcts_expand_actions_per_step": "mcts_expand_actions_per_step",
         "esmfold2_stagea_soft_steps": "esmfold2_stagea_soft_steps",
         "esmfold2_stageb_soft_steps": "esmfold2_stageb_soft_steps",
+        "esmfold2_experimental_model": "esmfold2_experimental_model",
+        "esmfold2_verifier_model": "esmfold2_verifier_model",
         "esmfold2_verifier_num_loops": "esmfold2_verifier_num_loops",
         "esmfold2_verifier_num_sampling_steps": "esmfold2_verifier_num_sampling_steps",
         "esmfold2_proposal_num_loops": "esmfold2_proposal_num_loops",
