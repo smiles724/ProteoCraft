@@ -931,21 +931,40 @@ def _annotate_stageb_quality_floor(result: Any, quality_floor: float) -> None:
 def _stageb_guarded_rank(
     result: Any,
     tree: "_ESMFold2StageBMCTSTree",
+    *,
+    quality_floor: Optional[float] = None,
 ) -> Tuple[float, ...]:
-    quality_ok = 1.0 if _stageb_result_quality_ok(result) else 0.0
+    pair_chain_iptm = _stageb_result_pair_chain_iptm(result)
+    effective_quality_floor = (
+        _stageb_result_quality_floor(result)
+        if quality_floor is None
+        else min(max(float(quality_floor), 0.0), 1.0)
+    )
+    quality_ok = 1.0 if pair_chain_iptm >= effective_quality_floor else 0.0
     coverage = _stageb_result_hotspot_coverage(result)
     distance = _stageb_result_hotspot_distance(result)
     reward = float(tree.result_reward(result))
     if coverage is None:
-        return quality_ok, reward, -float(result.total_loss)
+        return quality_ok, reward, pair_chain_iptm, -float(result.total_loss)
     fully_covered = 1.0 if coverage >= 1.0 - 1.0e-8 else 0.0
     finite_distance = distance if distance is not None else float("inf")
+    if fully_covered:
+        return (
+            quality_ok,
+            fully_covered,
+            float(coverage),
+            reward,
+            pair_chain_iptm,
+            -float(finite_distance),
+            -float(result.total_loss),
+        )
     return (
         quality_ok,
         fully_covered,
         float(coverage),
         -float(finite_distance),
         reward,
+        pair_chain_iptm,
         -float(result.total_loss),
     )
 
@@ -990,15 +1009,23 @@ def _select_stageb_tree_expansions(
 def _stageb_selection_surface(
     result: Any,
     tree: "_ESMFold2StageBMCTSTree",
+    *,
+    quality_floor: Optional[float] = None,
 ) -> Dict[str, Any]:
     summary = dict(getattr(result, "summary_confidence", {}) or {})
+    pair_chain_iptm = _stageb_result_pair_chain_iptm(result)
+    effective_quality_floor = (
+        _stageb_result_quality_floor(result)
+        if quality_floor is None
+        else min(max(float(quality_floor), 0.0), 1.0)
+    )
     return {
         "sequence": str(result.binder_seq),
         "total_loss": float(result.total_loss),
         "tree_reward": float(tree.result_reward(result)),
-        "pair_chain_iptm": _stageb_result_pair_chain_iptm(result),
-        "quality_floor": _stageb_result_quality_floor(result),
-        "quality_ok": _stageb_result_quality_ok(result),
+        "pair_chain_iptm": pair_chain_iptm,
+        "quality_floor": effective_quality_floor,
+        "quality_ok": pair_chain_iptm >= effective_quality_floor,
         "hotspot_coverage": _stageb_result_hotspot_coverage(result),
         "hotspot_coverage_5a": _finite_float(
             summary.get("hotspot_heavy_atom_coverage_5a")
@@ -2779,9 +2806,18 @@ def run_esmfold2_mcts_hallucination(
         handoff_results,
         key=strict_tree.result_reward,
     )
+    final_quality_floor = max(
+        stageb_min_pair_chain_iptm,
+        max(_stageb_result_pair_chain_iptm(result) for result in handoff_results)
+        - stageb_handoff_quality_tolerance,
+    )
     best_by_guarded = max(
         handoff_results,
-        key=lambda result: _stageb_guarded_rank(result, strict_tree),
+        key=lambda result: _stageb_guarded_rank(
+            result,
+            strict_tree,
+            quality_floor=final_quality_floor,
+        ),
     )
     _remember_global_best(best_by_guarded)
 
@@ -3072,7 +3108,11 @@ def run_esmfold2_mcts_hallucination(
         if round_results:
             round_best = max(
                 round_results,
-                key=lambda result: _stageb_guarded_rank(result, strict_tree),
+                key=lambda result: _stageb_guarded_rank(
+                    result,
+                    strict_tree,
+                    quality_floor=final_quality_floor,
+                ),
             )
 
             round_total_best = min(
@@ -3093,8 +3133,16 @@ def run_esmfold2_mcts_hallucination(
                 best_by_composite = round_composite_best
 
             if (
-                _stageb_guarded_rank(round_best, strict_tree)
-                > _stageb_guarded_rank(best_by_guarded, strict_tree)
+                _stageb_guarded_rank(
+                    round_best,
+                    strict_tree,
+                    quality_floor=final_quality_floor,
+                )
+                > _stageb_guarded_rank(
+                    best_by_guarded,
+                    strict_tree,
+                    quality_floor=final_quality_floor,
+                )
             ):
                 best_by_guarded = round_best
                 guarded_action = next(
@@ -3231,14 +3279,17 @@ def run_esmfold2_mcts_hallucination(
             "best_by_total_loss": _stageb_selection_surface(
                 best_by_total_loss,
                 strict_tree,
+                quality_floor=final_quality_floor,
             ),
             "best_by_composite_reward": _stageb_selection_surface(
                 best_by_composite,
                 strict_tree,
+                quality_floor=final_quality_floor,
             ),
             "best_by_hotspot_guarded_quality": _stageb_selection_surface(
                 best_by_guarded,
                 strict_tree,
+                quality_floor=final_quality_floor,
             ),
         },
         **hotspot_summary,
