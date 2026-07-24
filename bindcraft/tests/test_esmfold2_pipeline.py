@@ -528,6 +528,96 @@ def test_stageb_tree_expansion_prefers_quality_guarded_hotspot_coverage():
     )
 
 
+def test_stageb_guarded_rank_prefers_global_quality_after_full_coverage():
+    tree = _ESMFold2StageBMCTSTree(
+        use_pareto_pruning=False,
+        hotspot_distance_weight=0.10,
+        hotspot_coverage_weight=0.25,
+    )
+
+    def result(
+        sequence,
+        *,
+        pair_chain_iptm,
+        binder_confidence_loss,
+        distance,
+    ):
+        return SimpleNamespace(
+            binder_seq=sequence,
+            total_loss=1.0 - pair_chain_iptm,
+            loss_dict={
+                "pair_chain_iptm_loss": 1.0 - pair_chain_iptm,
+                "binder_confidence_loss": binder_confidence_loss,
+                "global_confidence_loss": binder_confidence_loss,
+                "binder_rg_excess_loss": binder_confidence_loss,
+                "hotspot_verify_distance_loss": 0.0,
+                "hotspot_heavy_atom_coverage": 1.0,
+                "stageb_pair_chain_quality_floor": 0.60,
+            },
+            summary_confidence={
+                "hotspot_heavy_atom_coverage": 1.0,
+                "hotspot_mean_min_heavy_atom_distance": distance,
+            },
+        )
+
+    close_but_weaker = result(
+        "close_but_weaker",
+        pair_chain_iptm=0.62,
+        binder_confidence_loss=0.30,
+        distance=2.0,
+    )
+    farther_but_better = result(
+        "farther_but_better",
+        pair_chain_iptm=0.70,
+        binder_confidence_loss=0.10,
+        distance=5.0,
+    )
+
+    assert (
+        _stageb_guarded_rank(farther_but_better, tree)
+        > _stageb_guarded_rank(close_but_weaker, tree)
+    )
+
+
+def test_stageb_guarded_rank_accepts_a_run_level_quality_floor():
+    tree = _ESMFold2StageBMCTSTree(use_pareto_pruning=False)
+
+    def result(sequence, pair_chain_iptm, branch_floor, coverage):
+        return SimpleNamespace(
+            binder_seq=sequence,
+            total_loss=1.0 - pair_chain_iptm,
+            loss_dict={
+                "pair_chain_iptm_loss": 1.0 - pair_chain_iptm,
+                "binder_confidence_loss": 0.10,
+                "global_confidence_loss": 0.10,
+                "binder_rg_excess_loss": 0.10,
+                "hotspot_verify_distance_loss": 0.0,
+                "hotspot_heavy_atom_coverage": coverage,
+                "stageb_pair_chain_quality_floor": branch_floor,
+            },
+            summary_confidence={
+                "hotspot_heavy_atom_coverage": coverage,
+                "hotspot_mean_min_heavy_atom_distance": 4.0,
+            },
+        )
+
+    weak_branch_candidate = result("weak", 0.56, 0.50, 1.0)
+    strong_root_candidate = result("strong", 0.62, 0.60, 0.75)
+
+    assert (
+        _stageb_guarded_rank(
+            strong_root_candidate,
+            tree,
+            quality_floor=0.60,
+        )
+        > _stageb_guarded_rank(
+            weak_branch_candidate,
+            tree,
+            quality_floor=0.60,
+        )
+    )
+
+
 def test_stageb_proposals_are_strict_single_mutations_with_gradient_priors():
     before = torch.zeros(3, 20)
     after = before.clone()
