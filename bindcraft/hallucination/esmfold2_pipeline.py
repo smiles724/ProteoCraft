@@ -2368,6 +2368,8 @@ def _stagea_handoff_verifier_contract(backend_config: Any) -> Dict[str, Any]:
         "hotspot_verify_weight",
         "hotspot_verify_near_cutoff",
         "hotspot_verify_far_cutoff",
+        "hotspot_verify_min_distance",
+        "hotspot_verify_too_close_weight",
         "target_chain_roles",
         "binder_mutable_mask",
     )
@@ -3091,6 +3093,12 @@ def run_esmfold2_mcts_hallucination(
                 "esmfold2_logit_init_mode": logit_init_mode,
                 "esmfold2_stagea_soft_steps": stagea_soft_steps,
                 "esmfold2_stagea_tree_children": stagea_tree_children,
+                "hotspot_weight": hotspot_weight,
+                "hotspot_satisfied_proposal_weight": (
+                    hotspot_satisfied_proposal_weight
+                ),
+                "hotspot_cutoff": hotspot_cutoff,
+                "hotspot_interface_mode": hotspot_interface_mode,
             },
             verifier_contract=_stagea_handoff_verifier_contract(backend_config),
         )
