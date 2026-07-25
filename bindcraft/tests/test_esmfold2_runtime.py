@@ -33,6 +33,11 @@ class FakeComplex:
         return "data_fake\n"
 
 
+class FakeModernComplex(FakeComplex):
+    def to_mmcif(self):
+        return "data_modern\n"
+
+
 class FakeGeometryComplex(FakeComplex):
     def __init__(self):
         self.chain_boundaries = [(0, 4), (5, 8)]
@@ -84,6 +89,12 @@ class FakeFoldResult:
                 [0.41, 1.0],
             ]
         )
+
+
+class FakeModernFoldResult(FakeFoldResult):
+    def __init__(self):
+        super().__init__()
+        self.complex = FakeModernComplex()
 
 
 class FakeGeometryFoldResult(FakeFoldResult):
@@ -182,6 +193,12 @@ class FakeInputBuilder:
         return FakeFoldResult()
 
 
+class FakeModernInputBuilder(FakeInputBuilder):
+    def fold(self, model, input_spec, **kwargs):
+        self.calls.append((model, input_spec, kwargs))
+        return FakeModernFoldResult()
+
+
 class FakeBatchedPairInputBuilder(FakeInputBuilder):
     def fold(self, model, input_spec, **kwargs):
         self.calls.append((model, input_spec, kwargs))
@@ -241,6 +258,21 @@ def test_runtime_verifier_extracts_pair_chain_metrics_and_mmcif():
     assert kwargs["seed"] == 7
     assert kwargs["num_loops"] == backend.verifier_num_loops
     assert kwargs["num_sampling_steps"] == backend.verifier_num_sampling_steps
+
+
+def test_runtime_verifier_uses_modern_to_mmcif_api():
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(),
+        device="cpu",
+        verifier_model=object(),
+        input_builder=FakeModernInputBuilder(),
+        protein_input_cls=FakeProteinInput,
+        structure_prediction_input_cls=FakeStructurePredictionInput,
+    )
+
+    result = backend.verify(binder_seq="YYY", target_seq="AAAA", seed=7)
+
+    assert result.summary_confidence["mmcif"] == "data_modern\n"
 
 
 def test_runtime_verifier_extracts_batched_pair_chain_metrics():
@@ -640,6 +672,8 @@ def test_runtime_continuous_design_records_soft_step_metrics(monkeypatch):
     assert "structure_total_loss" in batch.soft_step_metrics[0]
     assert "backprop_loss" in batch.soft_step_metrics[0]
     assert "temperature" in batch.soft_step_metrics[0]
+    assert "argmax_sequence" in batch.soft_step_metrics[0]
+    assert "logits_snapshot" in batch.soft_step_metrics[0]
 
 
 def test_hotspot_structure_loss_is_additive_and_weight_zero_preserves_base_loss():

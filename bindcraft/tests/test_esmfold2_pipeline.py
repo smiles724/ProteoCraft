@@ -859,6 +859,32 @@ def test_esmfold2_best_of_n_runs_independent_continuous_trajectories(tmp_path):
         )
         assert (trajectory_dir / "initial_logits.pt").exists()
         assert (trajectory_dir / "final_logits.pt").exists()
+        assert (trajectory_dir / "trajectory_summary.json").exists()
+
+
+def test_esmfold2_best_of_n_resumes_completed_trajectories(tmp_path):
+    backend = FakeESMFold2Backend()
+    kwargs = {
+        "backend": backend,
+        "target_seq": "TTTT",
+        "L_binder": 3,
+        "best_of_n": 2,
+        "init_binder_seq": "AAA",
+        "mutable_mask": [True, True, True],
+        "seed": 7,
+        "artifact_dir": tmp_path,
+        "esmfold2_logit_init_mode": "official_exact",
+        "esmfold2_soft_steps": 2,
+    }
+
+    first = run_esmfold2_best_of_n(**kwargs)
+    first_continuous_count = len(backend.continuous_calls)
+    second = run_esmfold2_best_of_n(**kwargs)
+
+    assert first == second
+    assert first_continuous_count == 2
+    assert len(backend.continuous_calls) == first_continuous_count
+    assert len((tmp_path / "trajectory.jsonl").read_text().splitlines()) == 2
 
 
 @pytest.mark.parametrize(

@@ -1081,8 +1081,12 @@ class ESMFold2RuntimeBackend:
             summary["scaffold_binder_pair_chain_iptm"] = scaffold_pair_chain
         summary["target_chain_roles"] = list(roles)
         complex_obj = getattr(fold_result, "complex", None)
-        if complex_obj is not None and hasattr(complex_obj, "to_mmcif_string"):
-            summary["mmcif"] = complex_obj.to_mmcif_string()
+        if complex_obj is not None:
+            if hasattr(complex_obj, "to_mmcif"):
+                summary["mmcif"] = complex_obj.to_mmcif()
+            elif hasattr(complex_obj, "to_mmcif_string"):
+                # Compatibility with older ESM SDK result objects.
+                summary["mmcif"] = complex_obj.to_mmcif_string()
         return summary
 
     def _run_soft_update(
@@ -1311,10 +1315,16 @@ class ESMFold2RuntimeBackend:
             optimizer.step()
             structure_total = losses["total_loss"]
             combined_total = structure_total + (esmc_loss if lambda_esmc != 0.0 else 0.0)
+            argmax_sequence = sequence_from_logits_argmax(
+                logits.detach()[0],
+                current_seq=current_seq,
+                mutable_mask=mutable_mask,
+            )
             metrics = {
                 "global_step": int(global_step),
                 "local_step": int(local_step),
                 "temperature": float(temperature),
+                "argmax_sequence": argmax_sequence,
                 "proposal_loss_source": _stageb_structure_loss(
                     losses,
                     action_group,
@@ -1352,6 +1362,12 @@ class ESMFold2RuntimeBackend:
                         ),
                     }
                 )
+            if (
+                local_step == 0
+                or local_step == soft_steps - 1
+                or (local_step + 1) % 10 == 0
+            ):
+                metrics["logits_snapshot"] = logits.detach().clone()[0].cpu()
             soft_step_metrics.append(metrics)
 
         return (

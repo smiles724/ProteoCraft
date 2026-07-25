@@ -460,6 +460,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="可选的 Best-of-N verifier loss 通过阈值；未设置时不计算 pass@N",
     )
     parser.add_argument(
+        "--esmfold2_best_of_n_resume",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help="Best-of-N 是否按 trajectory 断点续跑（默认：true）",
+    )
+    parser.add_argument(
         "--esmfold2_stageb_discrete_rerank",
         type=lambda x: x.lower() == "true",
         default=True,
@@ -1037,6 +1043,7 @@ def main():
                 esmfold2_soft_steps=args.esmfold2_stagea_soft_steps,
                 track_confidence=args.esmfold2_track_proposal_confidence,
                 pass_loss_threshold=args.esmfold2_best_of_n_pass_loss_threshold,
+                resume=args.esmfold2_best_of_n_resume,
             )
         else:
             best_seq, final_seq, losses_history = run_esmfold2_mcts_hallucination(

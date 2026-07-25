@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import random
+import shutil
 import statistics
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -101,11 +102,26 @@ class _NoopArtifactRecorder:
     def write_summary(self, **summary: Any) -> None:
         return None
 
+    def reset_best_of_n_trajectory(self, trajectory_index: int) -> None:
+        return None
+
+    def write_best_of_n_trajectory_summary(
+        self,
+        trajectory_index: int,
+        summary: Mapping[str, Any],
+    ) -> None:
+        return None
+
 
 class _ESMArtifactRecorder(_NoopArtifactRecorder):
     """Append-only JSONL artifact writer for ESMFold2 MCTS diagnostics."""
 
-    def __init__(self, artifact_dir: Union[str, os.PathLike[str]]) -> None:
+    def __init__(
+        self,
+        artifact_dir: Union[str, os.PathLike[str]],
+        *,
+        append: bool = False,
+    ) -> None:
         self.artifact_dir = Path(artifact_dir)
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.trajectory_path = self.artifact_dir / "trajectory.jsonl"
@@ -116,13 +132,20 @@ class _ESMArtifactRecorder(_NoopArtifactRecorder):
         self.soft_steps_path = self.artifact_dir / "soft_steps.jsonl"
         self.handoff_path = self.artifact_dir / "mcts_handoff.jsonl"
         self.summary_path = self.artifact_dir / "run_summary.json"
-        self.trajectory_path.write_text("", encoding="utf-8")
-        self.candidates_path.write_text("", encoding="utf-8")
-        self.nodes_path.write_text("", encoding="utf-8")
-        self.edges_path.write_text("", encoding="utf-8")
-        self.actions_path.write_text("", encoding="utf-8")
-        self.soft_steps_path.write_text("", encoding="utf-8")
-        self.handoff_path.write_text("", encoding="utf-8")
+        jsonl_paths = (
+            self.trajectory_path,
+            self.candidates_path,
+            self.nodes_path,
+            self.edges_path,
+            self.actions_path,
+            self.soft_steps_path,
+            self.handoff_path,
+        )
+        for path in jsonl_paths:
+            if append:
+                path.touch(exist_ok=True)
+            else:
+                path.write_text("", encoding="utf-8")
 
     def write_step(self, **event: Any) -> None:
         self._append_jsonl(self.trajectory_path, event)
@@ -213,9 +236,62 @@ class _ESMArtifactRecorder(_NoopArtifactRecorder):
         torch.save(payload, trajectory_dir / f"{label}.pt")
 
     def write_summary(self, **summary: Any) -> None:
-        self.summary_path.write_text(
-            json.dumps(_json_ready(summary), ensure_ascii=False, sort_keys=True, indent=2),
-            encoding="utf-8",
+        self._write_json_atomic(self.summary_path, summary)
+
+    def reset_best_of_n_trajectory(self, trajectory_index: int) -> None:
+        trajectory_index = int(trajectory_index)
+        for path in (
+            self.trajectory_path,
+            self.candidates_path,
+            self.soft_steps_path,
+        ):
+            if not path.exists():
+                continue
+            kept_lines: List[str] = []
+            for raw_line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    payload = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                is_target = (
+                    payload.get("stage") == "best_of_n"
+                    and int(payload.get("step", -1)) == trajectory_index
+                )
+                if not is_target:
+                    kept_lines.append(raw_line)
+            path.write_text(
+                "".join(f"{line}\n" for line in kept_lines),
+                encoding="utf-8",
+            )
+
+        trajectory_dir = (
+            self.artifact_dir
+            / "best_of_n"
+            / f"trajectory_{trajectory_index:03d}"
+        )
+        checkpoint_dir = (
+            self.artifact_dir
+            / "checkpoints"
+            / "best_of_n"
+            / f"step_{trajectory_index:04d}"
+        )
+        shutil.rmtree(trajectory_dir, ignore_errors=True)
+        shutil.rmtree(checkpoint_dir, ignore_errors=True)
+
+    def write_best_of_n_trajectory_summary(
+        self,
+        trajectory_index: int,
+        summary: Mapping[str, Any],
+    ) -> None:
+        trajectory_dir = (
+            self.artifact_dir
+            / "best_of_n"
+            / f"trajectory_{int(trajectory_index):03d}"
+        )
+        trajectory_dir.mkdir(parents=True, exist_ok=True)
+        self._write_json_atomic(
+            trajectory_dir / "trajectory_summary.json",
+            dict(summary),
         )
 
     @staticmethod
@@ -224,13 +300,25 @@ class _ESMArtifactRecorder(_NoopArtifactRecorder):
             handle.write(json.dumps(_json_ready(payload), ensure_ascii=False, sort_keys=True))
             handle.write("\n")
 
+    @staticmethod
+    def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_suffix(path.suffix + ".tmp")
+        temporary_path.write_text(
+            json.dumps(_json_ready(dict(payload)), ensure_ascii=False, sort_keys=True, indent=2),
+            encoding="utf-8",
+        )
+        temporary_path.replace(path)
+
 
 def _make_artifact_recorder(
     artifact_dir: Optional[Union[str, os.PathLike[str]]],
+    *,
+    append: bool = False,
 ) -> _NoopArtifactRecorder:
     if artifact_dir is None:
         return _NoopArtifactRecorder()
-    return _ESMArtifactRecorder(artifact_dir)
+    return _ESMArtifactRecorder(artifact_dir, append=append)
 
 
 def _json_ready(value: Any) -> Any:
@@ -290,6 +378,8 @@ def _loss_dict_for_artifact(result: Any) -> Dict[str, float]:
 def _summary_for_artifact(result: Any) -> Dict[str, Any]:
     summary: Dict[str, Any] = {}
     for key, value in dict(getattr(result, "summary_confidence", {}) or {}).items():
+        if str(key) == "mmcif":
+            continue
         if isinstance(value, torch.Tensor) and value.numel() != 1:
             continue
         summary[str(key)] = _json_ready(value)
@@ -329,12 +419,23 @@ def _write_soft_step_artifacts(
     action_group: Optional[str] = None,
 ) -> None:
     for metric in list(getattr(batch, "soft_step_metrics", []) or []):
+        metric = dict(metric)
+        logits_snapshot = metric.pop("logits_snapshot", None)
+        if stage == "best_of_n" and logits_snapshot is not None:
+            local_step = int(metric.get("local_step", 0))
+            recorder.write_logits(
+                trajectory_index=0 if step is None else int(step),
+                label=f"soft_step_{local_step + 1:04d}",
+                logits=logits_snapshot,
+                sequence=metric.get("argmax_sequence"),
+                seed=None,
+            )
         recorder.write_soft_step(
             stage=stage,
             step=step,
             selected_sequence=str(selected_sequence),
             action_group=action_group,
-            **dict(metric),
+            **metric,
         )
 
 
@@ -1297,6 +1398,7 @@ def run_esmfold2_best_of_n(
     esmfold2_soft_steps: int = 150,
     track_confidence: bool = True,
     pass_loss_threshold: Optional[float] = None,
+    resume: bool = True,
 ) -> Tuple[str, str, List[float]]:
     """Run independent continuous ESMFold2 trajectories without MCTS.
 
@@ -1344,13 +1446,50 @@ def run_esmfold2_best_of_n(
 
     target_key = _normalize_target_key(target_seq)
     logit_init_mode = _normalize_logit_init_mode(esmfold2_logit_init_mode)
-    artifact_recorder = _make_artifact_recorder(artifact_dir)
-    verifier_cache: Dict[str, Any] = {}
     shared_verify_seed = _stable_seed(
         seed,
         "esm_best_of_n_full_verify",
         target_key,
     )
+    artifact_path = Path(artifact_dir) if artifact_dir is not None else None
+    contract_path = (
+        artifact_path / "best_of_n_config.json"
+        if artifact_path is not None
+        else None
+    )
+    contract = {
+        "schema_version": 1,
+        "strategy": "best_of_n",
+        "target_key": target_key,
+        "binder_length": L_binder,
+        "best_of_n": best_of_n,
+        "base_seed": seed,
+        "soft_steps_per_trajectory": soft_steps,
+        "logit_init_mode": logit_init_mode,
+        "track_confidence": bool(track_confidence),
+        "shared_verifier_seed": shared_verify_seed,
+        "initial_binder_sequence": init_binder_seq,
+        "mutable_mask": mutable_mask,
+        "hotspot_indices_0based": hotspot_indices,
+        "pass_loss_threshold": pass_loss_threshold,
+    }
+    contract_exists = bool(contract_path is not None and contract_path.exists())
+    if contract_exists:
+        existing_contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        if existing_contract != _json_ready(contract):
+            raise ValueError(
+                "Best-of-N resume configuration does not match the existing "
+                f"artifact contract at {contract_path}"
+            )
+    elif artifact_path is not None:
+        artifact_path.mkdir(parents=True, exist_ok=True)
+        _ESMArtifactRecorder._write_json_atomic(contract_path, contract)
+
+    artifact_recorder = _make_artifact_recorder(
+        artifact_dir,
+        append=bool(resume and contract_exists),
+    )
+    verifier_cache: Dict[str, Any] = {}
     trajectory_summaries: List[Dict[str, Any]] = []
     trajectory_best_losses: List[float] = []
     global_best_result: Optional[Any] = None
@@ -1370,6 +1509,79 @@ def run_esmfold2_best_of_n(
     logger.info("=" * 70)
 
     for trajectory_index in range(best_of_n):
+        trajectory_summary_path = (
+            artifact_path
+            / "best_of_n"
+            / f"trajectory_{trajectory_index:03d}"
+            / "trajectory_summary.json"
+            if artifact_path is not None
+            else None
+        )
+        if resume and trajectory_summary_path is not None and trajectory_summary_path.exists():
+            trajectory_summary = json.loads(
+                trajectory_summary_path.read_text(encoding="utf-8")
+            )
+            if int(trajectory_summary.get("trajectory_index", -1)) != trajectory_index:
+                raise ValueError(
+                    f"Invalid trajectory summary at {trajectory_summary_path}"
+                )
+            resumed_sequence = str(trajectory_summary["best_sequence"])
+            trajectory_best = _verify_with_cache(
+                backend,
+                verifier_cache,
+                binder_seq=resumed_sequence,
+                target_seq=target_seq,
+                seed=shared_verify_seed,
+                hotspot_params=hotspot_params,
+            )
+            trajectory_best_loss = float(trajectory_best.total_loss)
+            recorded_loss = float(trajectory_summary["best_loss"])
+            loss_delta = trajectory_best_loss - recorded_loss
+            if abs(loss_delta) > 0.05:
+                raise ValueError(
+                    "Resumed Best-of-N trajectory verifier result changed: "
+                    f"trajectory={trajectory_index} recorded={recorded_loss:.6f} "
+                    f"current={trajectory_best_loss:.6f}"
+                )
+            trajectory_summary.setdefault("original_best_loss", recorded_loss)
+            trajectory_summary["best_loss"] = trajectory_best_loss
+            trajectory_summary["resume_reverified_loss"] = trajectory_best_loss
+            trajectory_summary["resume_reverify_loss_delta"] = loss_delta
+            trajectory_summary["best_loss_dict"] = _loss_dict_for_artifact(
+                trajectory_best
+            )
+            trajectory_summary["best_summary_confidence"] = _json_ready(
+                _summary_without_structure(
+                    dict(
+                        getattr(
+                            trajectory_best,
+                            "summary_confidence",
+                            {},
+                        )
+                        or {}
+                    )
+                )
+            )
+            artifact_recorder.write_best_of_n_trajectory_summary(
+                trajectory_index,
+                trajectory_summary,
+            )
+            trajectory_summaries.append(trajectory_summary)
+            trajectory_best_losses.append(trajectory_best_loss)
+            if (
+                global_best_result is None
+                or trajectory_best_loss < float(global_best_result.total_loss)
+            ):
+                global_best_result = trajectory_best
+            logger.info(
+                "Best-of-N trajectory %d/%d resumed | best_loss=%.4f",
+                trajectory_index + 1,
+                best_of_n,
+                trajectory_best_loss,
+            )
+            continue
+
+        artifact_recorder.reset_best_of_n_trajectory(trajectory_index)
         trajectory_seed = _stable_seed(
             seed,
             "esm_best_of_n_trajectory",
@@ -1522,6 +1734,10 @@ def run_esmfold2_best_of_n(
             parent_sequence=initial_sequence,
             is_global_best=False,
         )
+        artifact_recorder.write_best_of_n_trajectory_summary(
+            trajectory_index,
+            trajectory_summary,
+        )
         logger.info(
             "Best-of-N trajectory %d/%d | seed=%d candidates=%d best_loss=%.4f",
             trajectory_index + 1,
@@ -1545,6 +1761,7 @@ def run_esmfold2_best_of_n(
         "best_of_n": best_of_n,
         "soft_steps_per_trajectory": soft_steps,
         "track_confidence": bool(track_confidence),
+        "resume_enabled": bool(resume),
         "logit_init_mode": logit_init_mode,
         "shared_verifier_seed": shared_verify_seed,
         "best_sequence": global_best_sequence,
