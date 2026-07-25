@@ -27,6 +27,7 @@ from bindcraft.hallucination.esmfold2_pipeline import (
     _rerank_stageb_candidates_with_preview,
     _select_stageb_actions_by_group_quota,
     _select_stageb_tree_expansions,
+    _select_stagea_tree_results,
     _stageb_guarded_rank,
     _stageb_preview_objective,
 )
@@ -793,6 +794,114 @@ def test_stagea_legacy_tree_selects_lower_average_loss_path():
     tree.backpropagate(low_loss, [0.1])
 
     assert tree.select().sequence == "AAA"
+
+
+def test_stagea_tree_frontier_keeps_argmax_and_best_remaining_candidate():
+    results = [
+        SimpleNamespace(binder_seq="AAF", total_loss=0.20),
+        SimpleNamespace(binder_seq="AAY", total_loss=0.70),
+        SimpleNamespace(binder_seq="AYF", total_loss=0.40),
+    ]
+
+    selected = _select_stagea_tree_results(
+        results,
+        argmax_sequence="AAY",
+        max_children=2,
+    )
+
+    assert [result.binder_seq for result in selected] == ["AAY", "AAF"]
+
+
+def test_stagea_argmax_child_preserves_raw_logits_and_only_two_children_enter_tree(
+    tmp_path,
+):
+    class RawLogitsStageABackend(FakeESMFold2Backend):
+        def __init__(self):
+            super().__init__()
+            self.scores.update(
+                {
+                    "AAA": 0.10,
+                    "AAY": 0.90,
+                    "AAF": 0.80,
+                    "AYF": 0.70,
+                }
+            )
+            self.raw_logits = torch.full((3, len(ESM_AA_ORDER)), -1.0)
+            self.raw_logits[:, AA_TO_ESM_IDX["C"]] = float("-inf")
+            self.raw_logits[0, AA_TO_ESM_IDX["A"]] = 0.3
+            self.raw_logits[1, AA_TO_ESM_IDX["A"]] = 0.4
+            self.raw_logits[2, AA_TO_ESM_IDX["Y"]] = 0.5
+
+        def propose(self, **kwargs):
+            self.propose_calls.append(dict(kwargs))
+            return ESMFold2ProposalBatch(
+                sequences=["AAF", "AAY", "AYF"],
+                logits_after=self.raw_logits.clone(),
+            )
+
+    backend = RawLogitsStageABackend()
+    artifact_dir = tmp_path / "artifacts"
+
+    best_seq, final_seq, _ = run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=1,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=3,
+        T_sample=1.0,
+        max_mutations_per_seq=3,
+        seed=7,
+        mcts_strategy="stage_a_only",
+        mcts_handoff_top_k=2,
+        esmfold2_stagea_tree_children=2,
+        esmfold2_stagea_handoff_checkpoint_interval=0,
+        artifact_dir=artifact_dir,
+    )
+
+    assert best_seq == final_seq == "AAY"
+    assert [call[0] for call in backend.verify_calls] == [
+        "AAA",
+        "AAF",
+        "AAY",
+        "AYF",
+    ]
+
+    trajectory = [
+        json.loads(line)
+        for line in (artifact_dir / "trajectory.jsonl").read_text().splitlines()
+    ]
+    stagea_event = next(event for event in trajectory if event["stage"] == "stage_a")
+    assert stagea_event["candidate_count"] == 3
+    assert stagea_event["expanded_child_count"] == 2
+    assert stagea_event["argmax_sequence"] == "AAY"
+    assert stagea_event["argmax_child_in_tree"] is True
+
+    nodes = [
+        json.loads(line)
+        for line in (artifact_dir / "mcts_nodes.jsonl").read_text().splitlines()
+    ]
+    expanded_sequences = [
+        event["sequence"]
+        for event in nodes
+        if event["stage"] == "stage_a" and event.get("parent_node_id") is not None
+    ]
+    assert expanded_sequences == ["AAY", "AAF"]
+
+    checkpoint = torch.load(
+        artifact_dir / "handoff_checkpoints" / "stagea_handoff_final.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    logits_by_sequence = {
+        entry["result"]["binder_seq"]: entry["proposal_logits"]
+        for entry in checkpoint["handoff_entries"]
+    }
+    assert torch.equal(logits_by_sequence["AAY"], backend.raw_logits)
+    assert not torch.equal(logits_by_sequence["AAF"], backend.raw_logits)
+    assert logits_by_sequence["AAF"][2, AA_TO_ESM_IDX["F"]] >= 2.0
 
 
 def test_esmfold2_continuous_stagea_designs_once_then_verifies_argmax_sequence():

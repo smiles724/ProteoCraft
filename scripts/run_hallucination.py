@@ -445,6 +445,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="兼容旧脚本：同时设置 ESMFold2 Stage A / Stage B 的 soft gradient update 步数")
     parser.add_argument("--esmfold2_stagea_soft_steps", type=int, default=None,
                        help="ESMFold2 Stage A 每个 MCTS 节点的 soft gradient update 步数（默认：30）")
+    parser.add_argument(
+        "--esmfold2_stagea_tree_children",
+        type=int,
+        default=2,
+        help=(
+            "ESMFold2 Stage A 每轮 full verify 后进入 MCTS tree 的 child 数；"
+            "默认 2（argmax soft trajectory + 其余候选中 verifier 最优者）"
+        ),
+    )
     parser.add_argument("--esmfold2_stageb_soft_steps", type=int, default=None,
                        help="ESMFold2 Stage B 每个 MCTS 节点的 soft gradient update 步数（默认：20）")
     parser.add_argument(
@@ -785,6 +794,11 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
+        if args.esmfold2_stagea_tree_children <= 0:
+            message = "--esmfold2_stagea_tree_children must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
         if args.esmfold2_best_of_n <= 0:
             message = "--esmfold2_best_of_n must be positive"
             if parser is not None:
@@ -1107,6 +1121,7 @@ def main():
                 artifact_dir=esmfold2_artifact_dir,
                 esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
                 esmfold2_stagea_soft_steps=args.esmfold2_stagea_soft_steps,
+                esmfold2_stagea_tree_children=args.esmfold2_stagea_tree_children,
                 esmfold2_stageb_soft_steps=args.esmfold2_stageb_soft_steps,
                 esmfold2_stageb_discrete_rerank=args.esmfold2_stageb_discrete_rerank,
                 esmfold2_stageb_rerank_pool_size=args.esmfold2_stageb_rerank_pool_size,
@@ -1224,6 +1239,10 @@ def main():
             f.write(f"ESMFold2 Experimental Model: {args.esmfold2_experimental_model}\n")
             f.write(f"ESMFold2 Soft Steps Legacy Override: {args.esmfold2_soft_steps}\n")
             f.write(f"ESMFold2 Stage A Soft Steps: {args.esmfold2_stagea_soft_steps}\n")
+            f.write(
+                "ESMFold2 Stage A Tree Children: "
+                f"{args.esmfold2_stagea_tree_children}\n"
+            )
             f.write(f"ESMFold2 Stage B Soft Steps: {args.esmfold2_stageb_soft_steps}\n")
             f.write(f"ESMFold2 Best-of-N: {args.esmfold2_best_of_n}\n")
             f.write(

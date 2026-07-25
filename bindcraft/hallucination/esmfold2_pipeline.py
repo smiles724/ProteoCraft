@@ -625,6 +625,44 @@ def _anchor_proposal_logits(
     )
 
 
+def _select_stagea_tree_results(
+    round_results: Sequence[Any],
+    *,
+    argmax_sequence: Optional[str],
+    max_children: int,
+) -> List[Any]:
+    """Select a narrow Stage-A tree frontier from fully verified candidates.
+
+    The direct argmax sequence represents the proposal model's continuous
+    soft-logit trajectory, so it receives the first tree slot when available.
+    Remaining slots use verifier loss. All candidates can still be recorded and
+    considered for the run-level best result without widening the MCTS tree.
+    """
+
+    limit = max(int(max_children), 1)
+    selected: List[Any] = []
+    selected_sequences = set()
+
+    if argmax_sequence:
+        for result in round_results:
+            sequence = str(result.binder_seq)
+            if sequence == str(argmax_sequence):
+                selected.append(result)
+                selected_sequences.add(sequence)
+                break
+
+    for result in sorted(round_results, key=lambda item: float(item.total_loss)):
+        sequence = str(result.binder_seq)
+        if sequence in selected_sequences:
+            continue
+        selected.append(result)
+        selected_sequences.add(sequence)
+        if len(selected) >= limit:
+            break
+
+    return selected[:limit]
+
+
 def _normalize_proposal_batch(raw: Any) -> ESMFold2ProposalBatch:
     if isinstance(raw, ESMFold2ProposalBatch):
         return raw
@@ -2546,6 +2584,7 @@ def run_esmfold2_mcts_hallucination(
     artifact_dir: Optional[Union[str, os.PathLike[str]]] = None,
     esmfold2_logit_init_mode: str = "legacy_anchor",
     esmfold2_stagea_soft_steps: Optional[int] = None,
+    esmfold2_stagea_tree_children: int = 2,
     esmfold2_stageb_soft_steps: Optional[int] = None,
     esmfold2_stageb_discrete_rerank: bool = True,
     esmfold2_stageb_rerank_pool_size: int = 20,
@@ -2665,6 +2704,7 @@ def run_esmfold2_mcts_hallucination(
     )
     if stagea_soft_steps is not None and stagea_soft_steps <= 0:
         raise ValueError("esmfold2_stagea_soft_steps must be positive")
+    stagea_tree_children = max(int(esmfold2_stagea_tree_children), 1)
     if stageb_soft_steps is not None and stageb_soft_steps <= 0:
         raise ValueError("esmfold2_stageb_soft_steps must be positive")
     stageb_rerank_pool_size = max(int(esmfold2_stageb_rerank_pool_size), 1)
@@ -2981,12 +3021,18 @@ def run_esmfold2_mcts_hallucination(
                 "mcts_bootstrap_max_steps": mcts_bootstrap_max_steps,
                 "esmfold2_logit_init_mode": logit_init_mode,
                 "esmfold2_stagea_soft_steps": stagea_soft_steps,
+                "esmfold2_stagea_tree_children": stagea_tree_children,
             },
             verifier_contract=_stagea_handoff_verifier_contract(backend_config),
         )
         return latest_handoff_checkpoint
 
-    def _remember_global_best(result: Any, logits: Optional[torch.Tensor] = None) -> None:
+    def _remember_global_best(
+        result: Any,
+        logits: Optional[torch.Tensor] = None,
+        *,
+        anchor_logits: bool = True,
+    ) -> None:
         nonlocal best_result, best_seq, best_loss, best_logits
         seq = str(result.binder_seq)
         source_logits = logits
@@ -2995,11 +3041,14 @@ def run_esmfold2_mcts_hallucination(
         best_result = result
         best_seq = seq
         best_loss = float(result.total_loss)
-        best_logits = _anchor_proposal_logits(
-            source_logits,
-            seq,
-            mutable_mask,
-        ).detach().cpu().clone()
+        if source_logits is not None and not anchor_logits:
+            best_logits = source_logits.detach().cpu().clone()
+        else:
+            best_logits = _anchor_proposal_logits(
+                source_logits,
+                seq,
+                mutable_mask,
+            ).detach().cpu().clone()
         proposal_logits_by_sequence[seq] = best_logits
 
     artifact_recorder.write_step(
@@ -3309,6 +3358,13 @@ def run_esmfold2_mcts_hallucination(
         if proposal_batch.logits_after is not None:
             selected_node.logits = proposal_batch.logits_after.detach().cpu().clone()
             proposal_logits_by_sequence[current_seq] = selected_node.logits
+            argmax_sequence = sequence_from_logits_argmax(
+                proposal_batch.logits_after,
+                current_seq=current_seq,
+                mutable_mask=mutable_mask,
+            )
+        else:
+            argmax_sequence = None
         candidates = _proposal_sequences_from_batch(proposal_batch, include_confidence=False)
         candidates = [
             _clip_sequence_by_mutable_mask(str(seq), mutable_mask, current_seq)
@@ -3345,16 +3401,31 @@ def run_esmfold2_mcts_hallucination(
                 result=result,
             )
 
-        new_nodes = tree.expand(selected_node, round_results)
+        tree_results = _select_stagea_tree_results(
+            round_results,
+            argmax_sequence=argmax_sequence,
+            max_children=stagea_tree_children,
+        )
+        new_nodes = tree.expand(selected_node, tree_results)
         for node in new_nodes:
-            node.logits = _anchor_proposal_logits(
-                proposal_batch.logits_after,
-                node.sequence,
-                mutable_mask,
-            )
+            if (
+                proposal_batch.logits_after is not None
+                and argmax_sequence is not None
+                and str(node.sequence) == str(argmax_sequence)
+            ):
+                node.logits = proposal_batch.logits_after.detach().cpu().clone()
+            else:
+                node.logits = _anchor_proposal_logits(
+                    proposal_batch.logits_after,
+                    node.sequence,
+                    mutable_mask,
+                )
             proposal_logits_by_sequence[str(node.sequence)] = node.logits
             stagea_node_by_sequence[str(node.sequence)] = node
-        tree.backpropagate(selected_node, [result.total_loss for result in round_results])
+        tree.backpropagate(
+            selected_node,
+            [result.total_loss for result in tree_results],
+        )
         for node in new_nodes:
             artifact_recorder.write_mcts_node(
                 **_mcts_node_artifact(
@@ -3376,7 +3447,14 @@ def run_esmfold2_mcts_hallucination(
 
         round_best = min(round_results, key=lambda result: result.total_loss)
         if float(round_best.total_loss) < best_loss:
-            _remember_global_best(round_best)
+            _remember_global_best(
+                round_best,
+                logits=proposal_batch.logits_after,
+                anchor_logits=(
+                    argmax_sequence is None
+                    or str(round_best.binder_seq) != str(argmax_sequence)
+                ),
+            )
         if best_loss < stagea_best - float(mcts_bootstrap_min_delta):
             stagea_best = best_loss
             stagea_stale = 0
@@ -3390,6 +3468,12 @@ def run_esmfold2_mcts_hallucination(
             selected_node_id=int(selected_node.node_id),
             selected_sequence=current_seq,
             candidate_count=len(round_results),
+            expanded_child_count=len(new_nodes),
+            argmax_sequence=argmax_sequence,
+            argmax_child_in_tree=any(
+                str(node.sequence) == str(argmax_sequence)
+                for node in new_nodes
+            ) if argmax_sequence is not None else False,
             round_best_loss=float(round_best.total_loss),
             global_best_loss=best_loss,
             best_sequence=best_seq,
@@ -3406,11 +3490,13 @@ def run_esmfold2_mcts_hallucination(
         )
 
         logger.info(
-            "ESM StageA step %3d/%d | selected=%s K=%d round_best=%.4f global_best=%.4f",
+            "ESM StageA step %3d/%d | selected=%s verified=%d expanded=%d "
+            "round_best=%.4f global_best=%.4f",
             step,
             N_steps,
             current_seq[:20],
             len(round_results),
+            len(new_nodes),
             round_best.total_loss,
             best_loss,
         )

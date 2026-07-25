@@ -27,6 +27,7 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert resolve_model_backend(args, parser) == "esmfold2"
     assert args.esmfold2_soft_steps is None
     assert args.esmfold2_stagea_soft_steps == 30
+    assert args.esmfold2_stagea_tree_children == 2
     assert args.esmfold2_stageb_soft_steps == 20
     assert args.mcts_expand_actions_per_step == 2
     assert args.mcts_handoff_top_k == 2
@@ -474,6 +475,7 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
         tmp_path / "initial_logits.pt"
     )
     assert captured["esmfold2_stagea_soft_steps"] == 30
+    assert captured["esmfold2_stagea_tree_children"] == 2
     assert captured["esmfold2_stageb_soft_steps"] == 20
     assert captured["esmfold2_stageb_discrete_rerank"] is True
     assert captured["esmfold2_stageb_rerank_pool_size"] == 20
