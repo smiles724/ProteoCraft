@@ -802,6 +802,9 @@ def propose_sequences_from_logit_delta(
     current_indices = [AA_TO_ESM_IDX[aa] for aa in current_seq]
     candidates: list[str] = []
     if include_logit_candidates:
+        # Stage A intentionally keeps this unrestricted argmax candidate: it may
+        # change every mutable position. ``max_mutations_per_seq`` only limits
+        # the sampled Top-K candidates below; it is not a global Stage-A cap.
         argmax_seq = sequence_from_logits_argmax(
             logits_after,
             current_seq=current_seq,
