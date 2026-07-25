@@ -930,6 +930,101 @@ def test_stagea_argmax_child_preserves_raw_logits_and_only_two_children_enter_tr
     assert logits_by_sequence["AAF"][2, AA_TO_ESM_IDX["F"]] >= 2.0
 
 
+def test_stagea_uses_one_run_level_verifier_seed_for_all_candidates():
+    backend = FakeESMFold2Backend()
+
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=1,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=2,
+        T_sample=1.0,
+        max_mutations_per_seq=1,
+        seed=7,
+        mcts_strategy="stage_a_only",
+        esmfold2_stagea_paired_verifier_seed=True,
+    )
+
+    assert len(backend.verify_calls) == 3
+    assert len({call[2] for call in backend.verify_calls}) == 1
+
+
+def test_raw_lineage_stagea_keeps_logits_continuous_and_defers_verifier():
+    class RawLineageBackend(FakeESMFold2Backend):
+        def continuous_design(self, **kwargs):
+            self.continuous_calls.append(dict(kwargs))
+            logits = kwargs["proposal_logits"].detach().clone()
+            chunk_index = kwargs["global_step"] // kwargs["soft_steps_override"]
+            next_sequence = "AAY" if chunk_index == 0 else "AYY"
+            for position, amino_acid in enumerate(next_sequence):
+                logits[position, :] = -1.0
+                logits[position, AA_TO_ESM_IDX[amino_acid]] = 1.0
+            confidence_candidates = (
+                [
+                    {
+                        "sequence": "AAF",
+                        "local_step": 1,
+                        "confidence_score": 0.7,
+                        "confidence_source": "pair_chain_iptm",
+                    }
+                ]
+                if kwargs["track_confidence_override"]
+                else []
+            )
+            return ESMFold2ProposalBatch(
+                sequences=[next_sequence],
+                logits_after=logits,
+                confidence_candidates=confidence_candidates,
+            )
+
+    backend = RawLineageBackend()
+    best_seq, final_seq, losses = run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=2,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=2,
+        T_sample=1.0,
+        max_mutations_per_seq=1,
+        seed=7,
+        mcts_strategy="raw_lineage_stage_a",
+        esmfold2_stagea_soft_steps=3,
+        esmfold2_raw_lineage_annealing_horizon=6,
+        esmfold2_stagea_paired_verifier_seed=True,
+        esmfold2_stagea_verifier_seed=12345,
+    )
+
+    assert [call["current_seq"] for call in backend.continuous_calls] == [
+        "AAA",
+        "AAY",
+    ]
+    assert [call["global_step"] for call in backend.continuous_calls] == [0, 3]
+    assert [call["temperature_step_offset"] for call in backend.continuous_calls] == [
+        0,
+        3,
+    ]
+    assert all(
+        call["temperature_total_steps"] == 6
+        for call in backend.continuous_calls
+    )
+    assert [call["track_confidence_override"] for call in backend.continuous_calls] == [
+        False,
+        True,
+    ]
+    assert all(call["seed"] == 7 for call in backend.continuous_calls)
+    assert [call[0] for call in backend.verify_calls] == ["AAA", "AAF", "AYY"]
+    assert {call[2] for call in backend.verify_calls} == {12345}
+    assert best_seq == final_seq == "AYY"
+    assert losses[-1] == pytest.approx(0.10)
+
+
 def test_esmfold2_continuous_stagea_designs_once_then_verifies_argmax_sequence():
     backend = FakeESMFold2Backend()
 

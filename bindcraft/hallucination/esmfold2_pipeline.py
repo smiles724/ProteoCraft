@@ -729,6 +729,8 @@ def _call_backend_propose(
     hotspot_weight_override: Optional[float] = None,
     track_confidence_override: Optional[bool] = None,
     soft_steps_override: Optional[int] = None,
+    temperature_step_offset: int = 0,
+    temperature_total_steps: Optional[int] = None,
     **kwargs: Any,
 ) -> ESMFold2ProposalBatch:
     propose_kwargs = dict(kwargs)
@@ -740,6 +742,16 @@ def _call_backend_propose(
         propose_kwargs["track_confidence_override"] = track_confidence_override
     if _callable_accepts_argument(backend.propose, "soft_steps_override"):
         propose_kwargs["soft_steps_override"] = soft_steps_override
+    if (
+        (int(temperature_step_offset) != 0 or temperature_total_steps is not None)
+        and _callable_accepts_argument(backend.propose, "temperature_step_offset")
+    ):
+        propose_kwargs["temperature_step_offset"] = int(temperature_step_offset)
+    if (
+        temperature_total_steps is not None
+        and _callable_accepts_argument(backend.propose, "temperature_total_steps")
+    ):
+        propose_kwargs["temperature_total_steps"] = temperature_total_steps
     if _callable_accepts_argument(backend.propose, "hotspot_params"):
         propose_kwargs["hotspot_params"] = (
             dict(hotspot_params) if hotspot_params is not None else None
@@ -762,6 +774,8 @@ def _call_backend_continuous_design(
     hotspot_weight_override: Optional[float] = None,
     track_confidence_override: Optional[bool] = None,
     soft_steps_override: Optional[int] = None,
+    temperature_step_offset: int = 0,
+    temperature_total_steps: Optional[int] = None,
     **kwargs: Any,
 ) -> ESMFold2ProposalBatch:
     if not hasattr(backend, "continuous_design"):
@@ -775,6 +789,20 @@ def _call_backend_continuous_design(
         design_kwargs["track_confidence_override"] = track_confidence_override
     if _callable_accepts_argument(backend.continuous_design, "soft_steps_override"):
         design_kwargs["soft_steps_override"] = soft_steps_override
+    if (
+        (int(temperature_step_offset) != 0 or temperature_total_steps is not None)
+        and _callable_accepts_argument(
+            backend.continuous_design, "temperature_step_offset"
+        )
+    ):
+        design_kwargs["temperature_step_offset"] = int(temperature_step_offset)
+    if (
+        temperature_total_steps is not None
+        and _callable_accepts_argument(
+            backend.continuous_design, "temperature_total_steps"
+        )
+    ):
+        design_kwargs["temperature_total_steps"] = temperature_total_steps
     if _callable_accepts_argument(backend.continuous_design, "hotspot_params"):
         design_kwargs["hotspot_params"] = (
             dict(hotspot_params) if hotspot_params is not None else None
@@ -2631,6 +2659,9 @@ def run_esmfold2_mcts_hallucination(
     esmfold2_logit_init_mode: str = "legacy_anchor",
     esmfold2_stagea_soft_steps: Optional[int] = None,
     esmfold2_stagea_tree_children: int = 2,
+    esmfold2_stagea_paired_verifier_seed: bool = True,
+    esmfold2_stagea_verifier_seed: Optional[int] = None,
+    esmfold2_raw_lineage_annealing_horizon: int = 150,
     esmfold2_stageb_soft_steps: Optional[int] = None,
     esmfold2_stageb_discrete_rerank: bool = True,
     esmfold2_stageb_rerank_pool_size: int = 20,
@@ -2684,12 +2715,27 @@ def run_esmfold2_mcts_hallucination(
         strategy = "two_stage"
     if strategy == "legacy":
         strategy = "stage_a_only"
-    if strategy not in {"stage_a_only", "two_stage", "continuous_stage_a"}:
+    if strategy not in {
+        "stage_a_only",
+        "two_stage",
+        "continuous_stage_a",
+        "raw_lineage_stage_a",
+    }:
         raise ValueError(
             "ESMFold2 backend supports mcts_strategy stage_a_only, "
-            "two_stage, or continuous_stage_a"
+            "two_stage, continuous_stage_a, or raw_lineage_stage_a"
         )
     target_key = _normalize_target_key(target_seq)
+    stagea_paired_verifier_seed = bool(esmfold2_stagea_paired_verifier_seed)
+    stagea_shared_verify_seed = (
+        (
+            int(esmfold2_stagea_verifier_seed)
+            if esmfold2_stagea_verifier_seed is not None
+            else _stable_seed(seed, "esm_stagea_paired_verify", target_key)
+        )
+        if stagea_paired_verifier_seed
+        else None
+    )
     stageb_shared_verify_seed = (
         _stable_seed(seed, "esm_stageb_paired_verify", target_key)
         if bool(esmfold2_stageb_paired_verifier_seed)
@@ -2772,6 +2818,11 @@ def run_esmfold2_mcts_hallucination(
     if stagea_soft_steps is not None and stagea_soft_steps <= 0:
         raise ValueError("esmfold2_stagea_soft_steps must be positive")
     stagea_tree_children = max(int(esmfold2_stagea_tree_children), 1)
+    raw_lineage_annealing_horizon = int(
+        esmfold2_raw_lineage_annealing_horizon
+    )
+    if raw_lineage_annealing_horizon <= 0:
+        raise ValueError("esmfold2_raw_lineage_annealing_horizon must be positive")
     if stageb_soft_steps is not None and stageb_soft_steps <= 0:
         raise ValueError("esmfold2_stageb_soft_steps must be positive")
     stageb_rerank_pool_size = max(int(esmfold2_stageb_rerank_pool_size), 1)
@@ -2889,6 +2940,21 @@ def run_esmfold2_mcts_hallucination(
         str(stagea_soft_steps or "backend_default"),
         str(stageb_soft_steps or "backend_default"),
     )
+    logger.info(
+        "ESMFold2 StageA verifier seed: %s",
+        str(
+            stagea_shared_verify_seed
+            if stagea_paired_verifier_seed
+            else "sequence_specific"
+        ),
+    )
+    if strategy == "raw_lineage_stage_a":
+        logger.info(
+            "ESMFold2 raw-lineage diagnostic: chunks=%d annealing_horizon=%d "
+            "parent_anchor=false",
+            N_steps,
+            raw_lineage_annealing_horizon,
+        )
     if resume_state is not None:
         logger.info(
             "Resuming StageB from StageA handoff checkpoint: %s "
@@ -2980,7 +3046,11 @@ def run_esmfold2_mcts_hallucination(
         phase0_verify_seed = (
             stageb_shared_verify_seed
             if resume_state is not None and stageb_paired_verifier_seed
-            else _stable_seed(seed, "esm_phase0", target_key, binder_seq)
+            else (
+                stagea_shared_verify_seed
+                if stagea_paired_verifier_seed
+                else _stable_seed(seed, "esm_phase0", target_key, binder_seq)
+            )
         )
         result = _verify_with_cache(
             backend,
@@ -3093,6 +3163,10 @@ def run_esmfold2_mcts_hallucination(
                 "esmfold2_logit_init_mode": logit_init_mode,
                 "esmfold2_stagea_soft_steps": stagea_soft_steps,
                 "esmfold2_stagea_tree_children": stagea_tree_children,
+                "esmfold2_stagea_paired_verifier_seed": (
+                    stagea_paired_verifier_seed
+                ),
+                "esmfold2_stagea_verifier_seed": stagea_shared_verify_seed,
                 "hotspot_weight": hotspot_weight,
                 "hotspot_satisfied_proposal_weight": (
                     hotspot_satisfied_proposal_weight
@@ -3403,6 +3477,166 @@ def run_esmfold2_mcts_hallucination(
         )
         return best_seq, str(round_best.binder_seq), losses_history
 
+    if strategy == "raw_lineage_stage_a":
+        if stagea_soft_steps is None:
+            raise ValueError(
+                "raw_lineage_stage_a requires esmfold2_stagea_soft_steps"
+            )
+        selected_node = stagea_node_by_sequence.get(best_seq) or tree.select()
+        raw_sequence = str(selected_node.sequence)
+        raw_logits = selected_node.logits.detach().cpu().clone()
+        final_batch: Optional[ESMFold2ProposalBatch] = None
+
+        for chunk_index in range(N_steps):
+            soft_step_offset = chunk_index * int(stagea_soft_steps)
+            is_final_chunk = chunk_index == N_steps - 1
+            proposal_hotspot_weight = _hotspot_proposal_weight_for_verified_state(
+                verifier_cache.get(raw_sequence),
+                configured_weight=hotspot_weight,
+                satisfied_weight=hotspot_satisfied_proposal_weight,
+            )
+            final_batch = _call_backend_continuous_design(
+                backend,
+                current_seq=raw_sequence,
+                target_seq=target_seq,
+                global_step=soft_step_offset,
+                seed=seed,
+                mutable_mask=mutable_mask,
+                proposal_logits=raw_logits,
+                hotspot_params=hotspot_params,
+                hotspot_weight_override=proposal_hotspot_weight,
+                track_confidence_override=is_final_chunk,
+                soft_steps_override=stagea_soft_steps,
+                temperature_step_offset=soft_step_offset,
+                temperature_total_steps=raw_lineage_annealing_horizon,
+            )
+            _write_soft_step_artifacts(
+                artifact_recorder,
+                stage="raw_lineage_stage_a",
+                step=chunk_index,
+                selected_sequence=raw_sequence,
+                batch=final_batch,
+            )
+            if final_batch.logits_after is None:
+                raise ValueError(
+                    "raw_lineage_stage_a requires backend logits_after"
+                )
+            raw_logits = final_batch.logits_after.detach().cpu().clone()
+            raw_sequence = sequence_from_logits_argmax(
+                raw_logits,
+                current_seq=raw_sequence,
+                mutable_mask=mutable_mask,
+            )
+            losses_history.append(best_loss)
+            artifact_recorder.write_step(
+                stage="raw_lineage_stage_a",
+                step=chunk_index,
+                selected_sequence=str(selected_node.sequence),
+                raw_sequence=raw_sequence,
+                soft_step_offset=soft_step_offset,
+                soft_step_end=soft_step_offset + int(stagea_soft_steps),
+                verifier_deferred=not is_final_chunk,
+                global_best_loss=best_loss,
+                best_sequence=best_seq,
+                proposal_hotspot_weight=proposal_hotspot_weight,
+                **_proposal_confidence_summary(final_batch),
+            )
+
+        if final_batch is None:
+            raise ValueError("raw_lineage_stage_a requires at least one chunk")
+
+        final_candidates = [
+            _clip_sequence_by_mutable_mask(
+                str(candidate),
+                mutable_mask,
+                raw_sequence,
+            )
+            for candidate in _proposal_sequences_from_batch(
+                final_batch,
+                include_confidence=True,
+            )
+        ]
+        final_candidates = list(
+            dict.fromkeys(candidate for candidate in final_candidates if candidate)
+        )
+        if raw_sequence not in final_candidates:
+            final_candidates.append(raw_sequence)
+
+        final_results = []
+        for candidate in final_candidates:
+            result = _verify_with_cache(
+                backend,
+                verifier_cache,
+                binder_seq=candidate,
+                target_seq=target_seq,
+                seed=(
+                    stagea_shared_verify_seed
+                    if stagea_paired_verifier_seed
+                    else _stable_seed(
+                        seed,
+                        "esm_verify",
+                        target_key,
+                        candidate,
+                    )
+                ),
+                hotspot_params=hotspot_params,
+            )
+            final_results.append(result)
+            _write_candidate_artifact(
+                artifact_recorder,
+                stage="raw_lineage_stage_a",
+                step=N_steps - 1,
+                parent_sequence=str(selected_node.sequence),
+                result=result,
+            )
+
+        round_best = min(final_results, key=lambda result: float(result.total_loss))
+        if float(round_best.total_loss) < best_loss:
+            _remember_global_best(
+                round_best,
+                raw_logits,
+                anchor_logits=(str(round_best.binder_seq) != raw_sequence),
+            )
+        losses_history[-1] = best_loss
+        artifact_recorder.write_checkpoint(
+            stage="raw_lineage_stage_a",
+            step=N_steps - 1,
+            label="round_best",
+            result=round_best,
+            selected_sequence=str(selected_node.sequence),
+            parent_sequence=str(selected_node.sequence),
+            is_global_best=(str(round_best.binder_seq) == best_seq),
+        )
+        artifact_recorder.write_summary(
+            best_sequence=best_seq,
+            final_sequence=str(round_best.binder_seq),
+            best_loss=best_loss,
+            n_steps=len(losses_history),
+            strategy=strategy,
+            artifact_dir=str(artifact_dir) if artifact_dir is not None else None,
+            raw_lineage_chunks=N_steps,
+            raw_lineage_soft_steps_per_chunk=stagea_soft_steps,
+            raw_lineage_annealing_horizon=raw_lineage_annealing_horizon,
+            raw_lineage_final_candidate_count=len(final_results),
+            stagea_paired_verifier_seed=stagea_paired_verifier_seed,
+            initial_logits_checkpoint_source=(
+                str(Path(esmfold2_initial_logits_checkpoint).expanduser())
+                if esmfold2_initial_logits_checkpoint is not None
+                else None
+            ),
+            initial_logits_checkpoint_paths=initial_logits_checkpoint_paths,
+            **hotspot_summary,
+        )
+        logger.info(
+            "ESM raw-lineage StageA | chunks=%d final_candidates=%d "
+            "round_best=%.4f global_best=%.4f",
+            N_steps,
+            len(final_results),
+            float(round_best.total_loss),
+            best_loss,
+        )
+        return best_seq, str(round_best.binder_seq), losses_history
+
     if resume_state is not None:
         stagea_steps = 0
     elif strategy == "stage_a_only":
@@ -3453,8 +3687,6 @@ def run_esmfold2_mcts_hallucination(
             batch=proposal_batch,
         )
         if proposal_batch.logits_after is not None:
-            selected_node.logits = proposal_batch.logits_after.detach().cpu().clone()
-            proposal_logits_by_sequence[current_seq] = selected_node.logits
             argmax_sequence = sequence_from_logits_argmax(
                 proposal_batch.logits_after,
                 current_seq=current_seq,
@@ -3486,7 +3718,11 @@ def run_esmfold2_mcts_hallucination(
                 verifier_cache,
                 binder_seq=cand_seq,
                 target_seq=target_seq,
-                seed=_stable_seed(seed, "esm_verify", target_key, cand_seq),
+                seed=(
+                    stagea_shared_verify_seed
+                    if stagea_paired_verifier_seed
+                    else _stable_seed(seed, "esm_verify", target_key, cand_seq)
+                ),
                 hotspot_params=hotspot_params,
             )
             round_results.append(result)

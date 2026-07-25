@@ -28,6 +28,11 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_soft_steps is None
     assert args.esmfold2_stagea_soft_steps == 30
     assert args.esmfold2_stagea_tree_children == 2
+    assert args.esmfold2_stagea_paired_verifier_seed is True
+    assert args.esmfold2_stagea_verifier_seed is None
+    assert args.esmfold2_temperature_min == pytest.approx(0.01)
+    assert args.esmfold2_temperature_max == pytest.approx(1.0)
+    assert args.esmfold2_raw_lineage_annealing_horizon == 150
     assert args.esmfold2_stageb_soft_steps == 20
     assert args.mcts_expand_actions_per_step == 2
     assert args.mcts_handoff_top_k == 2
@@ -201,6 +206,24 @@ def test_esmfold2_best_of_n_resolves_strategy_specific_defaults():
     assert args.esmfold2_stagea_soft_steps == 150
     assert args.esmfold2_stageb_soft_steps == 20
     assert args.esmfold2_track_proposal_confidence is True
+    assert args.esmfold2_proposal_confidence_tail_steps == 20
+
+
+def test_esmfold2_raw_lineage_resolves_tail_confidence_defaults():
+    args, parser = _parse(
+        [
+            "--model_backend",
+            "esmfold2",
+            "--mode",
+            "mcts",
+            "--mcts_strategy",
+            "raw_lineage_stage_a",
+        ]
+    )
+
+    assert resolve_model_backend(args, parser) == "esmfold2"
+    assert args.esmfold2_stagea_soft_steps == 30
+    assert args.esmfold2_track_proposal_confidence is False
     assert args.esmfold2_proposal_confidence_tail_steps == 20
 
 

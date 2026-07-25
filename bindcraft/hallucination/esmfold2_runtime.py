@@ -844,6 +844,8 @@ class ESMFold2RuntimeBackend:
         hotspot_weight_override: Optional[float] = None,
         track_confidence_override: Optional[bool] = None,
         soft_steps_override: Optional[int] = None,
+        temperature_step_offset: int = 0,
+        temperature_total_steps: Optional[int] = None,
     ) -> ESMFold2ProposalBatch:
         logits_before, logits_after, confidence_candidates, soft_step_metrics = self._run_soft_update_with_tracking(
             current_seq=current_seq,
@@ -857,6 +859,8 @@ class ESMFold2RuntimeBackend:
             hotspot_weight_override=hotspot_weight_override,
             track_confidence_override=track_confidence_override,
             soft_steps_override=soft_steps_override,
+            temperature_step_offset=temperature_step_offset,
+            temperature_total_steps=temperature_total_steps,
         )
         confidence_sequences = self._top_confidence_sequences(confidence_candidates)
         with _seed_context(seed):
@@ -893,6 +897,8 @@ class ESMFold2RuntimeBackend:
         hotspot_weight_override: Optional[float] = None,
         track_confidence_override: Optional[bool] = None,
         soft_steps_override: Optional[int] = None,
+        temperature_step_offset: int = 0,
+        temperature_total_steps: Optional[int] = None,
     ) -> ESMFold2ProposalBatch:
         """Run one continuous ESMFold2 soft-logit trajectory and discretize it.
 
@@ -912,6 +918,8 @@ class ESMFold2RuntimeBackend:
             hotspot_weight_override=hotspot_weight_override,
             track_confidence_override=track_confidence_override,
             soft_steps_override=soft_steps_override,
+            temperature_step_offset=temperature_step_offset,
+            temperature_total_steps=temperature_total_steps,
         )
         sequence = sequence_from_logits_argmax(
             logits_after,
@@ -1161,6 +1169,8 @@ class ESMFold2RuntimeBackend:
         hotspot_weight_override: Optional[float] = None,
         track_confidence_override: Optional[bool] = None,
         soft_steps_override: Optional[int] = None,
+        temperature_step_offset: int = 0,
+        temperature_total_steps: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]], List[Dict[str, Any]]]:
         track_confidence = bool(getattr(self.config, "track_proposal_confidence", False))
         if track_confidence_override is not None:
@@ -1177,6 +1187,8 @@ class ESMFold2RuntimeBackend:
             hotspot_weight_override=hotspot_weight_override,
             track_confidence=track_confidence,
             soft_steps_override=soft_steps_override,
+            temperature_step_offset=temperature_step_offset,
+            temperature_total_steps=temperature_total_steps,
         )
 
     def _run_soft_update_impl(
@@ -1193,6 +1205,8 @@ class ESMFold2RuntimeBackend:
         hotspot_weight_override: Optional[float],
         track_confidence: bool,
         soft_steps_override: Optional[int] = None,
+        temperature_step_offset: int = 0,
+        temperature_total_steps: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]], List[Dict[str, Any]]]:
         if self.soft_update_fn is not None:
             kwargs = dict(
@@ -1207,6 +1221,14 @@ class ESMFold2RuntimeBackend:
                 kwargs["proposal_logits"] = proposal_logits
             if _callable_accepts_argument(self.soft_update_fn, "soft_steps_override"):
                 kwargs["soft_steps_override"] = soft_steps_override
+            if _callable_accepts_argument(
+                self.soft_update_fn, "temperature_step_offset"
+            ):
+                kwargs["temperature_step_offset"] = temperature_step_offset
+            if _callable_accepts_argument(
+                self.soft_update_fn, "temperature_total_steps"
+            ):
+                kwargs["temperature_total_steps"] = temperature_total_steps
             if _callable_accepts_argument(self.soft_update_fn, "hotspot_params"):
                 kwargs["hotspot_params"] = hotspot_params
             if _callable_accepts_argument(
@@ -1277,12 +1299,23 @@ class ESMFold2RuntimeBackend:
         )
         if soft_steps <= 0:
             raise ValueError("ESMFold2 soft steps must be positive")
+        temperature_step_offset = int(temperature_step_offset)
+        if temperature_step_offset < 0:
+            raise ValueError("temperature_step_offset must be non-negative")
+        resolved_temperature_total_steps = (
+            int(temperature_total_steps)
+            if temperature_total_steps is not None
+            else soft_steps
+        )
+        if resolved_temperature_total_steps <= 0:
+            raise ValueError("temperature_total_steps must be positive")
 
         for local_step in range(soft_steps):
             optimizer.zero_grad()
+            temperature_step = temperature_step_offset + local_step
             temperature = esm_temperature(
-                local_step,
-                total_steps=soft_steps,
+                temperature_step,
+                total_steps=resolved_temperature_total_steps,
                 temperature_min=float(self.config.temperature_min),
                 temperature_max=float(self.config.temperature_max),
             )
@@ -1378,6 +1411,8 @@ class ESMFold2RuntimeBackend:
             metrics = {
                 "global_step": int(global_step),
                 "local_step": int(local_step),
+                "temperature_step": int(temperature_step),
+                "temperature_total_steps": int(resolved_temperature_total_steps),
                 "temperature": float(temperature),
                 "argmax_sequence": argmax_sequence,
                 "proposal_loss_source": _stageb_structure_loss(

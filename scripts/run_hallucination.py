@@ -382,6 +382,8 @@ def load_esmfold2_backend(
         verifier_num_loops=args.esmfold2_verifier_num_loops,
         verifier_num_sampling_steps=args.esmfold2_verifier_num_sampling_steps,
         soft_steps=stagea_soft_steps,
+        temperature_min=args.esmfold2_temperature_min,
+        temperature_max=args.esmfold2_temperature_max,
         lambda_esmc=args.esmfold2_lambda_esmc,
         num_loops=args.esmfold2_proposal_num_loops,
         num_sampling_steps=args.esmfold2_proposal_num_sampling_steps,
@@ -457,6 +459,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--esmfold2_stagea_soft_steps", type=int, default=None,
                        help="ESMFold2 Stage A 每个 MCTS 节点的 soft gradient update 步数（默认：30）")
     parser.add_argument(
+        "--esmfold2_temperature_min",
+        type=float,
+        default=0.01,
+        help="ESMFold2 soft optimization 最低温度（默认：0.01）",
+    )
+    parser.add_argument(
+        "--esmfold2_temperature_max",
+        type=float,
+        default=1.0,
+        help="ESMFold2 soft optimization 最高温度（默认：1.0；与最低温度相等时使用固定温度）",
+    )
+    parser.add_argument(
         "--esmfold2_stagea_tree_children",
         type=int,
         default=2,
@@ -467,6 +481,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--esmfold2_stageb_soft_steps", type=int, default=None,
                        help="ESMFold2 Stage B 每个 MCTS 节点的 soft gradient update 步数（默认：20）")
+    parser.add_argument(
+        "--esmfold2_stagea_paired_verifier_seed",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help="Stage A 是否让所有 sequence 使用同一个 run-level verifier seed（默认：true）",
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_verifier_seed",
+        type=int,
+        default=None,
+        help="可选的 Stage A 固定 verifier seed；未设置时由 run seed 和 target 推导",
+    )
+    parser.add_argument(
+        "--esmfold2_raw_lineage_annealing_horizon",
+        type=int,
+        default=150,
+        help="raw_lineage_stage_a 连续退火总 soft-step 数（默认：150）",
+    )
     parser.add_argument(
         "--esmfold2_best_of_n",
         type=int,
@@ -733,7 +765,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcts_tau_fixed", type=float, default=4.0, help="MCTS 固定扩散 tau（默认：4.0）")
     parser.add_argument("--mcts_num_beams", type=int, default=8, help="MCTS Phase0 根节点数 / beam（默认：8）")
     parser.add_argument("--mcts_strategy", type=str, default="two_stage",
-                       choices=["legacy", "stage_a_only", "strict", "two_stage", "continuous_stage_a", "best_of_n"],
+                       choices=["legacy", "stage_a_only", "strict", "two_stage", "continuous_stage_a", "raw_lineage_stage_a", "best_of_n"],
                        help="搜索策略：best_of_n 运行独立连续轨迹且不使用 MCTS；其余为 StageA/两阶段 MCTS 模式（默认：two_stage）")
     parser.add_argument("--mcts_bootstrap_steps", type=int, default=50,
                        help="two_stage: StageA 原版 MCTS 至少运行步数（默认：50）")
@@ -834,6 +866,21 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
+        if args.esmfold2_temperature_min <= 0.0:
+            message = "--esmfold2_temperature_min must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_temperature_max < args.esmfold2_temperature_min:
+            message = "--esmfold2_temperature_max must be >= --esmfold2_temperature_min"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_raw_lineage_annealing_horizon <= 0:
+            message = "--esmfold2_raw_lineage_annealing_horizon must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
         if args.esmfold2_best_of_n <= 0:
             message = "--esmfold2_best_of_n must be positive"
             if parser is not None:
@@ -845,7 +892,9 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             )
         if args.esmfold2_proposal_confidence_tail_steps is None:
             args.esmfold2_proposal_confidence_tail_steps = (
-                20 if args.mcts_strategy == "best_of_n" else 0
+                20
+                if args.mcts_strategy in {"best_of_n", "raw_lineage_stage_a"}
+                else 0
             )
         if args.esmfold2_proposal_confidence_tail_steps < 0:
             message = "--esmfold2_proposal_confidence_tail_steps must be non-negative"
@@ -1199,6 +1248,9 @@ def main():
                 esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
                 esmfold2_stagea_soft_steps=args.esmfold2_stagea_soft_steps,
                 esmfold2_stagea_tree_children=args.esmfold2_stagea_tree_children,
+                esmfold2_stagea_paired_verifier_seed=args.esmfold2_stagea_paired_verifier_seed,
+                esmfold2_stagea_verifier_seed=args.esmfold2_stagea_verifier_seed,
+                esmfold2_raw_lineage_annealing_horizon=args.esmfold2_raw_lineage_annealing_horizon,
                 esmfold2_stageb_soft_steps=args.esmfold2_stageb_soft_steps,
                 esmfold2_stageb_discrete_rerank=args.esmfold2_stageb_discrete_rerank,
                 esmfold2_stageb_rerank_pool_size=args.esmfold2_stageb_rerank_pool_size,
@@ -1316,9 +1368,23 @@ def main():
             f.write(f"ESMFold2 Experimental Model: {args.esmfold2_experimental_model}\n")
             f.write(f"ESMFold2 Soft Steps Legacy Override: {args.esmfold2_soft_steps}\n")
             f.write(f"ESMFold2 Stage A Soft Steps: {args.esmfold2_stagea_soft_steps}\n")
+            f.write(f"ESMFold2 Temperature Min: {args.esmfold2_temperature_min}\n")
+            f.write(f"ESMFold2 Temperature Max: {args.esmfold2_temperature_max}\n")
             f.write(
                 "ESMFold2 Stage A Tree Children: "
                 f"{args.esmfold2_stagea_tree_children}\n"
+            )
+            f.write(
+                "ESMFold2 Stage A Paired Verifier Seed: "
+                f"{args.esmfold2_stagea_paired_verifier_seed}\n"
+            )
+            f.write(
+                "ESMFold2 Stage A Verifier Seed: "
+                f"{args.esmfold2_stagea_verifier_seed or 'AUTO'}\n"
+            )
+            f.write(
+                "ESMFold2 Raw Lineage Annealing Horizon: "
+                f"{args.esmfold2_raw_lineage_annealing_horizon}\n"
             )
             f.write(f"ESMFold2 Stage B Soft Steps: {args.esmfold2_stageb_soft_steps}\n")
             f.write(f"ESMFold2 Best-of-N: {args.esmfold2_best_of_n}\n")
