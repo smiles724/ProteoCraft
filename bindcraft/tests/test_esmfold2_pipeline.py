@@ -12,7 +12,10 @@ from bindcraft.hallucination.esmfold2_backend import (
     build_esm_verifier_result,
 )
 from bindcraft.hallucination.mcts_legacy import LegacyMCTSTree
-from bindcraft.hallucination.esmfold2_pipeline import run_esmfold2_mcts_hallucination
+from bindcraft.hallucination.esmfold2_pipeline import (
+    run_esmfold2_best_of_n,
+    run_esmfold2_mcts_hallucination,
+)
 from bindcraft.hallucination.esmfold2_pipeline import (
     _ESMFold2StageBMCTSTree,
     _allocate_group_budgets,
@@ -814,6 +817,83 @@ def test_esmfold2_continuous_stagea_designs_once_then_verifies_argmax_sequence()
     assert [call["current_seq"] for call in backend.continuous_calls] == ["AAA"]
     assert backend.propose_calls == []
     assert backend.preview_calls == []
+
+
+def test_esmfold2_best_of_n_runs_independent_continuous_trajectories(tmp_path):
+    backend = FakeESMFold2Backend()
+
+    best_seq, final_seq, losses = run_esmfold2_best_of_n(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        best_of_n=3,
+        init_binder_seq="AAA",
+        mutable_mask=[True, True, True],
+        seed=7,
+        artifact_dir=tmp_path,
+        esmfold2_logit_init_mode="official_exact",
+        esmfold2_soft_steps=11,
+        pass_loss_threshold=0.2,
+    )
+
+    assert best_seq == "AYY"
+    assert final_seq == "AYY"
+    assert losses == [pytest.approx(0.10)] * 3
+    assert len(backend.continuous_calls) == 3
+    assert len({call["seed"] for call in backend.continuous_calls}) == 3
+    assert all(call["track_confidence_override"] is True for call in backend.continuous_calls)
+    assert all(call["soft_steps_override"] == 11 for call in backend.continuous_calls)
+    assert backend.propose_calls == []
+    assert backend.preview_calls == []
+
+    summary = json.loads((tmp_path / "run_summary.json").read_text())
+    assert summary["strategy"] == "best_of_n"
+    assert summary["best_of_n"] == 3
+    assert summary["soft_steps_per_trajectory"] == 11
+    assert summary["passing_trajectory_count"] == 3
+    assert summary["pass_at_n"] is True
+    assert len(summary["trajectory_summaries"]) == 3
+    for trajectory_index in range(3):
+        trajectory_dir = (
+            tmp_path / "best_of_n" / f"trajectory_{trajectory_index:03d}"
+        )
+        assert (trajectory_dir / "initial_logits.pt").exists()
+        assert (trajectory_dir / "final_logits.pt").exists()
+
+
+@pytest.mark.parametrize(
+    ("target_seq", "mutable_mask"),
+    [
+        ("TTTT", [True, True, True]),
+        (["AA", "BB"], [False, True, False]),
+        (["AA", "SS", "SS"], [False, True, False]),
+    ],
+)
+def test_esmfold2_best_of_n_supports_denovo_tcr_and_cdr_state_contracts(
+    target_seq,
+    mutable_mask,
+):
+    backend = FakeESMFold2Backend()
+
+    best_seq, _, _ = run_esmfold2_best_of_n(
+        backend=backend,
+        target_seq=target_seq,
+        L_binder=3,
+        best_of_n=2,
+        init_binder_seq="AAA",
+        mutable_mask=mutable_mask,
+        seed=13,
+        esmfold2_logit_init_mode="official_exact",
+        esmfold2_soft_steps=2,
+    )
+
+    assert len(backend.continuous_calls) == 2
+    assert all(call["target_seq"] == target_seq for call in backend.continuous_calls)
+    assert all(call["mutable_mask"] == mutable_mask for call in backend.continuous_calls)
+    assert all(
+        is_mutable or best_seq[index] == "A"
+        for index, is_mutable in enumerate(mutable_mask)
+    )
 
 
 def test_esmfold2_pipeline_propagates_hotspot_to_proposal_and_preview_rerank():

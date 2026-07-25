@@ -448,6 +448,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--esmfold2_stageb_soft_steps", type=int, default=None,
                        help="ESMFold2 Stage B 每个 MCTS 节点的 soft gradient update 步数（默认：20）")
     parser.add_argument(
+        "--esmfold2_best_of_n",
+        type=int,
+        default=8,
+        help="ESMFold2 Best-of-N 独立 continuous trajectories 数量（默认：8）",
+    )
+    parser.add_argument(
+        "--esmfold2_best_of_n_pass_loss_threshold",
+        type=float,
+        default=None,
+        help="可选的 Best-of-N verifier loss 通过阈值；未设置时不计算 pass@N",
+    )
+    parser.add_argument(
         "--esmfold2_stageb_discrete_rerank",
         type=lambda x: x.lower() == "true",
         default=True,
@@ -552,8 +564,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2Experimental proposal LM dropout；官方 binder design inversion/proposal 使用 0.5")
     parser.add_argument("--esmfold2_force_proposal_lm_dropout", type=lambda x: x.lower() == "true", default=True,
                        help="是否在 eval/inference 状态强制启用 proposal LM dropout（官方 binder design 为 true）")
-    parser.add_argument("--esmfold2_track_proposal_confidence", type=lambda x: x.lower() == "true", default=False,
-                       help="ESMFold2 proposal 后期是否计算 confidence/iPTM 并加入候选（默认：false）")
+    parser.add_argument("--esmfold2_track_proposal_confidence", type=lambda x: x.lower() == "true", default=None,
+                       help="ESMFold2 proposal 后期是否计算 confidence/iPTM 并加入候选（Best-of-N 默认 true，其余模式默认 false）")
     parser.add_argument("--esmfold2_proposal_confidence_temperature", type=float, default=0.05,
                        help="ESMFold2 proposal temperature 低于该值时记录 confidence/iPTM（默认：0.05）")
     parser.add_argument("--esmfold2_proposal_confidence_interval", type=int, default=1,
@@ -564,8 +576,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2 proposal confidence forward sampling steps（默认：50）")
     parser.add_argument("--esmfold2_proposal_confidence_max_candidates", type=int, default=8,
                        help="每次 proposal 最多把多少个 late-confidence 序列加入 verifier 候选（默认：8）")
-    parser.add_argument("--esmfold2_proposal_confidence_tail_steps", type=int, default=0,
-                       help="ESMFold2 proposal 固定记录最后 N 个 local steps；0 表示使用 temperature 阈值（默认：0）")
+    parser.add_argument("--esmfold2_proposal_confidence_tail_steps", type=int, default=None,
+                       help="ESMFold2 proposal 固定记录最后 N 个 local steps；Best-of-N 默认 20，其余模式默认 0")
     parser.add_argument("--esmfold2_final_polish", type=lambda x: x.lower() == "true", default=False,
                        help="ESMFold2 MCTS 搜索结束后是否从 best node logits 做 final continuous polish，并只在该阶段使用 late-confidence candidates（默认：false）")
     parser.add_argument(
@@ -662,8 +674,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcts_tau_fixed", type=float, default=4.0, help="MCTS 固定扩散 tau（默认：4.0）")
     parser.add_argument("--mcts_num_beams", type=int, default=8, help="MCTS Phase0 根节点数 / beam（默认：8）")
     parser.add_argument("--mcts_strategy", type=str, default="two_stage",
-                       choices=["legacy", "stage_a_only", "strict", "two_stage", "continuous_stage_a"],
-                       help="MCTS 策略：stage_a_only 只跑 StageA / continuous_stage_a 连续 soft-logit 诊断 / legacy 兼容旧名 / strict 文档版 / two_stage 两阶段（默认：two_stage）")
+                       choices=["legacy", "stage_a_only", "strict", "two_stage", "continuous_stage_a", "best_of_n"],
+                       help="搜索策略：best_of_n 运行独立连续轨迹且不使用 MCTS；其余为 StageA/两阶段 MCTS 模式（默认：two_stage）")
     parser.add_argument("--mcts_bootstrap_steps", type=int, default=50,
                        help="two_stage: StageA 原版 MCTS 至少运行步数（默认：50）")
     parser.add_argument("--mcts_bootstrap_patience", type=int, default=10,
@@ -715,6 +727,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def resolve_esmfold2_stage_soft_steps(args) -> tuple[int, int]:
     """Resolve ESMFold2 Stage A/B soft-step defaults with legacy compatibility."""
 
+    strategy = str(getattr(args, "mcts_strategy", "") or "").strip().lower()
     legacy_soft_steps = getattr(args, "esmfold2_soft_steps", None)
     stagea_soft_steps = getattr(args, "esmfold2_stagea_soft_steps", None)
     stageb_soft_steps = getattr(args, "esmfold2_stageb_soft_steps", None)
@@ -724,7 +737,7 @@ def resolve_esmfold2_stage_soft_steps(args) -> tuple[int, int]:
         if stageb_soft_steps is None:
             stageb_soft_steps = legacy_soft_steps
     if stagea_soft_steps is None:
-        stagea_soft_steps = 30
+        stagea_soft_steps = 150 if strategy == "best_of_n" else 30
     if stageb_soft_steps is None:
         stageb_soft_steps = 20
     args.esmfold2_stagea_soft_steps = int(stagea_soft_steps)
@@ -754,6 +767,24 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             raise ValueError(message) from exc
         if stagea_soft_steps <= 0 or stageb_soft_steps <= 0:
             message = "--esmfold2_stagea_soft_steps and --esmfold2_stageb_soft_steps must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_best_of_n <= 0:
+            message = "--esmfold2_best_of_n must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_track_proposal_confidence is None:
+            args.esmfold2_track_proposal_confidence = (
+                args.mcts_strategy == "best_of_n"
+            )
+        if args.esmfold2_proposal_confidence_tail_steps is None:
+            args.esmfold2_proposal_confidence_tail_steps = (
+                20 if args.mcts_strategy == "best_of_n" else 0
+            )
+        if args.esmfold2_proposal_confidence_tail_steps < 0:
+            message = "--esmfold2_proposal_confidence_tail_steps must be non-negative"
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
@@ -982,54 +1013,77 @@ def main():
             loss_weights[key] = val
 
     if model_backend == "esmfold2":
-        from bindcraft.hallucination.esmfold2_pipeline import run_esmfold2_mcts_hallucination
-
-        best_seq, final_seq, losses_history = run_esmfold2_mcts_hallucination(
-            backend=esmfold2_backend,
-            target_seq=args.target,
-            L_binder=args.binder_length,
-            N_steps=args.n_steps,
-            K_top=args.k_top,
-            B_candidates=args.b_candidates,
-            T_sample=args.t_sample,
-            max_mutations_per_seq=args.max_mutations_per_seq,
-            stagea_max_mutations_per_seq=args.stagea_max_mutations_per_seq,
-            stageb_max_mutations_per_seq=args.stageb_max_mutations_per_seq,
-            num_beams=args.mcts_num_beams,
-            init_binder_seq=args.init_binder_seq,
-            mcts_C=args.mcts_c,
-            mcts_max_nodes=args.mcts_max_nodes,
-            mcts_strategy=args.mcts_strategy,
-            mcts_bootstrap_steps=args.mcts_bootstrap_steps,
-            mcts_bootstrap_patience=args.mcts_bootstrap_patience,
-            mcts_bootstrap_min_delta=args.mcts_bootstrap_min_delta,
-            mcts_bootstrap_max_steps=args.mcts_bootstrap_max_steps,
-            mcts_handoff_top_k=args.mcts_handoff_top_k,
-            mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
-            mcts_prior_mode=args.mcts_prior_mode,
-            seed=args.seed,
-            mutable_mask=esmfold2_mutable_mask,
-            hotspot_params=hotspot_params,
-            artifact_dir=args.esmfold2_artifact_dir
-            or os.path.join(args.output_dir, "esmfold2_artifacts"),
-            esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
-            esmfold2_stagea_soft_steps=args.esmfold2_stagea_soft_steps,
-            esmfold2_stageb_soft_steps=args.esmfold2_stageb_soft_steps,
-            esmfold2_stageb_discrete_rerank=args.esmfold2_stageb_discrete_rerank,
-            esmfold2_stageb_rerank_pool_size=args.esmfold2_stageb_rerank_pool_size,
-            esmfold2_stageb_exploration_actions=args.esmfold2_stageb_exploration_actions,
-            esmfold2_stageb_verifier_candidates=args.esmfold2_stageb_verifier_candidates,
-            esmfold2_stageb_hotspot_coverage_weight=args.esmfold2_stageb_hotspot_coverage_weight,
-            esmfold2_stageb_hotspot_distance_weight=args.esmfold2_stageb_hotspot_distance_weight,
-            esmfold2_stageb_hotspot_miss_penalty=args.esmfold2_stageb_hotspot_miss_penalty,
-            esmfold2_stageb_min_pair_chain_iptm=args.esmfold2_stageb_min_pair_chain_iptm,
-            esmfold2_stageb_handoff_quality_tolerance=args.esmfold2_stageb_handoff_quality_tolerance,
-            esmfold2_stageb_paired_verifier_seed=args.esmfold2_stageb_paired_verifier_seed,
-            esmfold2_final_polish=args.esmfold2_final_polish,
-            esmfold2_stagea_handoff_checkpoint_interval=args.esmfold2_stagea_handoff_checkpoint_interval,
-            esmfold2_resume_handoff_checkpoint=args.esmfold2_resume_handoff_checkpoint,
-            esmfold2_resume_reverify_roots=args.esmfold2_resume_reverify_roots,
+        from bindcraft.hallucination.esmfold2_pipeline import (
+            run_esmfold2_best_of_n,
+            run_esmfold2_mcts_hallucination,
         )
+
+        esmfold2_artifact_dir = (
+            args.esmfold2_artifact_dir
+            or os.path.join(args.output_dir, "esmfold2_artifacts")
+        )
+        if args.mcts_strategy == "best_of_n":
+            best_seq, final_seq, losses_history = run_esmfold2_best_of_n(
+                backend=esmfold2_backend,
+                target_seq=args.target,
+                L_binder=args.binder_length,
+                best_of_n=args.esmfold2_best_of_n,
+                init_binder_seq=args.init_binder_seq,
+                seed=args.seed,
+                mutable_mask=esmfold2_mutable_mask,
+                hotspot_params=hotspot_params,
+                artifact_dir=esmfold2_artifact_dir,
+                esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
+                esmfold2_soft_steps=args.esmfold2_stagea_soft_steps,
+                track_confidence=args.esmfold2_track_proposal_confidence,
+                pass_loss_threshold=args.esmfold2_best_of_n_pass_loss_threshold,
+            )
+        else:
+            best_seq, final_seq, losses_history = run_esmfold2_mcts_hallucination(
+                backend=esmfold2_backend,
+                target_seq=args.target,
+                L_binder=args.binder_length,
+                N_steps=args.n_steps,
+                K_top=args.k_top,
+                B_candidates=args.b_candidates,
+                T_sample=args.t_sample,
+                max_mutations_per_seq=args.max_mutations_per_seq,
+                stagea_max_mutations_per_seq=args.stagea_max_mutations_per_seq,
+                stageb_max_mutations_per_seq=args.stageb_max_mutations_per_seq,
+                num_beams=args.mcts_num_beams,
+                init_binder_seq=args.init_binder_seq,
+                mcts_C=args.mcts_c,
+                mcts_max_nodes=args.mcts_max_nodes,
+                mcts_strategy=args.mcts_strategy,
+                mcts_bootstrap_steps=args.mcts_bootstrap_steps,
+                mcts_bootstrap_patience=args.mcts_bootstrap_patience,
+                mcts_bootstrap_min_delta=args.mcts_bootstrap_min_delta,
+                mcts_bootstrap_max_steps=args.mcts_bootstrap_max_steps,
+                mcts_handoff_top_k=args.mcts_handoff_top_k,
+                mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
+                mcts_prior_mode=args.mcts_prior_mode,
+                seed=args.seed,
+                mutable_mask=esmfold2_mutable_mask,
+                hotspot_params=hotspot_params,
+                artifact_dir=esmfold2_artifact_dir,
+                esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
+                esmfold2_stagea_soft_steps=args.esmfold2_stagea_soft_steps,
+                esmfold2_stageb_soft_steps=args.esmfold2_stageb_soft_steps,
+                esmfold2_stageb_discrete_rerank=args.esmfold2_stageb_discrete_rerank,
+                esmfold2_stageb_rerank_pool_size=args.esmfold2_stageb_rerank_pool_size,
+                esmfold2_stageb_exploration_actions=args.esmfold2_stageb_exploration_actions,
+                esmfold2_stageb_verifier_candidates=args.esmfold2_stageb_verifier_candidates,
+                esmfold2_stageb_hotspot_coverage_weight=args.esmfold2_stageb_hotspot_coverage_weight,
+                esmfold2_stageb_hotspot_distance_weight=args.esmfold2_stageb_hotspot_distance_weight,
+                esmfold2_stageb_hotspot_miss_penalty=args.esmfold2_stageb_hotspot_miss_penalty,
+                esmfold2_stageb_min_pair_chain_iptm=args.esmfold2_stageb_min_pair_chain_iptm,
+                esmfold2_stageb_handoff_quality_tolerance=args.esmfold2_stageb_handoff_quality_tolerance,
+                esmfold2_stageb_paired_verifier_seed=args.esmfold2_stageb_paired_verifier_seed,
+                esmfold2_final_polish=args.esmfold2_final_polish,
+                esmfold2_stagea_handoff_checkpoint_interval=args.esmfold2_stagea_handoff_checkpoint_interval,
+                esmfold2_resume_handoff_checkpoint=args.esmfold2_resume_handoff_checkpoint,
+                esmfold2_resume_reverify_roots=args.esmfold2_resume_reverify_roots,
+            )
     elif args.mode == "first_order":
         from bindcraft.hallucination.pipeline import run_hallucination
 
@@ -1132,6 +1186,11 @@ def main():
             f.write(f"ESMFold2 Soft Steps Legacy Override: {args.esmfold2_soft_steps}\n")
             f.write(f"ESMFold2 Stage A Soft Steps: {args.esmfold2_stagea_soft_steps}\n")
             f.write(f"ESMFold2 Stage B Soft Steps: {args.esmfold2_stageb_soft_steps}\n")
+            f.write(f"ESMFold2 Best-of-N: {args.esmfold2_best_of_n}\n")
+            f.write(
+                "ESMFold2 Best-of-N Pass Loss Threshold: "
+                f"{args.esmfold2_best_of_n_pass_loss_threshold}\n"
+            )
             f.write(f"ESMFold2 Stage B Discrete Rerank: {args.esmfold2_stageb_discrete_rerank}\n")
             f.write(f"ESMFold2 Stage B Rerank Pool Size: {args.esmfold2_stageb_rerank_pool_size}\n")
             f.write(f"ESMFold2 Stage B Exploration Actions: {args.esmfold2_stageb_exploration_actions}\n")
@@ -1223,9 +1282,19 @@ def main():
         f.write(f"Best Sequence: {best_seq}\n")
         f.write(f"Final Sequence: {final_seq}\n")
         f.write(f"\n")
-        f.write(f"Loss History:\n")
+        history_label = (
+            "Trajectory Best Losses"
+            if model_backend == "esmfold2" and args.mcts_strategy == "best_of_n"
+            else "Loss History"
+        )
+        item_label = (
+            "Trajectory"
+            if model_backend == "esmfold2" and args.mcts_strategy == "best_of_n"
+            else "Step"
+        )
+        f.write(f"{history_label}:\n")
         for i, loss in enumerate(losses_history):
-            f.write(f"Step {i}: {loss:.6f}\n")
+            f.write(f"{item_label} {i}: {loss:.6f}\n")
 
     logging.info(f"结果已保存到: {output_file}")
 

@@ -175,6 +175,53 @@ def test_esmfold2_backend_accepts_explicit_stage_a_only_strategy():
     assert args.mcts_strategy == "stage_a_only"
 
 
+def test_esmfold2_best_of_n_resolves_strategy_specific_defaults():
+    args, parser = _parse(
+        [
+            "--model_backend",
+            "esmfold2",
+            "--mode",
+            "mcts",
+            "--mcts_strategy",
+            "best_of_n",
+        ]
+    )
+
+    assert resolve_model_backend(args, parser) == "esmfold2"
+    assert args.esmfold2_best_of_n == 8
+    assert args.esmfold2_stagea_soft_steps == 150
+    assert args.esmfold2_stageb_soft_steps == 20
+    assert args.esmfold2_track_proposal_confidence is True
+    assert args.esmfold2_proposal_confidence_tail_steps == 20
+
+
+def test_esmfold2_best_of_n_explicit_overrides_win_over_defaults():
+    args, parser = _parse(
+        [
+            "--model_backend",
+            "esmfold2",
+            "--mode",
+            "mcts",
+            "--mcts_strategy",
+            "best_of_n",
+            "--esmfold2_best_of_n",
+            "3",
+            "--esmfold2_stagea_soft_steps",
+            "42",
+            "--esmfold2_track_proposal_confidence",
+            "false",
+            "--esmfold2_proposal_confidence_tail_steps",
+            "5",
+        ]
+    )
+
+    assert resolve_model_backend(args, parser) == "esmfold2"
+    assert args.esmfold2_best_of_n == 3
+    assert args.esmfold2_stagea_soft_steps == 42
+    assert args.esmfold2_track_proposal_confidence is False
+    assert args.esmfold2_proposal_confidence_tail_steps == 5
+
+
 def test_esmfold2_legacy_soft_steps_override_sets_both_stages():
     args, parser = _parse(
         [
@@ -436,6 +483,70 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     assert captured["esmfold2_resume_handoff_checkpoint"] is None
     assert captured["esmfold2_resume_reverify_roots"] is False
     assert captured["task_type_arg"] == "tcr"
+
+
+def test_main_dispatches_best_of_n_without_entering_mcts(monkeypatch, tmp_path):
+    captured = {}
+
+    monkeypatch.setattr(
+        run_hallucination_script,
+        "load_protenix_model",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Protenix loader should not run")
+        ),
+    )
+    monkeypatch.setattr(
+        run_hallucination_script,
+        "load_esmfold2_backend",
+        lambda *args, **kwargs: object(),
+    )
+
+    def fake_best_of_n(**kwargs):
+        captured.update(kwargs)
+        return "AAY", "AAY", [0.3, 0.2, 0.1]
+
+    monkeypatch.setattr(
+        "bindcraft.hallucination.esmfold2_pipeline.run_esmfold2_best_of_n",
+        fake_best_of_n,
+    )
+    monkeypatch.setattr(
+        "bindcraft.hallucination.esmfold2_pipeline.run_esmfold2_mcts_hallucination",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("Best-of-N must not enter the MCTS pipeline")
+        ),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_hallucination.py",
+            "--target",
+            "TTTT",
+            "--mode",
+            "mcts",
+            "--model_backend",
+            "esmfold2",
+            "--mcts_strategy",
+            "best_of_n",
+            "--esmfold2_best_of_n",
+            "3",
+            "--esmfold2_stagea_soft_steps",
+            "4",
+            "--binder_length",
+            "3",
+            "--output_dir",
+            str(tmp_path),
+        ],
+    )
+
+    run_hallucination_script.main()
+
+    assert captured["best_of_n"] == 3
+    assert captured["esmfold2_soft_steps"] == 4
+    assert captured["track_confidence"] is True
+    assert captured["mutable_mask"] is None
+    assert "MCTS Strategy: best_of_n" in (
+        tmp_path / "hallucination_result.txt"
+    ).read_text()
 
 
 def test_multichain_hotspot_parser_uses_residue_count_without_separator():

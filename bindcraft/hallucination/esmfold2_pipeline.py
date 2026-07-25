@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import random
+import statistics
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,6 +93,9 @@ class _NoopArtifactRecorder:
         return None
 
     def write_checkpoint(self, **event: Any) -> None:
+        return None
+
+    def write_logits(self, **event: Any) -> None:
         return None
 
     def write_summary(self, **summary: Any) -> None:
@@ -185,6 +189,28 @@ class _ESMArtifactRecorder(_NoopArtifactRecorder):
             json.dumps(_json_ready(metadata), ensure_ascii=False, sort_keys=True, indent=2),
             encoding="utf-8",
         )
+
+    def write_logits(self, **event: Any) -> None:
+        logits = event.get("logits")
+        if logits is None:
+            return
+        trajectory_index = int(event.get("trajectory_index", 0))
+        label = _safe_path_token(str(event.get("label", "logits")))
+        trajectory_dir = (
+            self.artifact_dir
+            / "best_of_n"
+            / f"trajectory_{trajectory_index:03d}"
+        )
+        trajectory_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "trajectory_index": trajectory_index,
+            "label": label,
+            "seed": event.get("seed"),
+            "sequence": event.get("sequence"),
+            "sequence_hash": _sequence_hash(event.get("sequence")),
+            "logits": torch.as_tensor(logits).detach().cpu().clone(),
+        }
+        torch.save(payload, trajectory_dir / f"{label}.pt")
 
     def write_summary(self, **summary: Any) -> None:
         self.summary_path.write_text(
@@ -1254,6 +1280,313 @@ def _make_phase0_seed_states(
             mutable_mask=mutable_mask,
         )
     ]
+
+
+def run_esmfold2_best_of_n(
+    *,
+    backend: Any,
+    target_seq: Union[str, Sequence[str]],
+    L_binder: int = 40,
+    best_of_n: int = 8,
+    init_binder_seq: Optional[str] = None,
+    seed: Optional[int] = 42,
+    mutable_mask: Optional[Sequence[bool]] = None,
+    hotspot_params: Optional[Dict[str, Any]] = None,
+    artifact_dir: Optional[Union[str, os.PathLike[str]]] = None,
+    esmfold2_logit_init_mode: str = "official_exact",
+    esmfold2_soft_steps: int = 150,
+    track_confidence: bool = True,
+    pass_loss_threshold: Optional[float] = None,
+) -> Tuple[str, str, List[float]]:
+    """Run independent continuous ESMFold2 trajectories without MCTS.
+
+    Each trajectory starts from independently seeded logits, performs one
+    uninterrupted soft-logit optimization, and full-verifies its final and
+    late-confidence candidates.  The same full-verifier seed is used for every
+    candidate so Best-of-N comparisons are not confounded by verifier noise.
+    """
+
+    if backend is None:
+        raise ValueError("backend is required for ESMFold2 Best-of-N")
+    L_binder = int(L_binder)
+    best_of_n = int(best_of_n)
+    soft_steps = int(esmfold2_soft_steps)
+    if L_binder <= 0:
+        raise ValueError("L_binder must be positive")
+    if best_of_n <= 0:
+        raise ValueError("best_of_n must be positive")
+    if soft_steps <= 0:
+        raise ValueError("esmfold2_soft_steps must be positive")
+    if pass_loss_threshold is not None and not math.isfinite(
+        float(pass_loss_threshold)
+    ):
+        raise ValueError("pass_loss_threshold must be finite when provided")
+
+    mutable_mask = _normalize_mutable_mask(mutable_mask, L_binder)
+    hotspot_params = dict(hotspot_params) if hotspot_params else None
+    hotspot_indices = [
+        int(index)
+        for index in (hotspot_params or {}).get("target_hotspot_concat_indices", [])
+    ]
+    backend_config = getattr(backend, "config", None)
+    hotspot_weight = float(getattr(backend_config, "hotspot_weight", 0.0))
+    hotspot_verify_weight = float(
+        getattr(backend_config, "hotspot_verify_weight", 0.0)
+    )
+    if hotspot_weight > 0.0 and not hotspot_indices:
+        raise ValueError(
+            "positive ESMFold2 hotspot_weight requires target hotspot indices"
+        )
+    if hotspot_verify_weight > 0.0 and not hotspot_indices:
+        raise ValueError(
+            "positive ESMFold2 hotspot_verify_weight requires target hotspot indices"
+        )
+
+    target_key = _normalize_target_key(target_seq)
+    logit_init_mode = _normalize_logit_init_mode(esmfold2_logit_init_mode)
+    artifact_recorder = _make_artifact_recorder(artifact_dir)
+    verifier_cache: Dict[str, Any] = {}
+    shared_verify_seed = _stable_seed(
+        seed,
+        "esm_best_of_n_full_verify",
+        target_key,
+    )
+    trajectory_summaries: List[Dict[str, Any]] = []
+    trajectory_best_losses: List[float] = []
+    global_best_result: Optional[Any] = None
+
+    logger.info("=" * 70)
+    logger.info("ESMFold2 Best-of-N continuous design")
+    logger.info(
+        "target=%s binder_length=%d trajectories=%d soft_steps=%d "
+        "logit_init=%s verifier_seed=%d",
+        target_key,
+        L_binder,
+        best_of_n,
+        soft_steps,
+        logit_init_mode,
+        shared_verify_seed,
+    )
+    logger.info("=" * 70)
+
+    for trajectory_index in range(best_of_n):
+        trajectory_seed = _stable_seed(
+            seed,
+            "esm_best_of_n_trajectory",
+            target_key,
+            trajectory_index,
+        )
+        initial_states = _make_phase0_seed_states(
+            init_binder_seq,
+            num_beams=1,
+            L_binder=L_binder,
+            seed=trajectory_seed,
+            mutable_mask=mutable_mask,
+            logit_init_mode=logit_init_mode,
+            device=(
+                getattr(backend, "device", None)
+                if logit_init_mode == "official_exact"
+                else None
+            ),
+        )
+        initial_sequence, initial_logits = initial_states[0]
+        proposal_batch = _call_backend_continuous_design(
+            backend,
+            current_seq=initial_sequence,
+            target_seq=target_seq,
+            global_step=0,
+            seed=trajectory_seed,
+            mutable_mask=mutable_mask,
+            proposal_logits=initial_logits,
+            hotspot_params=hotspot_params,
+            track_confidence_override=bool(track_confidence),
+            soft_steps_override=soft_steps,
+        )
+        _write_soft_step_artifacts(
+            artifact_recorder,
+            stage="best_of_n",
+            step=trajectory_index,
+            selected_sequence=initial_sequence,
+            batch=proposal_batch,
+        )
+        artifact_recorder.write_logits(
+            trajectory_index=trajectory_index,
+            label="initial_logits",
+            logits=(
+                proposal_batch.logits_before
+                if proposal_batch.logits_before is not None
+                else initial_logits
+            ),
+            sequence=initial_sequence,
+            seed=trajectory_seed,
+        )
+
+        candidates = [
+            _clip_sequence_by_mutable_mask(
+                str(candidate),
+                mutable_mask,
+                initial_sequence,
+            )
+            for candidate in _proposal_sequences_from_batch(proposal_batch)
+        ]
+        candidates = list(
+            dict.fromkeys(candidate for candidate in candidates if candidate)
+        )
+        if not candidates:
+            candidates = [initial_sequence]
+
+        candidate_results = []
+        for candidate in candidates:
+            result = _verify_with_cache(
+                backend,
+                verifier_cache,
+                binder_seq=candidate,
+                target_seq=target_seq,
+                seed=shared_verify_seed,
+                hotspot_params=hotspot_params,
+            )
+            candidate_results.append(result)
+            _write_candidate_artifact(
+                artifact_recorder,
+                stage="best_of_n",
+                step=trajectory_index,
+                parent_sequence=initial_sequence,
+                result=result,
+                action_group=f"trajectory_{trajectory_index:03d}",
+            )
+
+        trajectory_best = min(
+            candidate_results,
+            key=lambda result: float(result.total_loss),
+        )
+        trajectory_best_loss = float(trajectory_best.total_loss)
+        trajectory_best_losses.append(trajectory_best_loss)
+        if (
+            global_best_result is None
+            or trajectory_best_loss < float(global_best_result.total_loss)
+        ):
+            global_best_result = trajectory_best
+
+        final_sequence = (
+            sequence_from_logits_argmax(
+                proposal_batch.logits_after,
+                current_seq=initial_sequence,
+                mutable_mask=mutable_mask,
+            )
+            if proposal_batch.logits_after is not None
+            else str(trajectory_best.binder_seq)
+        )
+        artifact_recorder.write_logits(
+            trajectory_index=trajectory_index,
+            label="final_logits",
+            logits=proposal_batch.logits_after,
+            sequence=final_sequence,
+            seed=trajectory_seed,
+        )
+        trajectory_summary = {
+            "trajectory_index": trajectory_index,
+            "trajectory_seed": trajectory_seed,
+            "verifier_seed": shared_verify_seed,
+            "initial_sequence": initial_sequence,
+            "initial_sequence_hash": _sequence_hash(initial_sequence),
+            "final_argmax_sequence": final_sequence,
+            "final_argmax_sequence_hash": _sequence_hash(final_sequence),
+            "verified_candidate_count": len(candidate_results),
+            "best_sequence": str(trajectory_best.binder_seq),
+            "best_sequence_hash": _sequence_hash(str(trajectory_best.binder_seq)),
+            "best_loss": trajectory_best_loss,
+            "best_loss_dict": _loss_dict_for_artifact(trajectory_best),
+            "best_summary_confidence": _json_ready(
+                _summary_without_structure(
+                    dict(getattr(trajectory_best, "summary_confidence", {}) or {})
+                )
+            ),
+            "passed": (
+                trajectory_best_loss <= float(pass_loss_threshold)
+                if pass_loss_threshold is not None
+                else None
+            ),
+        }
+        trajectory_summaries.append(trajectory_summary)
+        artifact_recorder.write_step(
+            stage="best_of_n",
+            step=trajectory_index,
+            **trajectory_summary,
+        )
+        artifact_recorder.write_checkpoint(
+            stage="best_of_n",
+            step=trajectory_index,
+            label="trajectory_best",
+            result=trajectory_best,
+            selected_sequence=str(trajectory_best.binder_seq),
+            parent_sequence=initial_sequence,
+            is_global_best=False,
+        )
+        logger.info(
+            "Best-of-N trajectory %d/%d | seed=%d candidates=%d best_loss=%.4f",
+            trajectory_index + 1,
+            best_of_n,
+            trajectory_seed,
+            len(candidate_results),
+            trajectory_best_loss,
+        )
+
+    if global_best_result is None:
+        raise RuntimeError("ESMFold2 Best-of-N produced no verified candidates")
+
+    global_best_sequence = str(global_best_result.binder_seq)
+    pass_count = (
+        sum(bool(item["passed"]) for item in trajectory_summaries)
+        if pass_loss_threshold is not None
+        else None
+    )
+    summary = {
+        "strategy": "best_of_n",
+        "best_of_n": best_of_n,
+        "soft_steps_per_trajectory": soft_steps,
+        "track_confidence": bool(track_confidence),
+        "logit_init_mode": logit_init_mode,
+        "shared_verifier_seed": shared_verify_seed,
+        "best_sequence": global_best_sequence,
+        "best_sequence_hash": _sequence_hash(global_best_sequence),
+        "best_loss": float(global_best_result.total_loss),
+        "mean_trajectory_best_loss": statistics.fmean(trajectory_best_losses),
+        "std_trajectory_best_loss": (
+            statistics.pstdev(trajectory_best_losses)
+            if len(trajectory_best_losses) > 1
+            else 0.0
+        ),
+        "min_trajectory_best_loss": min(trajectory_best_losses),
+        "max_trajectory_best_loss": max(trajectory_best_losses),
+        "pass_loss_threshold": pass_loss_threshold,
+        "passing_trajectory_count": pass_count,
+        "pass_at_n": (
+            bool(pass_count and pass_count > 0)
+            if pass_loss_threshold is not None
+            else None
+        ),
+        "hotspot_indices_0based": hotspot_indices,
+        "trajectory_summaries": trajectory_summaries,
+        "artifact_dir": str(artifact_dir) if artifact_dir is not None else None,
+    }
+    artifact_recorder.write_checkpoint(
+        stage="best_of_n",
+        step=best_of_n,
+        label="overall_best",
+        result=global_best_result,
+        selected_sequence=global_best_sequence,
+        parent_sequence=None,
+        is_global_best=True,
+    )
+    artifact_recorder.write_summary(**summary)
+    logger.info(
+        "ESMFold2 Best-of-N complete | N=%d best=%.4f mean=%.4f std=%.4f",
+        best_of_n,
+        float(global_best_result.total_loss),
+        float(summary["mean_trajectory_best_loss"]),
+        float(summary["std_trajectory_best_loss"]),
+    )
+    return global_best_sequence, global_best_sequence, trajectory_best_losses
 
 
 def _normalize_mutable_mask(
