@@ -164,6 +164,10 @@ def resolve_esmfold2_hotspot_defaults(
         )
     if args.esmfold2_hotspot_verify_weight is None:
         args.esmfold2_hotspot_verify_weight = 0.25 if use_hotspot_defaults else 0.0
+    if args.esmfold2_hotspot_verify_too_close_weight is None:
+        args.esmfold2_hotspot_verify_too_close_weight = (
+            0.25 if use_hotspot_defaults else 0.0
+        )
 
 
 def parse_esmfold2_mutable_mask(raw_mask, binder_length: int, parser: argparse.ArgumentParser):
@@ -392,11 +396,18 @@ def load_esmfold2_backend(
         proposal_confidence_max_candidates=args.esmfold2_proposal_confidence_max_candidates,
         proposal_confidence_tail_steps=args.esmfold2_proposal_confidence_tail_steps,
         hotspot_weight=args.esmfold2_hotspot_weight,
+        hotspot_satisfied_proposal_weight=(
+            args.esmfold2_hotspot_satisfied_proposal_weight
+        ),
         hotspot_cutoff=args.esmfold2_hotspot_cutoff,
         hotspot_interface_mode=args.esmfold2_hotspot_interface_mode,
         hotspot_verify_weight=args.esmfold2_hotspot_verify_weight,
         hotspot_verify_near_cutoff=args.esmfold2_hotspot_verify_near_cutoff,
         hotspot_verify_far_cutoff=args.esmfold2_hotspot_verify_far_cutoff,
+        hotspot_verify_min_distance=args.esmfold2_hotspot_verify_min_distance,
+        hotspot_verify_too_close_weight=(
+            args.esmfold2_hotspot_verify_too_close_weight
+        ),
         target_chain_roles=target_chain_roles,
         binder_mutable_mask=(
             None
@@ -616,6 +627,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--esmfold2_hotspot_cutoff", type=float, default=8.0,
                        help="ESMFold2 proposal hotspot contact 距离阈值，单位 Å（默认：8.0）")
     parser.add_argument(
+        "--esmfold2_hotspot_satisfied_proposal_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "所有 hotspot 已在 verifier near cutoff 内命中后继续使用的 "
+            "proposal hotspot 权重（默认：0.0，停止继续拉近）"
+        ),
+    )
+    parser.add_argument(
         "--esmfold2_hotspot_interface_mode",
         type=str,
         choices=["additive", "localized"],
@@ -639,6 +659,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2 hotspot verifier 满足接触的重原子距离，单位 Å（默认：8.0；同时记录严格 5 Å coverage）")
     parser.add_argument("--esmfold2_hotspot_verify_far_cutoff", type=float, default=20.0,
                        help="ESMFold2 hotspot verifier 距离 loss 饱和上限，单位 Å（默认：20.0）")
+    parser.add_argument(
+        "--esmfold2_hotspot_verify_min_distance",
+        type=float,
+        default=2.5,
+        help="hotspot 与 binder 的最小安全重原子距离，单位 Å（默认：2.5）",
+    )
+    parser.add_argument(
+        "--esmfold2_hotspot_verify_too_close_weight",
+        type=float,
+        default=None,
+        help=(
+            "低于最小安全距离时的 verifier 软惩罚权重；未显式设置时，"
+            "ESMFold2 有 hotspot 为 0.25，否则为 0.0"
+        ),
+    )
     parser.add_argument("--checkpoint_dir", type=str, default=None,
                        help="Checkpoint 目录；默认依次读取 --checkpoint_dir、PROTENIX_CHECKPOINT_DIR、PROTENIX_ROOT_DIR/checkpoint")
     parser.add_argument("--save_checkpoint_dir", type=str, default=None,
@@ -951,6 +986,10 @@ def main():
         parser.error("--esmfold2_hotspot_weight 必须大于等于 0")
     if args.esmfold2_hotspot_cutoff <= 0.0:
         parser.error("--esmfold2_hotspot_cutoff 必须大于 0")
+    if args.esmfold2_hotspot_satisfied_proposal_weight < 0.0:
+        parser.error(
+            "--esmfold2_hotspot_satisfied_proposal_weight 必须大于等于 0"
+        )
     if (
         args.esmfold2_hotspot_interface_mode == "localized"
         and args.esmfold2_hotspot_weight > 1.0
@@ -958,6 +997,14 @@ def main():
         parser.error(
             "--esmfold2_hotspot_interface_mode localized 时，"
             "--esmfold2_hotspot_weight 必须位于 [0, 1]"
+        )
+    if (
+        args.esmfold2_hotspot_interface_mode == "localized"
+        and args.esmfold2_hotspot_satisfied_proposal_weight > 1.0
+    ):
+        parser.error(
+            "--esmfold2_hotspot_interface_mode localized 时，"
+            "--esmfold2_hotspot_satisfied_proposal_weight 必须位于 [0, 1]"
         )
     if args.esmfold2_hotspot_verify_weight < 0.0:
         parser.error("--esmfold2_hotspot_verify_weight 必须大于等于 0")
@@ -970,6 +1017,20 @@ def main():
         parser.error(
             "--esmfold2_hotspot_verify_far_cutoff 必须大于 "
             "--esmfold2_hotspot_verify_near_cutoff"
+        )
+    if args.esmfold2_hotspot_verify_min_distance < 0.0:
+        parser.error("--esmfold2_hotspot_verify_min_distance 必须大于等于 0")
+    if (
+        args.esmfold2_hotspot_verify_min_distance
+        > args.esmfold2_hotspot_verify_near_cutoff
+    ):
+        parser.error(
+            "--esmfold2_hotspot_verify_min_distance 不能大于 "
+            "--esmfold2_hotspot_verify_near_cutoff"
+        )
+    if args.esmfold2_hotspot_verify_too_close_weight < 0.0:
+        parser.error(
+            "--esmfold2_hotspot_verify_too_close_weight 必须大于等于 0"
         )
     if (
         model_backend == "esmfold2"
@@ -987,6 +1048,15 @@ def main():
         parser.error(
             "--esmfold2_hotspot_verify_weight > 0 时必须同时提供 --target_hotspots"
         )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_hotspot_verify_too_close_weight > 0.0
+        and hotspot_params is None
+    ):
+        parser.error(
+            "--esmfold2_hotspot_verify_too_close_weight > 0 时必须同时提供 "
+            "--target_hotspots"
+        )
 
     setup_logging(args.log_file, level=args.log_level)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -996,11 +1066,12 @@ def main():
         if model_backend == "esmfold2":
             logging.info(
                 "ESMFold2 hotspot contact configured: target_hotspots_1based=%s "
-                "target_concat_indices_0based=%s weight=%.4f cutoff=%.2fA "
-                "interface_mode=%s enabled=%s",
+                "target_concat_indices_0based=%s weight=%.4f "
+                "satisfied_weight=%.4f cutoff=%.2fA interface_mode=%s enabled=%s",
                 hotspot_params["target_hotspot_residues_1based"],
                 hotspot_params["target_hotspot_concat_indices"],
                 args.esmfold2_hotspot_weight,
+                args.esmfold2_hotspot_satisfied_proposal_weight,
                 args.esmfold2_hotspot_cutoff,
                 args.esmfold2_hotspot_interface_mode,
                 args.esmfold2_hotspot_weight > 0.0,
@@ -1013,14 +1084,20 @@ def main():
             )
     if model_backend == "esmfold2":
         logging.info(
-            "ESMFold2 hotspot verifier configured: weight=%.4f near=%.2fA "
-            "far=%.2fA enabled=%s",
+            "ESMFold2 hotspot verifier configured: attraction_weight=%.4f "
+            "near=%.2fA far=%.2fA min_safe=%.2fA "
+            "too_close_weight=%.4f enabled=%s",
             args.esmfold2_hotspot_verify_weight,
             args.esmfold2_hotspot_verify_near_cutoff,
             args.esmfold2_hotspot_verify_far_cutoff,
+            args.esmfold2_hotspot_verify_min_distance,
+            args.esmfold2_hotspot_verify_too_close_weight,
             bool(
                 hotspot_params is not None
-                and args.esmfold2_hotspot_verify_weight > 0.0
+                and (
+                    args.esmfold2_hotspot_verify_weight > 0.0
+                    or args.esmfold2_hotspot_verify_too_close_weight > 0.0
+                )
             ),
         )
     if model_backend == "esmfold2" and args.target_template_path:
@@ -1304,6 +1381,10 @@ def main():
             f.write(f"ESMFold2 Proposal Confidence Tail Steps: {args.esmfold2_proposal_confidence_tail_steps}\n")
             f.write(f"ESMFold2 Final Polish: {args.esmfold2_final_polish}\n")
             f.write(f"ESMFold2 Hotspot Weight: {args.esmfold2_hotspot_weight}\n")
+            f.write(
+                "ESMFold2 Hotspot Satisfied Proposal Weight: "
+                f"{args.esmfold2_hotspot_satisfied_proposal_weight}\n"
+            )
             f.write(f"ESMFold2 Hotspot Cutoff: {args.esmfold2_hotspot_cutoff} A\n")
             f.write(
                 "ESMFold2 Hotspot Interface Mode: "
@@ -1320,6 +1401,14 @@ def main():
             f.write(
                 "ESMFold2 Hotspot Verify Far Cutoff: "
                 f"{args.esmfold2_hotspot_verify_far_cutoff} A\n"
+            )
+            f.write(
+                "ESMFold2 Hotspot Verify Min Distance: "
+                f"{args.esmfold2_hotspot_verify_min_distance} A\n"
+            )
+            f.write(
+                "ESMFold2 Hotspot Verify Too Close Weight: "
+                f"{args.esmfold2_hotspot_verify_too_close_weight}\n"
             )
         f.write(f"Optimization Steps: {args.n_steps}\n")
         f.write(f"Learning Rate: {args.learning_rate}\n")

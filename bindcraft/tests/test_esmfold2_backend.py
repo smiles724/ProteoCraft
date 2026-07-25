@@ -79,6 +79,25 @@ def test_verifier_result_combines_global_and_hotspot_losses_without_overwriting_
     assert result.summary_confidence["esm_verify_loss"] == pytest.approx(0.37)
 
 
+def test_verifier_result_adds_hotspot_too_close_penalty():
+    result = build_esm_verifier_result(
+        binder_seq="ALY",
+        target_seq="TARGET",
+        summary_confidence={"pair_chain_iptm": 0.75},
+        hotspot_verify_loss=0.0,
+        hotspot_verify_weight=0.2,
+        hotspot_too_close_loss=0.4,
+        hotspot_too_close_weight=0.25,
+    )
+
+    assert result.total_loss == pytest.approx(0.35)
+    assert result.loss_dict["pair_chain_iptm_loss"] == pytest.approx(0.25)
+    assert result.loss_dict["hotspot_too_close_loss"] == pytest.approx(0.4)
+    assert result.loss_dict[
+        "hotspot_too_close_weighted_contribution"
+    ] == pytest.approx(0.1)
+
+
 def test_zero_hotspot_verify_weight_preserves_legacy_verifier_result_shape():
     result = build_esm_verifier_result(
         binder_seq="ALY",
@@ -220,11 +239,14 @@ def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     assert default_config.force_proposal_lm_dropout is True
     assert default_config.experimental_model_name.endswith("ESMFold2-Experimental")
     assert default_config.hotspot_weight == pytest.approx(0.0)
+    assert default_config.hotspot_satisfied_proposal_weight == pytest.approx(0.0)
     assert default_config.hotspot_cutoff == pytest.approx(8.0)
     assert default_config.hotspot_interface_mode == "additive"
     assert default_config.hotspot_verify_weight == pytest.approx(0.0)
     assert default_config.hotspot_verify_near_cutoff == pytest.approx(8.0)
     assert default_config.hotspot_verify_far_cutoff == pytest.approx(20.0)
+    assert default_config.hotspot_verify_min_distance == pytest.approx(2.5)
+    assert default_config.hotspot_verify_too_close_weight == pytest.approx(0.0)
 
     config = ESMFold2ProposalConfig(soft_steps=3, lambda_esmc="auto")
     assert config.soft_steps == 3

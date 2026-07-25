@@ -340,6 +340,7 @@ def _hotspot_structure_metrics(
     hotspot_params: Optional[Dict[str, Any]],
     near_cutoff: float,
     far_cutoff: float,
+    min_safe_distance: float = 0.0,
 ) -> dict[str, Any]:
     """Measure hotspot-to-binder distances from an ESMFold2 full structure."""
 
@@ -347,6 +348,14 @@ def _hotspot_structure_metrics(
         raise ValueError("hotspot verifier near cutoff must be non-negative")
     if float(far_cutoff) <= float(near_cutoff):
         raise ValueError("hotspot verifier far cutoff must exceed near cutoff")
+    if float(min_safe_distance) < 0.0:
+        raise ValueError(
+            "hotspot verifier minimum safe distance must be non-negative"
+        )
+    if float(min_safe_distance) > float(near_cutoff):
+        raise ValueError(
+            "hotspot verifier minimum safe distance must not exceed near cutoff"
+        )
     n_target_chains = len(target_sequences)
     expected_target_lengths = [len(sequence) for sequence in target_sequences]
     expected_target_length = sum(expected_target_lengths)
@@ -489,11 +498,18 @@ def _hotspot_structure_metrics(
         min=0.0,
         max=1.0,
     ).mean()
+    too_close_loss = torch.clamp(
+        (float(min_safe_distance) - distance_tensor)
+        / max(float(min_safe_distance), 1.0e-8),
+        min=0.0,
+        max=1.0,
+    ).max()
     covered_count = int((distance_tensor <= float(near_cutoff)).sum().item())
     strict_covered_count = int((distance_tensor <= 5.0).sum().item())
     hotspot_count = len(hotspot_indices)
     return {
         "hotspot_verify_distance_loss": float(distance_loss.item()),
+        "hotspot_too_close_loss": float(too_close_loss.item()),
         "hotspot_mean_min_heavy_atom_distance": float(distance_tensor.mean().item()),
         "hotspot_heavy_atom_coverage": covered_count / hotspot_count,
         "hotspot_heavy_atom_covered_count": covered_count,
@@ -502,6 +518,7 @@ def _hotspot_structure_metrics(
         "hotspot_count": hotspot_count,
         "hotspot_verify_near_cutoff": float(near_cutoff),
         "hotspot_verify_far_cutoff": float(far_cutoff),
+        "hotspot_verify_min_distance": float(min_safe_distance),
         "hotspot_min_heavy_atom_distances": minimum_distances,
     }
 
@@ -776,14 +793,20 @@ class ESMFold2RuntimeBackend:
             )
         )
         hotspot_verify_weight = float(self.config.hotspot_verify_weight)
+        hotspot_too_close_weight = float(
+            self.config.hotspot_verify_too_close_weight
+        )
         hotspot_metrics: dict[str, Any] = {}
-        if hotspot_verify_weight > 0.0:
+        if hotspot_verify_weight > 0.0 or hotspot_too_close_weight > 0.0:
             hotspot_metrics = _hotspot_structure_metrics(
                 fold_result.complex,
                 target_sequences=targets,
                 hotspot_params=hotspot_params,
                 near_cutoff=float(self.config.hotspot_verify_near_cutoff),
                 far_cutoff=float(self.config.hotspot_verify_far_cutoff),
+                min_safe_distance=float(
+                    self.config.hotspot_verify_min_distance
+                ),
             )
             summary.update(hotspot_metrics)
         return build_esm_verifier_result(
@@ -797,6 +820,10 @@ class ESMFold2RuntimeBackend:
             },
             hotspot_verify_loss=hotspot_metrics.get("hotspot_verify_distance_loss"),
             hotspot_verify_weight=hotspot_verify_weight,
+            hotspot_too_close_loss=hotspot_metrics.get(
+                "hotspot_too_close_loss"
+            ),
+            hotspot_too_close_weight=hotspot_too_close_weight,
         )
 
     def propose(
@@ -814,6 +841,7 @@ class ESMFold2RuntimeBackend:
         action_group: Optional[str] = None,
         proposal_logits: Optional[torch.Tensor] = None,
         hotspot_params: Optional[Dict[str, Any]] = None,
+        hotspot_weight_override: Optional[float] = None,
         track_confidence_override: Optional[bool] = None,
         soft_steps_override: Optional[int] = None,
     ) -> ESMFold2ProposalBatch:
@@ -826,6 +854,7 @@ class ESMFold2RuntimeBackend:
             action_group=action_group,
             proposal_logits=proposal_logits,
             hotspot_params=hotspot_params,
+            hotspot_weight_override=hotspot_weight_override,
             track_confidence_override=track_confidence_override,
             soft_steps_override=soft_steps_override,
         )
@@ -861,6 +890,7 @@ class ESMFold2RuntimeBackend:
         mutable_mask: Optional[Sequence[bool]] = None,
         proposal_logits: Optional[torch.Tensor] = None,
         hotspot_params: Optional[Dict[str, Any]] = None,
+        hotspot_weight_override: Optional[float] = None,
         track_confidence_override: Optional[bool] = None,
         soft_steps_override: Optional[int] = None,
     ) -> ESMFold2ProposalBatch:
@@ -879,6 +909,7 @@ class ESMFold2RuntimeBackend:
             action_group=None,
             proposal_logits=proposal_logits,
             hotspot_params=hotspot_params,
+            hotspot_weight_override=hotspot_weight_override,
             track_confidence_override=track_confidence_override,
             soft_steps_override=soft_steps_override,
         )
@@ -1100,6 +1131,7 @@ class ESMFold2RuntimeBackend:
         action_group: Optional[str],
         proposal_logits: Optional[torch.Tensor],
         hotspot_params: Optional[Dict[str, Any]] = None,
+        hotspot_weight_override: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         logits_before, logits_after, _, _ = self._run_soft_update_impl(
             current_seq=current_seq,
@@ -1110,6 +1142,7 @@ class ESMFold2RuntimeBackend:
             action_group=action_group,
             proposal_logits=proposal_logits,
             hotspot_params=hotspot_params,
+            hotspot_weight_override=hotspot_weight_override,
             track_confidence=False,
         )
         return logits_before, logits_after
@@ -1125,6 +1158,7 @@ class ESMFold2RuntimeBackend:
         action_group: Optional[str],
         proposal_logits: Optional[torch.Tensor],
         hotspot_params: Optional[Dict[str, Any]],
+        hotspot_weight_override: Optional[float] = None,
         track_confidence_override: Optional[bool] = None,
         soft_steps_override: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -1140,6 +1174,7 @@ class ESMFold2RuntimeBackend:
             action_group=action_group,
             proposal_logits=proposal_logits,
             hotspot_params=hotspot_params,
+            hotspot_weight_override=hotspot_weight_override,
             track_confidence=track_confidence,
             soft_steps_override=soft_steps_override,
         )
@@ -1155,6 +1190,7 @@ class ESMFold2RuntimeBackend:
         action_group: Optional[str],
         proposal_logits: Optional[torch.Tensor],
         hotspot_params: Optional[Dict[str, Any]],
+        hotspot_weight_override: Optional[float],
         track_confidence: bool,
         soft_steps_override: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -1173,6 +1209,10 @@ class ESMFold2RuntimeBackend:
                 kwargs["soft_steps_override"] = soft_steps_override
             if _callable_accepts_argument(self.soft_update_fn, "hotspot_params"):
                 kwargs["hotspot_params"] = hotspot_params
+            if _callable_accepts_argument(
+                self.soft_update_fn, "hotspot_weight_override"
+            ):
+                kwargs["hotspot_weight_override"] = hotspot_weight_override
             logits_before, logits_after = self.soft_update_fn(**kwargs)
             return logits_before, logits_after, [], []
 
@@ -1198,6 +1238,21 @@ class ESMFold2RuntimeBackend:
                     "runtime mutable_mask does not match configured binder_mutable_mask"
                 )
         self._ensure_proposal_models_loaded()
+        effective_hotspot_weight = (
+            float(self.config.hotspot_weight)
+            if hotspot_weight_override is None
+            else float(hotspot_weight_override)
+        )
+        if effective_hotspot_weight < 0.0:
+            raise ValueError("hotspot_weight_override must be non-negative")
+        if (
+            str(self.config.hotspot_interface_mode).strip().lower()
+            == "localized"
+            and effective_hotspot_weight > 1.0
+        ):
+            raise ValueError(
+                "localized hotspot_weight_override must be in [0, 1]"
+            )
 
         logits = self._init_current_sequence_logits(
             current_seq,
@@ -1281,7 +1336,7 @@ class ESMFold2RuntimeBackend:
                     else None
                 ),
                 hotspot_params=hotspot_params,
-                hotspot_weight=float(self.config.hotspot_weight),
+                hotspot_weight=effective_hotspot_weight,
                 hotspot_cutoff=float(self.config.hotspot_cutoff),
                 hotspot_interface_mode=str(self.config.hotspot_interface_mode),
             )
@@ -1346,7 +1401,14 @@ class ESMFold2RuntimeBackend:
                     {
                         "base_structure_loss": _as_float(losses.get("base_structure_loss")),
                         "hotspot_contact_loss": _as_float(losses.get("hotspot_contact_loss")),
-                        "hotspot_weight": float(self.config.hotspot_weight),
+                        "hotspot_weight": effective_hotspot_weight,
+                        "hotspot_weight_configured": float(
+                            self.config.hotspot_weight
+                        ),
+                        "hotspot_attraction_suppressed": bool(
+                            effective_hotspot_weight
+                            < float(self.config.hotspot_weight)
+                        ),
                         "hotspot_cutoff": float(self.config.hotspot_cutoff),
                         "hotspot_interface_mode": str(
                             self.config.hotspot_interface_mode

@@ -726,6 +726,7 @@ def _call_backend_propose(
     *,
     proposal_logits: Optional[torch.Tensor],
     hotspot_params: Optional[Dict[str, Any]] = None,
+    hotspot_weight_override: Optional[float] = None,
     track_confidence_override: Optional[bool] = None,
     soft_steps_override: Optional[int] = None,
     **kwargs: Any,
@@ -743,6 +744,12 @@ def _call_backend_propose(
         propose_kwargs["hotspot_params"] = (
             dict(hotspot_params) if hotspot_params is not None else None
         )
+    if (
+        hotspot_params is not None
+        and hotspot_weight_override is not None
+        and _callable_accepts_argument(backend.propose, "hotspot_weight_override")
+    ):
+        propose_kwargs["hotspot_weight_override"] = hotspot_weight_override
     raw = backend.propose(**propose_kwargs)
     return _normalize_proposal_batch(raw)
 
@@ -752,6 +759,7 @@ def _call_backend_continuous_design(
     *,
     proposal_logits: Optional[torch.Tensor],
     hotspot_params: Optional[Dict[str, Any]] = None,
+    hotspot_weight_override: Optional[float] = None,
     track_confidence_override: Optional[bool] = None,
     soft_steps_override: Optional[int] = None,
     **kwargs: Any,
@@ -771,6 +779,14 @@ def _call_backend_continuous_design(
         design_kwargs["hotspot_params"] = (
             dict(hotspot_params) if hotspot_params is not None else None
         )
+    if (
+        hotspot_params is not None
+        and hotspot_weight_override is not None
+        and _callable_accepts_argument(
+            backend.continuous_design, "hotspot_weight_override"
+        )
+    ):
+        design_kwargs["hotspot_weight_override"] = hotspot_weight_override
     raw = backend.continuous_design(**design_kwargs)
     return _normalize_proposal_batch(raw)
 
@@ -2070,6 +2086,34 @@ def _finite_float(value: Any) -> Optional[float]:
     return scalar
 
 
+def _hotspot_proposal_weight_for_verified_state(
+    state: Any,
+    *,
+    configured_weight: float,
+    satisfied_weight: float,
+) -> float:
+    """Reduce hotspot attraction after every requested hotspot is covered."""
+
+    configured = max(float(configured_weight), 0.0)
+    satisfied = max(float(satisfied_weight), 0.0)
+    if state is None or configured <= 0.0:
+        return configured
+
+    mappings: List[Mapping[str, Any]] = []
+    if isinstance(state, Mapping):
+        mappings.append(state)
+    for attr in ("summary_confidence", "loss_dict", "loss_vector"):
+        value = getattr(state, attr, None)
+        if isinstance(value, Mapping):
+            mappings.append(value)
+
+    for values in mappings:
+        coverage = _finite_float(values.get("hotspot_heavy_atom_coverage"))
+        if coverage is not None:
+            return satisfied if coverage >= 1.0 - 1.0e-8 else configured
+    return configured
+
+
 def _merge_preview_losses_for_routing(
     backend: Any,
     preview_cache: Dict[str, Dict[str, float]],
@@ -2657,6 +2701,9 @@ def run_esmfold2_mcts_hallucination(
     ]
     backend_config = getattr(backend, "config", None)
     hotspot_weight = float(getattr(backend_config, "hotspot_weight", 0.0))
+    hotspot_satisfied_proposal_weight = float(
+        getattr(backend_config, "hotspot_satisfied_proposal_weight", 0.0)
+    )
     hotspot_cutoff = float(getattr(backend_config, "hotspot_cutoff", 8.0))
     hotspot_interface_mode = str(
         getattr(backend_config, "hotspot_interface_mode", "additive")
@@ -2670,6 +2717,12 @@ def run_esmfold2_mcts_hallucination(
     hotspot_verify_far_cutoff = float(
         getattr(backend_config, "hotspot_verify_far_cutoff", 20.0)
     )
+    hotspot_verify_min_distance = float(
+        getattr(backend_config, "hotspot_verify_min_distance", 0.0)
+    )
+    hotspot_verify_too_close_weight = float(
+        getattr(backend_config, "hotspot_verify_too_close_weight", 0.0)
+    )
     if hotspot_weight > 0.0 and not hotspot_indices:
         raise ValueError(
             "positive ESMFold2 hotspot_weight requires target hotspot indices"
@@ -2678,17 +2731,29 @@ def run_esmfold2_mcts_hallucination(
         raise ValueError(
             "positive ESMFold2 hotspot_verify_weight requires target hotspot indices"
         )
+    if hotspot_verify_too_close_weight > 0.0 and not hotspot_indices:
+        raise ValueError(
+            "positive ESMFold2 hotspot_verify_too_close_weight requires "
+            "target hotspot indices"
+        )
     hotspot_summary = {
         "hotspot_indices_0based": hotspot_indices,
         "hotspot_weight": hotspot_weight,
+        "hotspot_satisfied_proposal_weight": hotspot_satisfied_proposal_weight,
         "hotspot_cutoff": hotspot_cutoff,
         "hotspot_interface_mode": hotspot_interface_mode,
         "hotspot_enabled": bool(hotspot_indices and hotspot_weight > 0.0),
         "hotspot_verify_weight": hotspot_verify_weight,
         "hotspot_verify_near_cutoff": hotspot_verify_near_cutoff,
         "hotspot_verify_far_cutoff": hotspot_verify_far_cutoff,
+        "hotspot_verify_min_distance": hotspot_verify_min_distance,
+        "hotspot_verify_too_close_weight": hotspot_verify_too_close_weight,
         "hotspot_verify_enabled": bool(
-            hotspot_indices and hotspot_verify_weight > 0.0
+            hotspot_indices
+            and (
+                hotspot_verify_weight > 0.0
+                or hotspot_verify_too_close_weight > 0.0
+            )
         ),
     }
     logit_init_mode = _normalize_logit_init_mode(esmfold2_logit_init_mode)
@@ -2837,19 +2902,23 @@ def run_esmfold2_mcts_hallucination(
             esmfold2_initial_logits_checkpoint,
         )
     logger.info(
-        "ESMFold2 hotspot: indices_0based=%s weight=%.4f cutoff=%.2fA "
-        "interface_mode=%s enabled=%s",
+        "ESMFold2 hotspot: indices_0based=%s weight=%.4f "
+        "satisfied_weight=%.4f cutoff=%.2fA interface_mode=%s enabled=%s",
         hotspot_indices or "none",
         hotspot_weight,
+        hotspot_satisfied_proposal_weight,
         hotspot_cutoff,
         hotspot_interface_mode,
         hotspot_summary["hotspot_enabled"],
     )
     logger.info(
-        "ESMFold2 hotspot verifier: weight=%.4f near=%.2fA far=%.2fA enabled=%s",
+        "ESMFold2 hotspot verifier: attraction_weight=%.4f near=%.2fA "
+        "far=%.2fA min_safe=%.2fA too_close_weight=%.4f enabled=%s",
         hotspot_verify_weight,
         hotspot_verify_near_cutoff,
         hotspot_verify_far_cutoff,
+        hotspot_verify_min_distance,
+        hotspot_verify_too_close_weight,
         hotspot_summary["hotspot_verify_enabled"],
     )
     logger.info(
@@ -3090,6 +3159,11 @@ def run_esmfold2_mcts_hallucination(
             current_best_seq,
             mutable_mask,
         ).detach().cpu().clone()
+        proposal_hotspot_weight = _hotspot_proposal_weight_for_verified_state(
+            current_best_result,
+            configured_weight=hotspot_weight,
+            satisfied_weight=hotspot_satisfied_proposal_weight,
+        )
 
         proposal_batch = _call_backend_continuous_design(
             backend,
@@ -3100,6 +3174,7 @@ def run_esmfold2_mcts_hallucination(
             mutable_mask=mutable_mask,
             proposal_logits=polish_logits,
             hotspot_params=hotspot_params,
+            hotspot_weight_override=proposal_hotspot_weight,
             track_confidence_override=True,
             soft_steps_override=stagea_soft_steps,
         )
@@ -3162,6 +3237,7 @@ def run_esmfold2_mcts_hallucination(
             best_sequence=final_best_seq,
             polish_sequence=str(round_best.binder_seq),
             polish_improved=polish_improved,
+            proposal_hotspot_weight=proposal_hotspot_weight,
             **_proposal_confidence_summary(proposal_batch),
         )
         artifact_recorder.write_checkpoint(
@@ -3185,6 +3261,11 @@ def run_esmfold2_mcts_hallucination(
     if strategy == "continuous_stage_a":
         selected_node = stagea_node_by_sequence.get(best_seq) or tree.select()
         current_seq = str(selected_node.sequence)
+        proposal_hotspot_weight = _hotspot_proposal_weight_for_verified_state(
+            verifier_cache.get(current_seq),
+            configured_weight=hotspot_weight,
+            satisfied_weight=hotspot_satisfied_proposal_weight,
+        )
         proposal_batch = _call_backend_continuous_design(
             backend,
             current_seq=current_seq,
@@ -3194,6 +3275,7 @@ def run_esmfold2_mcts_hallucination(
             mutable_mask=mutable_mask,
             proposal_logits=selected_node.logits,
             hotspot_params=hotspot_params,
+            hotspot_weight_override=proposal_hotspot_weight,
             track_confidence_override=None,
             soft_steps_override=stagea_soft_steps,
         )
@@ -3277,6 +3359,7 @@ def run_esmfold2_mcts_hallucination(
             round_best_loss=float(round_best.total_loss),
             global_best_loss=best_loss,
             best_sequence=best_seq,
+            proposal_hotspot_weight=proposal_hotspot_weight,
             **_proposal_confidence_summary(proposal_batch),
         )
         artifact_recorder.write_checkpoint(
@@ -3330,6 +3413,11 @@ def run_esmfold2_mcts_hallucination(
     for step in range(stagea_steps):
         selected_node = tree.select()
         current_seq = selected_node.sequence
+        proposal_hotspot_weight = _hotspot_proposal_weight_for_verified_state(
+            verifier_cache.get(str(current_seq)),
+            configured_weight=hotspot_weight,
+            satisfied_weight=hotspot_satisfied_proposal_weight,
+        )
         proposal_seed = _stable_seed(seed, "esm_propose", target_key, current_seq, step)
         proposal_batch = _call_backend_propose(
             backend,
@@ -3345,6 +3433,7 @@ def run_esmfold2_mcts_hallucination(
             mutable_mask=mutable_mask,
             proposal_logits=selected_node.logits,
             hotspot_params=hotspot_params,
+            hotspot_weight_override=proposal_hotspot_weight,
             track_confidence_override=False,
             soft_steps_override=stagea_soft_steps,
         )
@@ -3474,6 +3563,7 @@ def run_esmfold2_mcts_hallucination(
                 str(node.sequence) == str(argmax_sequence)
                 for node in new_nodes
             ) if argmax_sequence is not None else False,
+            proposal_hotspot_weight=proposal_hotspot_weight,
             round_best_loss=float(round_best.total_loss),
             global_best_loss=best_loss,
             best_sequence=best_seq,
@@ -3665,6 +3755,11 @@ def run_esmfold2_mcts_hallucination(
         selection = strict_tree.select_decision()
         selected_node = selection.node
         current_seq = selected_node.sequence
+        proposal_hotspot_weight = _hotspot_proposal_weight_for_verified_state(
+            selected_node.loss_vector,
+            configured_weight=hotspot_weight,
+            satisfied_weight=hotspot_satisfied_proposal_weight,
+        )
 
         if selected_node.loss_vector is None:
             raise ValueError("ESMFold2 Stage-B node is missing full-verifier loss metrics")
@@ -3728,6 +3823,7 @@ def run_esmfold2_mcts_hallucination(
                 mutable_mask=mutable_mask,
                 proposal_logits=selected_node.logits,
                 hotspot_params=hotspot_params,
+                hotspot_weight_override=proposal_hotspot_weight,
                 track_confidence_override=False,
                 soft_steps_override=stageb_soft_steps,
             )
@@ -4054,6 +4150,7 @@ def run_esmfold2_mcts_hallucination(
             ),
             best_reward_gain=best_reward_gain,
             best_pair_chain_iptm_gain=best_pair_chain_gain,
+            proposal_hotspot_weight=proposal_hotspot_weight,
             loss_vector_keys=sorted(str(key) for key in selected_node.loss_vector.keys()),
         )
         if round_results:

@@ -51,8 +51,11 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_resume_handoff_checkpoint is None
     assert args.esmfold2_resume_reverify_roots is False
     assert args.esmfold2_hotspot_weight is None
+    assert args.esmfold2_hotspot_satisfied_proposal_weight == pytest.approx(0.0)
     assert args.esmfold2_hotspot_interface_mode is None
     assert args.esmfold2_hotspot_verify_weight is None
+    assert args.esmfold2_hotspot_verify_min_distance == pytest.approx(2.5)
+    assert args.esmfold2_hotspot_verify_too_close_weight is None
     run_hallucination_script.resolve_esmfold2_hotspot_defaults(
         args,
         model_backend="esmfold2",
@@ -64,6 +67,7 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_hotspot_verify_weight == pytest.approx(0.0)
     assert args.esmfold2_hotspot_verify_near_cutoff == pytest.approx(8.0)
     assert args.esmfold2_hotspot_verify_far_cutoff == pytest.approx(20.0)
+    assert args.esmfold2_hotspot_verify_too_close_weight == pytest.approx(0.0)
 
 
 def test_esmfold2_hotspot_defaults_to_localized_half_weight():
@@ -88,6 +92,9 @@ def test_esmfold2_hotspot_defaults_to_localized_half_weight():
     assert args.esmfold2_hotspot_weight == pytest.approx(0.5)
     assert args.esmfold2_hotspot_interface_mode == "localized"
     assert args.esmfold2_hotspot_verify_weight == pytest.approx(0.25)
+    assert args.esmfold2_hotspot_satisfied_proposal_weight == pytest.approx(0.0)
+    assert args.esmfold2_hotspot_verify_min_distance == pytest.approx(2.5)
+    assert args.esmfold2_hotspot_verify_too_close_weight == pytest.approx(0.25)
 
 
 def test_explicit_esmfold2_hotspot_settings_override_conditional_defaults():

@@ -21,6 +21,7 @@ from bindcraft.hallucination.esmfold2_pipeline import (
 from bindcraft.hallucination.esmfold2_pipeline import (
     _ESMFold2StageBMCTSTree,
     _allocate_group_budgets,
+    _hotspot_proposal_weight_for_verified_state,
     _load_initial_logits_checkpoint_states,
     _make_phase0_seed_states,
     _make_stageb_proposals,
@@ -584,6 +585,31 @@ def test_stageb_guarded_rank_prefers_global_quality_after_full_coverage():
         _stageb_guarded_rank(farther_but_better, tree)
         > _stageb_guarded_rank(close_but_weaker, tree)
     )
+
+
+def test_hotspot_proposal_weight_stops_after_full_verified_coverage():
+    hit = SimpleNamespace(
+        summary_confidence={"hotspot_heavy_atom_coverage": 1.0}
+    )
+    miss = SimpleNamespace(
+        summary_confidence={"hotspot_heavy_atom_coverage": 0.5}
+    )
+
+    assert _hotspot_proposal_weight_for_verified_state(
+        hit,
+        configured_weight=0.5,
+        satisfied_weight=0.0,
+    ) == pytest.approx(0.0)
+    assert _hotspot_proposal_weight_for_verified_state(
+        miss,
+        configured_weight=0.5,
+        satisfied_weight=0.0,
+    ) == pytest.approx(0.5)
+    assert _hotspot_proposal_weight_for_verified_state(
+        None,
+        configured_weight=0.5,
+        satisfied_weight=0.0,
+    ) == pytest.approx(0.5)
 
 
 def test_stageb_guarded_rank_accepts_a_run_level_quality_floor():

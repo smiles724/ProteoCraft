@@ -381,6 +381,27 @@ def test_hotspot_structure_metrics_map_concatenated_indices_across_target_chains
     assert metrics["hotspot_verify_distance_loss"] == pytest.approx(1.0)
 
 
+def test_hotspot_structure_metrics_penalize_unsafe_heavy_atom_distance():
+    complex_obj = FakeGeometryComplex()
+    complex_obj.chain_boundaries = [(0, 4), (5, 8)]
+    complex_obj.atom37_positions[5:8, 0] = torch.tensor([1.8, 0.0, 0.0])
+
+    metrics = _hotspot_structure_metrics(
+        complex_obj,
+        target_sequences=["AAAA"],
+        hotspot_params={"target_hotspot_concat_indices": [0]},
+        near_cutoff=8.0,
+        far_cutoff=20.0,
+        min_safe_distance=2.5,
+    )
+
+    assert metrics["hotspot_verify_distance_loss"] == pytest.approx(0.0)
+    assert metrics["hotspot_too_close_loss"] == pytest.approx(
+        (2.5 - 1.8) / 2.5
+    )
+    assert metrics["hotspot_verify_min_distance"] == pytest.approx(2.5)
+
+
 def test_runtime_preserves_matching_free_proposal_logits_without_hard_anchor():
     generator = torch.Generator().manual_seed(11)
     proposal_logits = init_binder_logits(

@@ -73,11 +73,14 @@ class ESMFold2ProposalConfig:
     proposal_lm_dropout: Optional[float] = 0.5
     force_proposal_lm_dropout: bool = True
     hotspot_weight: float = 0.0
+    hotspot_satisfied_proposal_weight: float = 0.0
     hotspot_cutoff: float = 8.0
     hotspot_interface_mode: str = "additive"
     hotspot_verify_weight: float = 0.0
     hotspot_verify_near_cutoff: float = 8.0
     hotspot_verify_far_cutoff: float = 20.0
+    hotspot_verify_min_distance: float = 2.5
+    hotspot_verify_too_close_weight: float = 0.0
     stageb_group_weight: float = 1.0
     track_proposal_confidence: bool = False
     proposal_confidence_temperature: float = 0.05
@@ -106,6 +109,10 @@ class ESMFold2ProposalConfig:
             raise ValueError("stageb_group_weight must be non-negative")
         if float(self.hotspot_weight) < 0.0:
             raise ValueError("hotspot_weight must be non-negative")
+        if float(self.hotspot_satisfied_proposal_weight) < 0.0:
+            raise ValueError(
+                "hotspot_satisfied_proposal_weight must be non-negative"
+            )
         if float(self.hotspot_cutoff) <= 0.0:
             raise ValueError("hotspot_cutoff must be positive")
         hotspot_interface_mode = str(self.hotspot_interface_mode).strip().lower()
@@ -117,6 +124,14 @@ class ESMFold2ProposalConfig:
             raise ValueError(
                 "localized hotspot_interface_mode requires hotspot_weight in [0, 1]"
             )
+        if (
+            hotspot_interface_mode == "localized"
+            and float(self.hotspot_satisfied_proposal_weight) > 1.0
+        ):
+            raise ValueError(
+                "localized hotspot_interface_mode requires "
+                "hotspot_satisfied_proposal_weight in [0, 1]"
+            )
         if float(self.hotspot_verify_weight) < 0.0:
             raise ValueError("hotspot_verify_weight must be non-negative")
         if float(self.hotspot_verify_near_cutoff) < 0.0:
@@ -127,6 +142,19 @@ class ESMFold2ProposalConfig:
             raise ValueError(
                 "hotspot_verify_far_cutoff must be greater than "
                 "hotspot_verify_near_cutoff"
+            )
+        if float(self.hotspot_verify_min_distance) < 0.0:
+            raise ValueError("hotspot_verify_min_distance must be non-negative")
+        if float(self.hotspot_verify_min_distance) > float(
+            self.hotspot_verify_near_cutoff
+        ):
+            raise ValueError(
+                "hotspot_verify_min_distance must not exceed "
+                "hotspot_verify_near_cutoff"
+            )
+        if float(self.hotspot_verify_too_close_weight) < 0.0:
+            raise ValueError(
+                "hotspot_verify_too_close_weight must be non-negative"
             )
         if self.proposal_lm_dropout is not None:
             dropout = float(self.proposal_lm_dropout)
@@ -280,6 +308,8 @@ def build_esm_verifier_result(
     extra_loss_dict: Optional[Mapping[str, float]] = None,
     hotspot_verify_loss: Optional[float] = None,
     hotspot_verify_weight: float = 0.0,
+    hotspot_too_close_loss: Optional[float] = None,
+    hotspot_too_close_weight: float = 0.0,
 ) -> ESMFold2VerifierResult:
     """Build a verifier result object accepted by the existing MCTS cache."""
 
@@ -298,19 +328,42 @@ def build_esm_verifier_result(
         if hotspot_loss < 0.0 or hotspot_loss > 1.0:
             raise ValueError("hotspot_verify_loss must be in [0, 1]")
         total_loss += hotspot_weight * hotspot_loss
+    too_close_loss = _finite_float(hotspot_too_close_loss)
+    too_close_weight = float(hotspot_too_close_weight)
+    if too_close_weight < 0.0:
+        raise ValueError("hotspot_too_close_weight must be non-negative")
+    if too_close_weight > 0.0 and too_close_loss is None:
+        raise ValueError(
+            "positive hotspot_too_close_weight requires hotspot_too_close_loss"
+        )
+    too_close_enabled = too_close_loss is not None and too_close_weight > 0.0
+    if too_close_enabled:
+        if too_close_loss < 0.0 or too_close_loss > 1.0:
+            raise ValueError("hotspot_too_close_loss must be in [0, 1]")
+        total_loss += too_close_weight * too_close_loss
     loss_dict: Dict[str, float] = {
         "total": float(total_loss),
         "esm_verify_loss": float(total_loss),
     }
     loss_dict["pair_chain_iptm_loss"] = float(global_loss)
+    if hotspot_enabled or too_close_enabled:
+        loss_dict["esm_verify_global_loss"] = float(global_loss)
     if hotspot_enabled:
         loss_dict.update(
             {
-                "esm_verify_global_loss": float(global_loss),
                 "hotspot_verify_distance_loss": float(hotspot_loss),
                 "hotspot_verify_weight": hotspot_weight,
                 "hotspot_verify_weighted_contribution": hotspot_weight
                 * float(hotspot_loss),
+            }
+        )
+    if too_close_enabled:
+        loss_dict.update(
+            {
+                "hotspot_too_close_loss": float(too_close_loss),
+                "hotspot_too_close_weight": too_close_weight,
+                "hotspot_too_close_weighted_contribution": too_close_weight
+                * float(too_close_loss),
             }
         )
     plddt = _finite_float(summary_confidence.get("binder_plddt"))
@@ -331,14 +384,24 @@ def build_esm_verifier_result(
     summary = dict(summary_confidence)
     summary["esm_verify_loss"] = float(total_loss)
     summary["esm_verify_source"] = source
+    if hotspot_enabled or too_close_enabled:
+        summary["esm_verify_global_loss"] = float(global_loss)
     if hotspot_enabled:
         summary.update(
             {
-                "esm_verify_global_loss": float(global_loss),
                 "hotspot_verify_distance_loss": float(hotspot_loss),
                 "hotspot_verify_weight": hotspot_weight,
                 "hotspot_verify_weighted_contribution": hotspot_weight
                 * float(hotspot_loss),
+            }
+        )
+    if too_close_enabled:
+        summary.update(
+            {
+                "hotspot_too_close_loss": float(too_close_loss),
+                "hotspot_too_close_weight": too_close_weight,
+                "hotspot_too_close_weighted_contribution": too_close_weight
+                * float(too_close_loss),
             }
         )
     return ESMFold2VerifierResult(
