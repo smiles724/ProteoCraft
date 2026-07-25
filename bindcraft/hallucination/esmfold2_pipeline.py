@@ -1383,6 +1383,169 @@ def _make_phase0_seed_states(
     ]
 
 
+def _resolve_initial_logits_checkpoint_paths(
+    source: Union[str, os.PathLike[str]],
+) -> List[Path]:
+    """Resolve one checkpoint file or a Best-of-N artifact directory."""
+
+    path = Path(source).expanduser()
+    if path.is_file():
+        return [path.resolve()]
+    if not path.exists():
+        raise FileNotFoundError(f"initial logits checkpoint does not exist: {path}")
+    if not path.is_dir():
+        raise ValueError(f"initial logits checkpoint must be a file or directory: {path}")
+
+    direct = path / "initial_logits.pt"
+    if direct.is_file():
+        return [direct.resolve()]
+
+    checkpoint_paths = sorted(path.glob("trajectory_*/initial_logits.pt"))
+    if not checkpoint_paths:
+        checkpoint_paths = sorted(
+            path.glob("best_of_n/trajectory_*/initial_logits.pt")
+        )
+    if not checkpoint_paths:
+        raise FileNotFoundError(
+            "no initial_logits.pt checkpoints found under "
+            f"{path}; expected trajectory_*/initial_logits.pt or "
+            "best_of_n/trajectory_*/initial_logits.pt"
+        )
+    return [checkpoint.resolve() for checkpoint in checkpoint_paths]
+
+
+def _load_initial_logits_checkpoint_states(
+    source: Union[str, os.PathLike[str]],
+    *,
+    L_binder: int,
+    num_beams: int,
+    init_binder_seq: Optional[str],
+    mutable_mask: Sequence[bool],
+) -> Tuple[List[Tuple[str, torch.Tensor]], List[str]]:
+    """Load exact MCTS Phase-0 roots from saved Best-of-N logits."""
+
+    checkpoint_paths = _resolve_initial_logits_checkpoint_paths(source)
+    expected_count = max(int(num_beams), 1)
+    if len(checkpoint_paths) != expected_count:
+        raise ValueError(
+            f"initial logits checkpoint count {len(checkpoint_paths)} does not "
+            f"match mcts_num_beams {expected_count}"
+        )
+
+    reference_sequence = None
+    if init_binder_seq is not None:
+        reference_sequence = str(init_binder_seq).strip().upper()
+        if len(reference_sequence) != int(L_binder):
+            raise ValueError(
+                f"init_binder_seq length {len(reference_sequence)} does not "
+                f"match L_binder {L_binder}"
+            )
+        invalid = sorted(set(reference_sequence) - set(ESM_AA_ORDER))
+        if invalid:
+            raise ValueError(f"Invalid amino acid(s) in init_binder_seq: {invalid}")
+    elif not all(bool(item) for item in mutable_mask):
+        raise ValueError(
+            "loading initial logits with fixed binder positions requires "
+            "init_binder_seq"
+        )
+
+    states: List[Tuple[str, torch.Tensor]] = []
+    for checkpoint_path in checkpoint_paths:
+        payload = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+        if isinstance(payload, Mapping):
+            if "logits" not in payload:
+                raise ValueError(
+                    f"checkpoint has no 'logits' tensor: {checkpoint_path}"
+                )
+            logits_value = payload["logits"]
+            stored_sequence_value = payload.get("sequence")
+            stored_hash = payload.get("sequence_hash")
+        else:
+            logits_value = payload
+            stored_sequence_value = None
+            stored_hash = None
+
+        if not isinstance(logits_value, torch.Tensor):
+            raise ValueError(
+                f"checkpoint logits must be a torch.Tensor: {checkpoint_path}"
+            )
+        logits = logits_value.detach().cpu()
+        if logits.ndim == 3 and logits.shape[0] == 1:
+            logits = logits[0]
+        expected_shape = (int(L_binder), len(ESM_AA_ORDER))
+        if logits.ndim != 2 or tuple(logits.shape) != expected_shape:
+            raise ValueError(
+                f"checkpoint logits shape {tuple(logits.shape)} does not match "
+                f"{expected_shape}: {checkpoint_path}"
+            )
+        if not torch.is_floating_point(logits):
+            raise ValueError(
+                f"checkpoint logits must use a floating dtype: {checkpoint_path}"
+            )
+        if torch.isnan(logits).any() or torch.isposinf(logits).any():
+            raise ValueError(
+                f"checkpoint logits contain NaN or +inf: {checkpoint_path}"
+            )
+        if torch.isneginf(logits).all(dim=-1).any():
+            raise ValueError(
+                f"checkpoint logits contain a position with no valid amino acid: "
+                f"{checkpoint_path}"
+            )
+
+        stored_sequence = None
+        if stored_sequence_value is not None:
+            stored_sequence = str(stored_sequence_value).strip().upper()
+            if len(stored_sequence) != int(L_binder):
+                raise ValueError(
+                    f"checkpoint sequence length {len(stored_sequence)} does not "
+                    f"match L_binder {L_binder}: {checkpoint_path}"
+                )
+            invalid = sorted(set(stored_sequence) - set(ESM_AA_ORDER))
+            if invalid:
+                raise ValueError(
+                    f"checkpoint sequence contains invalid amino acid(s) "
+                    f"{invalid}: {checkpoint_path}"
+                )
+            if stored_hash is not None and str(stored_hash) != _sequence_hash(
+                stored_sequence
+            ):
+                raise ValueError(
+                    f"checkpoint sequence hash does not match sequence: "
+                    f"{checkpoint_path}"
+                )
+
+        base_sequence = reference_sequence or stored_sequence or ("A" * int(L_binder))
+        derived_sequence = sequence_from_logits_argmax(
+            logits,
+            current_seq=base_sequence,
+            mutable_mask=mutable_mask,
+        )
+        if stored_sequence is not None and stored_sequence != derived_sequence:
+            raise ValueError(
+                f"checkpoint sequence does not match logits argmax: {checkpoint_path}"
+            )
+        if reference_sequence is not None:
+            for index, is_mutable in enumerate(mutable_mask):
+                checkpoint_amino_acid = ESM_AA_ORDER[
+                    int(torch.argmax(logits[index]).item())
+                ]
+                if (
+                    not is_mutable
+                    and checkpoint_amino_acid != reference_sequence[index]
+                ):
+                    raise ValueError(
+                        f"checkpoint changes fixed binder position {index + 1}: "
+                        f"{checkpoint_path}"
+                    )
+        states.append((derived_sequence, logits.clone()))
+
+    return states, [str(path) for path in checkpoint_paths]
+
+
 def run_esmfold2_best_of_n(
     *,
     backend: Any,
@@ -2364,6 +2527,9 @@ def run_esmfold2_mcts_hallucination(
     stageb_max_mutations_per_seq: Optional[int] = None,
     num_beams: int = 8,
     init_binder_seq: Optional[str] = None,
+    esmfold2_initial_logits_checkpoint: Optional[
+        Union[str, os.PathLike[str]]
+    ] = None,
     mcts_C: float = 1.0,
     mcts_max_nodes: int = 5000,
     mcts_strategy: str = "legacy",
@@ -2554,6 +2720,14 @@ def run_esmfold2_mcts_hallucination(
         raise ValueError("esmfold2_stagea_handoff_checkpoint_interval must be non-negative")
     if esmfold2_resume_handoff_checkpoint is not None and strategy != "two_stage":
         raise ValueError("StageA handoff checkpoints can only resume into two_stage MCTS")
+    if (
+        esmfold2_initial_logits_checkpoint is not None
+        and esmfold2_resume_handoff_checkpoint is not None
+    ):
+        raise ValueError(
+            "esmfold2_initial_logits_checkpoint and "
+            "esmfold2_resume_handoff_checkpoint are mutually exclusive"
+        )
     if esmfold2_resume_reverify_roots and esmfold2_resume_handoff_checkpoint is None:
         raise ValueError(
             "esmfold2_resume_reverify_roots requires a StageA handoff checkpoint"
@@ -2617,6 +2791,11 @@ def run_esmfold2_mcts_hallucination(
             bool(esmfold2_resume_reverify_roots),
             bool(resume_state["verifier_contract_matches"]),
         )
+    elif esmfold2_initial_logits_checkpoint is not None:
+        logger.info(
+            "Loading exact Phase0 logits from checkpoint source: %s",
+            esmfold2_initial_logits_checkpoint,
+        )
     logger.info(
         "ESMFold2 hotspot: indices_0based=%s weight=%.4f cutoff=%.2fA "
         "interface_mode=%s enabled=%s",
@@ -2650,7 +2829,18 @@ def run_esmfold2_mcts_hallucination(
     )
     logger.info("=" * 70)
 
-    if resume_state is None:
+    initial_logits_checkpoint_paths: List[str] = []
+    if resume_state is None and esmfold2_initial_logits_checkpoint is not None:
+        phase0_states, initial_logits_checkpoint_paths = (
+            _load_initial_logits_checkpoint_states(
+                esmfold2_initial_logits_checkpoint,
+                L_binder=L_binder,
+                num_beams=num_beams,
+                init_binder_seq=init_binder_seq,
+                mutable_mask=mutable_mask,
+            )
+        )
+    elif resume_state is None:
         phase0_states = _make_phase0_seed_states(
             init_binder_seq,
             num_beams=num_beams,
@@ -3056,6 +3246,12 @@ def run_esmfold2_mcts_hallucination(
             n_steps=len(losses_history),
             strategy=strategy,
             artifact_dir=str(artifact_dir) if artifact_dir is not None else None,
+            initial_logits_checkpoint_source=(
+                str(Path(esmfold2_initial_logits_checkpoint).expanduser())
+                if esmfold2_initial_logits_checkpoint is not None
+                else None
+            ),
+            initial_logits_checkpoint_paths=initial_logits_checkpoint_paths,
             **hotspot_summary,
         )
         logger.info(
@@ -3244,6 +3440,12 @@ def run_esmfold2_mcts_hallucination(
             stagea_handoff_checkpoint=(
                 str(latest_handoff_checkpoint) if latest_handoff_checkpoint is not None else None
             ),
+            initial_logits_checkpoint_source=(
+                str(Path(esmfold2_initial_logits_checkpoint).expanduser())
+                if esmfold2_initial_logits_checkpoint is not None
+                else None
+            ),
+            initial_logits_checkpoint_paths=initial_logits_checkpoint_paths,
             **hotspot_summary,
         )
         return best_seq, final_seq, losses_history
@@ -3824,6 +4026,12 @@ def run_esmfold2_mcts_hallucination(
         resumed_handoff_verifier_contract_matches=(
             None if resume_state is None else bool(resume_state["verifier_contract_matches"])
         ),
+        initial_logits_checkpoint_source=(
+            str(Path(esmfold2_initial_logits_checkpoint).expanduser())
+            if esmfold2_initial_logits_checkpoint is not None
+            else None
+        ),
+        initial_logits_checkpoint_paths=initial_logits_checkpoint_paths,
         stageb_shared_verifier_seed=(
             stageb_shared_verify_seed if stageb_paired_verifier_seed else None
         ),

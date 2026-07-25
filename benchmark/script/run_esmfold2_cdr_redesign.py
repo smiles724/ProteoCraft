@@ -148,6 +148,7 @@ def build_hallucination_command(
         "esmfold2_force_proposal_lm_dropout": "esmfold2_force_proposal_lm_dropout",
         "esmfold2_lambda_esmc": "esmfold2_lambda_esmc",
         "esmfold2_logit_init_mode": "esmfold2_logit_init_mode",
+        "esmfold2_initial_logits_checkpoint": "esmfold2_initial_logits_checkpoint",
         "esmfold2_stagea_handoff_checkpoint_interval": "esmfold2_stagea_handoff_checkpoint_interval",
     }
     for config_key, cli_name in option_map.items():

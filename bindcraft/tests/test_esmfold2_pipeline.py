@@ -1,8 +1,10 @@
-import torch
-import pytest
+import hashlib
 import json
 import random
 from types import SimpleNamespace
+
+import pytest
+import torch
 
 from bindcraft.hallucination.esmfold2_backend import (
     AA_TO_ESM_IDX,
@@ -19,6 +21,7 @@ from bindcraft.hallucination.esmfold2_pipeline import (
 from bindcraft.hallucination.esmfold2_pipeline import (
     _ESMFold2StageBMCTSTree,
     _allocate_group_budgets,
+    _load_initial_logits_checkpoint_states,
     _make_phase0_seed_states,
     _make_stageb_proposals,
     _rerank_stageb_candidates_with_preview,
@@ -1101,6 +1104,107 @@ def test_esmfold2_official_exact_roots_use_direct_torch_seed():
     seq, logits = states[0]
     assert seq == expected_seq
     assert torch.allclose(logits, expected_logits, equal_nan=False)
+
+
+def test_initial_logits_checkpoint_directory_restores_exact_phase0_roots(tmp_path):
+    best_of_n_dir = tmp_path / "best_of_n"
+    expected_states = []
+    for trajectory_index, sequence in enumerate(("AYY", "FYA")):
+        trajectory_dir = best_of_n_dir / f"trajectory_{trajectory_index:03d}"
+        trajectory_dir.mkdir(parents=True)
+        logits = torch.full((3, len(ESM_AA_ORDER)), -1.0)
+        for position, amino_acid in enumerate(sequence):
+            logits[position, AA_TO_ESM_IDX[amino_acid]] = 1.0
+        torch.save(
+            {
+                "trajectory_index": trajectory_index,
+                "label": "initial_logits",
+                "seed": trajectory_index + 10,
+                "sequence": sequence,
+                "sequence_hash": hashlib.sha256(sequence.encode("utf-8")).hexdigest()[:16],
+                "logits": logits,
+            },
+            trajectory_dir / "initial_logits.pt",
+        )
+        expected_states.append((sequence, logits))
+
+    states, paths = _load_initial_logits_checkpoint_states(
+        tmp_path,
+        L_binder=3,
+        num_beams=2,
+        init_binder_seq=None,
+        mutable_mask=[True, True, True],
+    )
+
+    assert [sequence for sequence, _ in states] == ["AYY", "FYA"]
+    assert len(paths) == 2
+    for (_, actual_logits), (_, expected_logits) in zip(states, expected_states):
+        assert torch.equal(actual_logits, expected_logits)
+
+
+def test_initial_logits_checkpoint_requires_exact_beam_count(tmp_path):
+    logits = torch.zeros((3, len(ESM_AA_ORDER)))
+    torch.save({"sequence": "AAA", "logits": logits}, tmp_path / "initial_logits.pt")
+
+    with pytest.raises(ValueError, match="does not match mcts_num_beams"):
+        _load_initial_logits_checkpoint_states(
+            tmp_path / "initial_logits.pt",
+            L_binder=3,
+            num_beams=2,
+            init_binder_seq=None,
+            mutable_mask=[True, True, True],
+        )
+
+
+def test_initial_logits_checkpoint_rejects_fixed_scaffold_mismatch(tmp_path):
+    logits = torch.full((3, len(ESM_AA_ORDER)), -1.0)
+    for position, amino_acid in enumerate("YAA"):
+        logits[position, AA_TO_ESM_IDX[amino_acid]] = 1.0
+    checkpoint = tmp_path / "initial_logits.pt"
+    torch.save({"logits": logits}, checkpoint)
+
+    with pytest.raises(ValueError, match="fixed binder"):
+        _load_initial_logits_checkpoint_states(
+            checkpoint,
+            L_binder=3,
+            num_beams=1,
+            init_binder_seq="AAA",
+            mutable_mask=[False, True, True],
+        )
+
+
+def test_mcts_uses_loaded_initial_logits_for_first_proposal(tmp_path):
+    backend = FakeESMFold2Backend()
+    logits = torch.full((3, len(ESM_AA_ORDER)), -1.0)
+    for position, amino_acid in enumerate("AAA"):
+        logits[position, AA_TO_ESM_IDX[amino_acid]] = 1.0 + position
+    checkpoint = tmp_path / "initial_logits.pt"
+    torch.save(
+        {
+            "sequence": "AAA",
+            "sequence_hash": hashlib.sha256(b"AAA").hexdigest()[:16],
+            "logits": logits,
+        },
+        checkpoint,
+    )
+
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=1,
+        num_beams=1,
+        K_top=4,
+        B_candidates=1,
+        T_sample=1.0,
+        max_mutations_per_seq=1,
+        seed=7,
+        mcts_strategy="stage_a_only",
+        esmfold2_initial_logits_checkpoint=checkpoint,
+    )
+
+    assert len(backend.propose_calls) == 1
+    assert torch.equal(backend.propose_calls[0]["proposal_logits"], logits)
 
 
 def test_esmfold2_official_free_scaffold_roots_anchor_only_fixed_positions():

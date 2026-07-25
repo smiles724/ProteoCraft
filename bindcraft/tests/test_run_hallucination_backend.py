@@ -42,6 +42,7 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_stageb_paired_verifier_seed is True
     assert args.stageb_max_mutations_per_seq == 1
     assert args.esmfold2_logit_init_mode == "official_exact"
+    assert args.esmfold2_initial_logits_checkpoint is None
     assert args.esmfold2_proposal_load_internal_esmc is True
     assert args.esmfold2_proposal_lm_dropout == pytest.approx(0.5)
     assert args.esmfold2_force_proposal_lm_dropout is True
@@ -432,6 +433,8 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
             "0.25",
             "--target_template_path",
             str(tmp_path / "target.cif"),
+            "--esmfold2_initial_logits_checkpoint",
+            str(tmp_path / "initial_logits.pt"),
             "--output_dir",
             str(tmp_path),
             "--log_file",
@@ -467,6 +470,9 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
         "target_hotspot_concat_indices": [1],
     }
     assert captured["esmfold2_logit_init_mode"] == "official_exact"
+    assert captured["esmfold2_initial_logits_checkpoint"] == str(
+        tmp_path / "initial_logits.pt"
+    )
     assert captured["esmfold2_stagea_soft_steps"] == 30
     assert captured["esmfold2_stageb_soft_steps"] == 20
     assert captured["esmfold2_stageb_discrete_rerank"] is True

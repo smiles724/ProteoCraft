@@ -533,6 +533,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--esmfold2_logit_init_mode", type=str, default="official_exact",
                        choices=["official_free", "official_exact", "legacy_anchor"],
                        help="ESMFold2 root logits 初始化方式；official_exact 用官方 seed 直接生成诊断初始 logits")
+    parser.add_argument(
+        "--esmfold2_initial_logits_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "ESMFold2 MCTS Phase0 初始 logits checkpoint 文件或 Best-of-N "
+            "artifact 目录；checkpoint 数量必须与 mcts_num_beams 完全一致"
+        ),
+    )
     parser.add_argument("--esmfold2_mutable_mask", type=str, default=None,
                        help="ESMFold2 可变位点 mask；长度需等于 binder_length，支持 01101 或 0,1,1,true")
     parser.add_argument(
@@ -848,6 +857,28 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
+        if (
+            args.esmfold2_initial_logits_checkpoint
+            and args.mcts_strategy == "best_of_n"
+        ):
+            message = (
+                "--esmfold2_initial_logits_checkpoint is only supported by "
+                "ESMFold2 MCTS strategies"
+            )
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if (
+            args.esmfold2_initial_logits_checkpoint
+            and args.esmfold2_resume_handoff_checkpoint
+        ):
+            message = (
+                "--esmfold2_initial_logits_checkpoint and "
+                "--esmfold2_resume_handoff_checkpoint are mutually exclusive"
+            )
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
         if args.esmfold2_resume_reverify_roots and not args.esmfold2_resume_handoff_checkpoint:
             message = (
                 "--esmfold2_resume_reverify_roots requires "
@@ -1059,6 +1090,7 @@ def main():
                 stageb_max_mutations_per_seq=args.stageb_max_mutations_per_seq,
                 num_beams=args.mcts_num_beams,
                 init_binder_seq=args.init_binder_seq,
+                esmfold2_initial_logits_checkpoint=args.esmfold2_initial_logits_checkpoint,
                 mcts_C=args.mcts_c,
                 mcts_max_nodes=args.mcts_max_nodes,
                 mcts_strategy=args.mcts_strategy,
@@ -1229,6 +1261,10 @@ def main():
             f.write(f"ESMFold2 Lambda ESMC: {args.esmfold2_lambda_esmc}\n")
             f.write(f"ESMFold2 Task Type: {args.esmfold2_task_type}\n")
             f.write(f"ESMFold2 Logit Init Mode: {args.esmfold2_logit_init_mode}\n")
+            f.write(
+                "ESMFold2 Initial Logits Checkpoint: "
+                f"{args.esmfold2_initial_logits_checkpoint or 'NONE'}\n"
+            )
             f.write(f"ESMFold2 Mutable Mask: {args.esmfold2_mutable_mask or 'ALL'}\n")
             f.write(
                 "ESMFold2 Target Chain Roles: "
