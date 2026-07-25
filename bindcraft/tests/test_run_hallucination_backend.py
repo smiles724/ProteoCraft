@@ -28,6 +28,8 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_soft_steps is None
     assert args.esmfold2_stagea_soft_steps == 30
     assert args.esmfold2_stageb_soft_steps == 20
+    assert args.esmfold2_stagea_cumulative_annealing is False
+    assert args.esmfold2_stagea_annealing_horizon == 150
     assert args.mcts_expand_actions_per_step == 2
     assert args.mcts_handoff_top_k == 2
     assert args.esmfold2_stageb_discrete_rerank is True

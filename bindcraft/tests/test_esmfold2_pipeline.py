@@ -92,6 +92,8 @@ class FakeESMFold2Backend:
         hotspot_params=None,
         track_confidence_override=None,
         soft_steps_override=None,
+        temperature_step_offset=0,
+        temperature_total_steps=None,
     ):
         self.propose_calls.append(
             {
@@ -106,6 +108,8 @@ class FakeESMFold2Backend:
                 "hotspot_params": hotspot_params,
                 "track_confidence_override": track_confidence_override,
                 "soft_steps_override": soft_steps_override,
+                "temperature_step_offset": temperature_step_offset,
+                "temperature_total_steps": temperature_total_steps,
             }
         )
         if current_seq == "AAA":
@@ -775,6 +779,30 @@ def test_esmfold2_stagea_pipeline_uses_backend_for_verify_and_proposal():
     assert [call[0] for call in backend.verify_calls] == ["AAA", "AAY", "AAF", "AYY"]
     assert [call["current_seq"] for call in backend.propose_calls] == ["AAA", "AAY"]
     assert [call["action_group"] for call in backend.propose_calls] == [None, None]
+
+
+def test_esmfold2_stagea_cumulative_annealing_is_inherited_by_children():
+    backend = FakeESMFold2Backend()
+
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=2,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=2,
+        T_sample=1.0,
+        max_mutations_per_seq=1,
+        seed=7,
+        esmfold2_stagea_soft_steps=30,
+        esmfold2_stagea_cumulative_annealing=True,
+        esmfold2_stagea_annealing_horizon=150,
+    )
+
+    assert [call["temperature_step_offset"] for call in backend.propose_calls] == [0, 30]
+    assert [call["temperature_total_steps"] for call in backend.propose_calls] == [150, 150]
 
 
 def test_stagea_legacy_tree_selects_lower_average_loss_path():

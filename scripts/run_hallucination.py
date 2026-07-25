@@ -448,6 +448,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--esmfold2_stageb_soft_steps", type=int, default=None,
                        help="ESMFold2 Stage B 每个 MCTS 节点的 soft gradient update 步数（默认：20）")
     parser.add_argument(
+        "--esmfold2_stagea_cumulative_annealing",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help="Stage A 是否让 child 继承累计温度进度，而非每个 proposal 重新退火（默认：false）",
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_annealing_horizon",
+        type=int,
+        default=150,
+        help="Stage A 累计退火的总 soft-step 周期；超过后保持最低温度（默认：150）",
+    )
+    parser.add_argument(
         "--esmfold2_best_of_n",
         type=int,
         default=8,
@@ -785,6 +797,11 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
+        if args.esmfold2_stagea_annealing_horizon <= 0:
+            message = "--esmfold2_stagea_annealing_horizon must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
         if args.esmfold2_best_of_n <= 0:
             message = "--esmfold2_best_of_n must be positive"
             if parser is not None:
@@ -1108,6 +1125,8 @@ def main():
                 esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
                 esmfold2_stagea_soft_steps=args.esmfold2_stagea_soft_steps,
                 esmfold2_stageb_soft_steps=args.esmfold2_stageb_soft_steps,
+                esmfold2_stagea_cumulative_annealing=args.esmfold2_stagea_cumulative_annealing,
+                esmfold2_stagea_annealing_horizon=args.esmfold2_stagea_annealing_horizon,
                 esmfold2_stageb_discrete_rerank=args.esmfold2_stageb_discrete_rerank,
                 esmfold2_stageb_rerank_pool_size=args.esmfold2_stageb_rerank_pool_size,
                 esmfold2_stageb_exploration_actions=args.esmfold2_stageb_exploration_actions,
@@ -1225,6 +1244,14 @@ def main():
             f.write(f"ESMFold2 Soft Steps Legacy Override: {args.esmfold2_soft_steps}\n")
             f.write(f"ESMFold2 Stage A Soft Steps: {args.esmfold2_stagea_soft_steps}\n")
             f.write(f"ESMFold2 Stage B Soft Steps: {args.esmfold2_stageb_soft_steps}\n")
+            f.write(
+                "ESMFold2 Stage A Cumulative Annealing: "
+                f"{args.esmfold2_stagea_cumulative_annealing}\n"
+            )
+            f.write(
+                "ESMFold2 Stage A Annealing Horizon: "
+                f"{args.esmfold2_stagea_annealing_horizon}\n"
+            )
             f.write(f"ESMFold2 Best-of-N: {args.esmfold2_best_of_n}\n")
             f.write(
                 "ESMFold2 Best-of-N Pass Loss Threshold: "

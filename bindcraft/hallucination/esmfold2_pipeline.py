@@ -463,6 +463,7 @@ def _mcts_node_artifact(
         "parent_node_id": None if parent is None else int(getattr(parent, "node_id")),
         "parent_node_uid": None if parent is None else f"{stage}:{int(getattr(parent, 'node_id'))}",
         "depth": int(getattr(node, "depth", 0)),
+        "anneal_step": int(getattr(node, "anneal_step", 0)),
         "sequence": sequence,
         "sequence_hash": _sequence_hash(sequence),
         "parent_sequence_hash": _sequence_hash(getattr(parent, "sequence", None)) if parent is not None else None,
@@ -690,6 +691,8 @@ def _call_backend_propose(
     hotspot_params: Optional[Dict[str, Any]] = None,
     track_confidence_override: Optional[bool] = None,
     soft_steps_override: Optional[int] = None,
+    temperature_step_offset: int = 0,
+    temperature_total_steps: Optional[int] = None,
     **kwargs: Any,
 ) -> ESMFold2ProposalBatch:
     propose_kwargs = dict(kwargs)
@@ -701,6 +704,10 @@ def _call_backend_propose(
         propose_kwargs["track_confidence_override"] = track_confidence_override
     if _callable_accepts_argument(backend.propose, "soft_steps_override"):
         propose_kwargs["soft_steps_override"] = soft_steps_override
+    if _callable_accepts_argument(backend.propose, "temperature_step_offset"):
+        propose_kwargs["temperature_step_offset"] = int(temperature_step_offset)
+    if _callable_accepts_argument(backend.propose, "temperature_total_steps"):
+        propose_kwargs["temperature_total_steps"] = temperature_total_steps
     if _callable_accepts_argument(backend.propose, "hotspot_params"):
         propose_kwargs["hotspot_params"] = (
             dict(hotspot_params) if hotspot_params is not None else None
@@ -2547,6 +2554,8 @@ def run_esmfold2_mcts_hallucination(
     esmfold2_logit_init_mode: str = "legacy_anchor",
     esmfold2_stagea_soft_steps: Optional[int] = None,
     esmfold2_stageb_soft_steps: Optional[int] = None,
+    esmfold2_stagea_cumulative_annealing: bool = False,
+    esmfold2_stagea_annealing_horizon: int = 150,
     esmfold2_stageb_discrete_rerank: bool = True,
     esmfold2_stageb_rerank_pool_size: int = 20,
     esmfold2_stageb_exploration_actions: int = 1,
@@ -2667,6 +2676,11 @@ def run_esmfold2_mcts_hallucination(
         raise ValueError("esmfold2_stagea_soft_steps must be positive")
     if stageb_soft_steps is not None and stageb_soft_steps <= 0:
         raise ValueError("esmfold2_stageb_soft_steps must be positive")
+    stagea_soft_step_count = int(
+        stagea_soft_steps
+        if stagea_soft_steps is not None
+        else getattr(backend_config, "soft_steps", 1)
+    )
     stageb_rerank_pool_size = max(int(esmfold2_stageb_rerank_pool_size), 1)
     stageb_exploration_actions = max(int(esmfold2_stageb_exploration_actions), 0)
     stageb_verifier_candidates = max(int(esmfold2_stageb_verifier_candidates), 1)
@@ -2681,6 +2695,10 @@ def run_esmfold2_mcts_hallucination(
         esmfold2_stageb_handoff_quality_tolerance
     )
     stageb_paired_verifier_seed = bool(esmfold2_stageb_paired_verifier_seed)
+    stagea_cumulative_annealing = bool(esmfold2_stagea_cumulative_annealing)
+    stagea_annealing_horizon = int(esmfold2_stagea_annealing_horizon)
+    if stagea_annealing_horizon <= 0:
+        raise ValueError("esmfold2_stagea_annealing_horizon must be positive")
     if stageb_hotspot_coverage_weight < 0.0:
         raise ValueError("esmfold2_stageb_hotspot_coverage_weight must be non-negative")
     if stageb_hotspot_distance_weight < 0.0:
@@ -2781,6 +2799,11 @@ def run_esmfold2_mcts_hallucination(
         "ESMFold2 soft_steps: stage_a=%s stage_b=%s",
         str(stagea_soft_steps or "backend_default"),
         str(stageb_soft_steps or "backend_default"),
+    )
+    logger.info(
+        "ESMFold2 StageA annealing: mode=%s horizon=%d",
+        "cumulative" if stagea_cumulative_annealing else "per_proposal",
+        stagea_annealing_horizon,
     )
     if resume_state is not None:
         logger.info(
@@ -2981,6 +3004,8 @@ def run_esmfold2_mcts_hallucination(
                 "mcts_bootstrap_max_steps": mcts_bootstrap_max_steps,
                 "esmfold2_logit_init_mode": logit_init_mode,
                 "esmfold2_stagea_soft_steps": stagea_soft_steps,
+                "esmfold2_stagea_cumulative_annealing": stagea_cumulative_annealing,
+                "esmfold2_stagea_annealing_horizon": stagea_annealing_horizon,
             },
             verifier_contract=_stagea_handoff_verifier_contract(backend_config),
         )
@@ -3281,6 +3306,11 @@ def run_esmfold2_mcts_hallucination(
     for step in range(stagea_steps):
         selected_node = tree.select()
         current_seq = selected_node.sequence
+        anneal_step_start = (
+            int(selected_node.anneal_step)
+            if stagea_cumulative_annealing
+            else 0
+        )
         proposal_seed = _stable_seed(seed, "esm_propose", target_key, current_seq, step)
         proposal_batch = _call_backend_propose(
             backend,
@@ -3298,6 +3328,12 @@ def run_esmfold2_mcts_hallucination(
             hotspot_params=hotspot_params,
             track_confidence_override=False,
             soft_steps_override=stagea_soft_steps,
+            temperature_step_offset=anneal_step_start,
+            temperature_total_steps=(
+                stagea_annealing_horizon
+                if stagea_cumulative_annealing
+                else None
+            ),
         )
         _write_soft_step_artifacts(
             artifact_recorder,
@@ -3309,6 +3345,8 @@ def run_esmfold2_mcts_hallucination(
         if proposal_batch.logits_after is not None:
             selected_node.logits = proposal_batch.logits_after.detach().cpu().clone()
             proposal_logits_by_sequence[current_seq] = selected_node.logits
+        if stagea_cumulative_annealing:
+            selected_node.anneal_step = anneal_step_start + stagea_soft_step_count
         candidates = _proposal_sequences_from_batch(proposal_batch, include_confidence=False)
         candidates = [
             _clip_sequence_by_mutable_mask(str(seq), mutable_mask, current_seq)
@@ -3393,6 +3431,8 @@ def run_esmfold2_mcts_hallucination(
             round_best_loss=float(round_best.total_loss),
             global_best_loss=best_loss,
             best_sequence=best_seq,
+            anneal_step_start=anneal_step_start,
+            anneal_step_end=int(selected_node.anneal_step),
             **_proposal_confidence_summary(proposal_batch),
         )
         artifact_recorder.write_checkpoint(
