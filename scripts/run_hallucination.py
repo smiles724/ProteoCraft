@@ -396,6 +396,7 @@ def load_esmfold2_backend(
         one_step_diffusion_hotspot_enabled=(
             args.esmfold2_one_step_diffusion_hotspot
         ),
+        distogram_hotspot_enabled=args.esmfold2_distogram_hotspot,
         verifier_loss_mode=args.esmfold2_verifier_loss_mode,
         track_proposal_confidence=args.esmfold2_track_proposal_confidence,
         proposal_confidence_temperature=args.esmfold2_proposal_confidence_temperature,
@@ -693,6 +694,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "是否让 one-step diffusion 的 iPAE loss 使用 hotspot-aware "
             "localized 聚合；默认 false，保持现有 one-step 行为"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_distogram_hotspot",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help=(
+            "是否在 ESMFold2 distogram proposal loss 中启用 hotspot；"
+            "默认 true。设为 false 可单独消融 distogram hotspot，"
+            "不会关闭 one-step diffusion hotspot 或 full-verifier hotspot"
         ),
     )
     parser.add_argument(

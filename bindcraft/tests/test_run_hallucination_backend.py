@@ -57,6 +57,7 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_proposal_lm_dropout == pytest.approx(0.5)
     assert args.esmfold2_force_proposal_lm_dropout is True
     assert args.esmfold2_one_step_diffusion_hotspot is False
+    assert args.esmfold2_distogram_hotspot is True
     assert args.esmfold2_stagea_handoff_checkpoint_interval == 10
     assert args.esmfold2_resume_handoff_checkpoint is None
     assert args.esmfold2_resume_reverify_roots is False

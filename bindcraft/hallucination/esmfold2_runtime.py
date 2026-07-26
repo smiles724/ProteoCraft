@@ -1136,7 +1136,11 @@ class ESMFold2RuntimeBackend:
                 else None
             ),
             hotspot_params=hotspot_params,
-            hotspot_weight=float(self.config.hotspot_weight),
+            hotspot_weight=(
+                float(self.config.hotspot_weight)
+                if self.config.distogram_hotspot_enabled
+                else 0.0
+            ),
             hotspot_cutoff=float(self.config.hotspot_cutoff),
             hotspot_interface_mode=str(self.config.hotspot_interface_mode),
         )
@@ -1472,6 +1476,11 @@ class ESMFold2RuntimeBackend:
             raise ValueError(
                 "localized hotspot_weight_override must be in [0, 1]"
             )
+        effective_distogram_hotspot_weight = (
+            effective_hotspot_weight
+            if self.config.distogram_hotspot_enabled
+            else 0.0
+        )
 
         logits = self._init_current_sequence_logits(
             current_seq,
@@ -1567,7 +1576,7 @@ class ESMFold2RuntimeBackend:
                     else None
                 ),
                 hotspot_params=hotspot_params,
-                hotspot_weight=effective_hotspot_weight,
+                hotspot_weight=effective_distogram_hotspot_weight,
                 hotspot_cutoff=float(self.config.hotspot_cutoff),
                 hotspot_interface_mode=str(self.config.hotspot_interface_mode),
             )
@@ -1634,12 +1643,18 @@ class ESMFold2RuntimeBackend:
                     {
                         "base_structure_loss": _as_float(losses.get("base_structure_loss")),
                         "hotspot_contact_loss": _as_float(losses.get("hotspot_contact_loss")),
-                        "hotspot_weight": effective_hotspot_weight,
+                        "hotspot_weight": effective_distogram_hotspot_weight,
+                        "distogram_hotspot_enabled": bool(
+                            self.config.distogram_hotspot_enabled
+                        ),
+                        "distogram_hotspot_weight": float(
+                            effective_distogram_hotspot_weight
+                        ),
                         "hotspot_weight_configured": float(
                             self.config.hotspot_weight
                         ),
                         "hotspot_attraction_suppressed": bool(
-                            effective_hotspot_weight
+                            effective_distogram_hotspot_weight
                             < float(self.config.hotspot_weight)
                         ),
                         "hotspot_cutoff": float(self.config.hotspot_cutoff),
@@ -1709,7 +1724,7 @@ class ESMFold2RuntimeBackend:
                     mutable_mask if explicit_target_chain_roles is not None else None
                 ),
                 hotspot_params=hotspot_params,
-                hotspot_weight=effective_hotspot_weight,
+                hotspot_weight=effective_distogram_hotspot_weight,
                 hotspot_cutoff=float(self.config.hotspot_cutoff),
                 hotspot_interface_mode=str(self.config.hotspot_interface_mode),
             )
@@ -1815,6 +1830,12 @@ class ESMFold2RuntimeBackend:
                 ),
                 "one_step_diffusion_hotspot_interface_mode": str(
                     self.config.hotspot_interface_mode
+                ),
+                "distogram_hotspot_enabled": bool(
+                    self.config.distogram_hotspot_enabled
+                ),
+                "distogram_hotspot_weight": float(
+                    effective_distogram_hotspot_weight
                 ),
                 "one_step_diffusion_loss": _as_float(diffusion_total),
                 "structure_total_loss": _as_float(losses["total_loss"]),

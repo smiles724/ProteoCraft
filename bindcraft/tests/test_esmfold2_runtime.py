@@ -909,6 +909,54 @@ def test_runtime_continuous_design_logs_multichain_hotspot_metrics(monkeypatch):
     )
 
 
+def test_runtime_can_disable_only_distogram_hotspot(monkeypatch):
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(
+            soft_steps=1,
+            lambda_esmc=0.0,
+            num_loops=1,
+            num_sampling_steps=1,
+            hotspot_weight=0.5,
+            hotspot_cutoff=8.0,
+            hotspot_interface_mode="localized",
+            distogram_hotspot_enabled=False,
+        ),
+        device="cpu",
+        experimental_model=object(),
+    )
+    monkeypatch.setattr(backend, "_ensure_proposal_models_loaded", lambda: None)
+
+    def fake_fold_distogram(**kwargs):
+        targets = esmfold2_runtime_module._target_sequences(kwargs["target_seq"])
+        design = kwargs["design"]
+        full_len = sum(len(seq) for seq in targets) + design.shape[1]
+        bins = torch.arange(128, dtype=design.dtype, device=design.device)
+        signal = design[..., 0].sum()
+        return {
+            "distogram_logits": signal
+            * bins.reshape(1, 1, 1, -1).expand(1, full_len, full_len, 128)
+        }
+
+    monkeypatch.setattr(backend, "_fold_distogram", fake_fold_distogram)
+
+    batch = backend.continuous_design(
+        current_seq="AAA",
+        target_seq=["TT", "GGG"],
+        global_step=0,
+        seed=5,
+        mutable_mask=[True, True, True],
+        proposal_logits=torch.zeros(3, 20),
+        hotspot_params={"target_hotspot_concat_indices": [3, 4]},
+    )
+
+    metrics = batch.soft_step_metrics[0]
+    assert metrics["hotspot_weight"] == pytest.approx(0.0)
+    assert metrics["distogram_hotspot_enabled"] is False
+    assert metrics["distogram_hotspot_weight"] == pytest.approx(0.0)
+    assert metrics["hotspot_contact_loss"] is not None
+    assert metrics["hotspot_objective_adjustment"] == pytest.approx(0.0)
+
+
 def test_runtime_continuous_design_accepts_multiple_target_chains(monkeypatch):
     captured = {}
     backend = ESMFold2RuntimeBackend(

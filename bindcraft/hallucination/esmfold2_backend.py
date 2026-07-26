@@ -76,6 +76,7 @@ class ESMFold2ProposalConfig:
     one_step_diffusion_tau: float = 4.0
     one_step_diffusion_weight: float = 1.0
     one_step_diffusion_hotspot_enabled: bool = False
+    distogram_hotspot_enabled: bool = True
     verifier_loss_mode: str = "pair_chain_iptm"
     hotspot_weight: float = 0.0
     hotspot_satisfied_proposal_weight: float = 0.0
