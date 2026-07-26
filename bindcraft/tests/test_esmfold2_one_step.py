@@ -4,6 +4,7 @@ import torch
 from bindcraft.hallucination.esmfold2_one_step import (
     ESMFOLD2_COMMON_LOSS_WEIGHTS,
     compute_esmfold2_common_losses,
+    remap_reference_coordinates,
     scatter_reference_coordinates,
 )
 
@@ -157,3 +158,86 @@ def test_scatter_reference_coordinates_handles_valid_atom_layout():
     assert padded.shape == (1, 5, 3)
     assert torch.equal(padded[0, atom_mask[0]], source[0])
     assert torch.equal(padded[0, ~atom_mask[0]], torch.zeros(2, 3))
+
+
+def _encoded_atom_name(name: str) -> list[int]:
+    return [ord(char) - 32 if char != " " else 0 for char in name.ljust(4)]
+
+
+def _atom_layout(
+    names: list[str],
+    positions: list[list[float]],
+    *,
+    mask: list[bool],
+) -> dict[str, torch.Tensor]:
+    return {
+        "atom_attention_mask": torch.tensor([mask]),
+        "atom_to_token": torch.zeros(1, len(names), dtype=torch.long),
+        "ref_atom_name_chars": torch.tensor(
+            [[_encoded_atom_name(name) for name in names]]
+        ),
+        "ref_element": torch.tensor(
+            [[7 if name == "N" else 8 if name == "O" else 6 for name in names]]
+        ),
+        "ref_pos": torch.tensor([positions], dtype=torch.float32),
+    }
+
+
+def test_remap_reference_coordinates_rebuilds_new_side_chain_from_backbone():
+    source_features = _atom_layout(
+        ["N", "CA", "PAD", "C", "O"],
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [1.0, 2.0, 0.0],
+        ],
+        mask=[True, True, False, True, True],
+    )
+    destination_features = _atom_layout(
+        ["N", "CA", "C", "O", "CB", "CG"],
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [1.0, 2.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 0.0, 2.0],
+        ],
+        mask=[True] * 6,
+    )
+    translation = torch.tensor([10.0, 20.0, 30.0])
+    source_coordinates = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 2.0, 0.0],
+            ]
+        ]
+    ) + translation
+
+    remapped = remap_reference_coordinates(
+        source_coordinates,
+        source_features=source_features,
+        destination_features=destination_features,
+    )
+
+    assert remapped.shape == (1, 6, 3)
+    assert torch.allclose(
+        remapped[0, :4],
+        source_coordinates[0],
+        atol=1e-5,
+    )
+    assert torch.allclose(
+        remapped[0, 4],
+        torch.tensor([1.0, 0.0, 1.0]) + translation,
+        atol=1e-5,
+    )
+    assert torch.allclose(
+        remapped[0, 5],
+        torch.tensor([1.0, 0.0, 2.0]) + translation,
+        atol=1e-5,
+    )

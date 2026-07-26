@@ -430,6 +430,160 @@ def scatter_reference_coordinates(
     return padded
 
 
+def remap_reference_coordinates(
+    coordinates: torch.Tensor,
+    *,
+    source_features: Mapping[str, torch.Tensor],
+    destination_features: Mapping[str, torch.Tensor],
+) -> torch.Tensor:
+    """Map parent coordinates into a child layout and rebuild new side chains."""
+
+    source_coords = _sample0_coordinates(coordinates)
+
+    def feature0(
+        features: Mapping[str, torch.Tensor],
+        name: str,
+    ) -> torch.Tensor:
+        value = features[name]
+        return value[0] if value.ndim > 1 and value.shape[0] == 1 else value
+
+    def atom_keys(
+        features: Mapping[str, torch.Tensor],
+    ) -> tuple[
+        torch.Tensor,
+        list[tuple[int, tuple[int, ...], int]],
+        torch.Tensor,
+    ]:
+        mask = feature0(features, "atom_attention_mask").bool()
+        atom_to_token = feature0(features, "atom_to_token").long()
+        atom_names = feature0(features, "ref_atom_name_chars").long()
+        elements = feature0(features, "ref_element").long()
+        ref_pos = feature0(features, "ref_pos").float()
+        if not (
+            mask.shape[0]
+            == atom_to_token.shape[0]
+            == atom_names.shape[0]
+            == elements.shape[0]
+            == ref_pos.shape[0]
+        ):
+            raise ValueError("ESMFold2 atom identity features have inconsistent sizes")
+        keys = [
+            (
+                int(atom_to_token[index].item()),
+                tuple(int(value) for value in atom_names[index].tolist()),
+                int(elements[index].item()),
+            )
+            for index in mask.nonzero(as_tuple=True)[0].tolist()
+        ]
+        return mask, keys, ref_pos[mask]
+
+    source_mask, source_keys, _ = atom_keys(source_features)
+    destination_mask, destination_keys, destination_ref_pos = atom_keys(
+        destination_features
+    )
+    if source_coords.shape[0] == source_mask.shape[0]:
+        source_valid_coords = source_coords[source_mask]
+    elif source_coords.shape[0] == int(source_mask.sum().item()):
+        source_valid_coords = source_coords
+    else:
+        raise ValueError(
+            "source coordinate count does not match verifier atom layout: "
+            f"source={source_coords.shape[0]}, padded={source_mask.shape[0]}, "
+            f"valid={int(source_mask.sum().item())}"
+        )
+
+    coordinate_by_key: dict[tuple[int, tuple[int, ...], int], torch.Tensor] = {}
+    for key, coordinate in zip(source_keys, source_valid_coords, strict=True):
+        if key in coordinate_by_key:
+            raise ValueError(f"duplicate verifier atom identity: {key}")
+        coordinate_by_key[key] = coordinate
+
+    def atom_name(key: tuple[int, tuple[int, ...], int]) -> str:
+        return "".join(
+            chr(value + 32) if value > 0 else " " for value in key[1]
+        ).strip()
+
+    source_by_token_and_name = {
+        (key[0], atom_name(key)): coordinate
+        for key, coordinate in coordinate_by_key.items()
+    }
+    destination_ref_by_token_and_name = {
+        (key[0], atom_name(key)): ref_pos
+        for key, ref_pos in zip(
+            destination_keys,
+            destination_ref_pos,
+            strict=True,
+        )
+    }
+
+    def rigid_transform(
+        moving: torch.Tensor,
+        target: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        moving_center = moving.mean(dim=0)
+        target_center = target.mean(dim=0)
+        covariance = (moving - moving_center).transpose(0, 1) @ (
+            target - target_center
+        )
+        u, _, vh = torch.linalg.svd(covariance)
+        correction = torch.eye(3, device=moving.device, dtype=moving.dtype)
+        correction[-1, -1] = torch.sign(torch.det(u @ vh))
+        rotation = u @ correction @ vh
+        translation = target_center - moving_center @ rotation
+        return rotation, translation
+
+    rebuilt_by_key: dict[tuple[int, tuple[int, ...], int], torch.Tensor] = {}
+    missing_by_token: dict[int, list[tuple[int, tuple[int, ...], int]]] = {}
+    for key in destination_keys:
+        if key in coordinate_by_key:
+            rebuilt_by_key[key] = coordinate_by_key[key]
+        else:
+            missing_by_token.setdefault(key[0], []).append(key)
+
+    for token_index, missing_keys in missing_by_token.items():
+        anchors = []
+        for name in ("N", "CA", "C"):
+            source_anchor = source_by_token_and_name.get((token_index, name))
+            destination_anchor = destination_ref_by_token_and_name.get(
+                (token_index, name)
+            )
+            if source_anchor is not None and destination_anchor is not None:
+                anchors.append((destination_anchor, source_anchor))
+        if len(anchors) != 3:
+            missing_names = ", ".join(atom_name(key) for key in missing_keys[:3])
+            raise ValueError(
+                "cannot rebuild proposal side-chain coordinates without N/CA/C "
+                f"anchors for token={token_index}; missing_atoms=[{missing_names}]"
+            )
+        moving = torch.stack([item[0] for item in anchors]).to(
+            device=source_coords.device,
+            dtype=source_coords.dtype,
+        )
+        target = torch.stack([item[1] for item in anchors]).to(
+            device=source_coords.device,
+            dtype=source_coords.dtype,
+        )
+        rotation, translation = rigid_transform(moving, target)
+        for key in missing_keys:
+            idealized = destination_ref_by_token_and_name[
+                (token_index, atom_name(key))
+            ].to(device=source_coords.device, dtype=source_coords.dtype)
+            rebuilt_by_key[key] = idealized @ rotation + translation
+
+    destination = torch.zeros(
+        1,
+        destination_mask.shape[0],
+        3,
+        dtype=source_coords.dtype,
+        device=source_coords.device,
+    )
+    destination[0, destination_mask.to(source_coords.device)] = torch.stack(
+        [rebuilt_by_key[key] for key in destination_keys],
+        dim=0,
+    )
+    return destination
+
+
 def run_esmfold2_one_step_diffusion(
     *,
     model: Any,

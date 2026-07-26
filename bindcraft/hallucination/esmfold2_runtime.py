@@ -42,6 +42,7 @@ from bindcraft.hallucination.esmfold2_backend import (
 from bindcraft.hallucination.esmfold2_one_step import (
     capture_experimental_trunk_state,
     compute_esmfold2_common_losses,
+    remap_reference_coordinates,
     run_esmfold2_one_step_diffusion,
 )
 
@@ -1244,6 +1245,26 @@ class ESMFold2RuntimeBackend:
         )
         return self.structure_prediction_input_cls(sequences=proteins)
 
+    def _prepare_sequence_atom_features(
+        self,
+        targets: Sequence[str],
+        binder_seq: str,
+        *,
+        seed: Optional[int],
+    ) -> dict[str, torch.Tensor]:
+        """Build the atom identity layout for a discrete parent sequence."""
+
+        from esm.models.esmfold2 import prepare_esmfold2_input
+
+        input_spec = self._build_structure_input(targets, binder_seq)
+        with _seed_context(seed):
+            features, _ = prepare_esmfold2_input(input_spec, seed=seed)
+        return {
+            key: value.unsqueeze(0)
+            for key, value in features.items()
+            if isinstance(value, torch.Tensor)
+        }
+
     def _summary_from_fold_result(
         self,
         fold_result: Any,
@@ -1719,7 +1740,15 @@ class ESMFold2RuntimeBackend:
                 model=self.experimental_model,
                 captured=fold_result["_captured"],
                 features=fold_result["_features"],
-                reference_coordinates=reference_coordinates,
+                reference_coordinates=remap_reference_coordinates(
+                    reference_coordinates,
+                    source_features=self._prepare_sequence_atom_features(
+                        targets,
+                        current_seq,
+                        seed=diffusion_seed,
+                    ),
+                    destination_features=fold_result["_features"],
+                ),
                 tau=float(self.config.one_step_diffusion_tau),
                 seed=diffusion_seed,
             )
