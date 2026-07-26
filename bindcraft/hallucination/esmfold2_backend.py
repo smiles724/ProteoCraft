@@ -75,6 +75,7 @@ class ESMFold2ProposalConfig:
     one_step_diffusion_enabled: bool = False
     one_step_diffusion_tau: float = 4.0
     one_step_diffusion_weight: float = 1.0
+    one_step_diffusion_rg_weight: float = 0.3
     one_step_diffusion_hotspot_enabled: bool = False
     distogram_hotspot_enabled: bool = True
     verifier_loss_mode: str = "pair_chain_iptm"
@@ -170,6 +171,10 @@ class ESMFold2ProposalConfig:
             raise ValueError("one_step_diffusion_tau must be positive")
         if float(self.one_step_diffusion_weight) < 0.0:
             raise ValueError("one_step_diffusion_weight must be non-negative")
+        if float(self.one_step_diffusion_rg_weight) < 0.0:
+            raise ValueError(
+                "one_step_diffusion_rg_weight must be non-negative"
+            )
         verifier_loss_mode = str(self.verifier_loss_mode).strip().lower()
         if verifier_loss_mode not in {"pair_chain_iptm", "aligned_common"}:
             raise ValueError(

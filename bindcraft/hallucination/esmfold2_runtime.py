@@ -1777,7 +1777,12 @@ class ESMFold2RuntimeBackend:
                 target_chain_roles=target_chain_roles,
                 binder_mutable_mask=mutable_mask,
                 distogram_losses=None,
-                weights={"con": 0.0, "i_con": 0.0, "helix": 0.0},
+                weights={
+                    "con": 0.0,
+                    "i_con": 0.0,
+                    "helix": 0.0,
+                    "rg": float(self.config.one_step_diffusion_rg_weight),
+                },
                 hotspot_params=(
                     hotspot_params
                     if self.config.one_step_diffusion_hotspot_enabled
@@ -1819,6 +1824,9 @@ class ESMFold2RuntimeBackend:
                 "one_step_diffusion_weight": float(
                     self.config.one_step_diffusion_weight
                 ),
+                "one_step_diffusion_rg_weight": float(
+                    self.config.one_step_diffusion_rg_weight
+                ),
                 "one_step_diffusion_hotspot_enabled": bool(
                     self.config.one_step_diffusion_hotspot_enabled
                     and hotspot_params is not None
@@ -1851,6 +1859,11 @@ class ESMFold2RuntimeBackend:
             }
             for name, value in diffusion_losses.items():
                 one_step_metrics[f"diffusion_{name}_loss"] = _as_float(value)
+            if "rg" in diffusion_losses:
+                one_step_metrics["diffusion_rg_weighted_contribution"] = _as_float(
+                    diffusion_losses["rg"]
+                    * float(self.config.one_step_diffusion_rg_weight)
+                )
             soft_step_metrics.append(one_step_metrics)
 
         return (

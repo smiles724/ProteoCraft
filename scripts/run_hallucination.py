@@ -393,6 +393,9 @@ def load_esmfold2_backend(
         one_step_diffusion_enabled=args.esmfold2_one_step_diffusion,
         one_step_diffusion_tau=args.esmfold2_one_step_diffusion_tau,
         one_step_diffusion_weight=args.esmfold2_one_step_diffusion_weight,
+        one_step_diffusion_rg_weight=(
+            args.esmfold2_one_step_diffusion_rg_weight
+        ),
         one_step_diffusion_hotspot_enabled=(
             args.esmfold2_one_step_diffusion_hotspot
         ),
@@ -686,6 +689,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="归一化 one-step diffusion gradient 的组合权重（默认：1.0）",
+    )
+    parser.add_argument(
+        "--esmfold2_one_step_diffusion_rg_weight",
+        type=float,
+        default=0.3,
+        help=(
+            "one-step diffusion common loss 中 Rg/compactness 项的权重"
+            "（默认：0.3，保持原有行为）"
+        ),
     )
     parser.add_argument(
         "--esmfold2_one_step_diffusion_hotspot",
@@ -1578,6 +1590,30 @@ def main():
             f.write(f"ESMFold2 Proposal Confidence Max Candidates: {args.esmfold2_proposal_confidence_max_candidates}\n")
             f.write(f"ESMFold2 Proposal Confidence Tail Steps: {args.esmfold2_proposal_confidence_tail_steps}\n")
             f.write(f"ESMFold2 Final Polish: {args.esmfold2_final_polish}\n")
+            f.write(
+                "ESMFold2 One-step Diffusion: "
+                f"{args.esmfold2_one_step_diffusion}\n"
+            )
+            f.write(
+                "ESMFold2 One-step Diffusion Tau: "
+                f"{args.esmfold2_one_step_diffusion_tau}\n"
+            )
+            f.write(
+                "ESMFold2 One-step Diffusion Weight: "
+                f"{args.esmfold2_one_step_diffusion_weight}\n"
+            )
+            f.write(
+                "ESMFold2 One-step Diffusion Rg Weight: "
+                f"{args.esmfold2_one_step_diffusion_rg_weight}\n"
+            )
+            f.write(
+                "ESMFold2 One-step Diffusion Hotspot: "
+                f"{args.esmfold2_one_step_diffusion_hotspot}\n"
+            )
+            f.write(
+                "ESMFold2 Distogram Hotspot: "
+                f"{args.esmfold2_distogram_hotspot}\n"
+            )
             f.write(f"ESMFold2 Hotspot Weight: {args.esmfold2_hotspot_weight}\n")
             f.write(
                 "ESMFold2 Hotspot Satisfied Proposal Weight: "
