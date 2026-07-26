@@ -390,6 +390,10 @@ def load_esmfold2_backend(
         proposal_load_internal_esmc=args.esmfold2_proposal_load_internal_esmc,
         proposal_lm_dropout=args.esmfold2_proposal_lm_dropout,
         force_proposal_lm_dropout=args.esmfold2_force_proposal_lm_dropout,
+        one_step_diffusion_enabled=args.esmfold2_one_step_diffusion,
+        one_step_diffusion_tau=args.esmfold2_one_step_diffusion_tau,
+        one_step_diffusion_weight=args.esmfold2_one_step_diffusion_weight,
+        verifier_loss_mode=args.esmfold2_verifier_loss_mode,
         track_proposal_confidence=args.esmfold2_track_proposal_confidence,
         proposal_confidence_temperature=args.esmfold2_proposal_confidence_temperature,
         proposal_confidence_interval=args.esmfold2_proposal_confidence_interval,
@@ -658,6 +662,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2Experimental proposal LM dropout；官方 binder design inversion/proposal 使用 0.5")
     parser.add_argument("--esmfold2_force_proposal_lm_dropout", type=lambda x: x.lower() == "true", default=True,
                        help="是否在 eval/inference 状态强制启用 proposal LM dropout（官方 binder design 为 true）")
+    parser.add_argument(
+        "--esmfold2_one_step_diffusion",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help=(
+            "是否在每次 ESMFold2 soft proposal 后增加一次可微 one-step "
+            "diffusion 更新；默认 false，保持旧链路"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_one_step_diffusion_tau",
+        type=float,
+        default=4.0,
+        help="ESMFold2 one-step diffusion 固定噪声尺度 tau（默认：4.0）",
+    )
+    parser.add_argument(
+        "--esmfold2_one_step_diffusion_weight",
+        type=float,
+        default=1.0,
+        help="归一化 one-step diffusion gradient 的组合权重（默认：1.0）",
+    )
+    parser.add_argument(
+        "--esmfold2_verifier_loss_mode",
+        choices=["pair_chain_iptm", "aligned_common"],
+        default="pair_chain_iptm",
+        help=(
+            "ESMFold2 full verifier loss：旧版 pair-chain iPTM，或不含 PDE "
+            "的 Protenix-aligned common loss；默认保留旧版"
+        ),
+    )
     parser.add_argument("--esmfold2_track_proposal_confidence", type=lambda x: x.lower() == "true", default=None,
                        help="ESMFold2 proposal 后期是否计算 confidence/iPTM 并加入候选（Best-of-N 默认 true，其余模式默认 false）")
     parser.add_argument("--esmfold2_proposal_confidence_temperature", type=float, default=0.05,

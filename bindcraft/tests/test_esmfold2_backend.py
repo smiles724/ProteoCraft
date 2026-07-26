@@ -101,6 +101,27 @@ def test_verifier_result_combines_global_and_hotspot_losses_without_overwriting_
     assert result.summary_confidence["esm_verify_loss"] == pytest.approx(0.37)
 
 
+def test_verifier_result_can_use_aligned_common_loss_without_losing_pair_metric():
+    result = build_esm_verifier_result(
+        binder_seq="ALY",
+        target_seq="TARGET",
+        summary_confidence={"pair_chain_iptm": 0.75},
+        aligned_loss_dict={
+            "total": 0.42,
+            "plddt": 0.12,
+            "i_pae": 0.20,
+        },
+        hotspot_verify_loss=0.5,
+        hotspot_verify_weight=0.2,
+    )
+
+    assert result.total_loss == pytest.approx(0.52)
+    assert result.loss_dict["pair_chain_iptm_loss"] == pytest.approx(0.25)
+    assert result.loss_dict["esm_verify_global_loss"] == pytest.approx(0.42)
+    assert result.loss_dict["plddt"] == pytest.approx(0.12)
+    assert result.summary_confidence["esm_verify_source"] == "esmfold2_aligned_common"
+
+
 def test_verifier_result_adds_hotspot_too_close_penalty():
     result = build_esm_verifier_result(
         binder_seq="ALY",
@@ -269,6 +290,10 @@ def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     assert default_config.hotspot_verify_far_cutoff == pytest.approx(20.0)
     assert default_config.hotspot_verify_min_distance == pytest.approx(2.5)
     assert default_config.hotspot_verify_too_close_weight == pytest.approx(0.0)
+    assert default_config.one_step_diffusion_enabled is False
+    assert default_config.one_step_diffusion_tau == pytest.approx(4.0)
+    assert default_config.one_step_diffusion_weight == pytest.approx(1.0)
+    assert default_config.verifier_loss_mode == "pair_chain_iptm"
 
     config = ESMFold2ProposalConfig(soft_steps=3, lambda_esmc="auto")
     assert config.soft_steps == 3
@@ -309,6 +334,15 @@ def test_proposal_config_validates_hotspot_verifier_parameters():
             hotspot_verify_near_cutoff=5.0,
             hotspot_verify_far_cutoff=5.0,
         )
+
+
+def test_proposal_config_validates_one_step_diffusion_parameters():
+    with pytest.raises(ValueError, match="one_step_diffusion_tau"):
+        ESMFold2ProposalConfig(one_step_diffusion_tau=0.0)
+    with pytest.raises(ValueError, match="one_step_diffusion_weight"):
+        ESMFold2ProposalConfig(one_step_diffusion_weight=-0.1)
+    with pytest.raises(ValueError, match="verifier_loss_mode"):
+        ESMFold2ProposalConfig(verifier_loss_mode="unknown")
 
 
 def test_logit_delta_candidates_reuse_stage_a_topk_sampling_contract():

@@ -752,6 +752,7 @@ def _call_backend_propose(
     backend: Any,
     *,
     proposal_logits: Optional[torch.Tensor],
+    reference_coordinates: Optional[torch.Tensor] = None,
     hotspot_params: Optional[Dict[str, Any]] = None,
     hotspot_weight_override: Optional[float] = None,
     track_confidence_override: Optional[bool] = None,
@@ -765,6 +766,22 @@ def _call_backend_propose(
     if _callable_accepts_argument(backend.propose, "proposal_logits"):
         propose_kwargs["proposal_logits"] = (
             proposal_logits.detach().clone() if proposal_logits is not None else None
+        )
+    one_step_enabled = bool(
+        getattr(
+            getattr(backend, "config", None),
+            "one_step_diffusion_enabled",
+            False,
+        )
+    )
+    if one_step_enabled and _callable_accepts_argument(
+        backend.propose,
+        "reference_coordinates",
+    ):
+        propose_kwargs["reference_coordinates"] = (
+            reference_coordinates.detach().clone()
+            if reference_coordinates is not None
+            else None
         )
     if _callable_accepts_argument(backend.propose, "track_confidence_override"):
         propose_kwargs["track_confidence_override"] = track_confidence_override
@@ -800,6 +817,7 @@ def _call_backend_continuous_design(
     backend: Any,
     *,
     proposal_logits: Optional[torch.Tensor],
+    reference_coordinates: Optional[torch.Tensor] = None,
     hotspot_params: Optional[Dict[str, Any]] = None,
     hotspot_weight_override: Optional[float] = None,
     track_confidence_override: Optional[bool] = None,
@@ -815,6 +833,22 @@ def _call_backend_continuous_design(
     if _callable_accepts_argument(backend.continuous_design, "proposal_logits"):
         design_kwargs["proposal_logits"] = (
             proposal_logits.detach().clone() if proposal_logits is not None else None
+        )
+    one_step_enabled = bool(
+        getattr(
+            getattr(backend, "config", None),
+            "one_step_diffusion_enabled",
+            False,
+        )
+    )
+    if one_step_enabled and _callable_accepts_argument(
+        backend.continuous_design,
+        "reference_coordinates",
+    ):
+        design_kwargs["reference_coordinates"] = (
+            reference_coordinates.detach().clone()
+            if reference_coordinates is not None
+            else None
         )
     if _callable_accepts_argument(backend.continuous_design, "track_confidence_override"):
         design_kwargs["track_confidence_override"] = track_confidence_override
@@ -3423,6 +3457,7 @@ def run_esmfold2_mcts_hallucination(
             seed=_stable_seed(seed, "esm_continuous_stage_a", target_key, current_seq),
             mutable_mask=mutable_mask,
             proposal_logits=selected_node.logits,
+            reference_coordinates=selected_node.coordinate,
             hotspot_params=hotspot_params,
             hotspot_weight_override=proposal_hotspot_weight,
             track_confidence_override=None,
@@ -3750,6 +3785,7 @@ def run_esmfold2_mcts_hallucination(
             action_group=None,
             mutable_mask=mutable_mask,
             proposal_logits=selected_node.logits,
+            reference_coordinates=selected_node.coordinate,
             hotspot_params=hotspot_params,
             hotspot_weight_override=proposal_hotspot_weight,
             track_confidence_override=False,
@@ -4182,6 +4218,7 @@ def run_esmfold2_mcts_hallucination(
                 action_group=group_name,
                 mutable_mask=mutable_mask,
                 proposal_logits=selected_node.logits,
+                reference_coordinates=selected_node.coordinate,
                 hotspot_params=hotspot_params,
                 hotspot_weight_override=proposal_hotspot_weight,
                 track_confidence_override=False,

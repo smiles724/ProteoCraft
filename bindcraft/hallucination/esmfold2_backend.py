@@ -72,6 +72,10 @@ class ESMFold2ProposalConfig:
     proposal_load_internal_esmc: bool = True
     proposal_lm_dropout: Optional[float] = 0.5
     force_proposal_lm_dropout: bool = True
+    one_step_diffusion_enabled: bool = False
+    one_step_diffusion_tau: float = 4.0
+    one_step_diffusion_weight: float = 1.0
+    verifier_loss_mode: str = "pair_chain_iptm"
     hotspot_weight: float = 0.0
     hotspot_satisfied_proposal_weight: float = 0.0
     hotspot_cutoff: float = 8.0
@@ -160,6 +164,15 @@ class ESMFold2ProposalConfig:
             dropout = float(self.proposal_lm_dropout)
             if dropout < 0.0 or dropout >= 1.0:
                 raise ValueError("proposal_lm_dropout must be in [0, 1)")
+        if float(self.one_step_diffusion_tau) <= 0.0:
+            raise ValueError("one_step_diffusion_tau must be positive")
+        if float(self.one_step_diffusion_weight) < 0.0:
+            raise ValueError("one_step_diffusion_weight must be non-negative")
+        verifier_loss_mode = str(self.verifier_loss_mode).strip().lower()
+        if verifier_loss_mode not in {"pair_chain_iptm", "aligned_common"}:
+            raise ValueError(
+                "verifier_loss_mode must be 'pair_chain_iptm' or 'aligned_common'"
+            )
         if float(self.proposal_confidence_temperature) <= 0.0:
             raise ValueError("proposal_confidence_temperature must be positive")
         if int(self.proposal_confidence_interval) <= 0:
@@ -310,11 +323,24 @@ def build_esm_verifier_result(
     hotspot_verify_weight: float = 0.0,
     hotspot_too_close_loss: Optional[float] = None,
     hotspot_too_close_weight: float = 0.0,
+    aligned_loss_dict: Optional[Mapping[str, float]] = None,
 ) -> ESMFold2VerifierResult:
     """Build a verifier result object accepted by the existing MCTS cache."""
 
     global_loss, source = resolve_esm_verifier_loss(summary_confidence)
-    total_loss = float(global_loss)
+    resolved_aligned_losses: Dict[str, float] = {}
+    if aligned_loss_dict is not None:
+        for key, value in aligned_loss_dict.items():
+            scalar = _finite_float(value)
+            if scalar is not None:
+                resolved_aligned_losses[str(key)] = scalar
+        if "total" not in resolved_aligned_losses:
+            raise ValueError("aligned_loss_dict must contain a finite total")
+        total_loss = float(resolved_aligned_losses["total"])
+        source = "esmfold2_aligned_common"
+    else:
+        total_loss = float(global_loss)
+    base_verifier_loss = float(total_loss)
     hotspot_loss = _finite_float(hotspot_verify_loss)
     hotspot_weight = float(hotspot_verify_weight)
     if hotspot_weight < 0.0:
@@ -346,8 +372,12 @@ def build_esm_verifier_result(
         "esm_verify_loss": float(total_loss),
     }
     loss_dict["pair_chain_iptm_loss"] = float(global_loss)
+    if resolved_aligned_losses:
+        for key, value in resolved_aligned_losses.items():
+            if key != "total":
+                loss_dict[key] = float(value)
     if hotspot_enabled or too_close_enabled:
-        loss_dict["esm_verify_global_loss"] = float(global_loss)
+        loss_dict["esm_verify_global_loss"] = base_verifier_loss
     if hotspot_enabled:
         loss_dict.update(
             {
@@ -384,8 +414,12 @@ def build_esm_verifier_result(
     summary = dict(summary_confidence)
     summary["esm_verify_loss"] = float(total_loss)
     summary["esm_verify_source"] = source
+    if resolved_aligned_losses:
+        summary["esm_verify_aligned_common_loss"] = float(
+            resolved_aligned_losses["total"]
+        )
     if hotspot_enabled or too_close_enabled:
-        summary["esm_verify_global_loss"] = float(global_loss)
+        summary["esm_verify_global_loss"] = base_verifier_loss
     if hotspot_enabled:
         summary.update(
             {
