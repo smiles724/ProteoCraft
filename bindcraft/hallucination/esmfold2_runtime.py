@@ -102,6 +102,31 @@ def _fold_result_coordinates(fold_result: Any) -> Optional[torch.Tensor]:
     return coordinates.unsqueeze(0)
 
 
+def _validate_decoded_coordinate_layout(
+    coordinate: Optional[torch.Tensor],
+    atom_attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Ensure decoded coordinates follow the valid-atom order of raw features."""
+
+    if coordinate is None:
+        raise RuntimeError("ESMFold2 verifier did not return decoded coordinates")
+    atom_mask = atom_attention_mask.bool()
+    if atom_mask.ndim == 2:
+        atom_mask = atom_mask[0]
+    if atom_mask.ndim != 1:
+        raise ValueError("atom_attention_mask must have shape [A] or [1,A]")
+    expected_real_atoms = int(atom_mask.sum().item())
+    if coordinate.ndim != 3 or coordinate.shape[0] != 1:
+        raise ValueError("decoded coordinates must have shape [1,A_valid,3]")
+    if coordinate.shape[1] != expected_real_atoms:
+        raise RuntimeError(
+            "ESMFold2 decoded coordinate layout is inconsistent with "
+            f"the verifier atom mask: decoded={coordinate.shape[1]}, "
+            f"expected_valid={expected_real_atoms}"
+        )
+    return coordinate
+
+
 def _tensor_loss_dict_to_float(
     losses: Mapping[str, Any],
 ) -> dict[str, float]:
@@ -907,8 +932,11 @@ class ESMFold2RuntimeBackend:
         aligned_loss_dict = None
         plddt_logits = None
         if raw_features is not None and raw_output is not None:
-            coordinate = raw_output["sample_atom_coords"].detach().float().cpu()
             plddt_logits = raw_output["plddt_logits"].detach().float().cpu()
+            coordinate = _validate_decoded_coordinate_layout(
+                coordinate,
+                raw_features["atom_attention_mask"],
+            )
             distogram_losses = _structure_losses(
                 raw_output["distogram_logits"],
                 len(binder_seq),

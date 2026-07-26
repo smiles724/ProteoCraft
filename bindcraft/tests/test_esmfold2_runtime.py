@@ -17,6 +17,7 @@ from bindcraft.hallucination.esmfold2_runtime import (
     _mean_target_to_binder_pair_iptm,
     _structure_losses,
     _stageb_structure_loss,
+    _validate_decoded_coordinate_layout,
 )
 import bindcraft.hallucination.esmfold2_runtime as esmfold2_runtime_module
 
@@ -120,6 +121,27 @@ class FakeFoldResultBatchedPairIptm(FakeFoldResult):
                 ]
             ]
         )
+
+
+def test_validate_decoded_coordinate_layout_uses_valid_atoms_not_padding():
+    coordinate = torch.zeros(1, 3, 3)
+    atom_mask = torch.tensor([[True, True, False, True, False]])
+
+    assert (
+        _validate_decoded_coordinate_layout(coordinate, atom_mask)
+        is coordinate
+    )
+
+
+def test_validate_decoded_coordinate_layout_rejects_padded_coordinates():
+    coordinate = torch.zeros(1, 5, 3)
+    atom_mask = torch.tensor([[True, True, False, True, False]])
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"decoded=5, expected_valid=3",
+    ):
+        _validate_decoded_coordinate_layout(coordinate, atom_mask)
 
 
 def test_role_aware_pair_chain_iptm_excludes_scaffold_chain():

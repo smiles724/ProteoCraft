@@ -423,7 +423,9 @@ def scatter_reference_coordinates(
             padded[batch_index, atom_mask[batch_index]] = source[batch_index]
         else:
             raise ValueError(
-                "reference coordinate count does not match padded or valid atom count"
+                "reference coordinate count does not match padded or valid atom "
+                f"count: source={source.shape[1]}, "
+                f"proposal_padded={atom_mask.shape[1]}, proposal_valid={expected}"
             )
     return padded
 
