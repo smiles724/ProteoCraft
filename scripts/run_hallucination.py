@@ -393,6 +393,9 @@ def load_esmfold2_backend(
         one_step_diffusion_enabled=args.esmfold2_one_step_diffusion,
         one_step_diffusion_tau=args.esmfold2_one_step_diffusion_tau,
         one_step_diffusion_weight=args.esmfold2_one_step_diffusion_weight,
+        one_step_diffusion_hotspot_enabled=(
+            args.esmfold2_one_step_diffusion_hotspot
+        ),
         verifier_loss_mode=args.esmfold2_verifier_loss_mode,
         track_proposal_confidence=args.esmfold2_track_proposal_confidence,
         proposal_confidence_temperature=args.esmfold2_proposal_confidence_temperature,
@@ -682,6 +685,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="归一化 one-step diffusion gradient 的组合权重（默认：1.0）",
+    )
+    parser.add_argument(
+        "--esmfold2_one_step_diffusion_hotspot",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help=(
+            "是否让 one-step diffusion 的 iPAE loss 使用 hotspot-aware "
+            "localized 聚合；默认 false，保持现有 one-step 行为"
+        ),
     )
     parser.add_argument(
         "--esmfold2_verifier_loss_mode",
@@ -1175,6 +1187,24 @@ def main():
     ):
         parser.error(
             "--esmfold2_hotspot_verify_too_close_weight > 0 时必须同时提供 "
+            "--target_hotspots"
+        )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_one_step_diffusion_hotspot
+        and not args.esmfold2_one_step_diffusion
+    ):
+        parser.error(
+            "--esmfold2_one_step_diffusion_hotspot true requires "
+            "--esmfold2_one_step_diffusion true"
+        )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_one_step_diffusion_hotspot
+        and hotspot_params is None
+    ):
+        parser.error(
+            "--esmfold2_one_step_diffusion_hotspot true requires "
             "--target_hotspots"
         )
 

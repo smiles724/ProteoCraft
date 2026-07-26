@@ -1763,6 +1763,19 @@ class ESMFold2RuntimeBackend:
                 binder_mutable_mask=mutable_mask,
                 distogram_losses=None,
                 weights={"con": 0.0, "i_con": 0.0, "helix": 0.0},
+                hotspot_params=(
+                    hotspot_params
+                    if self.config.one_step_diffusion_hotspot_enabled
+                    else None
+                ),
+                hotspot_weight=(
+                    effective_hotspot_weight
+                    if self.config.one_step_diffusion_hotspot_enabled
+                    else 0.0
+                ),
+                hotspot_interface_mode=str(
+                    self.config.hotspot_interface_mode
+                ),
             )
             diffusion_grad = torch.autograd.grad(diffusion_total, logits)[0]
             combined_grad = combine_normalized_gradients(
@@ -1790,6 +1803,18 @@ class ESMFold2RuntimeBackend:
                 ),
                 "one_step_diffusion_weight": float(
                     self.config.one_step_diffusion_weight
+                ),
+                "one_step_diffusion_hotspot_enabled": bool(
+                    self.config.one_step_diffusion_hotspot_enabled
+                    and hotspot_params is not None
+                ),
+                "one_step_diffusion_hotspot_weight": float(
+                    effective_hotspot_weight
+                    if self.config.one_step_diffusion_hotspot_enabled
+                    else 0.0
+                ),
+                "one_step_diffusion_hotspot_interface_mode": str(
+                    self.config.hotspot_interface_mode
                 ),
                 "one_step_diffusion_loss": _as_float(diffusion_total),
                 "structure_total_loss": _as_float(losses["total_loss"]),

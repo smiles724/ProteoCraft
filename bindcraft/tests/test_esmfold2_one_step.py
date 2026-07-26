@@ -133,6 +133,63 @@ def test_common_losses_respect_binder_mutable_mask():
     assert coordinates.grad is not None
 
 
+def test_common_losses_localize_one_step_ipae_to_hotspot():
+    coordinates = torch.randn(1, 4, 3, requires_grad=True)
+    plddt_logits = torch.zeros(1, 4, 50, requires_grad=True)
+    pae_logits = torch.full((1, 4, 4, 64), -20.0, requires_grad=True)
+    with torch.no_grad():
+        # Tokens 0-1 are target and 2-3 are binder.  Make target token 0
+        # confident and target token 1 uncertain for both binder residues.
+        for binder_index in (2, 3):
+            pae_logits[0, binder_index, 0, 0] = 20.0
+            pae_logits[0, 0, binder_index, 0] = 20.0
+            pae_logits[0, binder_index, 1, 63] = 20.0
+            pae_logits[0, 1, binder_index, 63] = 20.0
+    distogram_logits = torch.zeros(1, 4, 4, 128, requires_grad=True)
+    weights = {name: 0.0 for name in ESMFOLD2_COMMON_LOSS_WEIGHTS}
+    weights["i_pae"] = 1.0
+
+    total, losses = compute_esmfold2_common_losses(
+        coordinates=coordinates,
+        plddt_logits=plddt_logits,
+        pae_logits=pae_logits,
+        distogram_logits=distogram_logits,
+        features=_features(),
+        binder_length=2,
+        weights=weights,
+        hotspot_params={"target_hotspot_concat_indices": [0]},
+        hotspot_weight=0.5,
+        hotspot_interface_mode="localized",
+    )
+
+    assert losses["i_pae_hotspot"] < losses["i_pae_global"]
+    assert losses["i_pae"].item() == pytest.approx(
+        0.5 * (
+            losses["i_pae_global"].item()
+            + losses["i_pae_hotspot"].item()
+        )
+    )
+    assert total.item() == pytest.approx(losses["i_pae"].item())
+    total.backward()
+    assert pae_logits.grad is not None
+    assert torch.isfinite(pae_logits.grad).all()
+
+
+def test_common_losses_reject_out_of_range_hotspot():
+    with pytest.raises(ValueError, match="hotspot target concat indices"):
+        compute_esmfold2_common_losses(
+            coordinates=torch.zeros(1, 4, 3),
+            plddt_logits=torch.zeros(1, 4, 50),
+            pae_logits=torch.zeros(1, 4, 4, 64),
+            distogram_logits=torch.zeros(1, 4, 4, 128),
+            features=_features(),
+            binder_length=2,
+            weights={"i_pae": 1.0},
+            hotspot_params={"target_hotspot_concat_indices": [2]},
+            hotspot_weight=0.5,
+        )
+
+
 def test_common_losses_reject_bad_mutable_mask():
     with pytest.raises(ValueError, match="binder_mutable_mask length"):
         compute_esmfold2_common_losses(

@@ -293,6 +293,7 @@ def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     assert default_config.one_step_diffusion_enabled is False
     assert default_config.one_step_diffusion_tau == pytest.approx(4.0)
     assert default_config.one_step_diffusion_weight == pytest.approx(1.0)
+    assert default_config.one_step_diffusion_hotspot_enabled is False
     assert default_config.verifier_loss_mode == "pair_chain_iptm"
 
     config = ESMFold2ProposalConfig(soft_steps=3, lambda_esmc="auto")

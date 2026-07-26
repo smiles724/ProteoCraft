@@ -150,6 +150,41 @@ def _token_masks(
     }
 
 
+def _hotspot_token_mask(
+    masks: Mapping[str, torch.Tensor],
+    hotspot_params: Optional[Mapping[str, Any]],
+) -> Optional[torch.Tensor]:
+    """Map target-concatenated hotspot indices onto ESMFold2 token indices."""
+
+    if hotspot_params is None:
+        return None
+    concat_indices = hotspot_params.get("target_hotspot_concat_indices") or []
+    if not concat_indices:
+        return None
+
+    target_indices = masks["target"].nonzero(as_tuple=True)[0]
+    normalized = [int(index) for index in concat_indices]
+    invalid = [
+        index
+        for index in normalized
+        if index < 0 or index >= int(target_indices.numel())
+    ]
+    if invalid:
+        raise ValueError(
+            "hotspot target concat indices out of range: "
+            f"{invalid}; target_len={int(target_indices.numel())}"
+        )
+
+    hotspot_mask = torch.zeros_like(masks["target"], dtype=torch.bool)
+    hotspot_indices = torch.as_tensor(
+        normalized,
+        device=target_indices.device,
+        dtype=torch.long,
+    )
+    hotspot_mask[target_indices[hotspot_indices]] = True
+    return hotspot_mask
+
+
 def _differentiable_pair_chain_iptm(
     pae_logits: torch.Tensor,
     *,
@@ -247,6 +282,9 @@ def compute_esmfold2_common_losses(
     binder_mutable_mask: Optional[Sequence[bool]] = None,
     distogram_losses: Optional[Mapping[str, torch.Tensor]] = None,
     weights: Optional[Mapping[str, float]] = None,
+    hotspot_params: Optional[Mapping[str, Any]] = None,
+    hotspot_weight: float = 0.0,
+    hotspot_interface_mode: str = "localized",
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Compute the Protenix-aligned loss subset available from ESMFold2."""
 
@@ -262,6 +300,19 @@ def compute_esmfold2_common_losses(
     )
     device = coordinates.device
     masks = {key: value.to(device) for key, value in masks.items()}
+    hotspot_mask = _hotspot_token_mask(masks, hotspot_params)
+    resolved_hotspot_weight = float(hotspot_weight)
+    resolved_hotspot_mode = str(hotspot_interface_mode).strip().lower()
+    if resolved_hotspot_weight < 0.0:
+        raise ValueError("hotspot_weight must be non-negative")
+    if resolved_hotspot_mode not in {"additive", "localized"}:
+        raise ValueError(
+            "hotspot_interface_mode must be 'additive' or 'localized'"
+        )
+    if resolved_hotspot_mode == "localized" and resolved_hotspot_weight > 1.0:
+        raise ValueError(
+            "localized hotspot_interface_mode requires hotspot_weight in [0, 1]"
+        )
 
     atom_mask = _batch0(features["atom_attention_mask"]).bool().to(device)
     atom_to_token = _batch0(features["atom_to_token"]).long().to(device)
@@ -303,7 +354,25 @@ def compute_esmfold2_common_losses(
         return (value * mask_f).sum() / mask_f.sum().clamp(min=1.0)
 
     losses["pae"] = masked_mean(pae, intra_pair_mask)
-    losses["i_pae"] = masked_mean(pae, inter_pair_mask)
+    global_i_pae = masked_mean(pae, inter_pair_mask)
+    if hotspot_mask is None:
+        losses["i_pae"] = global_i_pae
+    else:
+        hotspot_inter_pair_mask = (
+            design.unsqueeze(-1) & hotspot_mask.unsqueeze(-2)
+        )
+        hotspot_i_pae = masked_mean(pae, hotspot_inter_pair_mask)
+        losses["i_pae_global"] = global_i_pae
+        losses["i_pae_hotspot"] = hotspot_i_pae
+        if resolved_hotspot_mode == "localized":
+            losses["i_pae"] = (
+                (1.0 - resolved_hotspot_weight) * global_i_pae
+                + resolved_hotspot_weight * hotspot_i_pae
+            )
+        else:
+            losses["i_pae"] = (
+                global_i_pae + resolved_hotspot_weight * hotspot_i_pae
+            )
     losses["iptm"] = 1.0 - _differentiable_pair_chain_iptm(
         pae_logits,
         masks=masks,
