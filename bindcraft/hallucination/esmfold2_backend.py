@@ -605,6 +605,67 @@ def anchor_binder_logits_to_sequence(
     return anchored.detach().cpu().clone()
 
 
+def softly_anchor_mutation_logits(
+    logits: torch.Tensor,
+    parent_sequence: str,
+    child_sequence: str,
+    mutable_mask: Optional[Sequence[bool]] = None,
+    *,
+    anchor_margin: float = 0.1,
+    suppress_cys: bool = True,
+) -> torch.Tensor:
+    """Make only explicit child mutations the argmax of their logit rows.
+
+    Stage-A mutation candidates branch from a shared soft-logit update.  A full
+    sequence anchor would rewrite every row where the candidate differs from
+    the raw argmax trajectory, discarding useful uncertainty.  This helper
+    changes only positions that differ between the verified parent and child;
+    all other mutable-position logits remain bitwise unchanged.
+    """
+
+    if logits.ndim == 3:
+        if logits.shape[0] != 1:
+            raise ValueError("node-local ESM logits must have batch size 1")
+        logits_2d = logits[0]
+    elif logits.ndim == 2:
+        logits_2d = logits
+    else:
+        raise ValueError("node-local ESM logits must have shape [L, 20] or [1, L, 20]")
+
+    parent_sequence = str(parent_sequence)
+    child_sequence = str(child_sequence)
+    if len(parent_sequence) != len(child_sequence):
+        raise ValueError("parent and child sequences must have the same length")
+    length = len(child_sequence)
+    if logits_2d.shape != (length, len(ESM_AA_ORDER)):
+        raise ValueError(
+            f"logits shape {tuple(logits_2d.shape)} does not match sequence shape "
+            f"({length}, {len(ESM_AA_ORDER)})"
+        )
+    if float(anchor_margin) <= 0.0:
+        raise ValueError("anchor_margin must be positive")
+
+    anchored = logits_2d.detach().clone()
+    mutable = _as_bool_mask(mutable_mask, length, device=anchored.device)
+    child_idx = _sequence_indices(child_sequence).to(device=anchored.device)
+
+    for pos, (parent_aa, child_aa) in enumerate(zip(parent_sequence, child_sequence)):
+        if parent_aa == child_aa:
+            continue
+        if not bool(mutable[pos].item()):
+            raise ValueError(f"child mutation at fixed binder position {pos}")
+        aa_idx = int(child_idx[pos].item())
+        if suppress_cys and aa_idx == CYS_INDEX:
+            raise ValueError("cysteine mutations are disabled for ESMFold2 proposals")
+        row = anchored[pos]
+        finite_row = row[torch.isfinite(row)]
+        row_max = float(finite_row.max().item()) if finite_row.numel() else 0.0
+        if not torch.isfinite(row[aa_idx]) or float(row[aa_idx].item()) <= row_max:
+            row[aa_idx] = row_max + float(anchor_margin)
+
+    return anchored.detach().cpu().clone()
+
+
 def build_gradient_mask(
     sequence: str,
     mutable_mask: Optional[Sequence[bool]] = None,

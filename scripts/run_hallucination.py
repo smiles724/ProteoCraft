@@ -479,6 +479,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "默认 2（argmax soft trajectory + 其余候选中 verifier 最优者）"
         ),
     )
+    parser.add_argument(
+        "--esmfold2_stagea_preserve_soft_state",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help=(
+            "Stage A 是否保留 child 的 soft logits：argmax child 不 anchor，"
+            "mutation child 只在真实突变位做轻量 anchor（默认：true）"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_cumulative_annealing",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help="Stage A 是否沿 MCTS 路径累计温度退火进度（默认：true）",
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_annealing_horizon",
+        type=int,
+        default=150,
+        help="Stage A 路径累计温度退火的 soft-step horizon（默认：150）",
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_soft_anchor_margin",
+        type=float,
+        default=0.1,
+        help="Stage A mutation child 在突变位超过当前最大 logit 的最小 margin（默认：0.1）",
+    )
     parser.add_argument("--esmfold2_stageb_soft_steps", type=int, default=None,
                        help="ESMFold2 Stage B 每个 MCTS 节点的 soft gradient update 步数（默认：20）")
     parser.add_argument(
@@ -866,6 +893,16 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
+        if args.esmfold2_stagea_annealing_horizon <= 0:
+            message = "--esmfold2_stagea_annealing_horizon must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_stagea_soft_anchor_margin <= 0.0:
+            message = "--esmfold2_stagea_soft_anchor_margin must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
         if args.esmfold2_temperature_min <= 0.0:
             message = "--esmfold2_temperature_min must be positive"
             if parser is not None:
@@ -1248,6 +1285,10 @@ def main():
                 esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
                 esmfold2_stagea_soft_steps=args.esmfold2_stagea_soft_steps,
                 esmfold2_stagea_tree_children=args.esmfold2_stagea_tree_children,
+                esmfold2_stagea_preserve_soft_state=args.esmfold2_stagea_preserve_soft_state,
+                esmfold2_stagea_cumulative_annealing=args.esmfold2_stagea_cumulative_annealing,
+                esmfold2_stagea_annealing_horizon=args.esmfold2_stagea_annealing_horizon,
+                esmfold2_stagea_soft_anchor_margin=args.esmfold2_stagea_soft_anchor_margin,
                 esmfold2_stagea_paired_verifier_seed=args.esmfold2_stagea_paired_verifier_seed,
                 esmfold2_stagea_verifier_seed=args.esmfold2_stagea_verifier_seed,
                 esmfold2_raw_lineage_annealing_horizon=args.esmfold2_raw_lineage_annealing_horizon,
@@ -1373,6 +1414,22 @@ def main():
             f.write(
                 "ESMFold2 Stage A Tree Children: "
                 f"{args.esmfold2_stagea_tree_children}\n"
+            )
+            f.write(
+                "ESMFold2 Stage A Preserve Soft State: "
+                f"{args.esmfold2_stagea_preserve_soft_state}\n"
+            )
+            f.write(
+                "ESMFold2 Stage A Cumulative Annealing: "
+                f"{args.esmfold2_stagea_cumulative_annealing}\n"
+            )
+            f.write(
+                "ESMFold2 Stage A Annealing Horizon: "
+                f"{args.esmfold2_stagea_annealing_horizon}\n"
+            )
+            f.write(
+                "ESMFold2 Stage A Soft Anchor Margin: "
+                f"{args.esmfold2_stagea_soft_anchor_margin}\n"
             )
             f.write(
                 "ESMFold2 Stage A Paired Verifier Seed: "

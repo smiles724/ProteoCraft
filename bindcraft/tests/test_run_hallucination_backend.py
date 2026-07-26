@@ -28,6 +28,10 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_soft_steps is None
     assert args.esmfold2_stagea_soft_steps == 30
     assert args.esmfold2_stagea_tree_children == 2
+    assert args.esmfold2_stagea_preserve_soft_state is True
+    assert args.esmfold2_stagea_cumulative_annealing is True
+    assert args.esmfold2_stagea_annealing_horizon == 150
+    assert args.esmfold2_stagea_soft_anchor_margin == pytest.approx(0.1)
     assert args.esmfold2_stagea_paired_verifier_seed is True
     assert args.esmfold2_stagea_verifier_seed is None
     assert args.esmfold2_temperature_min == pytest.approx(0.01)

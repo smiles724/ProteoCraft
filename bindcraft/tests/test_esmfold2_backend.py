@@ -17,8 +17,30 @@ from bindcraft.hallucination.esmfold2_backend import (
     resolve_esm_verifier_loss,
     resolve_lambda_esmc,
     select_esmfold2_action_group,
+    softly_anchor_mutation_logits,
 )
 from bindcraft.hallucination.mcts_controller import MCTSTree
+
+
+def test_soft_mutation_anchor_changes_only_explicit_edit_positions():
+    logits = torch.arange(3 * len(ESM_AA_ORDER), dtype=torch.float32).reshape(
+        3, len(ESM_AA_ORDER)
+    )
+    logits[:, CYS_INDEX] = float("-inf")
+
+    anchored = softly_anchor_mutation_logits(
+        logits,
+        parent_sequence="AAA",
+        child_sequence="AYA",
+        mutable_mask=[True, True, True],
+        anchor_margin=0.1,
+    )
+
+    assert torch.equal(anchored[0], logits[0])
+    assert torch.equal(anchored[2], logits[2])
+    y_idx = ESM_AA_ORDER.index("Y")
+    finite_before = logits[1][torch.isfinite(logits[1])]
+    assert anchored[1, y_idx] == pytest.approx(float(finite_before.max()) + 0.1)
 
 
 def test_verifier_loss_requires_pair_chain_iptm_without_global_fallback():

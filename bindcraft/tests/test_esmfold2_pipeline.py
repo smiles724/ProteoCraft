@@ -94,6 +94,9 @@ class FakeESMFold2Backend:
         hotspot_params=None,
         track_confidence_override=None,
         soft_steps_override=None,
+        temperature_step_offset=0,
+        temperature_total_steps=None,
+        preserve_proposal_logits=False,
     ):
         self.propose_calls.append(
             {
@@ -108,6 +111,9 @@ class FakeESMFold2Backend:
                 "hotspot_params": hotspot_params,
                 "track_confidence_override": track_confidence_override,
                 "soft_steps_override": soft_steps_override,
+                "temperature_step_offset": temperature_step_offset,
+                "temperature_total_steps": temperature_total_steps,
+                "preserve_proposal_logits": preserve_proposal_logits,
             }
         )
         if current_seq == "AAA":
@@ -128,6 +134,9 @@ class FakeESMFold2Backend:
         hotspot_params=None,
         track_confidence_override=None,
         soft_steps_override=None,
+        temperature_step_offset=0,
+        temperature_total_steps=None,
+        preserve_proposal_logits=False,
     ):
         self.continuous_calls.append(
             {
@@ -140,6 +149,9 @@ class FakeESMFold2Backend:
                 "hotspot_params": hotspot_params,
                 "track_confidence_override": track_confidence_override,
                 "soft_steps_override": soft_steps_override,
+                "temperature_step_offset": temperature_step_offset,
+                "temperature_total_steps": temperature_total_steps,
+                "preserve_proposal_logits": preserve_proposal_logits,
             }
         )
         logits = (
@@ -927,7 +939,9 @@ def test_stagea_argmax_child_preserves_raw_logits_and_only_two_children_enter_tr
     }
     assert torch.equal(logits_by_sequence["AAY"], backend.raw_logits)
     assert not torch.equal(logits_by_sequence["AAF"], backend.raw_logits)
-    assert logits_by_sequence["AAF"][2, AA_TO_ESM_IDX["F"]] >= 2.0
+    assert torch.equal(logits_by_sequence["AAF"][0], backend.raw_logits[0])
+    assert torch.equal(logits_by_sequence["AAF"][1], backend.raw_logits[1])
+    assert logits_by_sequence["AAF"][2, AA_TO_ESM_IDX["F"]] == pytest.approx(0.6)
 
 
 def test_stagea_uses_one_run_level_verifier_seed_for_all_candidates():
@@ -951,6 +965,50 @@ def test_stagea_uses_one_run_level_verifier_seed_for_all_candidates():
 
     assert len(backend.verify_calls) == 3
     assert len({call[2] for call in backend.verify_calls}) == 1
+
+
+def test_stagea_cumulative_annealing_follows_selected_node_soft_depth(tmp_path):
+    backend = FakeESMFold2Backend()
+
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=2,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=2,
+        T_sample=1.0,
+        max_mutations_per_seq=1,
+        seed=7,
+        mcts_C=0.0,
+        mcts_strategy="stage_a_only",
+        esmfold2_stagea_soft_steps=30,
+        esmfold2_stagea_cumulative_annealing=True,
+        esmfold2_stagea_annealing_horizon=150,
+        esmfold2_stagea_preserve_soft_state=True,
+        esmfold2_stagea_handoff_checkpoint_interval=0,
+        artifact_dir=tmp_path / "artifacts",
+    )
+
+    assert [call["temperature_step_offset"] for call in backend.propose_calls] == [
+        0,
+        30,
+    ]
+    assert [call["temperature_total_steps"] for call in backend.propose_calls] == [
+        150,
+        150,
+    ]
+    assert all(call["preserve_proposal_logits"] for call in backend.propose_calls)
+
+    trajectory = [
+        json.loads(line)
+        for line in (tmp_path / "artifacts" / "trajectory.jsonl").read_text().splitlines()
+    ]
+    stagea_events = [event for event in trajectory if event["stage"] == "stage_a"]
+    assert [event["soft_step_start"] for event in stagea_events] == [0, 30]
+    assert [event["soft_step_end"] for event in stagea_events] == [30, 60]
 
 
 def test_raw_lineage_stagea_keeps_logits_continuous_and_defers_verifier():

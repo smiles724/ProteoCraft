@@ -35,6 +35,7 @@ class LegacyMCTSNode:
     parent: Optional["LegacyMCTSNode"] = field(default=None, repr=False)
     children: List["LegacyMCTSNode"] = field(default_factory=list, repr=False)
     depth: int = field(default=0)
+    soft_step: int = field(default=0)
 
     def is_root(self) -> bool:
         return self.parent is None
@@ -98,6 +99,7 @@ class LegacyMCTSTree:
             parent=None,
             children=[],
             depth=0,
+            soft_step=0,
         )
         self._register_node(node)
         self._roots.append(node)
@@ -165,6 +167,7 @@ class LegacyMCTSTree:
                 parent=parent,
                 children=[],
                 depth=parent.depth + 1,
+                soft_step=parent.soft_step,
             )
             self._register_node(child)
             parent.children.append(child)

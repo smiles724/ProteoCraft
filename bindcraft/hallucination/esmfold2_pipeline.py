@@ -33,6 +33,7 @@ from bindcraft.hallucination.esmfold2_backend import (
     logit_delta_mutation_scores,
     select_esmfold2_action_group,
     sequence_from_logits_argmax,
+    softly_anchor_mutation_logits,
 )
 from bindcraft.hallucination.mcts_legacy import LegacyMCTSTree
 from bindcraft.hallucination.mcts_controller import MCTSTree
@@ -469,6 +470,7 @@ def _mcts_node_artifact(
         "edits": list(getattr(node, "edit_from_parent", []) or []),
         "total_loss": float(getattr(node, "L_real")),
         "visit_count": int(getattr(node, "visit_count", 0)),
+        "soft_step": int(getattr(node, "soft_step", 0)),
     }
     if parent is not None and not payload["edits"]:
         payload["edits"] = _sequence_edits(str(getattr(parent, "sequence", "")), sequence)
@@ -663,6 +665,31 @@ def _select_stagea_tree_results(
     return selected[:limit]
 
 
+def _stagea_child_logits(
+    *,
+    logits_after: Optional[torch.Tensor],
+    parent_sequence: str,
+    child_sequence: str,
+    argmax_sequence: Optional[str],
+    mutable_mask: Optional[Sequence[bool]],
+    preserve_soft_state: bool,
+    soft_anchor_margin: float,
+) -> torch.Tensor:
+    if logits_after is None:
+        return _initial_proposal_logits(child_sequence, mutable_mask)
+    if argmax_sequence is not None and str(child_sequence) == str(argmax_sequence):
+        return logits_after.detach().cpu().clone()
+    if preserve_soft_state:
+        return softly_anchor_mutation_logits(
+            logits_after,
+            parent_sequence=str(parent_sequence),
+            child_sequence=str(child_sequence),
+            mutable_mask=mutable_mask,
+            anchor_margin=soft_anchor_margin,
+        )
+    return _anchor_proposal_logits(logits_after, child_sequence, mutable_mask)
+
+
 def _normalize_proposal_batch(raw: Any) -> ESMFold2ProposalBatch:
     if isinstance(raw, ESMFold2ProposalBatch):
         return raw
@@ -731,6 +758,7 @@ def _call_backend_propose(
     soft_steps_override: Optional[int] = None,
     temperature_step_offset: int = 0,
     temperature_total_steps: Optional[int] = None,
+    preserve_proposal_logits: bool = False,
     **kwargs: Any,
 ) -> ESMFold2ProposalBatch:
     propose_kwargs = dict(kwargs)
@@ -752,6 +780,8 @@ def _call_backend_propose(
         and _callable_accepts_argument(backend.propose, "temperature_total_steps")
     ):
         propose_kwargs["temperature_total_steps"] = temperature_total_steps
+    if _callable_accepts_argument(backend.propose, "preserve_proposal_logits"):
+        propose_kwargs["preserve_proposal_logits"] = bool(preserve_proposal_logits)
     if _callable_accepts_argument(backend.propose, "hotspot_params"):
         propose_kwargs["hotspot_params"] = (
             dict(hotspot_params) if hotspot_params is not None else None
@@ -776,6 +806,7 @@ def _call_backend_continuous_design(
     soft_steps_override: Optional[int] = None,
     temperature_step_offset: int = 0,
     temperature_total_steps: Optional[int] = None,
+    preserve_proposal_logits: bool = False,
     **kwargs: Any,
 ) -> ESMFold2ProposalBatch:
     if not hasattr(backend, "continuous_design"):
@@ -803,6 +834,10 @@ def _call_backend_continuous_design(
         )
     ):
         design_kwargs["temperature_total_steps"] = temperature_total_steps
+    if _callable_accepts_argument(
+        backend.continuous_design, "preserve_proposal_logits"
+    ):
+        design_kwargs["preserve_proposal_logits"] = bool(preserve_proposal_logits)
     if _callable_accepts_argument(backend.continuous_design, "hotspot_params"):
         design_kwargs["hotspot_params"] = (
             dict(hotspot_params) if hotspot_params is not None else None
@@ -2659,6 +2694,10 @@ def run_esmfold2_mcts_hallucination(
     esmfold2_logit_init_mode: str = "legacy_anchor",
     esmfold2_stagea_soft_steps: Optional[int] = None,
     esmfold2_stagea_tree_children: int = 2,
+    esmfold2_stagea_preserve_soft_state: bool = True,
+    esmfold2_stagea_cumulative_annealing: bool = True,
+    esmfold2_stagea_annealing_horizon: int = 150,
+    esmfold2_stagea_soft_anchor_margin: float = 0.1,
     esmfold2_stagea_paired_verifier_seed: bool = True,
     esmfold2_stagea_verifier_seed: Optional[int] = None,
     esmfold2_raw_lineage_annealing_horizon: int = 150,
@@ -2817,7 +2856,22 @@ def run_esmfold2_mcts_hallucination(
     )
     if stagea_soft_steps is not None and stagea_soft_steps <= 0:
         raise ValueError("esmfold2_stagea_soft_steps must be positive")
+    stagea_soft_step_count = int(
+        stagea_soft_steps
+        if stagea_soft_steps is not None
+        else getattr(backend_config, "soft_steps", 30)
+    )
+    if stagea_soft_step_count <= 0:
+        raise ValueError("resolved ESMFold2 Stage A soft steps must be positive")
     stagea_tree_children = max(int(esmfold2_stagea_tree_children), 1)
+    stagea_preserve_soft_state = bool(esmfold2_stagea_preserve_soft_state)
+    stagea_cumulative_annealing = bool(esmfold2_stagea_cumulative_annealing)
+    stagea_annealing_horizon = int(esmfold2_stagea_annealing_horizon)
+    if stagea_annealing_horizon <= 0:
+        raise ValueError("esmfold2_stagea_annealing_horizon must be positive")
+    stagea_soft_anchor_margin = float(esmfold2_stagea_soft_anchor_margin)
+    if stagea_soft_anchor_margin <= 0.0:
+        raise ValueError("esmfold2_stagea_soft_anchor_margin must be positive")
     raw_lineage_annealing_horizon = int(
         esmfold2_raw_lineage_annealing_horizon
     )
@@ -2939,6 +2993,15 @@ def run_esmfold2_mcts_hallucination(
         "ESMFold2 soft_steps: stage_a=%s stage_b=%s",
         str(stagea_soft_steps or "backend_default"),
         str(stageb_soft_steps or "backend_default"),
+    )
+    logger.info(
+        "ESMFold2 StageA soft state: preserve=%s cumulative_annealing=%s "
+        "horizon=%d soft_anchor_margin=%.3f children=%d",
+        stagea_preserve_soft_state,
+        stagea_cumulative_annealing,
+        stagea_annealing_horizon,
+        stagea_soft_anchor_margin,
+        stagea_tree_children,
     )
     logger.info(
         "ESMFold2 StageA verifier seed: %s",
@@ -3163,6 +3226,10 @@ def run_esmfold2_mcts_hallucination(
                 "esmfold2_logit_init_mode": logit_init_mode,
                 "esmfold2_stagea_soft_steps": stagea_soft_steps,
                 "esmfold2_stagea_tree_children": stagea_tree_children,
+                "esmfold2_stagea_preserve_soft_state": stagea_preserve_soft_state,
+                "esmfold2_stagea_cumulative_annealing": stagea_cumulative_annealing,
+                "esmfold2_stagea_annealing_horizon": stagea_annealing_horizon,
+                "esmfold2_stagea_soft_anchor_margin": stagea_soft_anchor_margin,
                 "esmfold2_stagea_paired_verifier_seed": (
                     stagea_paired_verifier_seed
                 ),
@@ -3490,11 +3557,11 @@ def run_esmfold2_mcts_hallucination(
         for chunk_index in range(N_steps):
             soft_step_offset = chunk_index * int(stagea_soft_steps)
             is_final_chunk = chunk_index == N_steps - 1
-            proposal_hotspot_weight = _hotspot_proposal_weight_for_verified_state(
-                verifier_cache.get(raw_sequence),
-                configured_weight=hotspot_weight,
-                satisfied_weight=hotspot_satisfied_proposal_weight,
-            )
+            # This diagnostic must match one official continuous trajectory.
+            # Intermediate argmax states are not full-verifier states, so using
+            # the verifier-aware saturation rule here would change the proposal
+            # objective between chunks.
+            proposal_hotspot_weight = hotspot_weight
             final_batch = _call_backend_continuous_design(
                 backend,
                 current_seq=raw_sequence,
@@ -3509,6 +3576,7 @@ def run_esmfold2_mcts_hallucination(
                 soft_steps_override=stagea_soft_steps,
                 temperature_step_offset=soft_step_offset,
                 temperature_total_steps=raw_lineage_annealing_horizon,
+                preserve_proposal_logits=True,
             )
             _write_soft_step_artifacts(
                 artifact_recorder,
@@ -3660,6 +3728,14 @@ def run_esmfold2_mcts_hallucination(
             configured_weight=hotspot_weight,
             satisfied_weight=hotspot_satisfied_proposal_weight,
         )
+        temperature_step_offset = (
+            int(getattr(selected_node, "soft_step", 0))
+            if stagea_cumulative_annealing
+            else 0
+        )
+        temperature_total_steps = (
+            stagea_annealing_horizon if stagea_cumulative_annealing else None
+        )
         proposal_seed = _stable_seed(seed, "esm_propose", target_key, current_seq, step)
         proposal_batch = _call_backend_propose(
             backend,
@@ -3678,6 +3754,9 @@ def run_esmfold2_mcts_hallucination(
             hotspot_weight_override=proposal_hotspot_weight,
             track_confidence_override=False,
             soft_steps_override=stagea_soft_steps,
+            temperature_step_offset=temperature_step_offset,
+            temperature_total_steps=temperature_total_steps,
+            preserve_proposal_logits=stagea_preserve_soft_state,
         )
         _write_soft_step_artifacts(
             artifact_recorder,
@@ -3741,18 +3820,19 @@ def run_esmfold2_mcts_hallucination(
         )
         new_nodes = tree.expand(selected_node, tree_results)
         for node in new_nodes:
-            if (
-                proposal_batch.logits_after is not None
-                and argmax_sequence is not None
-                and str(node.sequence) == str(argmax_sequence)
-            ):
-                node.logits = proposal_batch.logits_after.detach().cpu().clone()
-            else:
-                node.logits = _anchor_proposal_logits(
-                    proposal_batch.logits_after,
-                    node.sequence,
-                    mutable_mask,
-                )
+            node.logits = _stagea_child_logits(
+                logits_after=proposal_batch.logits_after,
+                parent_sequence=str(current_seq),
+                child_sequence=str(node.sequence),
+                argmax_sequence=argmax_sequence,
+                mutable_mask=mutable_mask,
+                preserve_soft_state=stagea_preserve_soft_state,
+                soft_anchor_margin=stagea_soft_anchor_margin,
+            )
+            node.soft_step = (
+                int(getattr(selected_node, "soft_step", 0))
+                + stagea_soft_step_count
+            )
             proposal_logits_by_sequence[str(node.sequence)] = node.logits
             stagea_node_by_sequence[str(node.sequence)] = node
         tree.backpropagate(
@@ -3765,7 +3845,19 @@ def run_esmfold2_mcts_hallucination(
                     stage="stage_a",
                     node=node,
                     step_created=step,
-                    extra={"source": "stage_a_expand"},
+                    extra={
+                        "source": "stage_a_expand",
+                        "soft_state_kind": (
+                            "raw_argmax"
+                            if argmax_sequence is not None
+                            and str(node.sequence) == str(argmax_sequence)
+                            else (
+                                "local_soft_anchor"
+                                if stagea_preserve_soft_state
+                                else "full_anchor"
+                            )
+                        ),
+                    },
                 )
             )
             artifact_recorder.write_mcts_edge(
@@ -3780,12 +3872,24 @@ def run_esmfold2_mcts_hallucination(
 
         round_best = min(round_results, key=lambda result: result.total_loss)
         if float(round_best.total_loss) < best_loss:
+            round_best_logits = _stagea_child_logits(
+                logits_after=proposal_batch.logits_after,
+                parent_sequence=str(current_seq),
+                child_sequence=str(round_best.binder_seq),
+                argmax_sequence=argmax_sequence,
+                mutable_mask=mutable_mask,
+                preserve_soft_state=stagea_preserve_soft_state,
+                soft_anchor_margin=stagea_soft_anchor_margin,
+            )
             _remember_global_best(
                 round_best,
-                logits=proposal_batch.logits_after,
+                logits=round_best_logits,
                 anchor_logits=(
-                    argmax_sequence is None
-                    or str(round_best.binder_seq) != str(argmax_sequence)
+                    not stagea_preserve_soft_state
+                    and (
+                        argmax_sequence is None
+                        or str(round_best.binder_seq) != str(argmax_sequence)
+                    )
                 ),
             )
         if best_loss < stagea_best - float(mcts_bootstrap_min_delta):
@@ -3808,6 +3912,10 @@ def run_esmfold2_mcts_hallucination(
                 for node in new_nodes
             ) if argmax_sequence is not None else False,
             proposal_hotspot_weight=proposal_hotspot_weight,
+            soft_step_start=temperature_step_offset,
+            soft_step_end=temperature_step_offset + stagea_soft_step_count,
+            temperature_total_steps=temperature_total_steps,
+            preserve_soft_state=stagea_preserve_soft_state,
             round_best_loss=float(round_best.total_loss),
             global_best_loss=best_loss,
             best_sequence=best_seq,
@@ -3866,6 +3974,14 @@ def run_esmfold2_mcts_hallucination(
                 else None
             ),
             initial_logits_checkpoint_paths=initial_logits_checkpoint_paths,
+            stagea_soft_state={
+                "preserve_soft_state": stagea_preserve_soft_state,
+                "cumulative_annealing": stagea_cumulative_annealing,
+                "annealing_horizon": stagea_annealing_horizon,
+                "soft_steps_per_expansion": stagea_soft_step_count,
+                "soft_anchor_margin": stagea_soft_anchor_margin,
+                "tree_children": stagea_tree_children,
+            },
             **hotspot_summary,
         )
         return best_seq, final_seq, losses_history
@@ -4459,6 +4575,14 @@ def run_esmfold2_mcts_hallucination(
             else None
         ),
         initial_logits_checkpoint_paths=initial_logits_checkpoint_paths,
+        stagea_soft_state={
+            "preserve_soft_state": stagea_preserve_soft_state,
+            "cumulative_annealing": stagea_cumulative_annealing,
+            "annealing_horizon": stagea_annealing_horizon,
+            "soft_steps_per_expansion": stagea_soft_step_count,
+            "soft_anchor_margin": stagea_soft_anchor_margin,
+            "tree_children": stagea_tree_children,
+        },
         stageb_shared_verifier_seed=(
             stageb_shared_verify_seed if stageb_paired_verifier_seed else None
         ),

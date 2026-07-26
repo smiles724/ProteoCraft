@@ -436,6 +436,26 @@ def test_runtime_preserves_matching_free_proposal_logits_without_hard_anchor():
         assert initialized[0, pos, aa_idx].item() < 0.5
 
 
+def test_runtime_can_preserve_soft_logits_when_sequence_is_a_local_branch():
+    proposal_logits = torch.full((3, len(AA_TO_ESM_IDX)), -1.0)
+    proposal_logits[:, AA_TO_ESM_IDX["C"]] = float("-inf")
+    proposal_logits[:, AA_TO_ESM_IDX["A"]] = 0.5
+    proposal_logits[1, AA_TO_ESM_IDX["Y"]] = 0.4
+
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(),
+        device="cpu",
+    )
+    initialized = backend._init_current_sequence_logits(
+        "AYA",
+        mutable_mask=[True, True, True],
+        proposal_logits=proposal_logits,
+        preserve_proposal_logits=True,
+    )
+
+    assert torch.equal(initialized[0].detach().cpu(), proposal_logits)
+
+
 def test_runtime_configures_official_proposal_lm_dropout(monkeypatch):
     class FakeExperimentalModel:
         last_instance = None

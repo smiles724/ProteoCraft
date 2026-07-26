@@ -846,6 +846,7 @@ class ESMFold2RuntimeBackend:
         soft_steps_override: Optional[int] = None,
         temperature_step_offset: int = 0,
         temperature_total_steps: Optional[int] = None,
+        preserve_proposal_logits: bool = False,
     ) -> ESMFold2ProposalBatch:
         logits_before, logits_after, confidence_candidates, soft_step_metrics = self._run_soft_update_with_tracking(
             current_seq=current_seq,
@@ -861,6 +862,7 @@ class ESMFold2RuntimeBackend:
             soft_steps_override=soft_steps_override,
             temperature_step_offset=temperature_step_offset,
             temperature_total_steps=temperature_total_steps,
+            preserve_proposal_logits=preserve_proposal_logits,
         )
         confidence_sequences = self._top_confidence_sequences(confidence_candidates)
         with _seed_context(seed):
@@ -899,6 +901,7 @@ class ESMFold2RuntimeBackend:
         soft_steps_override: Optional[int] = None,
         temperature_step_offset: int = 0,
         temperature_total_steps: Optional[int] = None,
+        preserve_proposal_logits: bool = False,
     ) -> ESMFold2ProposalBatch:
         """Run one continuous ESMFold2 soft-logit trajectory and discretize it.
 
@@ -920,6 +923,7 @@ class ESMFold2RuntimeBackend:
             soft_steps_override=soft_steps_override,
             temperature_step_offset=temperature_step_offset,
             temperature_total_steps=temperature_total_steps,
+            preserve_proposal_logits=preserve_proposal_logits,
         )
         sequence = sequence_from_logits_argmax(
             logits_after,
@@ -1140,6 +1144,7 @@ class ESMFold2RuntimeBackend:
         proposal_logits: Optional[torch.Tensor],
         hotspot_params: Optional[Dict[str, Any]] = None,
         hotspot_weight_override: Optional[float] = None,
+        preserve_proposal_logits: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         logits_before, logits_after, _, _ = self._run_soft_update_impl(
             current_seq=current_seq,
@@ -1152,6 +1157,7 @@ class ESMFold2RuntimeBackend:
             hotspot_params=hotspot_params,
             hotspot_weight_override=hotspot_weight_override,
             track_confidence=False,
+            preserve_proposal_logits=preserve_proposal_logits,
         )
         return logits_before, logits_after
 
@@ -1171,6 +1177,7 @@ class ESMFold2RuntimeBackend:
         soft_steps_override: Optional[int] = None,
         temperature_step_offset: int = 0,
         temperature_total_steps: Optional[int] = None,
+        preserve_proposal_logits: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]], List[Dict[str, Any]]]:
         track_confidence = bool(getattr(self.config, "track_proposal_confidence", False))
         if track_confidence_override is not None:
@@ -1189,6 +1196,7 @@ class ESMFold2RuntimeBackend:
             soft_steps_override=soft_steps_override,
             temperature_step_offset=temperature_step_offset,
             temperature_total_steps=temperature_total_steps,
+            preserve_proposal_logits=preserve_proposal_logits,
         )
 
     def _run_soft_update_impl(
@@ -1207,6 +1215,7 @@ class ESMFold2RuntimeBackend:
         soft_steps_override: Optional[int] = None,
         temperature_step_offset: int = 0,
         temperature_total_steps: Optional[int] = None,
+        preserve_proposal_logits: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]], List[Dict[str, Any]]]:
         if self.soft_update_fn is not None:
             kwargs = dict(
@@ -1229,6 +1238,10 @@ class ESMFold2RuntimeBackend:
                 self.soft_update_fn, "temperature_total_steps"
             ):
                 kwargs["temperature_total_steps"] = temperature_total_steps
+            if _callable_accepts_argument(
+                self.soft_update_fn, "preserve_proposal_logits"
+            ):
+                kwargs["preserve_proposal_logits"] = preserve_proposal_logits
             if _callable_accepts_argument(self.soft_update_fn, "hotspot_params"):
                 kwargs["hotspot_params"] = hotspot_params
             if _callable_accepts_argument(
@@ -1280,6 +1293,7 @@ class ESMFold2RuntimeBackend:
             current_seq,
             mutable_mask=mutable_mask,
             proposal_logits=proposal_logits,
+            preserve_proposal_logits=preserve_proposal_logits,
         )
         logits_before = logits.detach().clone()[0]
         gradient_mask = build_gradient_mask(
@@ -1555,10 +1569,11 @@ class ESMFold2RuntimeBackend:
         *,
         mutable_mask: Optional[Sequence[bool]],
         proposal_logits: Optional[torch.Tensor] = None,
+        preserve_proposal_logits: bool = False,
     ) -> torch.Tensor:
         if proposal_logits is not None:
             current_seq = str(current_seq)
-            if (
+            if preserve_proposal_logits or (
                 sequence_from_logits_argmax(
                     proposal_logits,
                     current_seq=current_seq,
