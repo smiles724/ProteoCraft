@@ -206,7 +206,7 @@ def _helix_loss(
     boundaries = torch.linspace(
         2.0,
         52.0,
-        127,
+        logits.shape[-1] - 1,
         device=logits.device,
         dtype=logits.dtype,
     )

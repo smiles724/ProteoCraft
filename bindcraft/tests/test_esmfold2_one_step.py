@@ -88,6 +88,29 @@ def test_common_losses_are_finite_and_differentiable():
     assert distogram_logits.grad is not None
 
 
+def test_common_losses_support_full_verifier_64_bin_distogram():
+    coordinates = torch.randn(1, 4, 3, requires_grad=True)
+    plddt_logits = torch.randn(1, 4, 50, requires_grad=True)
+    pae_logits = torch.randn(1, 4, 4, 64, requires_grad=True)
+    distogram_logits = torch.randn(1, 4, 4, 64, requires_grad=True)
+    distogram_losses = {
+        "intra_contact_loss": distogram_logits[..., :8].mean(),
+        "inter_contact_loss": distogram_logits[..., 8:16].mean(),
+    }
+
+    total, losses = compute_esmfold2_common_losses(
+        coordinates=coordinates,
+        plddt_logits=plddt_logits,
+        pae_logits=pae_logits,
+        distogram_logits=distogram_logits,
+        features=_features(),
+        binder_length=2,
+        distogram_losses=distogram_losses,
+    )
+    assert torch.isfinite(total)
+    assert torch.isfinite(losses["helix"])
+
+
 def test_common_losses_respect_binder_mutable_mask():
     coordinates = torch.randn(1, 4, 3, requires_grad=True)
     plddt_logits = torch.randn(1, 4, 50, requires_grad=True)
