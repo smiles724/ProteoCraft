@@ -184,6 +184,14 @@ def test_cdr_structure_loss_uses_true_target_and_mutable_cdr_only(monkeypatch):
     assert inter_binder_mask == [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 
 
+def test_structure_losses_support_full_verifier_64_bin_distogram():
+    losses = _structure_losses(
+        torch.zeros(1, 7, 7, 64),
+        binder_length=3,
+    )
+    assert torch.isfinite(losses["total_loss"]).all()
+
+
 class FakeInputBuilder:
     def __init__(self):
         self.calls = []

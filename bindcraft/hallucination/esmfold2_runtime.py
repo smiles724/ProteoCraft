@@ -199,10 +199,23 @@ def _mean_target_to_binder_pair_iptm(
     return _as_float(values)
 
 
-def _midpoint_bins(device: torch.device) -> torch.Tensor:
-    boundaries = torch.linspace(2.0, 52.0, 127, device=device)
-    lower = torch.tensor([1.0], device=device)
-    upper = torch.tensor([57.0], device=device)
+def _midpoint_bins(
+    device: torch.device,
+    *,
+    num_bins: int = 128,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    if int(num_bins) < 2:
+        raise ValueError("num_bins must be at least 2")
+    boundaries = torch.linspace(
+        2.0,
+        52.0,
+        int(num_bins) - 1,
+        device=device,
+        dtype=dtype,
+    )
+    lower = torch.tensor([1.0], device=device, dtype=dtype)
+    upper = torch.tensor([57.0], device=device, dtype=dtype)
     expanded = torch.cat((lower, boundaries, upper))
     return (expanded[:-1] + expanded[1:]) / 2.0
 
@@ -563,7 +576,11 @@ def _structure_losses(
     hotspot_cutoff: float = 8.0,
     hotspot_interface_mode: str = "additive",
 ) -> dict[str, torch.Tensor]:
-    bin_distance = _midpoint_bins(distogram_logits.device)
+    bin_distance = _midpoint_bins(
+        distogram_logits.device,
+        num_bins=distogram_logits.shape[-1],
+        dtype=distogram_logits.dtype,
+    )
     full_len = distogram_logits.shape[1]
     target_length = int(full_len) - int(binder_length)
     if target_length <= 0:
