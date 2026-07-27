@@ -29,6 +29,15 @@ esmfold2_proposal_num_sampling_steps: 1
 esmfold2_proposal_load_internal_esmc: true
 esmfold2_proposal_lm_dropout: 0.5
 esmfold2_force_proposal_lm_dropout: true
+# Optional differentiable coordinate proposal. Keep disabled to preserve the
+# established CDR Stage-A baseline; set true for CDR one-step experiments.
+esmfold2_one_step_diffusion: false
+esmfold2_one_step_diffusion_tau: 4.0
+esmfold2_one_step_diffusion_weight: 1.0
+esmfold2_one_step_diffusion_rg_weight: 0.3
+esmfold2_one_step_diffusion_hotspot: false
+esmfold2_distogram_hotspot: true
+esmfold2_verifier_loss_mode: pair_chain_iptm
 esmfold2_lambda_esmc: auto
 esmfold2_logit_init_mode: official_exact
 esmfold2_stagea_handoff_checkpoint_interval: 10

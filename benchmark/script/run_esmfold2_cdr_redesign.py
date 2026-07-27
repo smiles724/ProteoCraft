@@ -117,6 +117,8 @@ def build_hallucination_command(
         str(case_dir),
         "--esmfold2_artifact_dir",
         str(case_dir / "esmfold2_artifacts"),
+        "--save_checkpoint_dir",
+        str(case_dir / "checkpoints"),
         "--log_file",
         str(case_dir / "run.log"),
     ]
@@ -136,6 +138,7 @@ def build_hallucination_command(
         "mcts_bootstrap_max_steps": "mcts_bootstrap_max_steps",
         "mcts_expand_actions_per_step": "mcts_expand_actions_per_step",
         "esmfold2_stagea_soft_steps": "esmfold2_stagea_soft_steps",
+        "esmfold2_stagea_cumulative_annealing": "esmfold2_stagea_cumulative_annealing",
         "esmfold2_stageb_soft_steps": "esmfold2_stageb_soft_steps",
         "esmfold2_experimental_model": "esmfold2_experimental_model",
         "esmfold2_verifier_model": "esmfold2_verifier_model",
@@ -146,10 +149,18 @@ def build_hallucination_command(
         "esmfold2_proposal_load_internal_esmc": "esmfold2_proposal_load_internal_esmc",
         "esmfold2_proposal_lm_dropout": "esmfold2_proposal_lm_dropout",
         "esmfold2_force_proposal_lm_dropout": "esmfold2_force_proposal_lm_dropout",
+        "esmfold2_one_step_diffusion": "esmfold2_one_step_diffusion",
+        "esmfold2_one_step_diffusion_tau": "esmfold2_one_step_diffusion_tau",
+        "esmfold2_one_step_diffusion_weight": "esmfold2_one_step_diffusion_weight",
+        "esmfold2_one_step_diffusion_rg_weight": "esmfold2_one_step_diffusion_rg_weight",
+        "esmfold2_one_step_diffusion_hotspot": "esmfold2_one_step_diffusion_hotspot",
+        "esmfold2_distogram_hotspot": "esmfold2_distogram_hotspot",
+        "esmfold2_verifier_loss_mode": "esmfold2_verifier_loss_mode",
         "esmfold2_lambda_esmc": "esmfold2_lambda_esmc",
         "esmfold2_logit_init_mode": "esmfold2_logit_init_mode",
         "esmfold2_initial_logits_checkpoint": "esmfold2_initial_logits_checkpoint",
         "esmfold2_stagea_handoff_checkpoint_interval": "esmfold2_stagea_handoff_checkpoint_interval",
+        "checkpoint_save_policy": "checkpoint_save_policy",
     }
     for config_key, cli_name in option_map.items():
         _append_cli_argument(command, cli_name, config.get(config_key))

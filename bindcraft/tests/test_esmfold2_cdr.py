@@ -6,6 +6,7 @@ from bindcraft.hallucination.esmfold2_cdr import (
     framework_unchanged,
     prepare_esmfold2_cdr_case,
 )
+from benchmark.script.run_esmfold2_cdr_redesign import build_hallucination_command
 
 
 def _write_case_fasta(path: Path) -> None:
@@ -76,3 +77,50 @@ def test_prepare_esmfold2_cdr_case_rejects_missing_motif(tmp_path):
             },
             input_dir=tmp_path,
         )
+
+
+def test_cdr_launcher_forwards_one_step_diffusion_options(tmp_path):
+    fasta_path = tmp_path / "case.fasta"
+    template_path = tmp_path / "case.cif"
+    _write_case_fasta(fasta_path)
+    template_path.write_text("data_case\n", encoding="utf-8")
+    case = prepare_esmfold2_cdr_case(
+        {
+            "id": "case_alpha",
+            "fasta_path": fasta_path.name,
+            "template_path": template_path.name,
+            "binder_chain": "C",
+            "target_chains": ["A"],
+            "scaffold_chains": ["B"],
+            "cdr_motif": "ACDEFG",
+        },
+        input_dir=tmp_path,
+    )
+
+    command = build_hallucination_command(
+        case,
+        {
+            "esmfold2_one_step_diffusion": True,
+            "esmfold2_stagea_cumulative_annealing": False,
+            "esmfold2_one_step_diffusion_tau": 2.0,
+            "esmfold2_one_step_diffusion_weight": 0.5,
+            "esmfold2_one_step_diffusion_rg_weight": 0.1,
+            "esmfold2_one_step_diffusion_hotspot": False,
+            "esmfold2_distogram_hotspot": True,
+            "esmfold2_verifier_loss_mode": "aligned_common",
+            "checkpoint_save_policy": "all",
+        },
+        case_dir=tmp_path / "output",
+    )
+    options = dict(zip(command[::2], command[1::2]))
+
+    assert options["--esmfold2_one_step_diffusion"] == "true"
+    assert options["--esmfold2_stagea_cumulative_annealing"] == "false"
+    assert options["--esmfold2_one_step_diffusion_tau"] == "2.0"
+    assert options["--esmfold2_one_step_diffusion_weight"] == "0.5"
+    assert options["--esmfold2_one_step_diffusion_rg_weight"] == "0.1"
+    assert options["--esmfold2_one_step_diffusion_hotspot"] == "false"
+    assert options["--esmfold2_distogram_hotspot"] == "true"
+    assert options["--esmfold2_verifier_loss_mode"] == "aligned_common"
+    assert options["--save_checkpoint_dir"] == str(tmp_path / "output" / "checkpoints")
+    assert options["--checkpoint_save_policy"] == "all"
