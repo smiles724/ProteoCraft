@@ -1087,17 +1087,6 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             raise ValueError(message)
         if (
             args.esmfold2_initial_logits_checkpoint
-            and args.mcts_strategy == "best_of_n"
-        ):
-            message = (
-                "--esmfold2_initial_logits_checkpoint is only supported by "
-                "ESMFold2 MCTS strategies"
-            )
-            if parser is not None:
-                parser.error(message)
-            raise ValueError(message)
-        if (
-            args.esmfold2_initial_logits_checkpoint
             and args.esmfold2_resume_handoff_checkpoint
         ):
             message = (
@@ -1383,10 +1372,14 @@ def main():
                 mutable_mask=esmfold2_mutable_mask,
                 hotspot_params=hotspot_params,
                 artifact_dir=esmfold2_artifact_dir,
+                esmfold2_initial_logits_checkpoint=(
+                    args.esmfold2_initial_logits_checkpoint
+                ),
                 esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
                 esmfold2_soft_steps=args.esmfold2_stagea_soft_steps,
                 track_confidence=args.esmfold2_track_proposal_confidence,
                 pass_loss_threshold=args.esmfold2_best_of_n_pass_loss_threshold,
+                verifier_seed=args.esmfold2_stagea_verifier_seed,
                 resume=args.esmfold2_best_of_n_resume,
             )
         else:

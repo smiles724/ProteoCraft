@@ -1708,18 +1708,23 @@ def run_esmfold2_best_of_n(
     mutable_mask: Optional[Sequence[bool]] = None,
     hotspot_params: Optional[Dict[str, Any]] = None,
     artifact_dir: Optional[Union[str, os.PathLike[str]]] = None,
+    esmfold2_initial_logits_checkpoint: Optional[
+        Union[str, os.PathLike[str]]
+    ] = None,
     esmfold2_logit_init_mode: str = "official_exact",
     esmfold2_soft_steps: int = 150,
     track_confidence: bool = True,
     pass_loss_threshold: Optional[float] = None,
+    verifier_seed: Optional[int] = None,
     resume: bool = True,
 ) -> Tuple[str, str, List[float]]:
     """Run independent continuous ESMFold2 trajectories without MCTS.
 
-    Each trajectory starts from independently seeded logits, performs one
-    uninterrupted soft-logit optimization, and full-verifies its final and
-    late-confidence candidates.  The same full-verifier seed is used for every
-    candidate so Best-of-N comparisons are not confounded by verifier noise.
+    Each trajectory starts from independently seeded logits, or from one exact
+    external logits checkpoint, performs one uninterrupted soft-logit
+    optimization, and full-verifies its final and late-confidence candidates.
+    The same full-verifier seed is used for every candidate so Best-of-N
+    comparisons are not confounded by verifier noise.
     """
 
     if backend is None:
@@ -1760,11 +1765,31 @@ def run_esmfold2_best_of_n(
 
     target_key = _normalize_target_key(target_seq)
     logit_init_mode = _normalize_logit_init_mode(esmfold2_logit_init_mode)
-    shared_verify_seed = _stable_seed(
-        seed,
-        "esm_best_of_n_full_verify",
-        target_key,
+    shared_verify_seed = (
+        int(verifier_seed)
+        if verifier_seed is not None
+        else _stable_seed(
+            seed,
+            "esm_best_of_n_full_verify",
+            target_key,
+        )
     )
+    loaded_initial_states: Optional[List[Tuple[str, torch.Tensor]]] = None
+    initial_logits_checkpoint_paths: List[str] = []
+    initial_logits_checkpoint_source = None
+    if esmfold2_initial_logits_checkpoint is not None:
+        loaded_initial_states, initial_logits_checkpoint_paths = (
+            _load_initial_logits_checkpoint_states(
+                esmfold2_initial_logits_checkpoint,
+                L_binder=L_binder,
+                num_beams=best_of_n,
+                init_binder_seq=init_binder_seq,
+                mutable_mask=mutable_mask,
+            )
+        )
+        initial_logits_checkpoint_source = str(
+            Path(esmfold2_initial_logits_checkpoint).expanduser().resolve()
+        )
     artifact_path = Path(artifact_dir) if artifact_dir is not None else None
     contract_path = (
         artifact_path / "best_of_n_config.json"
@@ -1782,6 +1807,8 @@ def run_esmfold2_best_of_n(
         "logit_init_mode": logit_init_mode,
         "track_confidence": bool(track_confidence),
         "shared_verifier_seed": shared_verify_seed,
+        "initial_logits_checkpoint_source": initial_logits_checkpoint_source,
+        "initial_logits_checkpoint_paths": initial_logits_checkpoint_paths,
         "initial_binder_sequence": init_binder_seq,
         "mutable_mask": mutable_mask,
         "hotspot_indices_0based": hotspot_indices,
@@ -1902,20 +1929,47 @@ def run_esmfold2_best_of_n(
             target_key,
             trajectory_index,
         )
-        initial_states = _make_phase0_seed_states(
-            init_binder_seq,
-            num_beams=1,
-            L_binder=L_binder,
-            seed=trajectory_seed,
-            mutable_mask=mutable_mask,
-            logit_init_mode=logit_init_mode,
-            device=(
-                getattr(backend, "device", None)
-                if logit_init_mode == "official_exact"
-                else None
-            ),
+        if loaded_initial_states is not None:
+            initial_sequence, initial_logits = loaded_initial_states[
+                trajectory_index
+            ]
+        else:
+            initial_states = _make_phase0_seed_states(
+                init_binder_seq,
+                num_beams=1,
+                L_binder=L_binder,
+                seed=trajectory_seed,
+                mutable_mask=mutable_mask,
+                logit_init_mode=logit_init_mode,
+                device=(
+                    getattr(backend, "device", None)
+                    if logit_init_mode == "official_exact"
+                    else None
+                ),
+            )
+            initial_sequence, initial_logits = initial_states[0]
+        one_step_enabled = bool(
+            getattr(
+                getattr(backend, "config", None),
+                "one_step_diffusion_enabled",
+                False,
+            )
         )
-        initial_sequence, initial_logits = initial_states[0]
+        initial_reference_result = None
+        if one_step_enabled:
+            initial_reference_result = _verify_with_cache(
+                backend,
+                verifier_cache,
+                binder_seq=initial_sequence,
+                target_seq=target_seq,
+                seed=shared_verify_seed,
+                hotspot_params=hotspot_params,
+            )
+            if initial_reference_result.coordinate is None:
+                raise ValueError(
+                    "Best-of-N One-step diffusion requires verifier "
+                    "coordinates for every initial trajectory"
+                )
         proposal_batch = _call_backend_continuous_design(
             backend,
             current_seq=initial_sequence,
@@ -1924,6 +1978,11 @@ def run_esmfold2_best_of_n(
             seed=trajectory_seed,
             mutable_mask=mutable_mask,
             proposal_logits=initial_logits,
+            reference_coordinates=(
+                initial_reference_result.coordinate
+                if initial_reference_result is not None
+                else None
+            ),
             hotspot_params=hotspot_params,
             track_confidence_override=bool(track_confidence),
             soft_steps_override=soft_steps,
@@ -2013,8 +2072,18 @@ def run_esmfold2_best_of_n(
             "trajectory_index": trajectory_index,
             "trajectory_seed": trajectory_seed,
             "verifier_seed": shared_verify_seed,
+            "initial_logits_checkpoint": (
+                initial_logits_checkpoint_paths[trajectory_index]
+                if initial_logits_checkpoint_paths
+                else None
+            ),
             "initial_sequence": initial_sequence,
             "initial_sequence_hash": _sequence_hash(initial_sequence),
+            "initial_reference_loss": (
+                float(initial_reference_result.total_loss)
+                if initial_reference_result is not None
+                else None
+            ),
             "final_argmax_sequence": final_sequence,
             "final_argmax_sequence_hash": _sequence_hash(final_sequence),
             "verified_candidate_count": len(candidate_results),

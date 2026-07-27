@@ -1213,6 +1213,81 @@ def test_esmfold2_best_of_n_supports_denovo_tcr_and_cdr_state_contracts(
     )
 
 
+def test_best_of_n_uses_exact_initial_logits_and_reference_coordinates(
+    tmp_path,
+):
+    class OneStepBackend(FakeESMFold2Backend):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(one_step_diffusion_enabled=True)
+
+        def continuous_design(
+            self,
+            *,
+            reference_coordinates=None,
+            **kwargs,
+        ):
+            batch = super().continuous_design(**kwargs)
+            self.continuous_calls[-1]["reference_coordinates"] = (
+                reference_coordinates.detach().clone()
+                if reference_coordinates is not None
+                else None
+            )
+            return batch
+
+    checkpoint_root = tmp_path / "shared_initial_logits"
+    expected_logits = []
+    expected_sequences = ("AYY", "FYA")
+    for trajectory_index, sequence in enumerate(expected_sequences):
+        trajectory_dir = (
+            checkpoint_root
+            / "best_of_n"
+            / f"trajectory_{trajectory_index:03d}"
+        )
+        trajectory_dir.mkdir(parents=True)
+        logits = torch.full((3, len(ESM_AA_ORDER)), -1.0)
+        for position, amino_acid in enumerate(sequence):
+            logits[position, AA_TO_ESM_IDX[amino_acid]] = 1.0
+        torch.save(
+            {
+                "sequence": sequence,
+                "sequence_hash": hashlib.sha256(
+                    sequence.encode("utf-8")
+                ).hexdigest()[:16],
+                "logits": logits,
+            },
+            trajectory_dir / "initial_logits.pt",
+        )
+        expected_logits.append(logits)
+
+    backend = OneStepBackend()
+    run_esmfold2_best_of_n(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        best_of_n=2,
+        mutable_mask=[True, True, True],
+        seed=13,
+        artifact_dir=tmp_path / "artifacts",
+        esmfold2_initial_logits_checkpoint=checkpoint_root,
+        esmfold2_soft_steps=2,
+        verifier_seed=1234,
+    )
+
+    assert [call["current_seq"] for call in backend.continuous_calls] == list(
+        expected_sequences
+    )
+    assert all(
+        torch.equal(call["proposal_logits"], logits)
+        for call, logits in zip(backend.continuous_calls, expected_logits)
+    )
+    assert all(
+        call["reference_coordinates"] is not None
+        for call in backend.continuous_calls
+    )
+    assert all(seed == 1234 for _, _, seed in backend.verify_calls)
+
+
 def test_esmfold2_pipeline_propagates_hotspot_to_proposal_and_preview_rerank():
     backend = FakeESMFold2Backend()
     hotspot_params = {"target_hotspot_concat_indices": [1, 2]}
