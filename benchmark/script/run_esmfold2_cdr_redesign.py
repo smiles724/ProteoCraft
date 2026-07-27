@@ -153,6 +153,8 @@ def build_hallucination_command(
         "esmfold2_one_step_diffusion_tau": "esmfold2_one_step_diffusion_tau",
         "esmfold2_one_step_diffusion_weight": "esmfold2_one_step_diffusion_weight",
         "esmfold2_one_step_diffusion_rg_weight": "esmfold2_one_step_diffusion_rg_weight",
+        "esmfold2_one_step_diffusion_interval": "esmfold2_one_step_diffusion_interval",
+        "esmfold2_one_step_recycle_coordinates": "esmfold2_one_step_recycle_coordinates",
         "esmfold2_one_step_diffusion_hotspot": "esmfold2_one_step_diffusion_hotspot",
         "esmfold2_distogram_hotspot": "esmfold2_distogram_hotspot",
         "esmfold2_verifier_loss_mode": "esmfold2_verifier_loss_mode",

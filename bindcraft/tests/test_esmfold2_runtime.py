@@ -15,11 +15,24 @@ from bindcraft.hallucination.esmfold2_runtime import (
     ESMFold2RuntimeBackend,
     _hotspot_structure_metrics,
     _mean_target_to_binder_pair_iptm,
+    _scheduled_one_step_soft_steps,
     _structure_losses,
     _stageb_structure_loss,
     _validate_decoded_coordinate_layout,
 )
 import bindcraft.hallucination.esmfold2_runtime as esmfold2_runtime_module
+
+
+def test_scheduled_one_step_soft_steps_include_interval_and_final_step():
+    assert _scheduled_one_step_soft_steps(soft_steps=30, interval=0) == ()
+    assert _scheduled_one_step_soft_steps(
+        soft_steps=30,
+        interval=5,
+    ) == (5, 10, 15, 20, 25, 30)
+    assert _scheduled_one_step_soft_steps(
+        soft_steps=30,
+        interval=7,
+    ) == (7, 14, 21, 28, 30)
 
 
 class FakeComplex:
@@ -745,6 +758,88 @@ def test_runtime_continuous_design_records_soft_step_metrics(monkeypatch):
     assert "temperature" in batch.soft_step_metrics[0]
     assert "argmax_sequence" in batch.soft_step_metrics[0]
     assert "logits_snapshot" in batch.soft_step_metrics[0]
+
+
+def test_runtime_schedules_and_recycles_interval_one_step_coordinates(monkeypatch):
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(
+            soft_steps=6,
+            lambda_esmc=0.0,
+            num_loops=1,
+            num_sampling_steps=1,
+            one_step_diffusion_enabled=True,
+            one_step_diffusion_interval=2,
+            one_step_diffusion_recycle_coordinates=True,
+        ),
+        device="cpu",
+        experimental_model=object(),
+    )
+    monkeypatch.setattr(backend, "_ensure_proposal_models_loaded", lambda: None)
+
+    def fake_fold_distogram(**kwargs):
+        design = kwargs["design"]
+        full_len = len(kwargs["target_seq"]) + design.shape[1]
+        bins = torch.arange(128, dtype=design.dtype, device=design.device)
+        signal = design[..., 0].sum()
+        return {
+            "distogram_logits": signal
+            * bins.reshape(1, 1, 1, -1).expand(
+                1,
+                full_len,
+                full_len,
+                128,
+            )
+        }
+
+    references = []
+
+    def fake_one_step_diffusion_gradient(**kwargs):
+        references.append(kwargs["reference_coordinates"].detach().clone())
+        call_index = len(references)
+        return {
+            "gradient": torch.ones_like(kwargs["logits"]),
+            "total": torch.tensor(float(call_index)),
+            "losses": {"rg": torch.tensor(0.5)},
+            "coordinates": torch.full(
+                (1, 1, 3),
+                float(call_index),
+            ),
+            "features": {"marker": torch.tensor(float(call_index))},
+            "reference_rmsd": torch.tensor(0.25),
+        }
+
+    monkeypatch.setattr(backend, "_fold_distogram", fake_fold_distogram)
+    monkeypatch.setattr(
+        backend,
+        "_one_step_diffusion_gradient",
+        fake_one_step_diffusion_gradient,
+    )
+
+    batch = backend.continuous_design(
+        current_seq="AAA",
+        target_seq="TTTT",
+        global_step=0,
+        seed=5,
+        mutable_mask=[True, True, True],
+        proposal_logits=torch.zeros(3, 20),
+        reference_coordinates=torch.zeros(1, 1, 3),
+    )
+
+    assert len(batch.soft_step_metrics) == 6
+    assert len(references) == 3
+    assert torch.equal(references[0], torch.zeros(1, 1, 3))
+    assert torch.equal(references[1], torch.ones(1, 1, 3))
+    assert torch.equal(references[2], torch.full((1, 1, 3), 2.0))
+    injection_metrics = [
+        metrics
+        for metrics in batch.soft_step_metrics
+        if metrics.get("one_step_diffusion")
+    ]
+    assert [metrics["local_step"] for metrics in injection_metrics] == [1, 3, 5]
+    assert [
+        metrics["one_step_diffusion_used_recycled_coordinates"]
+        for metrics in injection_metrics
+    ] == [False, True, True]
 
 
 def test_hotspot_structure_loss_is_additive_and_weight_zero_preserves_base_loss():

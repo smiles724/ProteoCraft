@@ -92,6 +92,36 @@ def _as_float(value: Any) -> Optional[float]:
     return scalar
 
 
+def _scheduled_one_step_soft_steps(
+    *,
+    soft_steps: int,
+    interval: int,
+) -> tuple[int, ...]:
+    """Return one-based soft steps that receive a joint diffusion update."""
+
+    if int(soft_steps) <= 0:
+        raise ValueError("soft_steps must be positive")
+    if int(interval) <= 0:
+        return ()
+    return tuple(
+        step
+        for step in range(1, int(soft_steps) + 1)
+        if step % int(interval) == 0 or step == int(soft_steps)
+    )
+
+
+def _first_coordinate_sample(coordinates: torch.Tensor) -> torch.Tensor:
+    if coordinates.ndim == 4:
+        return coordinates[0, 0]
+    if coordinates.ndim == 3:
+        return coordinates[0]
+    if coordinates.ndim == 2:
+        return coordinates
+    raise ValueError(
+        "coordinates must have shape [A,3], [B,A,3], or [B,S,A,3]"
+    )
+
+
 def _fold_result_coordinates(fold_result: Any) -> Optional[torch.Tensor]:
     complex_obj = getattr(fold_result, "complex", None)
     atom_positions = getattr(complex_obj, "atom_positions", None)
@@ -1386,6 +1416,96 @@ class ESMFold2RuntimeBackend:
             preserve_proposal_logits=preserve_proposal_logits,
         )
 
+    def _one_step_diffusion_gradient(
+        self,
+        *,
+        logits: torch.Tensor,
+        fold_result: Mapping[str, Any],
+        targets: Sequence[str],
+        current_seq: str,
+        mutable_mask: Optional[Sequence[bool]],
+        target_chain_roles: Sequence[str],
+        reference_coordinates: torch.Tensor,
+        reference_features: Optional[Mapping[str, torch.Tensor]],
+        diffusion_seed: Optional[int],
+        hotspot_params: Optional[Dict[str, Any]],
+        effective_hotspot_weight: float,
+    ) -> Dict[str, Any]:
+        source_features = reference_features
+        if source_features is None:
+            source_features = self._prepare_sequence_atom_features(
+                targets,
+                current_seq,
+                seed=diffusion_seed,
+            )
+        remapped_reference = remap_reference_coordinates(
+            reference_coordinates,
+            source_features=source_features,
+            destination_features=fold_result["_features"],
+        )
+        one_step = run_esmfold2_one_step_diffusion(
+            model=self.experimental_model,
+            captured=fold_result["_captured"],
+            features=fold_result["_features"],
+            reference_coordinates=remapped_reference,
+            tau=float(self.config.one_step_diffusion_tau),
+            seed=diffusion_seed,
+        )
+        diffusion_total, diffusion_losses = compute_esmfold2_common_losses(
+            coordinates=one_step["coordinates"],
+            plddt_logits=one_step["plddt_logits"],
+            pae_logits=one_step["pae_logits"],
+            distogram_logits=fold_result["distogram_logits"],
+            features=fold_result["_features"],
+            binder_length=len(current_seq),
+            target_chain_roles=target_chain_roles,
+            binder_mutable_mask=mutable_mask,
+            distogram_losses=None,
+            weights={
+                "con": 0.0,
+                "i_con": 0.0,
+                "helix": 0.0,
+                "rg": float(self.config.one_step_diffusion_rg_weight),
+            },
+            hotspot_params=(
+                hotspot_params
+                if self.config.one_step_diffusion_hotspot_enabled
+                else None
+            ),
+            hotspot_weight=(
+                effective_hotspot_weight
+                if self.config.one_step_diffusion_hotspot_enabled
+                else 0.0
+            ),
+            hotspot_interface_mode=str(self.config.hotspot_interface_mode),
+        )
+        diffusion_grad = torch.autograd.grad(diffusion_total, logits)[0]
+
+        denoised_sample = _first_coordinate_sample(one_step["coordinates"])
+        reference_sample = _first_coordinate_sample(remapped_reference).to(
+            device=denoised_sample.device,
+            dtype=denoised_sample.dtype,
+        )
+        atom_mask = fold_result["_features"]["atom_attention_mask"]
+        if atom_mask.ndim > 1:
+            atom_mask = atom_mask[0]
+        atom_mask = atom_mask.to(device=denoised_sample.device).bool()
+        coordinate_rmsd = torch.sqrt(
+            torch.square(
+                denoised_sample[atom_mask] - reference_sample[atom_mask]
+            )
+            .sum(dim=-1)
+            .mean()
+        )
+        return {
+            "gradient": diffusion_grad,
+            "total": diffusion_total,
+            "losses": diffusion_losses,
+            "coordinates": one_step["coordinates"],
+            "features": fold_result["_features"],
+            "reference_rmsd": coordinate_rmsd,
+        }
+
     def _run_soft_update_impl(
         self,
         *,
@@ -1517,8 +1637,34 @@ class ESMFold2RuntimeBackend:
         if resolved_temperature_total_steps <= 0:
             raise ValueError("temperature_total_steps must be positive")
 
+        one_step_enabled = bool(self.config.one_step_diffusion_enabled)
+        one_step_interval = int(self.config.one_step_diffusion_interval)
+        scheduled_one_step_steps = set(
+            _scheduled_one_step_soft_steps(
+                soft_steps=soft_steps,
+                interval=one_step_interval,
+            )
+            if one_step_enabled
+            else ()
+        )
+        if one_step_enabled and reference_coordinates is None:
+            raise ValueError(
+                "ESMFold2 one-step diffusion requires coordinates from the "
+                "selected verifier node"
+            )
+        recycle_one_step_coordinates = bool(
+            self.config.one_step_diffusion_recycle_coordinates
+        )
+        recycled_reference_coordinates: Optional[torch.Tensor] = None
+        recycled_reference_features: Optional[Mapping[str, torch.Tensor]] = None
+        one_step_injection_count = 0
+
         for local_step in range(soft_steps):
             optimizer.zero_grad()
+            one_based_soft_step = local_step + 1
+            run_scheduled_one_step = (
+                one_based_soft_step in scheduled_one_step_steps
+            )
             temperature_step = temperature_step_offset + local_step
             temperature = esm_temperature(
                 temperature_step,
@@ -1548,6 +1694,7 @@ class ESMFold2RuntimeBackend:
                     if should_track_confidence
                     else int(self.config.num_sampling_steps)
                 ),
+                capture_diffusion_state=run_scheduled_one_step,
             )
             if should_track_confidence:
                 record = self._proposal_confidence_record(
@@ -1586,7 +1733,11 @@ class ESMFold2RuntimeBackend:
                 group_weight=getattr(self.config, "stageb_group_weight", 1.0),
                 hotspot_interface_mode=str(self.config.hotspot_interface_mode),
             )
-            structure_grad = torch.autograd.grad(structure_loss.mean(), logits)[0]
+            structure_grad = torch.autograd.grad(
+                structure_loss.mean(),
+                logits,
+                retain_graph=run_scheduled_one_step,
+            )[0]
 
             esmc_grad = None
             if lambda_esmc != 0.0:
@@ -1599,12 +1750,68 @@ class ESMFold2RuntimeBackend:
                     )
                 esmc_grad = torch.autograd.grad(esmc_loss.mean(), logits)[0]
 
-            logits.grad = combine_normalized_gradients(
+            combined_grad = combine_normalized_gradients(
                 structure_grad,
                 esmc_grad,
                 gradient_mask=gradient_mask,
                 lambda_esmc=lambda_esmc,
             )
+            scheduled_one_step: Optional[Dict[str, Any]] = None
+            if run_scheduled_one_step:
+                diffusion_seed = (
+                    None
+                    if seed is None
+                    else int(seed)
+                    + int(global_step)
+                    + one_based_soft_step
+                    + 100_003
+                )
+                use_recycled_reference = bool(
+                    recycle_one_step_coordinates
+                    and recycled_reference_coordinates is not None
+                    and recycled_reference_features is not None
+                )
+                scheduled_one_step = self._one_step_diffusion_gradient(
+                    logits=logits,
+                    fold_result=fold_result,
+                    targets=targets,
+                    current_seq=current_seq,
+                    mutable_mask=mutable_mask,
+                    target_chain_roles=target_chain_roles,
+                    reference_coordinates=(
+                        recycled_reference_coordinates
+                        if use_recycled_reference
+                        else reference_coordinates
+                    ),
+                    reference_features=(
+                        recycled_reference_features
+                        if use_recycled_reference
+                        else None
+                    ),
+                    diffusion_seed=diffusion_seed,
+                    hotspot_params=hotspot_params,
+                    effective_hotspot_weight=effective_hotspot_weight,
+                )
+                combined_grad = combined_grad + float(
+                    self.config.one_step_diffusion_weight
+                ) * normalized_gradient_tensor(
+                    scheduled_one_step["gradient"],
+                    gradient_mask,
+                )
+                if recycle_one_step_coordinates:
+                    recycled_reference_coordinates = scheduled_one_step[
+                        "coordinates"
+                    ].detach()
+                    recycled_reference_features = {
+                        key: (
+                            value.detach()
+                            if isinstance(value, torch.Tensor)
+                            else value
+                        )
+                        for key, value in scheduled_one_step["features"].items()
+                    }
+                one_step_injection_count += 1
+            logits.grad = combined_grad * gradient_mask
             for group in optimizer.param_groups:
                 group["lr"] = float(self.config.learning_rate) * temperature
             optimizer.step()
@@ -1672,6 +1879,64 @@ class ESMFold2RuntimeBackend:
                         ),
                     }
                 )
+            if scheduled_one_step is not None:
+                metrics.update(
+                    {
+                        "one_step_diffusion": True,
+                        "one_step_diffusion_schedule": "interval",
+                        "one_step_diffusion_interval": int(one_step_interval),
+                        "one_step_diffusion_injection_index": int(
+                            one_step_injection_count
+                        ),
+                        "one_step_diffusion_recycle_coordinates": bool(
+                            recycle_one_step_coordinates
+                        ),
+                        "one_step_diffusion_used_recycled_coordinates": bool(
+                            recycle_one_step_coordinates
+                            and one_step_injection_count > 1
+                        ),
+                        "one_step_diffusion_tau": float(
+                            self.config.one_step_diffusion_tau
+                        ),
+                        "one_step_diffusion_weight": float(
+                            self.config.one_step_diffusion_weight
+                        ),
+                        "one_step_diffusion_rg_weight": float(
+                            self.config.one_step_diffusion_rg_weight
+                        ),
+                        "one_step_diffusion_hotspot_enabled": bool(
+                            self.config.one_step_diffusion_hotspot_enabled
+                            and hotspot_params is not None
+                        ),
+                        "one_step_diffusion_hotspot_weight": float(
+                            effective_hotspot_weight
+                            if self.config.one_step_diffusion_hotspot_enabled
+                            else 0.0
+                        ),
+                        "one_step_diffusion_hotspot_interface_mode": str(
+                            self.config.hotspot_interface_mode
+                        ),
+                        "distogram_hotspot_enabled": bool(
+                            self.config.distogram_hotspot_enabled
+                        ),
+                        "distogram_hotspot_weight": float(
+                            effective_distogram_hotspot_weight
+                        ),
+                        "one_step_diffusion_loss": _as_float(
+                            scheduled_one_step["total"]
+                        ),
+                        "one_step_diffusion_reference_rmsd": _as_float(
+                            scheduled_one_step["reference_rmsd"]
+                        ),
+                    }
+                )
+                for name, value in scheduled_one_step["losses"].items():
+                    metrics[f"diffusion_{name}_loss"] = _as_float(value)
+                if "rg" in scheduled_one_step["losses"]:
+                    metrics["diffusion_rg_weighted_contribution"] = _as_float(
+                        scheduled_one_step["losses"]["rg"]
+                        * float(self.config.one_step_diffusion_rg_weight)
+                    )
             if (
                 local_step == 0
                 or local_step == soft_steps - 1
@@ -1680,12 +1945,7 @@ class ESMFold2RuntimeBackend:
                 metrics["logits_snapshot"] = logits.detach().clone()[0].cpu()
             soft_step_metrics.append(metrics)
 
-        if bool(self.config.one_step_diffusion_enabled):
-            if reference_coordinates is None:
-                raise ValueError(
-                    "ESMFold2 one-step diffusion requires coordinates from the "
-                    "selected verifier node"
-                )
+        if one_step_enabled and one_step_interval == 0:
             optimizer.zero_grad()
             final_temperature = esm_temperature(
                 min(
@@ -1818,6 +2078,11 @@ class ESMFold2RuntimeBackend:
                 "temperature": float(final_temperature),
                 "proposal_loss_source": proposal_loss_source,
                 "one_step_diffusion": True,
+                "one_step_diffusion_schedule": "legacy_final_only",
+                "one_step_diffusion_interval": 0,
+                "one_step_diffusion_injection_index": 1,
+                "one_step_diffusion_recycle_coordinates": False,
+                "one_step_diffusion_used_recycled_coordinates": False,
                 "one_step_diffusion_tau": float(
                     self.config.one_step_diffusion_tau
                 ),

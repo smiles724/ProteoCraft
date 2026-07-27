@@ -35,6 +35,8 @@ esmfold2_one_step_diffusion: false
 esmfold2_one_step_diffusion_tau: 4.0
 esmfold2_one_step_diffusion_weight: 1.0
 esmfold2_one_step_diffusion_rg_weight: 0.3
+esmfold2_one_step_diffusion_interval: 0
+esmfold2_one_step_recycle_coordinates: false
 esmfold2_one_step_diffusion_hotspot: false
 esmfold2_distogram_hotspot: true
 esmfold2_verifier_loss_mode: pair_chain_iptm

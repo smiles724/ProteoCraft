@@ -396,6 +396,12 @@ def load_esmfold2_backend(
         one_step_diffusion_rg_weight=(
             args.esmfold2_one_step_diffusion_rg_weight
         ),
+        one_step_diffusion_interval=(
+            args.esmfold2_one_step_diffusion_interval
+        ),
+        one_step_diffusion_recycle_coordinates=(
+            args.esmfold2_one_step_recycle_coordinates
+        ),
         one_step_diffusion_hotspot_enabled=(
             args.esmfold2_one_step_diffusion_hotspot
         ),
@@ -674,8 +680,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=lambda x: x.lower() == "true",
         default=False,
         help=(
-            "是否在每次 ESMFold2 soft proposal 后增加一次可微 one-step "
-            "diffusion 更新；默认 false，保持旧链路"
+            "是否启用可微 ESMFold2 one-step diffusion；默认 false。"
+            "interval=0 时保持旧行为，在全部 soft steps 后额外更新一次"
         ),
     )
     parser.add_argument(
@@ -697,6 +703,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "one-step diffusion common loss 中 Rg/compactness 项的权重"
             "（默认：0.3，保持原有行为）"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_one_step_diffusion_interval",
+        type=int,
+        default=0,
+        help=(
+            "在 soft optimization 内每隔多少步联合加入一次 one-step "
+            "diffusion；0 表示保持旧行为，在全部 soft steps 后额外更新一次"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_one_step_recycle_coordinates",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help=(
+            "间隔式 one-step 中是否将上一次去噪坐标作为下一次的参考结构；"
+            "仅在 interval > 0 时有效"
         ),
     )
     parser.add_argument(
@@ -1214,6 +1238,31 @@ def main():
         )
     if (
         model_backend == "esmfold2"
+        and args.esmfold2_one_step_diffusion_interval < 0
+    ):
+        parser.error(
+            "--esmfold2_one_step_diffusion_interval must be non-negative"
+        )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_one_step_diffusion_interval > 0
+        and not args.esmfold2_one_step_diffusion
+    ):
+        parser.error(
+            "--esmfold2_one_step_diffusion_interval > 0 requires "
+            "--esmfold2_one_step_diffusion true"
+        )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_one_step_recycle_coordinates
+        and args.esmfold2_one_step_diffusion_interval <= 0
+    ):
+        parser.error(
+            "--esmfold2_one_step_recycle_coordinates true requires "
+            "--esmfold2_one_step_diffusion_interval > 0"
+        )
+    if (
+        model_backend == "esmfold2"
         and args.esmfold2_one_step_diffusion_hotspot
         and not args.esmfold2_one_step_diffusion
     ):
@@ -1605,6 +1654,14 @@ def main():
             f.write(
                 "ESMFold2 One-step Diffusion Rg Weight: "
                 f"{args.esmfold2_one_step_diffusion_rg_weight}\n"
+            )
+            f.write(
+                "ESMFold2 One-step Diffusion Interval: "
+                f"{args.esmfold2_one_step_diffusion_interval}\n"
+            )
+            f.write(
+                "ESMFold2 One-step Recycle Coordinates: "
+                f"{args.esmfold2_one_step_recycle_coordinates}\n"
             )
             f.write(
                 "ESMFold2 One-step Diffusion Hotspot: "

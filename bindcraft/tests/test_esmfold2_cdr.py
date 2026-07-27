@@ -105,6 +105,8 @@ def test_cdr_launcher_forwards_one_step_diffusion_options(tmp_path):
             "esmfold2_one_step_diffusion_tau": 2.0,
             "esmfold2_one_step_diffusion_weight": 0.5,
             "esmfold2_one_step_diffusion_rg_weight": 0.1,
+            "esmfold2_one_step_diffusion_interval": 5,
+            "esmfold2_one_step_recycle_coordinates": True,
             "esmfold2_one_step_diffusion_hotspot": False,
             "esmfold2_distogram_hotspot": True,
             "esmfold2_verifier_loss_mode": "aligned_common",
@@ -119,6 +121,8 @@ def test_cdr_launcher_forwards_one_step_diffusion_options(tmp_path):
     assert options["--esmfold2_one_step_diffusion_tau"] == "2.0"
     assert options["--esmfold2_one_step_diffusion_weight"] == "0.5"
     assert options["--esmfold2_one_step_diffusion_rg_weight"] == "0.1"
+    assert options["--esmfold2_one_step_diffusion_interval"] == "5"
+    assert options["--esmfold2_one_step_recycle_coordinates"] == "true"
     assert options["--esmfold2_one_step_diffusion_hotspot"] == "false"
     assert options["--esmfold2_distogram_hotspot"] == "true"
     assert options["--esmfold2_verifier_loss_mode"] == "aligned_common"
