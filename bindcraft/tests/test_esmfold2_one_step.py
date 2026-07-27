@@ -3,6 +3,7 @@ import torch
 
 from bindcraft.hallucination.esmfold2_one_step import (
     ESMFOLD2_COMMON_LOSS_WEIGHTS,
+    ESMFOLD2_VERIFIER_LOSS_WEIGHTS,
     compute_esmfold2_common_losses,
     remap_reference_coordinates,
     scatter_reference_coordinates,
@@ -36,6 +37,17 @@ def test_common_loss_weights_match_protenix_subset_without_pde():
     assert ESMFOLD2_COMMON_LOSS_WEIGHTS["i_con"] == 3.0
     assert "pde" not in ESMFOLD2_COMMON_LOSS_WEIGHTS
     assert "i_pde" not in ESMFOLD2_COMMON_LOSS_WEIGHTS
+
+
+def test_verifier_weights_recalibrate_interface_selection_only():
+    expected = {
+        **ESMFOLD2_COMMON_LOSS_WEIGHTS,
+        "i_con": 0.5,
+        "iptm": 1.0,
+    }
+    assert ESMFOLD2_VERIFIER_LOSS_WEIGHTS == expected
+    assert ESMFOLD2_COMMON_LOSS_WEIGHTS["i_con"] == 3.0
+    assert ESMFOLD2_COMMON_LOSS_WEIGHTS["iptm"] == 0.3
 
 
 def test_common_losses_are_finite_and_differentiable():

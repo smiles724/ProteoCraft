@@ -31,6 +31,15 @@ ESMFOLD2_COMMON_LOSS_WEIGHTS: Dict[str, float] = {
     "i_clash": 0.1,
 }
 
+# The Protenix-calibrated common weights remain the proposal/One-step default.
+# Full ESMFold2 verification uses a separate calibration because its raw
+# interface-contact loss has a different scale.
+ESMFOLD2_VERIFIER_LOSS_WEIGHTS: Dict[str, float] = {
+    **ESMFOLD2_COMMON_LOSS_WEIGHTS,
+    "i_con": 0.5,
+    "iptm": 1.0,
+}
+
 
 def _batch0(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.ndim == 0:

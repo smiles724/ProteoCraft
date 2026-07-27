@@ -40,6 +40,7 @@ from bindcraft.hallucination.esmfold2_backend import (
     sequence_from_logits_argmax,
 )
 from bindcraft.hallucination.esmfold2_one_step import (
+    ESMFOLD2_VERIFIER_LOSS_WEIGHTS,
     capture_experimental_trunk_state,
     compute_esmfold2_common_losses,
     remap_reference_coordinates,
@@ -989,8 +990,12 @@ class ESMFold2RuntimeBackend:
                 target_chain_roles=target_chain_roles,
                 binder_mutable_mask=self.config.binder_mutable_mask,
                 distogram_losses=distogram_losses,
+                weights=ESMFOLD2_VERIFIER_LOSS_WEIGHTS,
             )
             aligned_loss_dict = _tensor_loss_dict_to_float(aligned_losses)
+            summary["esm_verify_loss_weights"] = dict(
+                ESMFOLD2_VERIFIER_LOSS_WEIGHTS
+            )
         return build_esm_verifier_result(
             binder_seq=binder_seq,
             target_seq=target_seq,
