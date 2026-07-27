@@ -1572,16 +1572,20 @@ def _load_initial_logits_checkpoint_states(
     num_beams: int,
     init_binder_seq: Optional[str],
     mutable_mask: Sequence[bool],
+    allow_extra_checkpoints: bool = False,
 ) -> Tuple[List[Tuple[str, torch.Tensor]], List[str]]:
     """Load exact MCTS Phase-0 roots from saved Best-of-N logits."""
 
     checkpoint_paths = _resolve_initial_logits_checkpoint_paths(source)
     expected_count = max(int(num_beams), 1)
-    if len(checkpoint_paths) != expected_count:
+    if len(checkpoint_paths) < expected_count or (
+        not allow_extra_checkpoints and len(checkpoint_paths) != expected_count
+    ):
         raise ValueError(
             f"initial logits checkpoint count {len(checkpoint_paths)} does not "
             f"match mcts_num_beams {expected_count}"
         )
+    checkpoint_paths = checkpoint_paths[:expected_count]
 
     reference_sequence = None
     if init_binder_seq is not None:
@@ -2185,6 +2189,567 @@ def run_esmfold2_best_of_n(
         float(global_best_result.total_loss),
         float(summary["mean_trajectory_best_loss"]),
         float(summary["std_trajectory_best_loss"]),
+    )
+    return global_best_sequence, global_best_sequence, trajectory_best_losses
+
+
+def _allocate_chunked_best_of_n_steps(
+    total_outer_steps: int,
+    best_of_n: int,
+) -> List[int]:
+    """Split a fixed outer-step budget as evenly as possible across trajectories."""
+
+    total_outer_steps = int(total_outer_steps)
+    best_of_n = int(best_of_n)
+    if best_of_n <= 0:
+        raise ValueError("best_of_n must be positive")
+    if total_outer_steps < best_of_n:
+        raise ValueError(
+            "total_outer_steps must be at least best_of_n so every trajectory "
+            "receives one outer step"
+        )
+    base_steps, remainder = divmod(total_outer_steps, best_of_n)
+    return [
+        base_steps + (1 if trajectory_index < remainder else 0)
+        for trajectory_index in range(best_of_n)
+    ]
+
+
+def run_esmfold2_chunked_best_of_n(
+    *,
+    backend: Any,
+    target_seq: Union[str, Sequence[str]],
+    L_binder: int = 40,
+    best_of_n: int = 4,
+    total_outer_steps: int = 70,
+    init_binder_seq: Optional[str] = None,
+    seed: Optional[int] = 42,
+    mutable_mask: Optional[Sequence[bool]] = None,
+    hotspot_params: Optional[Dict[str, Any]] = None,
+    artifact_dir: Optional[Union[str, os.PathLike[str]]] = None,
+    esmfold2_initial_logits_checkpoint: Optional[
+        Union[str, os.PathLike[str]]
+    ] = None,
+    esmfold2_logit_init_mode: str = "official_exact",
+    esmfold2_soft_steps: int = 30,
+    pass_loss_threshold: Optional[float] = None,
+    verifier_seed: Optional[int] = None,
+    resume: bool = True,
+) -> Tuple[str, str, List[float]]:
+    """Run compute-matched chunked trajectories without MCTS decisions.
+
+    The fixed outer-step budget is split across independent trajectories. Each
+    outer step runs the same soft-logit proposal chunk used by Stage A, carries
+    the unanchored argmax logits into the next chunk, and performs no candidate
+    branching or intermediate verifier-based selection. Full verification is
+    used only to initialize One-step coordinates and to rank final trajectories.
+    """
+
+    if backend is None:
+        raise ValueError("backend is required for chunked ESMFold2 Best-of-N")
+    L_binder = int(L_binder)
+    best_of_n = int(best_of_n)
+    total_outer_steps = int(total_outer_steps)
+    soft_steps = int(esmfold2_soft_steps)
+    if L_binder <= 0:
+        raise ValueError("L_binder must be positive")
+    if soft_steps <= 0:
+        raise ValueError("esmfold2_soft_steps must be positive")
+    if pass_loss_threshold is not None and not math.isfinite(
+        float(pass_loss_threshold)
+    ):
+        raise ValueError("pass_loss_threshold must be finite when provided")
+
+    outer_step_allocation = _allocate_chunked_best_of_n_steps(
+        total_outer_steps,
+        best_of_n,
+    )
+    mutable_mask = _normalize_mutable_mask(mutable_mask, L_binder)
+    hotspot_params = dict(hotspot_params) if hotspot_params else None
+    hotspot_indices = [
+        int(index)
+        for index in (hotspot_params or {}).get(
+            "target_hotspot_concat_indices",
+            [],
+        )
+    ]
+    backend_config = getattr(backend, "config", None)
+    hotspot_weight = float(getattr(backend_config, "hotspot_weight", 0.0))
+    hotspot_verify_weight = float(
+        getattr(backend_config, "hotspot_verify_weight", 0.0)
+    )
+    if hotspot_weight > 0.0 and not hotspot_indices:
+        raise ValueError(
+            "positive ESMFold2 hotspot_weight requires target hotspot indices"
+        )
+    if hotspot_verify_weight > 0.0 and not hotspot_indices:
+        raise ValueError(
+            "positive ESMFold2 hotspot_verify_weight requires target hotspot indices"
+        )
+
+    one_step_enabled = bool(
+        getattr(backend_config, "one_step_diffusion_enabled", False)
+    )
+    one_step_config = {
+        "enabled": one_step_enabled,
+        "interval": int(
+            getattr(backend_config, "one_step_diffusion_interval", 0)
+        ),
+        "tau": float(
+            getattr(backend_config, "one_step_diffusion_tau", 0.0)
+        ),
+        "weight": float(
+            getattr(backend_config, "one_step_diffusion_weight", 0.0)
+        ),
+        "rg_weight": float(
+            getattr(backend_config, "one_step_diffusion_rg_weight", 0.0)
+        ),
+        "recycle_coordinates": bool(
+            getattr(
+                backend_config,
+                "one_step_diffusion_recycle_coordinates",
+                False,
+            )
+        ),
+        "hotspot_enabled": bool(
+            getattr(
+                backend_config,
+                "one_step_diffusion_hotspot_enabled",
+                False,
+            )
+        ),
+    }
+    target_key = _normalize_target_key(target_seq)
+    logit_init_mode = _normalize_logit_init_mode(esmfold2_logit_init_mode)
+    shared_verify_seed = (
+        int(verifier_seed)
+        if verifier_seed is not None
+        else _stable_seed(
+            seed,
+            "esm_chunked_best_of_n_full_verify",
+            target_key,
+        )
+    )
+
+    initial_logits_checkpoint_paths: List[str] = []
+    initial_logits_checkpoint_source = None
+    if esmfold2_initial_logits_checkpoint is not None:
+        initial_states, initial_logits_checkpoint_paths = (
+            _load_initial_logits_checkpoint_states(
+                esmfold2_initial_logits_checkpoint,
+                L_binder=L_binder,
+                num_beams=best_of_n,
+                init_binder_seq=init_binder_seq,
+                mutable_mask=mutable_mask,
+                allow_extra_checkpoints=True,
+            )
+        )
+        initial_logits_checkpoint_source = str(
+            Path(esmfold2_initial_logits_checkpoint).expanduser().resolve()
+        )
+    else:
+        initial_states = _make_phase0_seed_states(
+            init_binder_seq,
+            num_beams=best_of_n,
+            L_binder=L_binder,
+            seed=seed,
+            mutable_mask=mutable_mask,
+            logit_init_mode=logit_init_mode,
+            device=(
+                getattr(backend, "device", None)
+                if logit_init_mode == "official_exact"
+                else None
+            ),
+        )
+
+    artifact_path = Path(artifact_dir) if artifact_dir is not None else None
+    contract_path = (
+        artifact_path / "chunked_best_of_n_config.json"
+        if artifact_path is not None
+        else None
+    )
+    contract = {
+        "schema_version": 1,
+        "strategy": "best_of_n_chunked",
+        "target_key": target_key,
+        "binder_length": L_binder,
+        "best_of_n": best_of_n,
+        "base_seed": seed,
+        "total_outer_steps": total_outer_steps,
+        "outer_step_allocation": outer_step_allocation,
+        "soft_steps_per_outer_step": soft_steps,
+        "total_soft_steps": total_outer_steps * soft_steps,
+        "logit_init_mode": logit_init_mode,
+        "shared_verifier_seed": shared_verify_seed,
+        "initial_logits_checkpoint_source": initial_logits_checkpoint_source,
+        "initial_logits_checkpoint_paths": initial_logits_checkpoint_paths,
+        "initial_binder_sequence": init_binder_seq,
+        "mutable_mask": mutable_mask,
+        "hotspot_indices_0based": hotspot_indices,
+        "pass_loss_threshold": pass_loss_threshold,
+        "one_step_diffusion": one_step_config,
+        "intermediate_verifier_selection": False,
+        "mutation_candidate_branching": False,
+        "logits_carry_policy": "raw_argmax_unanchored",
+        "reference_coordinate_policy": (
+            "initial_full_verifier_fixed" if one_step_enabled else "unused"
+        ),
+        "verifier_loss_mode": str(
+            getattr(backend_config, "verifier_loss_mode", "pair_chain_iptm")
+        ),
+    }
+    contract_exists = bool(contract_path is not None and contract_path.exists())
+    if contract_exists:
+        existing_contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        if existing_contract != _json_ready(contract):
+            raise ValueError(
+                "Chunked Best-of-N resume configuration does not match the "
+                f"existing artifact contract at {contract_path}"
+            )
+    elif artifact_path is not None:
+        artifact_path.mkdir(parents=True, exist_ok=True)
+        _ESMArtifactRecorder._write_json_atomic(contract_path, contract)
+
+    artifact_recorder = _make_artifact_recorder(
+        artifact_dir,
+        append=bool(resume and contract_exists),
+    )
+    verifier_cache: Dict[str, Any] = {}
+    trajectory_summaries: List[Dict[str, Any]] = []
+    trajectory_best_losses: List[float] = []
+    global_best_result: Optional[Any] = None
+
+    logger.info("=" * 70)
+    logger.info("ESMFold2 chunked Best-of-N design")
+    logger.info(
+        "target=%s binder_length=%d trajectories=%d total_outer_steps=%d "
+        "allocation=%s soft_steps=%d verifier_seed=%d",
+        target_key,
+        L_binder,
+        best_of_n,
+        total_outer_steps,
+        outer_step_allocation,
+        soft_steps,
+        shared_verify_seed,
+    )
+    logger.info(
+        "No per-step candidate branching or verifier selection; "
+        "raw argmax logits continue between chunks"
+    )
+    logger.info("=" * 70)
+
+    for trajectory_index, allocated_outer_steps in enumerate(
+        outer_step_allocation
+    ):
+        trajectory_dir = (
+            artifact_path
+            / "chunked_best_of_n"
+            / f"trajectory_{trajectory_index:03d}"
+            if artifact_path is not None
+            else None
+        )
+        trajectory_summary_path = (
+            trajectory_dir / "trajectory_summary.json"
+            if trajectory_dir is not None
+            else None
+        )
+        if (
+            resume
+            and trajectory_summary_path is not None
+            and trajectory_summary_path.exists()
+        ):
+            trajectory_summary = json.loads(
+                trajectory_summary_path.read_text(encoding="utf-8")
+            )
+            final_sequence = str(trajectory_summary["final_sequence"])
+            final_result = _verify_with_cache(
+                backend,
+                verifier_cache,
+                binder_seq=final_sequence,
+                target_seq=target_seq,
+                seed=shared_verify_seed,
+                hotspot_params=hotspot_params,
+            )
+            final_loss = float(final_result.total_loss)
+            recorded_loss = float(trajectory_summary["final_loss"])
+            if abs(final_loss - recorded_loss) > 0.05:
+                raise ValueError(
+                    "Resumed chunked Best-of-N verifier result changed: "
+                    f"trajectory={trajectory_index} "
+                    f"recorded={recorded_loss:.6f} current={final_loss:.6f}"
+                )
+            trajectory_summary["resume_reverified_loss"] = final_loss
+            trajectory_summaries.append(trajectory_summary)
+            trajectory_best_losses.append(final_loss)
+            if (
+                global_best_result is None
+                or final_loss < float(global_best_result.total_loss)
+            ):
+                global_best_result = final_result
+            continue
+
+        initial_sequence, initial_logits = initial_states[trajectory_index]
+        if initial_logits is None:
+            raise ValueError(
+                "chunked Best-of-N requires persistent proposal logits; "
+                "use official_exact or provide an initial logits checkpoint"
+            )
+        trajectory_seed = _stable_seed(
+            seed,
+            "esm_chunked_best_of_n_trajectory",
+            target_key,
+            trajectory_index,
+        )
+        initial_reference_result = None
+        if one_step_enabled:
+            initial_reference_result = _verify_with_cache(
+                backend,
+                verifier_cache,
+                binder_seq=initial_sequence,
+                target_seq=target_seq,
+                seed=shared_verify_seed,
+                hotspot_params=hotspot_params,
+            )
+            if initial_reference_result.coordinate is None:
+                raise ValueError(
+                    "Chunked Best-of-N One-step diffusion requires initial "
+                    "verifier coordinates for every trajectory"
+                )
+
+        current_sequence = str(initial_sequence)
+        current_logits = initial_logits.detach().clone()
+        if trajectory_dir is not None:
+            trajectory_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "sequence": current_sequence,
+                    "sequence_hash": _sequence_hash(current_sequence),
+                    "logits": current_logits.detach().cpu(),
+                    "trajectory_seed": trajectory_seed,
+                },
+                trajectory_dir / "initial_logits.pt",
+            )
+
+        for outer_step in range(allocated_outer_steps):
+            chunk_seed = _stable_seed(
+                trajectory_seed,
+                "outer_step",
+                outer_step,
+            )
+            proposal_batch = _call_backend_continuous_design(
+                backend,
+                current_seq=current_sequence,
+                target_seq=target_seq,
+                global_step=outer_step,
+                seed=chunk_seed,
+                mutable_mask=mutable_mask,
+                proposal_logits=current_logits,
+                reference_coordinates=(
+                    initial_reference_result.coordinate
+                    if initial_reference_result is not None
+                    else None
+                ),
+                hotspot_params=hotspot_params,
+                track_confidence_override=False,
+                soft_steps_override=soft_steps,
+                preserve_proposal_logits=True,
+            )
+            if proposal_batch.logits_after is None:
+                raise RuntimeError(
+                    "chunked Best-of-N requires logits_after from every "
+                    "continuous proposal chunk"
+                )
+            _write_soft_step_artifacts(
+                artifact_recorder,
+                stage="best_of_n_chunked",
+                step=outer_step,
+                selected_sequence=current_sequence,
+                batch=proposal_batch,
+                action_group=f"trajectory_{trajectory_index:03d}",
+            )
+            next_logits = proposal_batch.logits_after.detach().clone()
+            next_sequence = sequence_from_logits_argmax(
+                next_logits,
+                current_seq=current_sequence,
+                mutable_mask=mutable_mask,
+            )
+            next_sequence = _clip_sequence_by_mutable_mask(
+                next_sequence,
+                mutable_mask,
+                current_sequence,
+            )
+            if trajectory_dir is not None:
+                torch.save(
+                    {
+                        "outer_step": outer_step,
+                        "seed": chunk_seed,
+                        "sequence": next_sequence,
+                        "sequence_hash": _sequence_hash(next_sequence),
+                        "parent_sequence": current_sequence,
+                        "parent_sequence_hash": _sequence_hash(current_sequence),
+                        "logits": next_logits.detach().cpu(),
+                    },
+                    trajectory_dir / f"outer_step_{outer_step + 1:04d}.pt",
+                )
+                _ESMArtifactRecorder._append_jsonl(
+                    trajectory_dir / "outer_steps.jsonl",
+                    {
+                        "trajectory_index": trajectory_index,
+                        "outer_step": outer_step,
+                        "seed": chunk_seed,
+                        "parent_sequence": current_sequence,
+                        "sequence": next_sequence,
+                        "edits": _sequence_edits(
+                            current_sequence,
+                            next_sequence,
+                        ),
+                        "soft_steps": soft_steps,
+                    },
+                )
+            current_sequence = next_sequence
+            current_logits = next_logits
+
+        final_result = _verify_with_cache(
+            backend,
+            verifier_cache,
+            binder_seq=current_sequence,
+            target_seq=target_seq,
+            seed=shared_verify_seed,
+            hotspot_params=hotspot_params,
+        )
+        final_loss = float(final_result.total_loss)
+        trajectory_best_losses.append(final_loss)
+        if (
+            global_best_result is None
+            or final_loss < float(global_best_result.total_loss)
+        ):
+            global_best_result = final_result
+
+        if trajectory_dir is not None:
+            torch.save(
+                {
+                    "sequence": current_sequence,
+                    "sequence_hash": _sequence_hash(current_sequence),
+                    "logits": current_logits.detach().cpu(),
+                    "trajectory_seed": trajectory_seed,
+                },
+                trajectory_dir / "final_logits.pt",
+            )
+        trajectory_summary = {
+            "trajectory_index": trajectory_index,
+            "trajectory_seed": trajectory_seed,
+            "verifier_seed": shared_verify_seed,
+            "allocated_outer_steps": allocated_outer_steps,
+            "soft_steps_per_outer_step": soft_steps,
+            "total_soft_steps": allocated_outer_steps * soft_steps,
+            "initial_logits_checkpoint": (
+                initial_logits_checkpoint_paths[trajectory_index]
+                if initial_logits_checkpoint_paths
+                else None
+            ),
+            "initial_sequence": initial_sequence,
+            "initial_sequence_hash": _sequence_hash(initial_sequence),
+            "initial_reference_loss": (
+                float(initial_reference_result.total_loss)
+                if initial_reference_result is not None
+                else None
+            ),
+            "final_sequence": current_sequence,
+            "final_sequence_hash": _sequence_hash(current_sequence),
+            "final_loss": final_loss,
+            "final_loss_dict": _loss_dict_for_artifact(final_result),
+            "final_summary_confidence": _json_ready(
+                _summary_without_structure(
+                    dict(getattr(final_result, "summary_confidence", {}) or {})
+                )
+            ),
+            "passed": (
+                final_loss <= float(pass_loss_threshold)
+                if pass_loss_threshold is not None
+                else None
+            ),
+        }
+        trajectory_summaries.append(trajectory_summary)
+        if trajectory_summary_path is not None:
+            _ESMArtifactRecorder._write_json_atomic(
+                trajectory_summary_path,
+                trajectory_summary,
+            )
+        artifact_recorder.write_checkpoint(
+            stage="best_of_n_chunked",
+            step=trajectory_index,
+            label="trajectory_final",
+            result=final_result,
+            selected_sequence=current_sequence,
+            parent_sequence=initial_sequence,
+            is_global_best=False,
+        )
+        logger.info(
+            "Chunked Best-of-N trajectory %d/%d | outer_steps=%d "
+            "soft_steps=%d final_loss=%.4f",
+            trajectory_index + 1,
+            best_of_n,
+            allocated_outer_steps,
+            allocated_outer_steps * soft_steps,
+            final_loss,
+        )
+
+    if global_best_result is None:
+        raise RuntimeError("Chunked ESMFold2 Best-of-N produced no final results")
+
+    global_best_sequence = str(global_best_result.binder_seq)
+    pass_count = (
+        sum(bool(item["passed"]) for item in trajectory_summaries)
+        if pass_loss_threshold is not None
+        else None
+    )
+    summary = {
+        "strategy": "best_of_n_chunked",
+        "best_of_n": best_of_n,
+        "total_outer_steps": total_outer_steps,
+        "outer_step_allocation": outer_step_allocation,
+        "soft_steps_per_outer_step": soft_steps,
+        "total_soft_steps": total_outer_steps * soft_steps,
+        "shared_verifier_seed": shared_verify_seed,
+        "intermediate_verifier_selection": False,
+        "mutation_candidate_branching": False,
+        "best_sequence": global_best_sequence,
+        "best_sequence_hash": _sequence_hash(global_best_sequence),
+        "best_loss": float(global_best_result.total_loss),
+        "mean_trajectory_final_loss": statistics.fmean(trajectory_best_losses),
+        "std_trajectory_final_loss": (
+            statistics.pstdev(trajectory_best_losses)
+            if len(trajectory_best_losses) > 1
+            else 0.0
+        ),
+        "pass_loss_threshold": pass_loss_threshold,
+        "passing_trajectory_count": pass_count,
+        "pass_at_n": (
+            bool(pass_count and pass_count > 0)
+            if pass_loss_threshold is not None
+            else None
+        ),
+        "trajectory_summaries": trajectory_summaries,
+        "artifact_dir": str(artifact_dir) if artifact_dir is not None else None,
+    }
+    artifact_recorder.write_checkpoint(
+        stage="best_of_n_chunked",
+        step=best_of_n,
+        label="overall_best",
+        result=global_best_result,
+        selected_sequence=global_best_sequence,
+        parent_sequence=None,
+        is_global_best=True,
+    )
+    artifact_recorder.write_summary(**summary)
+    logger.info(
+        "ESMFold2 chunked Best-of-N complete | N=%d allocation=%s "
+        "best=%.4f mean=%.4f std=%.4f",
+        best_of_n,
+        outer_step_allocation,
+        float(global_best_result.total_loss),
+        float(summary["mean_trajectory_final_loss"]),
+        float(summary["std_trajectory_final_loss"]),
     )
     return global_best_sequence, global_best_sequence, trajectory_best_losses
 

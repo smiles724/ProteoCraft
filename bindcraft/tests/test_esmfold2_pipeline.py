@@ -16,10 +16,12 @@ from bindcraft.hallucination.esmfold2_backend import (
 from bindcraft.hallucination.mcts_legacy import LegacyMCTSTree
 from bindcraft.hallucination.esmfold2_pipeline import (
     run_esmfold2_best_of_n,
+    run_esmfold2_chunked_best_of_n,
     run_esmfold2_mcts_hallucination,
 )
 from bindcraft.hallucination.esmfold2_pipeline import (
     _ESMFold2StageBMCTSTree,
+    _allocate_chunked_best_of_n_steps,
     _allocate_group_budgets,
     _hotspot_proposal_weight_for_verified_state,
     _load_initial_logits_checkpoint_states,
@@ -177,6 +179,51 @@ class FakeHotspotVerifyBackend(FakeESMFold2Backend):
             target_seq=target_seq,
             seed=seed,
         )
+
+
+def test_chunked_best_of_n_splits_fixed_outer_budget_without_mcts(tmp_path):
+    backend = FakeESMFold2Backend()
+
+    best_seq, final_seq, losses = run_esmfold2_chunked_best_of_n(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        best_of_n=4,
+        total_outer_steps=70,
+        init_binder_seq="AAA",
+        mutable_mask=[True, True, True],
+        seed=7,
+        artifact_dir=tmp_path,
+        esmfold2_logit_init_mode="official_exact",
+        esmfold2_soft_steps=3,
+    )
+
+    assert best_seq == final_seq
+    assert len(losses) == 4
+    assert _allocate_chunked_best_of_n_steps(70, 4) == [18, 18, 17, 17]
+    assert len(backend.continuous_calls) == 70
+    assert backend.propose_calls == []
+    assert backend.preview_calls == []
+    assert len(backend.verify_calls) <= 4
+    assert all(
+        call["track_confidence_override"] is False
+        for call in backend.continuous_calls
+    )
+    assert all(
+        call["soft_steps_override"] == 3
+        for call in backend.continuous_calls
+    )
+    assert all(
+        call["preserve_proposal_logits"] is True
+        for call in backend.continuous_calls
+    )
+
+    contract = json.loads(
+        (tmp_path / "chunked_best_of_n_config.json").read_text()
+    )
+    assert contract["outer_step_allocation"] == [18, 18, 17, 17]
+    assert contract["intermediate_verifier_selection"] is False
+    assert contract["mutation_candidate_branching"] is False
 
 
 def test_stageb_group_budget_keeps_every_repair_group_represented():

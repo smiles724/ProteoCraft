@@ -547,7 +547,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--esmfold2_best_of_n",
         type=int,
         default=8,
-        help="ESMFold2 Best-of-N 独立 continuous trajectories 数量（默认：8）",
+        help=(
+            "ESMFold2 Best-of-N 独立轨迹数量；continuous 模式默认 8，"
+            "chunked 对照建议显式设为 4"
+        ),
     )
     parser.add_argument(
         "--esmfold2_best_of_n_pass_loss_threshold",
@@ -885,8 +888,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcts_tau_fixed", type=float, default=4.0, help="MCTS 固定扩散 tau（默认：4.0）")
     parser.add_argument("--mcts_num_beams", type=int, default=8, help="MCTS Phase0 根节点数 / beam（默认：8）")
     parser.add_argument("--mcts_strategy", type=str, default="two_stage",
-                       choices=["legacy", "stage_a_only", "strict", "two_stage", "continuous_stage_a", "raw_lineage_stage_a", "best_of_n"],
-                       help="搜索策略：best_of_n 运行独立连续轨迹且不使用 MCTS；其余为 StageA/两阶段 MCTS 模式（默认：two_stage）")
+                       choices=["legacy", "stage_a_only", "strict", "two_stage", "continuous_stage_a", "raw_lineage_stage_a", "best_of_n", "best_of_n_chunked"],
+                       help=(
+                           "搜索策略：best_of_n 运行独立连续轨迹且不使用 MCTS；"
+                           "best_of_n_chunked 将 --n_steps 总 outer-step 预算"
+                           "均分给独立分段轨迹，不做逐步 verifier 选择；"
+                           "其余为 StageA/两阶段 MCTS 模式（默认：two_stage）"
+                       ))
     parser.add_argument("--mcts_bootstrap_steps", type=int, default=50,
                        help="two_stage: StageA 原版 MCTS 至少运行步数（默认：50）")
     parser.add_argument("--mcts_bootstrap_patience", type=int, default=10,
@@ -1354,6 +1362,7 @@ def main():
     if model_backend == "esmfold2":
         from bindcraft.hallucination.esmfold2_pipeline import (
             run_esmfold2_best_of_n,
+            run_esmfold2_chunked_best_of_n,
             run_esmfold2_mcts_hallucination,
         )
 
@@ -1381,6 +1390,31 @@ def main():
                 pass_loss_threshold=args.esmfold2_best_of_n_pass_loss_threshold,
                 verifier_seed=args.esmfold2_stagea_verifier_seed,
                 resume=args.esmfold2_best_of_n_resume,
+            )
+        elif args.mcts_strategy == "best_of_n_chunked":
+            best_seq, final_seq, losses_history = (
+                run_esmfold2_chunked_best_of_n(
+                    backend=esmfold2_backend,
+                    target_seq=args.target,
+                    L_binder=args.binder_length,
+                    best_of_n=args.esmfold2_best_of_n,
+                    total_outer_steps=args.n_steps,
+                    init_binder_seq=args.init_binder_seq,
+                    seed=args.seed,
+                    mutable_mask=esmfold2_mutable_mask,
+                    hotspot_params=hotspot_params,
+                    artifact_dir=esmfold2_artifact_dir,
+                    esmfold2_initial_logits_checkpoint=(
+                        args.esmfold2_initial_logits_checkpoint
+                    ),
+                    esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
+                    esmfold2_soft_steps=args.esmfold2_stagea_soft_steps,
+                    pass_loss_threshold=(
+                        args.esmfold2_best_of_n_pass_loss_threshold
+                    ),
+                    verifier_seed=args.esmfold2_stagea_verifier_seed,
+                    resume=args.esmfold2_best_of_n_resume,
+                )
             )
         else:
             best_seq, final_seq, losses_history = run_esmfold2_mcts_hallucination(
@@ -1574,6 +1608,11 @@ def main():
             )
             f.write(f"ESMFold2 Stage B Soft Steps: {args.esmfold2_stageb_soft_steps}\n")
             f.write(f"ESMFold2 Best-of-N: {args.esmfold2_best_of_n}\n")
+            if args.mcts_strategy == "best_of_n_chunked":
+                f.write(
+                    "ESMFold2 Chunked Best-of-N Total Outer Steps: "
+                    f"{args.n_steps}\n"
+                )
             f.write(
                 "ESMFold2 Best-of-N Pass Loss Threshold: "
                 f"{args.esmfold2_best_of_n_pass_loss_threshold}\n"
@@ -1719,12 +1758,18 @@ def main():
         f.write(f"\n")
         history_label = (
             "Trajectory Best Losses"
-            if model_backend == "esmfold2" and args.mcts_strategy == "best_of_n"
+            if (
+                model_backend == "esmfold2"
+                and args.mcts_strategy in {"best_of_n", "best_of_n_chunked"}
+            )
             else "Loss History"
         )
         item_label = (
             "Trajectory"
-            if model_backend == "esmfold2" and args.mcts_strategy == "best_of_n"
+            if (
+                model_backend == "esmfold2"
+                and args.mcts_strategy in {"best_of_n", "best_of_n_chunked"}
+            )
             else "Step"
         )
         f.write(f"{history_label}:\n")
