@@ -7,6 +7,7 @@ Protenix one-step diffusion implementation.
 
 from __future__ import annotations
 
+import math
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Mapping, Optional, Sequence
 
@@ -31,14 +32,72 @@ ESMFOLD2_COMMON_LOSS_WEIGHTS: Dict[str, float] = {
     "i_clash": 0.1,
 }
 
-# The Protenix-calibrated common weights remain the proposal/One-step default.
-# Full ESMFold2 verification uses a separate calibration because its raw
-# interface-contact loss has a different scale.
-ESMFOLD2_VERIFIER_LOSS_WEIGHTS: Dict[str, float] = {
+# Preserve the previous Protenix-style verifier score as a diagnostic.  Its raw
+# Rg, helix, and contact terms are not scale-compatible with bounded ESMFold2
+# confidence metrics, so this score must not drive MCTS selection.
+ESMFOLD2_LEGACY_VERIFIER_LOSS_WEIGHTS: Dict[str, float] = {
     **ESMFOLD2_COMMON_LOSS_WEIGHTS,
     "i_con": 0.5,
     "iptm": 1.0,
 }
+
+# Full ESMFold2 verification uses bounded terms only.  This keeps pair-chain
+# iPTM primary while retaining small fold-confidence and compactness guards.
+ESMFOLD2_VERIFIER_LOSS_WEIGHTS: Dict[str, float] = {
+    "pair_chain_iptm_loss": 1.0,
+    "binder_confidence_loss": 0.2,
+    "global_confidence_loss": 0.1,
+    "binder_rg_excess_loss": 0.1,
+}
+
+
+def compute_esmfold2_bounded_verifier_losses(
+    summary_confidence: Mapping[str, Any],
+    *,
+    weights: Optional[Mapping[str, float]] = None,
+) -> tuple[float, Dict[str, float]]:
+    """Build a bounded ESMFold2 verifier score from full-prediction metrics."""
+
+    resolved_weights = dict(ESMFOLD2_VERIFIER_LOSS_WEIGHTS)
+    if weights is not None:
+        resolved_weights.update({str(key): float(value) for key, value in weights.items()})
+
+    def finite_metric(name: str) -> float:
+        value = summary_confidence.get(name)
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                raise ValueError(f"ESMFold2 verifier metric {name!r} is empty")
+            value = value.detach().float().mean().item()
+        try:
+            scalar = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"ESMFold2 verifier metric {name!r} is missing or non-numeric"
+            ) from exc
+        if not math.isfinite(scalar):
+            raise ValueError(f"ESMFold2 verifier metric {name!r} is not finite")
+        return scalar
+
+    pair_chain_iptm = min(max(finite_metric("pair_chain_iptm"), 0.0), 1.0)
+    binder_plddt = finite_metric("binder_plddt")
+    if binder_plddt > 1.0:
+        binder_plddt /= 100.0
+    binder_plddt = min(max(binder_plddt, 0.0), 1.0)
+    ptm = min(max(finite_metric("ptm"), 0.0), 1.0)
+    rg_excess = min(max(finite_metric("binder_rg_excess"), 0.0), 1.0)
+
+    losses = {
+        "pair_chain_iptm_loss": 1.0 - pair_chain_iptm,
+        "binder_confidence_loss": 1.0 - binder_plddt,
+        "global_confidence_loss": 1.0 - ptm,
+        "binder_rg_excess_loss": rg_excess,
+    }
+    total = sum(
+        float(resolved_weights.get(name, 0.0)) * value
+        for name, value in losses.items()
+    )
+    losses["total"] = float(total)
+    return float(total), losses
 
 
 def _batch0(tensor: torch.Tensor) -> torch.Tensor:

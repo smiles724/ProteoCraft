@@ -3,7 +3,9 @@ import torch
 
 from bindcraft.hallucination.esmfold2_one_step import (
     ESMFOLD2_COMMON_LOSS_WEIGHTS,
+    ESMFOLD2_LEGACY_VERIFIER_LOSS_WEIGHTS,
     ESMFOLD2_VERIFIER_LOSS_WEIGHTS,
+    compute_esmfold2_bounded_verifier_losses,
     compute_esmfold2_common_losses,
     remap_reference_coordinates,
     scatter_reference_coordinates,
@@ -39,15 +41,59 @@ def test_common_loss_weights_match_protenix_subset_without_pde():
     assert "i_pde" not in ESMFOLD2_COMMON_LOSS_WEIGHTS
 
 
-def test_verifier_weights_recalibrate_interface_selection_only():
-    expected = {
+def test_verifier_weights_use_bounded_full_prediction_metrics():
+    expected_legacy = {
         **ESMFOLD2_COMMON_LOSS_WEIGHTS,
         "i_con": 0.5,
         "iptm": 1.0,
     }
-    assert ESMFOLD2_VERIFIER_LOSS_WEIGHTS == expected
+    assert ESMFOLD2_LEGACY_VERIFIER_LOSS_WEIGHTS == expected_legacy
+    assert ESMFOLD2_VERIFIER_LOSS_WEIGHTS == {
+        "pair_chain_iptm_loss": 1.0,
+        "binder_confidence_loss": 0.2,
+        "global_confidence_loss": 0.1,
+        "binder_rg_excess_loss": 0.1,
+    }
     assert ESMFOLD2_COMMON_LOSS_WEIGHTS["i_con"] == 3.0
     assert ESMFOLD2_COMMON_LOSS_WEIGHTS["iptm"] == 0.3
+
+
+def test_bounded_verifier_loss_is_not_affected_by_raw_helix_or_rg_scale():
+    total, losses = compute_esmfold2_bounded_verifier_losses(
+        {
+            "pair_chain_iptm": 0.7,
+            "binder_plddt": 0.8,
+            "ptm": 0.9,
+            "binder_rg_excess": 4.0,
+            "helix": 100.0,
+            "rg": 100.0,
+        }
+    )
+
+    assert losses == pytest.approx(
+        {
+            "pair_chain_iptm_loss": 0.3,
+            "binder_confidence_loss": 0.2,
+            "global_confidence_loss": 0.1,
+            "binder_rg_excess_loss": 1.0,
+            "total": 0.45,
+        }
+    )
+    assert total == pytest.approx(0.45)
+
+
+def test_bounded_verifier_loss_accepts_percent_binder_plddt():
+    total, losses = compute_esmfold2_bounded_verifier_losses(
+        {
+            "pair_chain_iptm": 0.75,
+            "binder_plddt": 80.0,
+            "ptm": 0.9,
+            "binder_rg_excess": 0.5,
+        }
+    )
+
+    assert losses["binder_confidence_loss"] == pytest.approx(0.2)
+    assert total == pytest.approx(0.35)
 
 
 def test_common_losses_are_finite_and_differentiable():

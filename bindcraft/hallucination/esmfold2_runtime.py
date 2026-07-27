@@ -40,8 +40,10 @@ from bindcraft.hallucination.esmfold2_backend import (
     sequence_from_logits_argmax,
 )
 from bindcraft.hallucination.esmfold2_one_step import (
+    ESMFOLD2_LEGACY_VERIFIER_LOSS_WEIGHTS,
     ESMFOLD2_VERIFIER_LOSS_WEIGHTS,
     capture_experimental_trunk_state,
+    compute_esmfold2_bounded_verifier_losses,
     compute_esmfold2_common_losses,
     remap_reference_coordinates,
     run_esmfold2_one_step_diffusion,
@@ -962,6 +964,7 @@ class ESMFold2RuntimeBackend:
             summary.update(hotspot_metrics)
         coordinate = _fold_result_coordinates(fold_result)
         aligned_loss_dict = None
+        raw_common_loss_dict: dict[str, float] = {}
         plddt_logits = None
         if raw_features is not None and raw_output is not None:
             plddt_logits = raw_output["plddt_logits"].detach().float().cpu()
@@ -980,7 +983,7 @@ class ESMFold2RuntimeBackend:
                 hotspot_cutoff=float(self.config.hotspot_cutoff),
                 hotspot_interface_mode="additive",
             )
-            _, aligned_losses = compute_esmfold2_common_losses(
+            _, raw_common_losses = compute_esmfold2_common_losses(
                 coordinates=raw_output["sample_atom_coords"],
                 plddt_logits=raw_output["plddt_logits"],
                 pae_logits=raw_output["pae_logits"],
@@ -990,12 +993,26 @@ class ESMFold2RuntimeBackend:
                 target_chain_roles=target_chain_roles,
                 binder_mutable_mask=self.config.binder_mutable_mask,
                 distogram_losses=distogram_losses,
+                weights=ESMFOLD2_LEGACY_VERIFIER_LOSS_WEIGHTS,
+            )
+            raw_common_loss_dict = _tensor_loss_dict_to_float(raw_common_losses)
+            _, aligned_loss_dict = compute_esmfold2_bounded_verifier_losses(
+                summary,
                 weights=ESMFOLD2_VERIFIER_LOSS_WEIGHTS,
             )
-            aligned_loss_dict = _tensor_loss_dict_to_float(aligned_losses)
             summary["esm_verify_loss_weights"] = dict(
                 ESMFOLD2_VERIFIER_LOSS_WEIGHTS
             )
+            summary["esm_verify_score_version"] = "bounded_pair_v1"
+            summary["esm_verify_raw_common_loss"] = raw_common_loss_dict["total"]
+            summary["esm_verify_raw_common_loss_weights"] = dict(
+                ESMFOLD2_LEGACY_VERIFIER_LOSS_WEIGHTS
+            )
+            summary["esm_verify_bounded_loss"] = aligned_loss_dict["total"]
+        raw_common_diagnostics = {
+            f"raw_common_{key}": value
+            for key, value in raw_common_loss_dict.items()
+        }
         return build_esm_verifier_result(
             binder_seq=binder_seq,
             target_seq=target_seq,
@@ -1003,9 +1020,12 @@ class ESMFold2RuntimeBackend:
             coordinate=coordinate,
             plddt_logits=plddt_logits,
             extra_loss_dict={
-                key: value
-                for key, value in hotspot_metrics.items()
-                if not isinstance(value, list)
+                **raw_common_diagnostics,
+                **{
+                    key: value
+                    for key, value in hotspot_metrics.items()
+                    if not isinstance(value, list)
+                },
             },
             hotspot_verify_loss=hotspot_metrics.get("hotspot_verify_distance_loss"),
             hotspot_verify_weight=hotspot_verify_weight,
