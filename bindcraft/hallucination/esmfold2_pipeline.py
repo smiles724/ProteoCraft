@@ -2674,10 +2674,16 @@ def run_esmfold2_chunked_best_of_n(
             )
             verified_results = []
             if verifier_candidates_per_outer_step > 0:
-                candidates = _proposal_sequences_from_batch(
-                    proposal_batch,
-                    include_confidence=False,
-                )
+                # The raw argmax sequence is the only state allowed to continue
+                # the trajectory. Verify it in the same fixed-size candidate
+                # batch so the final selection cannot add an unbudgeted call.
+                candidates = [
+                    next_sequence,
+                    *_proposal_sequences_from_batch(
+                        proposal_batch,
+                        include_confidence=False,
+                    ),
+                ]
                 candidates = [
                     _clip_sequence_by_mutable_mask(
                         str(candidate),

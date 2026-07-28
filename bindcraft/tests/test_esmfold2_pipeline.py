@@ -231,10 +231,16 @@ def test_chunked_best_of_n_matches_verifier_budget_without_feedback(tmp_path):
         def propose(self, **kwargs):
             self.propose_calls.append(dict(kwargs))
             logits_after = kwargs["proposal_logits"].detach().clone()
+            next_sequence = (
+                "AAY" if int(kwargs["global_step"]) == 0 else "AYY"
+            )
+            for position, amino_acid in enumerate(next_sequence):
+                logits_after[position, :] = -1.0
+                logits_after[position, AA_TO_ESM_IDX[amino_acid]] = 1.0
             candidates = (
-                ["AAY", "AAF"]
+                ["AAF", "AFF"]
                 if int(kwargs["global_step"]) == 0
-                else ["AYY", "FYY"]
+                else ["FYY", "YFY"]
             )
             return ESMFold2ProposalBatch(
                 sequences=candidates,
@@ -266,6 +272,9 @@ def test_chunked_best_of_n_matches_verifier_budget_without_feedback(tmp_path):
     assert backend.continuous_calls == []
     assert [call["global_step"] for call in backend.propose_calls] == [0, 1]
     assert all(call["B_candidates"] == 2 for call in backend.propose_calls)
+    verified_sequences = [call[0] for call in backend.verify_calls]
+    assert "AAY" in verified_sequences
+    assert "AYY" in verified_sequences
 
     summary = json.loads((tmp_path / "run_summary.json").read_text())
     assert [
