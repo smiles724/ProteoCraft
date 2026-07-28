@@ -293,6 +293,114 @@ def test_chunked_best_of_n_matches_verifier_budget_without_feedback(tmp_path):
     assert summary["actual_full_verifier_attempts"] == 6
 
 
+def test_chunked_best_of_n_can_follow_verifier_best_with_soft_anchor(tmp_path):
+    class VerifierGuidedBackend(FakeESMFold2Backend):
+        def __init__(self):
+            super().__init__()
+            self.scores.update(
+                {
+                    "AAY": 0.40,
+                    "AAF": 0.90,
+                    "AYY": 0.50,
+                    "AFF": 0.95,
+                }
+            )
+
+        def propose(self, **kwargs):
+            self.propose_calls.append(dict(kwargs))
+            logits_after = kwargs["proposal_logits"].detach().clone()
+            next_sequence = (
+                "AAY" if int(kwargs["global_step"]) == 0 else "AYY"
+            )
+            for position, amino_acid in enumerate(next_sequence):
+                logits_after[position, :] = -1.0
+                logits_after[position, AA_TO_ESM_IDX[amino_acid]] = 1.0
+            candidates = (
+                ["AAF"] if int(kwargs["global_step"]) == 0 else ["AFF"]
+            )
+            return ESMFold2ProposalBatch(
+                sequences=candidates,
+                logits_after=logits_after,
+            )
+
+    backend = VerifierGuidedBackend()
+    best_seq, final_seq, losses = run_esmfold2_chunked_best_of_n(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        best_of_n=1,
+        total_outer_steps=2,
+        init_binder_seq="AAA",
+        mutable_mask=[True, True, True],
+        seed=7,
+        artifact_dir=tmp_path,
+        esmfold2_logit_init_mode="official_exact",
+        esmfold2_soft_steps=3,
+        verifier_candidates_per_outer_step=2,
+        continuation_policy="verifier_best",
+        candidate_k_top=4,
+        candidate_temperature=1.0,
+        candidate_max_mutations_per_seq=3,
+    )
+
+    assert best_seq == final_seq == "AFF"
+    assert len(losses) == 1
+    assert len(backend.propose_calls) == 2
+    assert backend.propose_calls[1]["current_seq"] == "AAF"
+    second_step_logits = backend.propose_calls[1]["proposal_logits"]
+    second_step_argmax = "".join(
+        ESM_AA_ORDER[int(index)]
+        for index in second_step_logits.argmax(dim=-1).tolist()
+    )
+    assert second_step_argmax == "AAF"
+
+    contract = json.loads(
+        (tmp_path / "chunked_best_of_n_config.json").read_text()
+    )
+    assert contract["schema_version"] == 3
+    assert contract["continuation_policy"] == "verifier_best"
+    assert contract["intermediate_verifier_selection"] is True
+    assert contract["verifier_feedback_to_trajectory"] is True
+    assert contract["logits_carry_policy"] == "verifier_best_soft_anchor"
+
+    summary = json.loads((tmp_path / "run_summary.json").read_text())
+    assert summary["continuation_policy"] == "verifier_best"
+    assert summary["verifier_feedback_to_trajectory"] is True
+    assert summary["trajectory_summaries"][0]["final_sequence"] == "AFF"
+
+    outer_steps = [
+        json.loads(line)
+        for line in (
+            tmp_path
+            / "chunked_best_of_n"
+            / "trajectory_000"
+            / "outer_steps.jsonl"
+        ).read_text().splitlines()
+    ]
+    assert outer_steps[0]["raw_argmax_sequence"] == "AAY"
+    assert outer_steps[0]["sequence"] == "AAF"
+    assert outer_steps[0]["verifier_feedback_applied"] is True
+
+
+def test_chunked_best_of_n_verifier_best_requires_verified_candidates(tmp_path):
+    with pytest.raises(
+        ValueError,
+        match="requires at least one verified candidate",
+    ):
+        run_esmfold2_chunked_best_of_n(
+            backend=FakeESMFold2Backend(),
+            target_seq="TTTT",
+            L_binder=3,
+            best_of_n=1,
+            total_outer_steps=1,
+            init_binder_seq="AAA",
+            mutable_mask=[True, True, True],
+            artifact_dir=tmp_path,
+            continuation_policy="verifier_best",
+            verifier_candidates_per_outer_step=0,
+        )
+
+
 def test_chunked_best_of_n_keeps_verifier_coordinates_and_features_paired(
     tmp_path,
 ):

@@ -234,6 +234,7 @@ def test_esmfold2_best_of_n_resolves_strategy_specific_defaults():
     assert resolve_model_backend(args, parser) == "esmfold2"
     assert args.esmfold2_best_of_n == 8
     assert args.esmfold2_best_of_n_verify_candidates_per_outer_step == 0
+    assert args.esmfold2_best_of_n_continuation_policy == "raw_argmax"
     assert args.esmfold2_stagea_soft_steps == 150
     assert args.esmfold2_stageb_soft_steps == 20
     assert args.esmfold2_track_proposal_confidence is True
@@ -277,12 +278,15 @@ def test_esmfold2_best_of_n_explicit_overrides_win_over_defaults():
             "5",
             "--esmfold2_best_of_n_verify_candidates_per_outer_step",
             "8",
+            "--esmfold2_best_of_n_continuation_policy",
+            "verifier_best",
         ]
     )
 
     assert resolve_model_backend(args, parser) == "esmfold2"
     assert args.esmfold2_best_of_n == 3
     assert args.esmfold2_best_of_n_verify_candidates_per_outer_step == 8
+    assert args.esmfold2_best_of_n_continuation_policy == "verifier_best"
     assert args.esmfold2_stagea_soft_steps == 42
     assert args.esmfold2_track_proposal_confidence is False
     assert args.esmfold2_proposal_confidence_tail_steps == 5

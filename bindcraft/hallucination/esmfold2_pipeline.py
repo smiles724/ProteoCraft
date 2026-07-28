@@ -2295,6 +2295,8 @@ def run_esmfold2_chunked_best_of_n(
     esmfold2_logit_init_mode: str = "official_exact",
     esmfold2_soft_steps: int = 30,
     verifier_candidates_per_outer_step: int = 0,
+    continuation_policy: str = "raw_argmax",
+    continuation_soft_anchor_margin: float = 0.1,
     candidate_k_top: int = 10,
     candidate_temperature: float = 1.0,
     candidate_max_mutations_per_seq: int = 8,
@@ -2305,13 +2307,14 @@ def run_esmfold2_chunked_best_of_n(
     """Run proposal-budget-matched chunked trajectories without MCTS.
 
     The fixed outer-step budget is split across independent trajectories. Each
-    outer step runs the same soft-logit proposal chunk used by Stage A, carries
-    the unanchored argmax logits into the next chunk, and never uses verifier
-    results to choose the continuation. When
+    outer step runs the same soft-logit proposal chunk used by Stage A. With
+    ``continuation_policy="raw_argmax"``, each trajectory carries the
+    unanchored argmax logits into the next chunk. With
+    ``continuation_policy="verifier_best"``, the lowest-loss verified
+    candidate continues after a minimal soft anchor when it differs from the
+    raw argmax sequence. When
     ``verifier_candidates_per_outer_step`` is positive, the proposal also emits
-    and full-verifies the same bounded candidate pool used by Stage A. Those
-    scores enter only the final Best-of-N pool, which matches verifier budget
-    without introducing tree search or intermediate verifier feedback.
+    and full-verifies the same bounded candidate pool used by Stage A.
     """
 
     if backend is None:
@@ -2322,6 +2325,10 @@ def run_esmfold2_chunked_best_of_n(
     soft_steps = int(esmfold2_soft_steps)
     verifier_candidates_per_outer_step = int(
         verifier_candidates_per_outer_step
+    )
+    continuation_policy = str(continuation_policy).strip().lower()
+    continuation_soft_anchor_margin = float(
+        continuation_soft_anchor_margin
     )
     candidate_k_top = int(candidate_k_top)
     candidate_temperature = float(candidate_temperature)
@@ -2335,6 +2342,22 @@ def run_esmfold2_chunked_best_of_n(
     if verifier_candidates_per_outer_step < 0:
         raise ValueError(
             "verifier_candidates_per_outer_step must be non-negative"
+        )
+    if continuation_policy not in {"raw_argmax", "verifier_best"}:
+        raise ValueError(
+            "continuation_policy must be one of: raw_argmax, verifier_best"
+        )
+    if (
+        continuation_policy == "verifier_best"
+        and verifier_candidates_per_outer_step <= 0
+    ):
+        raise ValueError(
+            "verifier_best continuation requires at least one verified "
+            "candidate per outer step"
+        )
+    if continuation_soft_anchor_margin <= 0.0:
+        raise ValueError(
+            "continuation_soft_anchor_margin must be positive"
         )
     if candidate_k_top <= 0:
         raise ValueError("candidate_k_top must be positive")
@@ -2379,6 +2402,7 @@ def run_esmfold2_chunked_best_of_n(
     one_step_enabled = bool(
         getattr(backend_config, "one_step_diffusion_enabled", False)
     )
+    uses_verifier_feedback = continuation_policy == "verifier_best"
     one_step_config = {
         "enabled": one_step_enabled,
         "interval": int(
@@ -2502,6 +2526,19 @@ def run_esmfold2_chunked_best_of_n(
             getattr(backend_config, "verifier_loss_mode", "pair_chain_iptm")
         ),
     }
+    if uses_verifier_feedback:
+        contract.update(
+            {
+                "schema_version": 3,
+                "continuation_policy": continuation_policy,
+                "continuation_soft_anchor_margin": (
+                    continuation_soft_anchor_margin
+                ),
+                "intermediate_verifier_selection": True,
+                "verifier_feedback_to_trajectory": True,
+                "logits_carry_policy": "verifier_best_soft_anchor",
+            }
+        )
     contract_exists = bool(contract_path is not None and contract_path.exists())
     if contract_exists:
         existing_contract = json.loads(contract_path.read_text(encoding="utf-8"))
@@ -2539,8 +2576,10 @@ def run_esmfold2_chunked_best_of_n(
         shared_verify_seed,
     )
     logger.info(
-        "No tree branching or intermediate verifier selection; raw argmax "
-        "logits continue between chunks; verifier_candidates_per_step=%d",
+        "No tree branching; continuation_policy=%s "
+        "soft_anchor_margin=%.3f verifier_candidates_per_step=%d",
+        continuation_policy,
+        continuation_soft_anchor_margin,
         verifier_candidates_per_outer_step,
     )
     logger.info("=" * 70)
@@ -2749,10 +2788,11 @@ def run_esmfold2_chunked_best_of_n(
                 current_sequence,
             )
             verified_results = []
+            round_best = None
             if verifier_candidates_per_outer_step > 0:
                 # The raw argmax sequence is the only state allowed to continue
-                # the trajectory. Verify it in the same fixed-size candidate
-                # batch so the final selection cannot add an unbudgeted call.
+                # an unanchored trajectory. Verify it in the same fixed-size
+                # candidate batch so final selection adds no unbudgeted call.
                 candidates = [
                     next_sequence,
                     *_proposal_sequences_from_batch(
@@ -2815,16 +2855,41 @@ def run_esmfold2_chunked_best_of_n(
                         < float(global_best_result.total_loss)
                     ):
                         global_best_result = round_best
+            raw_argmax_sequence = next_sequence
+            continuation_sequence = raw_argmax_sequence
+            continuation_logits = next_logits
+            verifier_feedback_applied = False
+            if uses_verifier_feedback and round_best is not None:
+                continuation_sequence = str(round_best.binder_seq)
+                if continuation_sequence != raw_argmax_sequence:
+                    continuation_logits = softly_anchor_mutation_logits(
+                        next_logits,
+                        parent_sequence=raw_argmax_sequence,
+                        child_sequence=continuation_sequence,
+                        mutable_mask=mutable_mask,
+                        anchor_margin=continuation_soft_anchor_margin,
+                    )
+                    verifier_feedback_applied = True
             if trajectory_dir is not None:
                 torch.save(
                     {
                         "outer_step": outer_step,
                         "seed": chunk_seed,
-                        "sequence": next_sequence,
-                        "sequence_hash": _sequence_hash(next_sequence),
+                        "sequence": continuation_sequence,
+                        "sequence_hash": _sequence_hash(
+                            continuation_sequence
+                        ),
+                        "raw_argmax_sequence": raw_argmax_sequence,
+                        "raw_argmax_sequence_hash": _sequence_hash(
+                            raw_argmax_sequence
+                        ),
                         "parent_sequence": current_sequence,
                         "parent_sequence_hash": _sequence_hash(current_sequence),
-                        "logits": next_logits.detach().cpu(),
+                        "logits": continuation_logits.detach().cpu(),
+                        "continuation_policy": continuation_policy,
+                        "verifier_feedback_applied": (
+                            verifier_feedback_applied
+                        ),
                     },
                     trajectory_dir / f"outer_step_{outer_step + 1:04d}.pt",
                 )
@@ -2836,10 +2901,15 @@ def run_esmfold2_chunked_best_of_n(
                         "budget_step": budget_step,
                         "seed": chunk_seed,
                         "parent_sequence": current_sequence,
-                        "sequence": next_sequence,
+                        "sequence": continuation_sequence,
                         "edits": _sequence_edits(
                             current_sequence,
-                            next_sequence,
+                            continuation_sequence,
+                        ),
+                        "raw_argmax_sequence": raw_argmax_sequence,
+                        "raw_argmax_edits": _sequence_edits(
+                            current_sequence,
+                            raw_argmax_sequence,
                         ),
                         "soft_steps": soft_steps,
                         "verified_candidate_count": len(verified_results),
@@ -2853,11 +2923,17 @@ def run_esmfold2_chunked_best_of_n(
                             if verified_results
                             else None
                         ),
-                        "verifier_feedback_to_trajectory": False,
+                        "continuation_policy": continuation_policy,
+                        "verifier_feedback_to_trajectory": (
+                            uses_verifier_feedback
+                        ),
+                        "verifier_feedback_applied": (
+                            verifier_feedback_applied
+                        ),
                     },
                 )
-            current_sequence = next_sequence
-            current_logits = next_logits
+            current_sequence = continuation_sequence
+            current_logits = continuation_logits
 
         final_result = _verify_with_cache(
             backend,
@@ -2928,7 +3004,8 @@ def run_esmfold2_chunked_best_of_n(
             "best_loss_dict": _loss_dict_for_artifact(
                 trajectory_best_result
             ),
-            "verifier_feedback_to_trajectory": False,
+            "continuation_policy": continuation_policy,
+            "verifier_feedback_to_trajectory": uses_verifier_feedback,
             "passed": (
                 trajectory_best_loss <= float(pass_loss_threshold)
                 if pass_loss_threshold is not None
@@ -2977,9 +3054,18 @@ def run_esmfold2_chunked_best_of_n(
         "soft_steps_per_outer_step": soft_steps,
         "total_soft_steps": total_outer_steps * soft_steps,
         "shared_verifier_seed": shared_verify_seed,
-        "intermediate_verifier_selection": False,
+        "continuation_policy": continuation_policy,
+        "continuation_soft_anchor_margin": (
+            continuation_soft_anchor_margin
+        ),
+        "intermediate_verifier_selection": uses_verifier_feedback,
         "mutation_candidate_branching": False,
-        "verifier_feedback_to_trajectory": False,
+        "verifier_feedback_to_trajectory": uses_verifier_feedback,
+        "logits_carry_policy": (
+            "verifier_best_soft_anchor"
+            if uses_verifier_feedback
+            else "raw_argmax_unanchored"
+        ),
         "verifier_candidates_per_outer_step": (
             verifier_candidates_per_outer_step
         ),

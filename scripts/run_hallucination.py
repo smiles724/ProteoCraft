@@ -570,7 +570,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
         help=(
             "chunked Best-of-N 每个 outer step 生成并 full-verify 的候选数；"
-            "这些分数只用于最终 Best-of-N 排名，不反馈轨迹（默认：0）"
+            "raw_argmax 模式只用于最终排名，verifier_best 模式还用于"
+            "选择下一轮 continuation（默认：0）"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_best_of_n_continuation_policy",
+        choices=["raw_argmax", "verifier_best"],
+        default="raw_argmax",
+        help=(
+            "chunked Best-of-N 下一轮轨迹的延续方式：raw_argmax 保留"
+            "未 anchor 的连续 logits；verifier_best 选择当前候选池中"
+            " verifier loss 最低的序列，并仅在必要时做 soft anchor"
         ),
     )
     parser.add_argument(
@@ -1429,6 +1440,12 @@ def main():
                     verifier_candidates_per_outer_step=(
                         args.esmfold2_best_of_n_verify_candidates_per_outer_step
                     ),
+                    continuation_policy=(
+                        args.esmfold2_best_of_n_continuation_policy
+                    ),
+                    continuation_soft_anchor_margin=(
+                        args.esmfold2_stagea_soft_anchor_margin
+                    ),
                     candidate_k_top=args.k_top,
                     candidate_temperature=args.t_sample,
                     candidate_max_mutations_per_seq=(
@@ -1645,6 +1662,10 @@ def main():
             f.write(
                 "ESMFold2 Best-of-N Verified Candidates Per Outer Step: "
                 f"{args.esmfold2_best_of_n_verify_candidates_per_outer_step}\n"
+            )
+            f.write(
+                "ESMFold2 Best-of-N Continuation Policy: "
+                f"{args.esmfold2_best_of_n_continuation_policy}\n"
             )
             f.write(f"ESMFold2 Stage B Discrete Rerank: {args.esmfold2_stageb_discrete_rerank}\n")
             f.write(f"ESMFold2 Stage B Rerank Pool Size: {args.esmfold2_stageb_rerank_pool_size}\n")
