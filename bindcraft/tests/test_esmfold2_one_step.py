@@ -356,3 +356,54 @@ def test_remap_reference_coordinates_rebuilds_new_side_chain_from_backbone():
         torch.tensor([1.0, 0.0, 2.0]) + translation,
         atol=1e-5,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_remap_reference_coordinates_accepts_cuda_features_and_cpu_coordinates():
+    source_features = {
+        key: value.cuda()
+        for key, value in _atom_layout(
+            ["N", "CA", "PAD", "C", "O"],
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 2.0, 0.0],
+            ],
+            mask=[True, True, False, True, True],
+        ).items()
+    }
+    destination_features = {
+        key: value.cuda()
+        for key, value in _atom_layout(
+            ["N", "CA", "C", "O"],
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 2.0, 0.0],
+            ],
+            mask=[True] * 4,
+        ).items()
+    }
+    source_coordinates = torch.tensor(
+        [
+            [
+                [10.0, 20.0, 30.0],
+                [11.0, 20.0, 30.0],
+                [11.0, 21.0, 30.0],
+                [11.0, 22.0, 30.0],
+            ]
+        ],
+        device="cpu",
+    )
+
+    remapped = remap_reference_coordinates(
+        source_coordinates,
+        source_features=source_features,
+        destination_features=destination_features,
+    )
+
+    assert remapped.device.type == "cpu"
+    assert torch.equal(remapped, source_coordinates)

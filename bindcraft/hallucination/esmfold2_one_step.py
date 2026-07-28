@@ -619,7 +619,9 @@ def remap_reference_coordinates(
         destination_features
     )
     if source_coords.shape[0] == source_mask.shape[0]:
-        source_valid_coords = source_coords[source_mask]
+        source_valid_coords = source_coords[
+            source_mask.to(device=source_coords.device)
+        ]
     elif source_coords.shape[0] == int(source_mask.sum().item()):
         source_valid_coords = source_coords
     else:
