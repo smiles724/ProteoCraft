@@ -226,6 +226,64 @@ def test_chunked_best_of_n_splits_fixed_outer_budget_without_mcts(tmp_path):
     assert contract["mutation_candidate_branching"] is False
 
 
+def test_chunked_best_of_n_matches_verifier_budget_without_feedback(tmp_path):
+    class VerifierMatchedBackend(FakeESMFold2Backend):
+        def propose(self, **kwargs):
+            self.propose_calls.append(dict(kwargs))
+            logits_after = kwargs["proposal_logits"].detach().clone()
+            candidates = (
+                ["AAY", "AAF"]
+                if int(kwargs["global_step"]) == 0
+                else ["AYY", "FYY"]
+            )
+            return ESMFold2ProposalBatch(
+                sequences=candidates,
+                logits_after=logits_after,
+            )
+
+    backend = VerifierMatchedBackend()
+    best_seq, final_seq, losses = run_esmfold2_chunked_best_of_n(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        best_of_n=2,
+        total_outer_steps=2,
+        init_binder_seq="AAA",
+        mutable_mask=[True, True, True],
+        seed=7,
+        artifact_dir=tmp_path,
+        esmfold2_logit_init_mode="official_exact",
+        esmfold2_soft_steps=3,
+        verifier_candidates_per_outer_step=2,
+        candidate_k_top=4,
+        candidate_temperature=1.0,
+        candidate_max_mutations_per_seq=3,
+    )
+
+    assert best_seq == final_seq == "AYY"
+    assert len(losses) == 2
+    assert len(backend.propose_calls) == 2
+    assert backend.continuous_calls == []
+    assert [call["global_step"] for call in backend.propose_calls] == [0, 1]
+    assert all(call["B_candidates"] == 2 for call in backend.propose_calls)
+
+    summary = json.loads((tmp_path / "run_summary.json").read_text())
+    assert [
+        call["current_seq"]
+        for call in backend.propose_calls
+    ] == [
+        item["initial_sequence"]
+        for item in summary["trajectory_summaries"]
+    ]
+    assert summary["intermediate_verifier_selection"] is False
+    assert summary["mutation_candidate_branching"] is False
+    assert summary["verifier_feedback_to_trajectory"] is False
+    assert summary["verifier_candidates_per_outer_step"] == 2
+    assert summary["configured_full_verifier_budget"] == 6
+    assert summary["candidate_verification_attempts"] == 4
+    assert summary["actual_full_verifier_attempts"] == 6
+
+
 def test_stageb_group_budget_keeps_every_repair_group_represented():
     budgets = _allocate_group_budgets(
         {

@@ -565,6 +565,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Best-of-N 是否按 trajectory 断点续跑（默认：true）",
     )
     parser.add_argument(
+        "--esmfold2_best_of_n_verify_candidates_per_outer_step",
+        type=int,
+        default=0,
+        help=(
+            "chunked Best-of-N 每个 outer step 生成并 full-verify 的候选数；"
+            "这些分数只用于最终 Best-of-N 排名，不反馈轨迹（默认：0）"
+        ),
+    )
+    parser.add_argument(
         "--esmfold2_stageb_discrete_rerank",
         type=lambda x: x.lower() == "true",
         default=True,
@@ -1024,6 +1033,14 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
+        if args.esmfold2_best_of_n_verify_candidates_per_outer_step < 0:
+            message = (
+                "--esmfold2_best_of_n_verify_candidates_per_outer_step "
+                "must be non-negative"
+            )
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
         if args.esmfold2_track_proposal_confidence is None:
             args.esmfold2_track_proposal_confidence = (
                 args.mcts_strategy == "best_of_n"
@@ -1409,6 +1426,14 @@ def main():
                     ),
                     esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
                     esmfold2_soft_steps=args.esmfold2_stagea_soft_steps,
+                    verifier_candidates_per_outer_step=(
+                        args.esmfold2_best_of_n_verify_candidates_per_outer_step
+                    ),
+                    candidate_k_top=args.k_top,
+                    candidate_temperature=args.t_sample,
+                    candidate_max_mutations_per_seq=(
+                        args.stagea_max_mutations_per_seq
+                    ),
                     pass_loss_threshold=(
                         args.esmfold2_best_of_n_pass_loss_threshold
                     ),
@@ -1616,6 +1641,10 @@ def main():
             f.write(
                 "ESMFold2 Best-of-N Pass Loss Threshold: "
                 f"{args.esmfold2_best_of_n_pass_loss_threshold}\n"
+            )
+            f.write(
+                "ESMFold2 Best-of-N Verified Candidates Per Outer Step: "
+                f"{args.esmfold2_best_of_n_verify_candidates_per_outer_step}\n"
             )
             f.write(f"ESMFold2 Stage B Discrete Rerank: {args.esmfold2_stageb_discrete_rerank}\n")
             f.write(f"ESMFold2 Stage B Rerank Pool Size: {args.esmfold2_stageb_rerank_pool_size}\n")

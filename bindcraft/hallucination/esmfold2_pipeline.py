@@ -2232,17 +2232,24 @@ def run_esmfold2_chunked_best_of_n(
     ] = None,
     esmfold2_logit_init_mode: str = "official_exact",
     esmfold2_soft_steps: int = 30,
+    verifier_candidates_per_outer_step: int = 0,
+    candidate_k_top: int = 10,
+    candidate_temperature: float = 1.0,
+    candidate_max_mutations_per_seq: int = 8,
     pass_loss_threshold: Optional[float] = None,
     verifier_seed: Optional[int] = None,
     resume: bool = True,
 ) -> Tuple[str, str, List[float]]:
-    """Run compute-matched chunked trajectories without MCTS decisions.
+    """Run proposal-budget-matched chunked trajectories without MCTS.
 
     The fixed outer-step budget is split across independent trajectories. Each
     outer step runs the same soft-logit proposal chunk used by Stage A, carries
-    the unanchored argmax logits into the next chunk, and performs no candidate
-    branching or intermediate verifier-based selection. Full verification is
-    used only to initialize One-step coordinates and to rank final trajectories.
+    the unanchored argmax logits into the next chunk, and never uses verifier
+    results to choose the continuation. When
+    ``verifier_candidates_per_outer_step`` is positive, the proposal also emits
+    and full-verifies the same bounded candidate pool used by Stage A. Those
+    scores enter only the final Best-of-N pool, which matches verifier budget
+    without introducing tree search or intermediate verifier feedback.
     """
 
     if backend is None:
@@ -2251,10 +2258,30 @@ def run_esmfold2_chunked_best_of_n(
     best_of_n = int(best_of_n)
     total_outer_steps = int(total_outer_steps)
     soft_steps = int(esmfold2_soft_steps)
+    verifier_candidates_per_outer_step = int(
+        verifier_candidates_per_outer_step
+    )
+    candidate_k_top = int(candidate_k_top)
+    candidate_temperature = float(candidate_temperature)
+    candidate_max_mutations_per_seq = int(
+        candidate_max_mutations_per_seq
+    )
     if L_binder <= 0:
         raise ValueError("L_binder must be positive")
     if soft_steps <= 0:
         raise ValueError("esmfold2_soft_steps must be positive")
+    if verifier_candidates_per_outer_step < 0:
+        raise ValueError(
+            "verifier_candidates_per_outer_step must be non-negative"
+        )
+    if candidate_k_top <= 0:
+        raise ValueError("candidate_k_top must be positive")
+    if candidate_temperature <= 0.0:
+        raise ValueError("candidate_temperature must be positive")
+    if candidate_max_mutations_per_seq <= 0:
+        raise ValueError(
+            "candidate_max_mutations_per_seq must be positive"
+        )
     if pass_loss_threshold is not None and not math.isfinite(
         float(pass_loss_threshold)
     ):
@@ -2390,6 +2417,19 @@ def run_esmfold2_chunked_best_of_n(
         "one_step_diffusion": one_step_config,
         "intermediate_verifier_selection": False,
         "mutation_candidate_branching": False,
+        "verifier_feedback_to_trajectory": False,
+        "verifier_candidates_per_outer_step": (
+            verifier_candidates_per_outer_step
+        ),
+        "candidate_k_top": candidate_k_top,
+        "candidate_temperature": candidate_temperature,
+        "candidate_max_mutations_per_seq": (
+            candidate_max_mutations_per_seq
+        ),
+        "configured_full_verifier_budget": (
+            best_of_n
+            + total_outer_steps * verifier_candidates_per_outer_step
+        ),
         "logits_carry_policy": "raw_argmax_unanchored",
         "reference_coordinate_policy": (
             "initial_full_verifier_fixed" if one_step_enabled else "unused"
@@ -2418,6 +2458,8 @@ def run_esmfold2_chunked_best_of_n(
     trajectory_summaries: List[Dict[str, Any]] = []
     trajectory_best_losses: List[float] = []
     global_best_result: Optional[Any] = None
+    candidate_verification_attempts = 0
+    resumed_trajectory_count = 0
 
     logger.info("=" * 70)
     logger.info("ESMFold2 chunked Best-of-N design")
@@ -2433,8 +2475,9 @@ def run_esmfold2_chunked_best_of_n(
         shared_verify_seed,
     )
     logger.info(
-        "No per-step candidate branching or verifier selection; "
-        "raw argmax logits continue between chunks"
+        "No tree branching or intermediate verifier selection; raw argmax "
+        "logits continue between chunks; verifier_candidates_per_step=%d",
+        verifier_candidates_per_outer_step,
     )
     logger.info("=" * 70)
 
@@ -2462,30 +2505,43 @@ def run_esmfold2_chunked_best_of_n(
                 trajectory_summary_path.read_text(encoding="utf-8")
             )
             final_sequence = str(trajectory_summary["final_sequence"])
-            final_result = _verify_with_cache(
+            selection_sequence = str(
+                trajectory_summary.get("best_sequence", final_sequence)
+            )
+            selection_result = _verify_with_cache(
                 backend,
                 verifier_cache,
-                binder_seq=final_sequence,
+                binder_seq=selection_sequence,
                 target_seq=target_seq,
                 seed=shared_verify_seed,
                 hotspot_params=hotspot_params,
             )
-            final_loss = float(final_result.total_loss)
-            recorded_loss = float(trajectory_summary["final_loss"])
-            if abs(final_loss - recorded_loss) > 0.05:
+            selection_loss = float(selection_result.total_loss)
+            recorded_loss = float(
+                trajectory_summary.get(
+                    "best_loss",
+                    trajectory_summary["final_loss"],
+                )
+            )
+            if abs(selection_loss - recorded_loss) > 0.05:
                 raise ValueError(
                     "Resumed chunked Best-of-N verifier result changed: "
                     f"trajectory={trajectory_index} "
-                    f"recorded={recorded_loss:.6f} current={final_loss:.6f}"
+                    f"recorded={recorded_loss:.6f} "
+                    f"current={selection_loss:.6f}"
                 )
-            trajectory_summary["resume_reverified_loss"] = final_loss
+            trajectory_summary["resume_reverified_loss"] = selection_loss
             trajectory_summaries.append(trajectory_summary)
-            trajectory_best_losses.append(final_loss)
+            trajectory_best_losses.append(selection_loss)
+            candidate_verification_attempts += int(
+                trajectory_summary.get("verified_candidate_count", 0)
+            )
+            resumed_trajectory_count += 1
             if (
                 global_best_result is None
-                or final_loss < float(global_best_result.total_loss)
+                or selection_loss < float(global_best_result.total_loss)
             ):
-                global_best_result = final_result
+                global_best_result = selection_result
             continue
 
         initial_sequence, initial_logits = initial_states[trajectory_index]
@@ -2501,7 +2557,7 @@ def run_esmfold2_chunked_best_of_n(
             trajectory_index,
         )
         initial_reference_result = None
-        if one_step_enabled:
+        if one_step_enabled or verifier_candidates_per_outer_step > 0:
             initial_reference_result = _verify_with_cache(
                 backend,
                 verifier_cache,
@@ -2510,11 +2566,13 @@ def run_esmfold2_chunked_best_of_n(
                 seed=shared_verify_seed,
                 hotspot_params=hotspot_params,
             )
-            if initial_reference_result.coordinate is None:
+            if one_step_enabled and initial_reference_result.coordinate is None:
                 raise ValueError(
                     "Chunked Best-of-N One-step diffusion requires initial "
                     "verifier coordinates for every trajectory"
                 )
+        trajectory_best_result = initial_reference_result
+        trajectory_verified_candidate_count = 0
 
         current_sequence = str(initial_sequence)
         current_logits = initial_logits.detach().clone()
@@ -2530,30 +2588,66 @@ def run_esmfold2_chunked_best_of_n(
                 trajectory_dir / "initial_logits.pt",
             )
 
+        trajectory_step_offset = sum(
+            outer_step_allocation[:trajectory_index]
+        )
         for outer_step in range(allocated_outer_steps):
-            chunk_seed = _stable_seed(
-                trajectory_seed,
-                "outer_step",
-                outer_step,
-            )
-            proposal_batch = _call_backend_continuous_design(
-                backend,
-                current_seq=current_sequence,
-                target_seq=target_seq,
-                global_step=outer_step,
-                seed=chunk_seed,
-                mutable_mask=mutable_mask,
-                proposal_logits=current_logits,
-                reference_coordinates=(
-                    initial_reference_result.coordinate
-                    if initial_reference_result is not None
-                    else None
-                ),
-                hotspot_params=hotspot_params,
-                track_confidence_override=False,
-                soft_steps_override=soft_steps,
-                preserve_proposal_logits=True,
-            )
+            budget_step = trajectory_step_offset + outer_step
+            if verifier_candidates_per_outer_step > 0:
+                chunk_seed = _stable_seed(
+                    seed,
+                    "esm_propose",
+                    target_key,
+                    current_sequence,
+                    budget_step,
+                )
+                proposal_batch = _call_backend_propose(
+                    backend,
+                    current_seq=current_sequence,
+                    target_seq=target_seq,
+                    global_step=budget_step,
+                    K_top=candidate_k_top,
+                    B_candidates=verifier_candidates_per_outer_step,
+                    T_sample=candidate_temperature,
+                    max_mutations_per_seq=candidate_max_mutations_per_seq,
+                    seed=chunk_seed,
+                    action_group=None,
+                    mutable_mask=mutable_mask,
+                    proposal_logits=current_logits,
+                    reference_coordinates=(
+                        initial_reference_result.coordinate
+                        if initial_reference_result is not None
+                        else None
+                    ),
+                    hotspot_params=hotspot_params,
+                    track_confidence_override=False,
+                    soft_steps_override=soft_steps,
+                    preserve_proposal_logits=True,
+                )
+            else:
+                chunk_seed = _stable_seed(
+                    trajectory_seed,
+                    "outer_step",
+                    outer_step,
+                )
+                proposal_batch = _call_backend_continuous_design(
+                    backend,
+                    current_seq=current_sequence,
+                    target_seq=target_seq,
+                    global_step=outer_step,
+                    seed=chunk_seed,
+                    mutable_mask=mutable_mask,
+                    proposal_logits=current_logits,
+                    reference_coordinates=(
+                        initial_reference_result.coordinate
+                        if initial_reference_result is not None
+                        else None
+                    ),
+                    hotspot_params=hotspot_params,
+                    track_confidence_override=False,
+                    soft_steps_override=soft_steps,
+                    preserve_proposal_logits=True,
+                )
             if proposal_batch.logits_after is None:
                 raise RuntimeError(
                     "chunked Best-of-N requires logits_after from every "
@@ -2578,6 +2672,67 @@ def run_esmfold2_chunked_best_of_n(
                 mutable_mask,
                 current_sequence,
             )
+            verified_results = []
+            if verifier_candidates_per_outer_step > 0:
+                candidates = _proposal_sequences_from_batch(
+                    proposal_batch,
+                    include_confidence=False,
+                )
+                candidates = [
+                    _clip_sequence_by_mutable_mask(
+                        str(candidate),
+                        mutable_mask,
+                        current_sequence,
+                    )
+                    for candidate in candidates
+                ]
+                candidates = [
+                    candidate
+                    for candidate in candidates
+                    if candidate and candidate != current_sequence
+                ]
+                candidates = list(dict.fromkeys(candidates))[
+                    :verifier_candidates_per_outer_step
+                ]
+                for candidate in candidates:
+                    result = _verify_with_cache(
+                        backend,
+                        verifier_cache,
+                        binder_seq=candidate,
+                        target_seq=target_seq,
+                        seed=shared_verify_seed,
+                        hotspot_params=hotspot_params,
+                    )
+                    verified_results.append(result)
+                    _write_candidate_artifact(
+                        artifact_recorder,
+                        stage="best_of_n_chunked",
+                        step=budget_step,
+                        parent_sequence=current_sequence,
+                        result=result,
+                        action_group=(
+                            f"trajectory_{trajectory_index:03d}"
+                        ),
+                    )
+                trajectory_verified_candidate_count += len(verified_results)
+                candidate_verification_attempts += len(verified_results)
+                if verified_results:
+                    round_best = min(
+                        verified_results,
+                        key=lambda result: float(result.total_loss),
+                    )
+                    if (
+                        trajectory_best_result is None
+                        or float(round_best.total_loss)
+                        < float(trajectory_best_result.total_loss)
+                    ):
+                        trajectory_best_result = round_best
+                    if (
+                        global_best_result is None
+                        or float(round_best.total_loss)
+                        < float(global_best_result.total_loss)
+                    ):
+                        global_best_result = round_best
             if trajectory_dir is not None:
                 torch.save(
                     {
@@ -2596,6 +2751,7 @@ def run_esmfold2_chunked_best_of_n(
                     {
                         "trajectory_index": trajectory_index,
                         "outer_step": outer_step,
+                        "budget_step": budget_step,
                         "seed": chunk_seed,
                         "parent_sequence": current_sequence,
                         "sequence": next_sequence,
@@ -2604,6 +2760,18 @@ def run_esmfold2_chunked_best_of_n(
                             next_sequence,
                         ),
                         "soft_steps": soft_steps,
+                        "verified_candidate_count": len(verified_results),
+                        "round_best_sequence": (
+                            str(round_best.binder_seq)
+                            if verified_results
+                            else None
+                        ),
+                        "round_best_loss": (
+                            float(round_best.total_loss)
+                            if verified_results
+                            else None
+                        ),
+                        "verifier_feedback_to_trajectory": False,
                     },
                 )
             current_sequence = next_sequence
@@ -2618,12 +2786,18 @@ def run_esmfold2_chunked_best_of_n(
             hotspot_params=hotspot_params,
         )
         final_loss = float(final_result.total_loss)
-        trajectory_best_losses.append(final_loss)
+        if (
+            trajectory_best_result is None
+            or final_loss < float(trajectory_best_result.total_loss)
+        ):
+            trajectory_best_result = final_result
+        trajectory_best_loss = float(trajectory_best_result.total_loss)
+        trajectory_best_losses.append(trajectory_best_loss)
         if (
             global_best_result is None
-            or final_loss < float(global_best_result.total_loss)
+            or trajectory_best_loss < float(global_best_result.total_loss)
         ):
-            global_best_result = final_result
+            global_best_result = trajectory_best_result
 
         if trajectory_dir is not None:
             torch.save(
@@ -2663,8 +2837,18 @@ def run_esmfold2_chunked_best_of_n(
                     dict(getattr(final_result, "summary_confidence", {}) or {})
                 )
             ),
+            "verified_candidate_count": trajectory_verified_candidate_count,
+            "best_sequence": str(trajectory_best_result.binder_seq),
+            "best_sequence_hash": _sequence_hash(
+                str(trajectory_best_result.binder_seq)
+            ),
+            "best_loss": trajectory_best_loss,
+            "best_loss_dict": _loss_dict_for_artifact(
+                trajectory_best_result
+            ),
+            "verifier_feedback_to_trajectory": False,
             "passed": (
-                final_loss <= float(pass_loss_threshold)
+                trajectory_best_loss <= float(pass_loss_threshold)
                 if pass_loss_threshold is not None
                 else None
             ),
@@ -2713,6 +2897,24 @@ def run_esmfold2_chunked_best_of_n(
         "shared_verifier_seed": shared_verify_seed,
         "intermediate_verifier_selection": False,
         "mutation_candidate_branching": False,
+        "verifier_feedback_to_trajectory": False,
+        "verifier_candidates_per_outer_step": (
+            verifier_candidates_per_outer_step
+        ),
+        "configured_full_verifier_budget": (
+            best_of_n
+            + total_outer_steps * verifier_candidates_per_outer_step
+        ),
+        "candidate_verification_attempts": candidate_verification_attempts,
+        "actual_full_verifier_attempts": (
+            best_of_n + candidate_verification_attempts
+        ),
+        "unique_verified_sequence_count": (
+            len(verifier_cache)
+            if resumed_trajectory_count == 0
+            else None
+        ),
+        "resumed_trajectory_count": resumed_trajectory_count,
         "best_sequence": global_best_sequence,
         "best_sequence_hash": _sequence_hash(global_best_sequence),
         "best_loss": float(global_best_result.total_loss),
