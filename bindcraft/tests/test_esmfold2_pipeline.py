@@ -293,6 +293,93 @@ def test_chunked_best_of_n_matches_verifier_budget_without_feedback(tmp_path):
     assert summary["actual_full_verifier_attempts"] == 6
 
 
+def test_chunked_best_of_n_keeps_verifier_coordinates_and_features_paired(
+    tmp_path,
+):
+    class OneStepBackend(FakeESMFold2Backend):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(one_step_diffusion_enabled=True)
+            self.reference_feature_calls = []
+
+        def prepare_verifier_reference_features(
+            self,
+            *,
+            binder_seq,
+            target_seq,
+            seed=None,
+        ):
+            self.reference_feature_calls.append(
+                (binder_seq, target_seq, seed)
+            )
+            return {"layout_id": torch.tensor([17])}
+
+        def propose(
+            self,
+            *,
+            reference_coordinates=None,
+            reference_features=None,
+            **kwargs,
+        ):
+            self.propose_calls.append(
+                {
+                    **kwargs,
+                    "reference_coordinates": reference_coordinates,
+                    "reference_features": reference_features,
+                }
+            )
+            logits_after = kwargs["proposal_logits"].detach().clone()
+            return ESMFold2ProposalBatch(
+                sequences=["AAY"],
+                logits_after=logits_after,
+            )
+
+    backend = OneStepBackend()
+    run_esmfold2_chunked_best_of_n(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        best_of_n=1,
+        total_outer_steps=2,
+        init_binder_seq="AAA",
+        mutable_mask=[True, True, True],
+        seed=7,
+        artifact_dir=tmp_path,
+        esmfold2_logit_init_mode="official_exact",
+        esmfold2_soft_steps=3,
+        verifier_candidates_per_outer_step=1,
+    )
+
+    assert len(backend.reference_feature_calls) == 1
+    assert backend.reference_feature_calls[0][0] == (
+        backend.propose_calls[0]["current_seq"]
+    )
+    assert backend.reference_feature_calls[0][1] == "TTTT"
+    assert isinstance(backend.reference_feature_calls[0][2], int)
+    assert len(backend.propose_calls) == 2
+    assert all(
+        call["reference_coordinates"] is not None
+        for call in backend.propose_calls
+    )
+    assert all(
+        torch.equal(
+            call["reference_features"]["layout_id"],
+            torch.tensor([17]),
+        )
+        for call in backend.propose_calls
+    )
+    assert backend.propose_calls[0]["reference_features"] is not (
+        backend.propose_calls[1]["reference_features"]
+    )
+    contract = json.loads(
+        (tmp_path / "chunked_best_of_n_config.json").read_text()
+    )
+    assert contract["schema_version"] == 2
+    assert contract["reference_coordinate_policy"] == (
+        "initial_full_verifier_coordinates_and_features_fixed"
+    )
+
+
 def test_stageb_group_budget_keeps_every_repair_group_represented():
     budgets = _allocate_group_budgets(
         {

@@ -748,11 +748,38 @@ def _proposal_confidence_summary(batch: ESMFold2ProposalBatch) -> Dict[str, Any]
     }
 
 
+def _prepare_backend_verifier_reference_features(
+    backend: Any,
+    *,
+    binder_seq: str,
+    target_seq: Union[str, Sequence[str]],
+    seed: Optional[int],
+) -> Optional[Dict[str, torch.Tensor]]:
+    prepare = getattr(backend, "prepare_verifier_reference_features", None)
+    if not callable(prepare):
+        return None
+    raw = prepare(
+        binder_seq=binder_seq,
+        target_seq=target_seq,
+        seed=seed,
+    )
+    if not isinstance(raw, Mapping):
+        raise TypeError(
+            "prepare_verifier_reference_features must return a mapping"
+        )
+    return {
+        str(key): value.detach().clone()
+        for key, value in raw.items()
+        if isinstance(value, torch.Tensor)
+    }
+
+
 def _call_backend_propose(
     backend: Any,
     *,
     proposal_logits: Optional[torch.Tensor],
     reference_coordinates: Optional[torch.Tensor] = None,
+    reference_features: Optional[Mapping[str, torch.Tensor]] = None,
     hotspot_params: Optional[Dict[str, Any]] = None,
     hotspot_weight_override: Optional[float] = None,
     track_confidence_override: Optional[bool] = None,
@@ -783,6 +810,18 @@ def _call_backend_propose(
             if reference_coordinates is not None
             else None
         )
+    if (
+        one_step_enabled
+        and reference_features is not None
+        and _callable_accepts_argument(
+            backend.propose,
+            "reference_features",
+        )
+    ):
+        propose_kwargs["reference_features"] = {
+            str(key): value.detach().clone()
+            for key, value in reference_features.items()
+        }
     if _callable_accepts_argument(backend.propose, "track_confidence_override"):
         propose_kwargs["track_confidence_override"] = track_confidence_override
     if _callable_accepts_argument(backend.propose, "soft_steps_override"):
@@ -818,6 +857,7 @@ def _call_backend_continuous_design(
     *,
     proposal_logits: Optional[torch.Tensor],
     reference_coordinates: Optional[torch.Tensor] = None,
+    reference_features: Optional[Mapping[str, torch.Tensor]] = None,
     hotspot_params: Optional[Dict[str, Any]] = None,
     hotspot_weight_override: Optional[float] = None,
     track_confidence_override: Optional[bool] = None,
@@ -850,6 +890,18 @@ def _call_backend_continuous_design(
             if reference_coordinates is not None
             else None
         )
+    if (
+        one_step_enabled
+        and reference_features is not None
+        and _callable_accepts_argument(
+            backend.continuous_design,
+            "reference_features",
+        )
+    ):
+        design_kwargs["reference_features"] = {
+            str(key): value.detach().clone()
+            for key, value in reference_features.items()
+        }
     if _callable_accepts_argument(backend.continuous_design, "track_confidence_override"):
         design_kwargs["track_confidence_override"] = track_confidence_override
     if _callable_accepts_argument(backend.continuous_design, "soft_steps_override"):
@@ -1960,6 +2012,7 @@ def run_esmfold2_best_of_n(
             )
         )
         initial_reference_result = None
+        initial_reference_features = None
         if one_step_enabled:
             initial_reference_result = _verify_with_cache(
                 backend,
@@ -1974,6 +2027,14 @@ def run_esmfold2_best_of_n(
                     "Best-of-N One-step diffusion requires verifier "
                     "coordinates for every initial trajectory"
                 )
+            initial_reference_features = (
+                _prepare_backend_verifier_reference_features(
+                    backend,
+                    binder_seq=initial_sequence,
+                    target_seq=target_seq,
+                    seed=shared_verify_seed,
+                )
+            )
         proposal_batch = _call_backend_continuous_design(
             backend,
             current_seq=initial_sequence,
@@ -1987,6 +2048,7 @@ def run_esmfold2_best_of_n(
                 if initial_reference_result is not None
                 else None
             ),
+            reference_features=initial_reference_features,
             hotspot_params=hotspot_params,
             track_confidence_override=bool(track_confidence),
             soft_steps_override=soft_steps,
@@ -2396,7 +2458,7 @@ def run_esmfold2_chunked_best_of_n(
         else None
     )
     contract = {
-        "schema_version": 1,
+        "schema_version": 2,
         "strategy": "best_of_n_chunked",
         "target_key": target_key,
         "binder_length": L_binder,
@@ -2432,7 +2494,9 @@ def run_esmfold2_chunked_best_of_n(
         ),
         "logits_carry_policy": "raw_argmax_unanchored",
         "reference_coordinate_policy": (
-            "initial_full_verifier_fixed" if one_step_enabled else "unused"
+            "initial_full_verifier_coordinates_and_features_fixed"
+            if one_step_enabled
+            else "unused"
         ),
         "verifier_loss_mode": str(
             getattr(backend_config, "verifier_loss_mode", "pair_chain_iptm")
@@ -2557,6 +2621,7 @@ def run_esmfold2_chunked_best_of_n(
             trajectory_index,
         )
         initial_reference_result = None
+        initial_reference_features = None
         if one_step_enabled or verifier_candidates_per_outer_step > 0:
             initial_reference_result = _verify_with_cache(
                 backend,
@@ -2570,6 +2635,15 @@ def run_esmfold2_chunked_best_of_n(
                 raise ValueError(
                     "Chunked Best-of-N One-step diffusion requires initial "
                     "verifier coordinates for every trajectory"
+                )
+            if one_step_enabled:
+                initial_reference_features = (
+                    _prepare_backend_verifier_reference_features(
+                        backend,
+                        binder_seq=initial_sequence,
+                        target_seq=target_seq,
+                        seed=shared_verify_seed,
+                    )
                 )
         trajectory_best_result = initial_reference_result
         trajectory_verified_candidate_count = 0
@@ -2619,6 +2693,7 @@ def run_esmfold2_chunked_best_of_n(
                         if initial_reference_result is not None
                         else None
                     ),
+                    reference_features=initial_reference_features,
                     hotspot_params=hotspot_params,
                     track_confidence_override=False,
                     soft_steps_override=soft_steps,
@@ -2643,6 +2718,7 @@ def run_esmfold2_chunked_best_of_n(
                         if initial_reference_result is not None
                         else None
                     ),
+                    reference_features=initial_reference_features,
                     hotspot_params=hotspot_params,
                     track_confidence_override=False,
                     soft_steps_override=soft_steps,

@@ -792,9 +792,13 @@ def test_runtime_schedules_and_recycles_interval_one_step_coordinates(monkeypatc
         }
 
     references = []
+    reference_feature_markers = []
 
     def fake_one_step_diffusion_gradient(**kwargs):
         references.append(kwargs["reference_coordinates"].detach().clone())
+        reference_feature_markers.append(
+            float(kwargs["reference_features"]["marker"].item())
+        )
         call_index = len(references)
         return {
             "gradient": torch.ones_like(kwargs["logits"]),
@@ -823,6 +827,7 @@ def test_runtime_schedules_and_recycles_interval_one_step_coordinates(monkeypatc
         mutable_mask=[True, True, True],
         proposal_logits=torch.zeros(3, 20),
         reference_coordinates=torch.zeros(1, 1, 3),
+        reference_features={"marker": torch.tensor(99.0)},
     )
 
     assert len(batch.soft_step_metrics) == 6
@@ -830,6 +835,7 @@ def test_runtime_schedules_and_recycles_interval_one_step_coordinates(monkeypatc
     assert torch.equal(references[0], torch.zeros(1, 1, 3))
     assert torch.equal(references[1], torch.ones(1, 1, 3))
     assert torch.equal(references[2], torch.full((1, 1, 3), 2.0))
+    assert reference_feature_markers == [99.0, 1.0, 2.0]
     injection_metrics = [
         metrics
         for metrics in batch.soft_step_metrics

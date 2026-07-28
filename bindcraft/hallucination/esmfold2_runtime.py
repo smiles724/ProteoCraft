@@ -899,6 +899,41 @@ class ESMFold2RuntimeBackend:
         )
         return fold_result, features, output
 
+    def prepare_verifier_reference_features(
+        self,
+        *,
+        binder_seq: str,
+        target_seq: Union[str, Sequence[str]],
+        seed: Optional[int] = None,
+    ) -> dict[str, torch.Tensor]:
+        """Build the atom identity layout paired with verifier coordinates."""
+
+        self._ensure_verifier_loaded()
+        targets = _target_sequences(target_seq)
+        input_spec = self._build_structure_input(targets, binder_seq)
+        features, _ = self.input_builder.prepare_input(
+            input_spec,
+            seed=seed,
+            device=self.verifier_model.device,
+        )
+        required = (
+            "atom_attention_mask",
+            "atom_to_token",
+            "ref_atom_name_chars",
+            "ref_element",
+            "ref_pos",
+        )
+        missing = [name for name in required if name not in features]
+        if missing:
+            raise ValueError(
+                "ESMFold2 verifier reference features are missing: "
+                + ", ".join(missing)
+            )
+        return {
+            name: features[name].detach().clone()
+            for name in required
+        }
+
     def verify(
         self,
         *,
@@ -1051,6 +1086,7 @@ class ESMFold2RuntimeBackend:
         action_group: Optional[str] = None,
         proposal_logits: Optional[torch.Tensor] = None,
         reference_coordinates: Optional[torch.Tensor] = None,
+        reference_features: Optional[Mapping[str, torch.Tensor]] = None,
         hotspot_params: Optional[Dict[str, Any]] = None,
         hotspot_weight_override: Optional[float] = None,
         track_confidence_override: Optional[bool] = None,
@@ -1068,6 +1104,7 @@ class ESMFold2RuntimeBackend:
             action_group=action_group,
             proposal_logits=proposal_logits,
             reference_coordinates=reference_coordinates,
+            reference_features=reference_features,
             hotspot_params=hotspot_params,
             hotspot_weight_override=hotspot_weight_override,
             track_confidence_override=track_confidence_override,
@@ -1108,6 +1145,7 @@ class ESMFold2RuntimeBackend:
         mutable_mask: Optional[Sequence[bool]] = None,
         proposal_logits: Optional[torch.Tensor] = None,
         reference_coordinates: Optional[torch.Tensor] = None,
+        reference_features: Optional[Mapping[str, torch.Tensor]] = None,
         hotspot_params: Optional[Dict[str, Any]] = None,
         hotspot_weight_override: Optional[float] = None,
         track_confidence_override: Optional[bool] = None,
@@ -1131,6 +1169,7 @@ class ESMFold2RuntimeBackend:
             action_group=None,
             proposal_logits=proposal_logits,
             reference_coordinates=reference_coordinates,
+            reference_features=reference_features,
             hotspot_params=hotspot_params,
             hotspot_weight_override=hotspot_weight_override,
             track_confidence_override=track_confidence_override,
@@ -1381,6 +1420,7 @@ class ESMFold2RuntimeBackend:
         action_group: Optional[str],
         proposal_logits: Optional[torch.Tensor],
         reference_coordinates: Optional[torch.Tensor] = None,
+        reference_features: Optional[Mapping[str, torch.Tensor]] = None,
         hotspot_params: Optional[Dict[str, Any]] = None,
         hotspot_weight_override: Optional[float] = None,
         preserve_proposal_logits: bool = False,
@@ -1394,6 +1434,7 @@ class ESMFold2RuntimeBackend:
             action_group=action_group,
             proposal_logits=proposal_logits,
             reference_coordinates=reference_coordinates,
+            reference_features=reference_features,
             hotspot_params=hotspot_params,
             hotspot_weight_override=hotspot_weight_override,
             track_confidence=False,
@@ -1412,6 +1453,7 @@ class ESMFold2RuntimeBackend:
         action_group: Optional[str],
         proposal_logits: Optional[torch.Tensor],
         reference_coordinates: Optional[torch.Tensor],
+        reference_features: Optional[Mapping[str, torch.Tensor]],
         hotspot_params: Optional[Dict[str, Any]],
         hotspot_weight_override: Optional[float] = None,
         track_confidence_override: Optional[bool] = None,
@@ -1432,6 +1474,7 @@ class ESMFold2RuntimeBackend:
             action_group=action_group,
             proposal_logits=proposal_logits,
             reference_coordinates=reference_coordinates,
+            reference_features=reference_features,
             hotspot_params=hotspot_params,
             hotspot_weight_override=hotspot_weight_override,
             track_confidence=track_confidence,
@@ -1542,6 +1585,7 @@ class ESMFold2RuntimeBackend:
         action_group: Optional[str],
         proposal_logits: Optional[torch.Tensor],
         reference_coordinates: Optional[torch.Tensor],
+        reference_features: Optional[Mapping[str, torch.Tensor]],
         hotspot_params: Optional[Dict[str, Any]],
         hotspot_weight_override: Optional[float],
         track_confidence: bool,
@@ -1811,7 +1855,7 @@ class ESMFold2RuntimeBackend:
                     reference_features=(
                         recycled_reference_features
                         if use_recycled_reference
-                        else None
+                        else reference_features
                     ),
                     diffusion_seed=diffusion_seed,
                     hotspot_params=hotspot_params,
