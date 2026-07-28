@@ -1225,6 +1225,9 @@ def test_stagea_argmax_child_preserves_raw_logits_and_only_two_children_enter_tr
     assert stagea_event["expanded_child_count"] == 2
     assert stagea_event["argmax_sequence"] == "AAY"
     assert stagea_event["argmax_child_in_tree"] is True
+    assert stagea_event["root_selection_mode"] == "global_ucb"
+    assert stagea_event["root_selection_phase"] == "global_ucb"
+    assert stagea_event["selected_root_expansions"] == 1
 
     nodes = [
         json.loads(line)
@@ -1236,6 +1239,13 @@ def test_stagea_argmax_child_preserves_raw_logits_and_only_two_children_enter_tr
         if event["stage"] == "stage_a" and event.get("parent_node_id") is not None
     ]
     assert expanded_sequences == ["AAY", "AAF"]
+
+    summary = json.loads((artifact_dir / "run_summary.json").read_text())
+    assert summary["stagea_root_selection"] == {
+        "mode": "global_ucb",
+        "min_root_expansions": 0,
+        "root_expansion_counts": {"0": 1},
+    }
 
     checkpoint = torch.load(
         artifact_dir / "handoff_checkpoints" / "stagea_handoff_final.pt",

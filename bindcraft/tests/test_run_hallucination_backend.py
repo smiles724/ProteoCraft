@@ -28,6 +28,8 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_soft_steps is None
     assert args.esmfold2_stagea_soft_steps == 30
     assert args.esmfold2_stagea_tree_children == 2
+    assert args.esmfold2_stagea_root_selection_mode == "global_ucb"
+    assert args.esmfold2_stagea_min_root_expansions == 0
     assert args.esmfold2_stagea_preserve_soft_state is True
     assert args.esmfold2_stagea_cumulative_annealing is True
     assert args.esmfold2_stagea_annealing_horizon == 150
@@ -504,6 +506,10 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
             str(tmp_path / "target.cif"),
             "--esmfold2_initial_logits_checkpoint",
             str(tmp_path / "initial_logits.pt"),
+            "--esmfold2_stagea_root_selection_mode",
+            "hierarchical_ucb",
+            "--esmfold2_stagea_min_root_expansions",
+            "2",
             "--output_dir",
             str(tmp_path),
             "--log_file",
@@ -544,6 +550,8 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     )
     assert captured["esmfold2_stagea_soft_steps"] == 30
     assert captured["esmfold2_stagea_tree_children"] == 2
+    assert captured["esmfold2_stagea_root_selection_mode"] == "hierarchical_ucb"
+    assert captured["esmfold2_stagea_min_root_expansions"] == 2
     assert captured["esmfold2_stageb_soft_steps"] == 20
     assert captured["esmfold2_stageb_discrete_rerank"] is True
     assert captured["esmfold2_stageb_rerank_pool_size"] == 20

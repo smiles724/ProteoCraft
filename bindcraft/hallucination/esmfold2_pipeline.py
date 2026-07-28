@@ -35,7 +35,10 @@ from bindcraft.hallucination.esmfold2_backend import (
     sequence_from_logits_argmax,
     softly_anchor_mutation_logits,
 )
-from bindcraft.hallucination.mcts_legacy import LegacyMCTSTree
+from bindcraft.hallucination.mcts_legacy import (
+    LEGACY_SELECTION_MODES,
+    LegacyMCTSTree,
+)
 from bindcraft.hallucination.mcts_controller import MCTSTree
 
 
@@ -3732,6 +3735,8 @@ def run_esmfold2_mcts_hallucination(
     esmfold2_logit_init_mode: str = "legacy_anchor",
     esmfold2_stagea_soft_steps: Optional[int] = None,
     esmfold2_stagea_tree_children: int = 2,
+    esmfold2_stagea_root_selection_mode: str = "global_ucb",
+    esmfold2_stagea_min_root_expansions: int = 0,
     esmfold2_stagea_preserve_soft_state: bool = True,
     esmfold2_stagea_cumulative_annealing: bool = True,
     esmfold2_stagea_annealing_horizon: int = 150,
@@ -3902,6 +3907,18 @@ def run_esmfold2_mcts_hallucination(
     if stagea_soft_step_count <= 0:
         raise ValueError("resolved ESMFold2 Stage A soft steps must be positive")
     stagea_tree_children = max(int(esmfold2_stagea_tree_children), 1)
+    stagea_root_selection_mode = str(
+        esmfold2_stagea_root_selection_mode
+    ).strip().lower()
+    if stagea_root_selection_mode not in LEGACY_SELECTION_MODES:
+        raise ValueError(
+            "esmfold2_stagea_root_selection_mode must be one of: "
+            + ", ".join(sorted(LEGACY_SELECTION_MODES))
+        )
+    stagea_min_root_expansions = max(
+        int(esmfold2_stagea_min_root_expansions),
+        0,
+    )
     stagea_preserve_soft_state = bool(esmfold2_stagea_preserve_soft_state)
     stagea_cumulative_annealing = bool(esmfold2_stagea_cumulative_annealing)
     stagea_annealing_horizon = int(esmfold2_stagea_annealing_horizon)
@@ -3984,7 +4001,12 @@ def run_esmfold2_mcts_hallucination(
         )
     artifact_recorder = _make_artifact_recorder(artifact_dir)
 
-    tree = LegacyMCTSTree(C=mcts_C, max_nodes=mcts_max_nodes)
+    tree = LegacyMCTSTree(
+        C=mcts_C,
+        max_nodes=mcts_max_nodes,
+        selection_mode=stagea_root_selection_mode,
+        min_root_expansions=stagea_min_root_expansions,
+    )
     verifier_cache: Dict[str, Any] = {}
     resume_state = None
     if esmfold2_resume_handoff_checkpoint is not None:
@@ -4040,6 +4062,11 @@ def run_esmfold2_mcts_hallucination(
         stagea_annealing_horizon,
         stagea_soft_anchor_margin,
         stagea_tree_children,
+    )
+    logger.info(
+        "ESMFold2 StageA root selection: mode=%s min_root_expansions=%d",
+        stagea_root_selection_mode,
+        stagea_min_root_expansions,
     )
     logger.info(
         "ESMFold2 StageA verifier seed: %s",
@@ -4264,6 +4291,12 @@ def run_esmfold2_mcts_hallucination(
                 "esmfold2_logit_init_mode": logit_init_mode,
                 "esmfold2_stagea_soft_steps": stagea_soft_steps,
                 "esmfold2_stagea_tree_children": stagea_tree_children,
+                "esmfold2_stagea_root_selection_mode": (
+                    stagea_root_selection_mode
+                ),
+                "esmfold2_stagea_min_root_expansions": (
+                    stagea_min_root_expansions
+                ),
                 "esmfold2_stagea_preserve_soft_state": stagea_preserve_soft_state,
                 "esmfold2_stagea_cumulative_annealing": stagea_cumulative_annealing,
                 "esmfold2_stagea_annealing_horizon": stagea_annealing_horizon,
@@ -4761,6 +4794,7 @@ def run_esmfold2_mcts_hallucination(
     stagea_stale = 0
     for step in range(stagea_steps):
         selected_node = tree.select()
+        root_selection = tree.last_selection
         current_seq = selected_node.sequence
         proposal_hotspot_weight = _hotspot_proposal_weight_for_verified_state(
             verifier_cache.get(str(current_seq)),
@@ -4943,6 +4977,16 @@ def run_esmfold2_mcts_hallucination(
             stage="stage_a",
             step=step,
             selected_node_id=int(selected_node.node_id),
+            selected_root_id=root_selection.get("selected_root_id"),
+            root_selection_mode=root_selection.get("selection_mode"),
+            root_selection_phase=root_selection.get("selection_phase"),
+            selected_root_expansions=root_selection.get(
+                "selected_root_expansions"
+            ),
+            root_score=root_selection.get("root_score"),
+            root_expansion_counts=root_selection.get(
+                "root_expansion_counts"
+            ),
             selected_sequence=current_seq,
             candidate_count=len(round_results),
             expanded_child_count=len(new_nodes),
@@ -5021,6 +5065,11 @@ def run_esmfold2_mcts_hallucination(
                 "soft_steps_per_expansion": stagea_soft_step_count,
                 "soft_anchor_margin": stagea_soft_anchor_margin,
                 "tree_children": stagea_tree_children,
+            },
+            stagea_root_selection={
+                "mode": stagea_root_selection_mode,
+                "min_root_expansions": stagea_min_root_expansions,
+                "root_expansion_counts": tree.root_expansion_counts,
             },
             **hotspot_summary,
         )
@@ -5623,6 +5672,11 @@ def run_esmfold2_mcts_hallucination(
             "soft_steps_per_expansion": stagea_soft_step_count,
             "soft_anchor_margin": stagea_soft_anchor_margin,
             "tree_children": stagea_tree_children,
+        },
+        stagea_root_selection={
+            "mode": stagea_root_selection_mode,
+            "min_root_expansions": stagea_min_root_expansions,
+            "root_expansion_counts": tree.root_expansion_counts,
         },
         stageb_shared_verifier_seed=(
             stageb_shared_verify_seed if stageb_paired_verifier_seed else None

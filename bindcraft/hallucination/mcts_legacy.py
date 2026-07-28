@@ -20,6 +20,8 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+LEGACY_SELECTION_MODES = frozenset({"global_ucb", "hierarchical_ucb"})
+
 
 @dataclass
 class LegacyMCTSNode:
@@ -63,14 +65,26 @@ class LegacyMCTSTree:
         C: float = 1.0,
         max_nodes: int = 5000,
         mcts_tau: float = 4.0,
+        selection_mode: str = "global_ucb",
+        min_root_expansions: int = 0,
     ):
         self.C = C
         self.max_nodes = max_nodes
         self.mcts_tau = mcts_tau
+        normalized_mode = str(selection_mode).strip().lower()
+        if normalized_mode not in LEGACY_SELECTION_MODES:
+            raise ValueError(
+                "selection_mode must be one of: "
+                + ", ".join(sorted(LEGACY_SELECTION_MODES))
+            )
+        self.selection_mode = normalized_mode
+        self.min_root_expansions = max(int(min_root_expansions), 0)
 
         self._nodes: Dict[int, LegacyMCTSNode] = {}
         self._next_id: int = 0
         self._roots: List[LegacyMCTSNode] = []
+        self._root_expansion_counts: Dict[int, int] = {}
+        self._last_selection: Dict[str, Any] = {}
         self.N_total: int = 0
 
     def _new_id(self) -> int:
@@ -103,6 +117,7 @@ class LegacyMCTSTree:
         )
         self._register_node(node)
         self._roots.append(node)
+        self._root_expansion_counts[node.node_id] = 0
         self.N_total += 1
         logger.debug(
             "[LegacyMCTS] Root added: id=%d seq=%s L=%.4f N_total=%d",
@@ -129,13 +144,121 @@ class LegacyMCTSTree:
         exploitation = -node.W / node.visit_count
         return exploitation + exploration
 
+    @staticmethod
+    def root_for_node(node: LegacyMCTSNode) -> LegacyMCTSNode:
+        root = node
+        while root.parent is not None:
+            root = root.parent
+        return root
+
+    @property
+    def root_expansion_counts(self) -> Dict[int, int]:
+        return dict(self._root_expansion_counts)
+
+    @property
+    def last_selection(self) -> Dict[str, Any]:
+        return dict(self._last_selection)
+
+    def root_ucb_score(self, root: LegacyMCTSNode) -> float:
+        if all(candidate is not root for candidate in self._roots):
+            raise ValueError("root_ucb_score requires a registered root node")
+        expansion_count = self._root_expansion_counts.get(root.node_id, 0)
+        if expansion_count == 0:
+            return float("inf")
+        total_expansions = max(sum(self._root_expansion_counts.values()), 1)
+        exploitation = -root.W / max(root.visit_count, 1)
+        exploration = self.C * math.sqrt(
+            math.log1p(total_expansions) / expansion_count
+        )
+        return exploitation + exploration
+
+    def _select_hierarchical_root(
+        self,
+    ) -> tuple[LegacyMCTSNode, str, Optional[float]]:
+        under_warmup = [
+            root
+            for root in self._roots
+            if self._root_expansion_counts.get(root.node_id, 0)
+            < self.min_root_expansions
+        ]
+        if under_warmup:
+            min_count = min(
+                self._root_expansion_counts.get(root.node_id, 0)
+                for root in under_warmup
+            )
+            root = min(
+                (
+                    candidate
+                    for candidate in under_warmup
+                    if self._root_expansion_counts.get(candidate.node_id, 0)
+                    == min_count
+                ),
+                key=lambda candidate: (candidate.L_real, candidate.node_id),
+            )
+            return root, "root_warmup", None
+
+        root = max(
+            self._roots,
+            key=lambda candidate: (
+                self.root_ucb_score(candidate),
+                -candidate.node_id,
+            ),
+        )
+        return root, "root_ucb", self.root_ucb_score(root)
+
+    def _record_selection(
+        self,
+        node: LegacyMCTSNode,
+        *,
+        phase: str,
+        root_score: Optional[float],
+    ) -> None:
+        root = self.root_for_node(node)
+        self._root_expansion_counts[root.node_id] = (
+            self._root_expansion_counts.get(root.node_id, 0) + 1
+        )
+        self._last_selection = {
+            "selection_mode": self.selection_mode,
+            "selection_phase": phase,
+            "selected_root_id": root.node_id,
+            "selected_node_id": node.node_id,
+            "selected_root_expansions": self._root_expansion_counts[root.node_id],
+            "root_score": root_score,
+            "root_expansion_counts": self.root_expansion_counts,
+        }
+
     def select(self) -> LegacyMCTSNode:
         if not self._nodes:
             raise RuntimeError("[LegacyMCTS] Tree is empty, cannot select")
 
-        best_node = max(self._nodes.values(), key=self.ucb_score)
+        if self.selection_mode == "hierarchical_ucb":
+            selected_root, phase, root_score = self._select_hierarchical_root()
+            root_nodes = [
+                node
+                for node in self._nodes.values()
+                if self.root_for_node(node) is selected_root
+            ]
+            best_node = max(
+                root_nodes,
+                key=lambda node: (self.ucb_score(node), -node.node_id),
+            )
+            self._record_selection(
+                best_node,
+                phase=phase,
+                root_score=root_score,
+            )
+        else:
+            best_node = max(self._nodes.values(), key=self.ucb_score)
+            self._record_selection(
+                best_node,
+                phase="global_ucb",
+                root_score=None,
+            )
         logger.debug(
-            "[LegacyMCTS] Selected: id=%d depth=%d seq=%s L=%.4f W=%.4f V=%d UCB=%.4f",
+            "[LegacyMCTS] Selected: mode=%s root=%d id=%d depth=%d "
+            "seq=%s L=%.4f W=%.4f V=%d UCB=%.4f root_count=%d",
+            self.selection_mode,
+            self._last_selection["selected_root_id"],
             best_node.node_id,
             best_node.depth,
             best_node.sequence[:20],
@@ -143,6 +266,7 @@ class LegacyMCTSTree:
             best_node.W,
             best_node.visit_count,
             self.ucb_score(best_node),
+            self._last_selection["selected_root_expansions"],
         )
         return best_node
 
@@ -278,6 +402,9 @@ class LegacyMCTSTree:
             "max_depth": max(depths) if depths else 0,
             "C": self.C,
             "max_nodes": self.max_nodes,
+            "selection_mode": self.selection_mode,
+            "min_root_expansions": self.min_root_expansions,
+            "root_expansion_counts": self.root_expansion_counts,
         }
 
     def log_tree_summary(self) -> None:

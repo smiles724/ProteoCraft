@@ -71,6 +71,76 @@ class TestLegacyMCTSBootstrap:
         assert tree.N_total == 3
         assert tree.get_global_best().sequence == "AAAC"
 
+    def test_hierarchical_root_warmup_expands_each_root_twice(self):
+        tree = LegacyMCTSTree(
+            C=1.0,
+            max_nodes=50,
+            selection_mode="hierarchical_ucb",
+            min_root_expansions=2,
+        )
+        roots = [
+            tree.add_root_node(
+                sequence=f"ROOT{index}",
+                logits=torch.zeros(5, 20),
+                L_real=float(index + 1),
+            )
+            for index in range(3)
+        ]
+
+        selected_root_ids = []
+        for step in range(6):
+            selected = tree.select()
+            selected_root_ids.append(tree.root_for_node(selected).node_id)
+            loss = float(step + 1) / 10.0
+            tree.expand(selected, [_result(f"CHILD{step}", loss)])
+            tree.backpropagate(selected, [loss])
+
+        expected_order = [root.node_id for root in roots] * 2
+        assert selected_root_ids == expected_order
+        assert tree.root_expansion_counts == {
+            root.node_id: 2 for root in roots
+        }
+        assert tree.last_selection["selection_phase"] == "root_warmup"
+
+    def test_hierarchical_selection_stays_inside_selected_root_subtree(self):
+        tree = LegacyMCTSTree(
+            C=0.5,
+            max_nodes=50,
+            selection_mode="hierarchical_ucb",
+            min_root_expansions=1,
+        )
+        roots = [
+            tree.add_root_node(
+                sequence=f"ROOT{index}",
+                logits=torch.zeros(5, 20),
+                L_real=float(index + 1),
+            )
+            for index in range(2)
+        ]
+
+        for step in range(2):
+            selected = tree.select()
+            loss = 0.1 + step
+            tree.expand(selected, [_result(f"CHILD{step}", loss)])
+            tree.backpropagate(selected, [loss])
+
+        selected = tree.select()
+        selected_root = tree.root_for_node(selected)
+
+        assert selected_root.node_id == tree.last_selection["selected_root_id"]
+        assert selected in [
+            node
+            for node in tree._nodes.values()
+            if tree.root_for_node(node) is selected_root
+        ]
+        assert set(tree.root_expansion_counts) == {
+            root.node_id for root in roots
+        }
+
+    def test_invalid_legacy_selection_mode_is_rejected(self):
+        with pytest.raises(ValueError, match="selection_mode"):
+            LegacyMCTSTree(selection_mode="not-a-mode")
+
     def test_legacy_mutation_proposal_keeps_plain_sequence_api(self):
         torch.manual_seed(0)
         grad = torch.zeros(4, 20)

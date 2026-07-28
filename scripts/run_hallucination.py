@@ -497,6 +497,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--esmfold2_stagea_root_selection_mode",
+        type=str,
+        choices=["global_ucb", "hierarchical_ucb"],
+        default="global_ucb",
+        help=(
+            "ESMFold2 Stage A root/node 选择方式；global_ucb 保留原全树 UCB，"
+            "hierarchical_ucb 先选 root 再在其子树内选 node"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_min_root_expansions",
+        type=int,
+        default=0,
+        help=(
+            "hierarchical_ucb 下每个 Phase0 root 在自适应选择前至少获得的 "
+            "outer-step 扩展次数（默认 0，旧行为不受影响）"
+        ),
+    )
+    parser.add_argument(
         "--esmfold2_stagea_preserve_soft_state",
         type=lambda x: x.lower() == "true",
         default=True,
@@ -1014,6 +1033,11 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
+        if args.esmfold2_stagea_min_root_expansions < 0:
+            message = "--esmfold2_stagea_min_root_expansions must be non-negative"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
         if args.esmfold2_stagea_annealing_horizon <= 0:
             message = "--esmfold2_stagea_annealing_horizon must be positive"
             if parser is not None:
@@ -1490,6 +1514,12 @@ def main():
                 esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
                 esmfold2_stagea_soft_steps=args.esmfold2_stagea_soft_steps,
                 esmfold2_stagea_tree_children=args.esmfold2_stagea_tree_children,
+                esmfold2_stagea_root_selection_mode=(
+                    args.esmfold2_stagea_root_selection_mode
+                ),
+                esmfold2_stagea_min_root_expansions=(
+                    args.esmfold2_stagea_min_root_expansions
+                ),
                 esmfold2_stagea_preserve_soft_state=args.esmfold2_stagea_preserve_soft_state,
                 esmfold2_stagea_cumulative_annealing=args.esmfold2_stagea_cumulative_annealing,
                 esmfold2_stagea_annealing_horizon=args.esmfold2_stagea_annealing_horizon,
