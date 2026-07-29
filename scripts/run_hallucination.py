@@ -43,6 +43,11 @@ sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, PROJECT_ROOT)
 
 from bindcraft.hallucination.reproducibility import set_global_seed
+from bindcraft.hallucination.profile_loader import (
+    LaunchProfileError,
+    apply_launch_profile,
+    available_launch_profiles,
+)
 from bindcraft.utils import LOSS_WEIGHT_PRESETS
 
 
@@ -445,6 +450,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="BindCraft v2 — Hallucination Pipeline")
 
     # === 基础参数 ===
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        help=(
+            "可选启动 profile 名称或 YAML 路径；显式 CLI 参数优先。"
+            "内置 profile: "
+            + ", ".join(available_launch_profiles())
+        ),
+    )
     parser.add_argument("--target", type=str, required=True,
                        help="Target 序列（单字母氨基酸序列）")
     parser.add_argument("--mode", type=str, default="first_order",
@@ -1169,9 +1184,36 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
     return backend
 
 
-def main():
+def parse_args_with_profile(argv=None):
+    """Parse CLI arguments after applying an optional launch profile."""
+
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    profile_parser = argparse.ArgumentParser(add_help=False)
+    profile_parser.add_argument("--profile", type=str, default=None)
+    profile_args, _ = profile_parser.parse_known_args(raw_argv)
+
     parser = build_arg_parser()
-    args = parser.parse_args()
+    profile_path = None
+    profile_name = None
+    if profile_args.profile:
+        try:
+            profile_path, profile_name, _ = apply_launch_profile(
+                parser,
+                profile_args.profile,
+            )
+        except LaunchProfileError as exc:
+            parser.error(str(exc))
+
+    args = parser.parse_args(raw_argv)
+    args.launch_profile_name = profile_name
+    args.launch_profile_path = (
+        None if profile_path is None else str(profile_path)
+    )
+    return args, parser
+
+
+def main(argv=None):
+    args, parser = parse_args_with_profile(argv)
     model_backend = resolve_model_backend(args, parser)
 
     if args.init_binder_seq is not None:
@@ -1331,6 +1373,12 @@ def main():
 
     setup_logging(args.log_file, level=args.log_level)
     os.makedirs(args.output_dir, exist_ok=True)
+    if args.launch_profile_path:
+        logging.info(
+            "Launch profile loaded: name=%s path=%s",
+            args.launch_profile_name,
+            args.launch_profile_path,
+        )
     set_global_seed(args.seed)
     logging.info("Random seed fixed to %s", args.seed)
     if hotspot_params is not None:
@@ -1638,6 +1686,14 @@ def main():
         f.write(f"Target: {args.target}\n")
         f.write(f"Binder Length: {args.binder_length}\n")
         f.write(f"Mode: {args.mode}\n")
+        f.write(
+            "Launch Profile: "
+            f"{args.launch_profile_name or 'NONE'}\n"
+        )
+        f.write(
+            "Launch Profile Path: "
+            f"{args.launch_profile_path or 'NONE'}\n"
+        )
         f.write(f"Model Backend: {model_backend}\n")
         f.write(f"Model Name: {args.model_name if model_backend == 'protenix' else args.esmfold2_verifier_model}\n")
         if model_backend == "esmfold2":
