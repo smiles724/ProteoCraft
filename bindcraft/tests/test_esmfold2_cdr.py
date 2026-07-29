@@ -100,7 +100,10 @@ def test_cdr_launcher_forwards_one_step_diffusion_options(tmp_path):
     command = build_hallucination_command(
         case,
         {
+            "launch_profile": "esmfold2_d",
             "esmfold2_one_step_diffusion": True,
+            "esmfold2_stagea_root_selection_mode": "hierarchical_ucb",
+            "esmfold2_stagea_min_root_expansions": 2,
             "esmfold2_stagea_cumulative_annealing": False,
             "esmfold2_one_step_diffusion_tau": 2.0,
             "esmfold2_one_step_diffusion_weight": 0.5,
@@ -116,7 +119,10 @@ def test_cdr_launcher_forwards_one_step_diffusion_options(tmp_path):
     )
     options = dict(zip(command[::2], command[1::2]))
 
+    assert options["--profile"] == "esmfold2_d"
     assert options["--esmfold2_one_step_diffusion"] == "true"
+    assert options["--esmfold2_stagea_root_selection_mode"] == "hierarchical_ucb"
+    assert options["--esmfold2_stagea_min_root_expansions"] == "2"
     assert options["--esmfold2_stagea_cumulative_annealing"] == "false"
     assert options["--esmfold2_one_step_diffusion_tau"] == "2.0"
     assert options["--esmfold2_one_step_diffusion_weight"] == "0.5"

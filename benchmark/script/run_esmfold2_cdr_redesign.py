@@ -97,34 +97,42 @@ def build_hallucination_command(
     command = [
         sys.executable,
         str(PROJECT_ROOT / "scripts" / "run_hallucination.py"),
-        "--model_backend",
-        "esmfold2",
-        "--mode",
-        "mcts",
-        "--esmfold2_task_type",
-        "cdr_redesign",
-        "--target",
-        case.target_sequence_argument,
-        "--esmfold2_target_chain_roles",
-        case.target_chain_roles_argument,
-        "--binder_length",
-        str(len(case.binder_sequence)),
-        "--init_binder_seq",
-        case.binder_sequence,
-        "--esmfold2_mutable_mask",
-        case.mutable_mask_argument,
-        "--output_dir",
-        str(case_dir),
-        "--esmfold2_artifact_dir",
-        str(case_dir / "esmfold2_artifacts"),
-        "--save_checkpoint_dir",
-        str(case_dir / "checkpoints"),
-        "--log_file",
-        str(case_dir / "run.log"),
     ]
+    launch_profile = config.get("launch_profile")
+    if launch_profile:
+        command.extend(("--profile", str(launch_profile)))
+    command.extend(
+        [
+            "--model_backend",
+            "esmfold2",
+            "--mode",
+            "mcts",
+            "--esmfold2_task_type",
+            "cdr_redesign",
+            "--target",
+            case.target_sequence_argument,
+            "--esmfold2_target_chain_roles",
+            case.target_chain_roles_argument,
+            "--binder_length",
+            str(len(case.binder_sequence)),
+            "--init_binder_seq",
+            case.binder_sequence,
+            "--esmfold2_mutable_mask",
+            case.mutable_mask_argument,
+            "--output_dir",
+            str(case_dir),
+            "--esmfold2_artifact_dir",
+            str(case_dir / "esmfold2_artifacts"),
+            "--save_checkpoint_dir",
+            str(case_dir / "checkpoints"),
+            "--log_file",
+            str(case_dir / "run.log"),
+        ]
+    )
     option_map = {
         "device": "device",
         "n_steps": "n_steps",
+        "learning_rate": "learning_rate",
         "seed": "seed",
         "k_top": "k_top",
         "b_candidates": "b_candidates",
@@ -137,8 +145,22 @@ def build_hallucination_command(
         "mcts_bootstrap_steps": "mcts_bootstrap_steps",
         "mcts_bootstrap_max_steps": "mcts_bootstrap_max_steps",
         "mcts_expand_actions_per_step": "mcts_expand_actions_per_step",
+        "mcts_prior_mode": "mcts_prior_mode",
         "esmfold2_stagea_soft_steps": "esmfold2_stagea_soft_steps",
+        "esmfold2_stagea_tree_children": "esmfold2_stagea_tree_children",
+        "esmfold2_stagea_root_selection_mode": (
+            "esmfold2_stagea_root_selection_mode"
+        ),
+        "esmfold2_stagea_min_root_expansions": (
+            "esmfold2_stagea_min_root_expansions"
+        ),
+        "esmfold2_stagea_preserve_soft_state": (
+            "esmfold2_stagea_preserve_soft_state"
+        ),
         "esmfold2_stagea_cumulative_annealing": "esmfold2_stagea_cumulative_annealing",
+        "esmfold2_stagea_paired_verifier_seed": (
+            "esmfold2_stagea_paired_verifier_seed"
+        ),
         "esmfold2_stageb_soft_steps": "esmfold2_stageb_soft_steps",
         "esmfold2_experimental_model": "esmfold2_experimental_model",
         "esmfold2_verifier_model": "esmfold2_verifier_model",
@@ -161,7 +183,29 @@ def build_hallucination_command(
         "esmfold2_lambda_esmc": "esmfold2_lambda_esmc",
         "esmfold2_logit_init_mode": "esmfold2_logit_init_mode",
         "esmfold2_initial_logits_checkpoint": "esmfold2_initial_logits_checkpoint",
+        "esmfold2_track_proposal_confidence": (
+            "esmfold2_track_proposal_confidence"
+        ),
+        "esmfold2_final_polish": "esmfold2_final_polish",
         "esmfold2_stagea_handoff_checkpoint_interval": "esmfold2_stagea_handoff_checkpoint_interval",
+        "esmfold2_hotspot_cutoff": "esmfold2_hotspot_cutoff",
+        "esmfold2_hotspot_satisfied_proposal_weight": (
+            "esmfold2_hotspot_satisfied_proposal_weight"
+        ),
+        "esmfold2_hotspot_interface_mode": "esmfold2_hotspot_interface_mode",
+        "esmfold2_hotspot_verify_weight": "esmfold2_hotspot_verify_weight",
+        "esmfold2_hotspot_verify_near_cutoff": (
+            "esmfold2_hotspot_verify_near_cutoff"
+        ),
+        "esmfold2_hotspot_verify_far_cutoff": (
+            "esmfold2_hotspot_verify_far_cutoff"
+        ),
+        "esmfold2_hotspot_verify_min_distance": (
+            "esmfold2_hotspot_verify_min_distance"
+        ),
+        "esmfold2_hotspot_verify_too_close_weight": (
+            "esmfold2_hotspot_verify_too_close_weight"
+        ),
         "checkpoint_save_policy": "checkpoint_save_policy",
     }
     for config_key, cli_name in option_map.items():
@@ -197,6 +241,7 @@ def write_case_record(
     provenance = {
         "model_backend": "esmfold2",
         "task_type": "cdr_redesign",
+        "launch_profile": config.get("launch_profile"),
         "structure_condition": "sequence_only",
         "template_path": case.template_path,
         "template_usage": "recorded_only_not_consumed_by_esmfold2",
