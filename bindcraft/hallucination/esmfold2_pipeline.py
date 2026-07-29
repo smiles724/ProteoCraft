@@ -125,9 +125,11 @@ class _ESMArtifactRecorder(_NoopArtifactRecorder):
         artifact_dir: Union[str, os.PathLike[str]],
         *,
         append: bool = False,
+        save_verified_candidate_cif: bool = False,
     ) -> None:
         self.artifact_dir = Path(artifact_dir)
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
+        self.save_verified_candidate_cif = bool(save_verified_candidate_cif)
         self.trajectory_path = self.artifact_dir / "trajectory.jsonl"
         self.candidates_path = self.artifact_dir / "candidates.jsonl"
         self.nodes_path = self.artifact_dir / "mcts_nodes.jsonl"
@@ -155,7 +157,37 @@ class _ESMArtifactRecorder(_NoopArtifactRecorder):
         self._append_jsonl(self.trajectory_path, event)
 
     def write_candidate(self, **event: Any) -> None:
-        self._append_jsonl(self.candidates_path, event)
+        payload = dict(event)
+        mmcif = payload.pop("_mmcif", None)
+        if self.save_verified_candidate_cif:
+            structure_status = "missing_mmcif"
+            if isinstance(mmcif, str) and mmcif.strip():
+                sequence = str(payload.get("sequence", ""))
+                sequence_hash = hashlib.sha256(
+                    sequence.encode("utf-8")
+                ).hexdigest()[:16]
+                structure_hash = hashlib.sha256(
+                    mmcif.encode("utf-8")
+                ).hexdigest()
+                structure_dir = (
+                    self.artifact_dir / "verified_candidate_cif"
+                )
+                structure_dir.mkdir(parents=True, exist_ok=True)
+                structure_name = (
+                    f"{sequence_hash}_{structure_hash[:16]}.cif"
+                )
+                structure_path = structure_dir / structure_name
+                if not structure_path.exists():
+                    temporary_path = structure_path.with_suffix(".cif.tmp")
+                    temporary_path.write_text(mmcif, encoding="utf-8")
+                    temporary_path.replace(structure_path)
+                payload["structure_cif"] = str(
+                    structure_path.relative_to(self.artifact_dir)
+                )
+                payload["structure_sha256"] = structure_hash
+                structure_status = "ok"
+            payload["structure_status"] = structure_status
+        self._append_jsonl(self.candidates_path, payload)
 
     def write_mcts_node(self, **event: Any) -> None:
         self._append_jsonl(self.nodes_path, event)
@@ -319,10 +351,15 @@ def _make_artifact_recorder(
     artifact_dir: Optional[Union[str, os.PathLike[str]]],
     *,
     append: bool = False,
+    save_verified_candidate_cif: bool = False,
 ) -> _NoopArtifactRecorder:
     if artifact_dir is None:
         return _NoopArtifactRecorder()
-    return _ESMArtifactRecorder(artifact_dir, append=append)
+    return _ESMArtifactRecorder(
+        artifact_dir,
+        append=append,
+        save_verified_candidate_cif=save_verified_candidate_cif,
+    )
 
 
 def _json_ready(value: Any) -> Any:
@@ -410,6 +447,9 @@ def _write_candidate_artifact(
         total_loss=float(result.total_loss),
         loss_dict=_loss_dict_for_artifact(result),
         summary_confidence=_summary_for_artifact(result),
+        _mmcif=dict(
+            getattr(result, "summary_confidence", {}) or {}
+        ).get("mmcif"),
     )
 
 
@@ -1767,6 +1807,7 @@ def run_esmfold2_best_of_n(
     mutable_mask: Optional[Sequence[bool]] = None,
     hotspot_params: Optional[Dict[str, Any]] = None,
     artifact_dir: Optional[Union[str, os.PathLike[str]]] = None,
+    save_verified_candidate_cif: bool = False,
     esmfold2_initial_logits_checkpoint: Optional[
         Union[str, os.PathLike[str]]
     ] = None,
@@ -1888,6 +1929,7 @@ def run_esmfold2_best_of_n(
     artifact_recorder = _make_artifact_recorder(
         artifact_dir,
         append=bool(resume and contract_exists),
+        save_verified_candidate_cif=save_verified_candidate_cif,
     )
     verifier_cache: Dict[str, Any] = {}
     trajectory_summaries: List[Dict[str, Any]] = []
@@ -2292,6 +2334,7 @@ def run_esmfold2_chunked_best_of_n(
     mutable_mask: Optional[Sequence[bool]] = None,
     hotspot_params: Optional[Dict[str, Any]] = None,
     artifact_dir: Optional[Union[str, os.PathLike[str]]] = None,
+    save_verified_candidate_cif: bool = False,
     esmfold2_initial_logits_checkpoint: Optional[
         Union[str, os.PathLike[str]]
     ] = None,
@@ -2557,6 +2600,7 @@ def run_esmfold2_chunked_best_of_n(
     artifact_recorder = _make_artifact_recorder(
         artifact_dir,
         append=bool(resume and contract_exists),
+        save_verified_candidate_cif=save_verified_candidate_cif,
     )
     verifier_cache: Dict[str, Any] = {}
     trajectory_summaries: List[Dict[str, Any]] = []
@@ -3732,6 +3776,7 @@ def run_esmfold2_mcts_hallucination(
     mutable_mask: Optional[Sequence[bool]] = None,
     hotspot_params: Optional[Dict[str, Any]] = None,
     artifact_dir: Optional[Union[str, os.PathLike[str]]] = None,
+    save_verified_candidate_cif: bool = False,
     esmfold2_logit_init_mode: str = "legacy_anchor",
     esmfold2_stagea_soft_steps: Optional[int] = None,
     esmfold2_stagea_tree_children: int = 2,
@@ -3999,7 +4044,10 @@ def run_esmfold2_mcts_hallucination(
         raise ValueError(
             "esmfold2_resume_reverify_roots requires a StageA handoff checkpoint"
         )
-    artifact_recorder = _make_artifact_recorder(artifact_dir)
+    artifact_recorder = _make_artifact_recorder(
+        artifact_dir,
+        save_verified_candidate_cif=save_verified_candidate_cif,
+    )
 
     tree = LegacyMCTSTree(
         C=mcts_C,

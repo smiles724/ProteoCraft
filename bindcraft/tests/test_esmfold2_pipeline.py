@@ -2528,6 +2528,7 @@ def test_esmfold2_pipeline_writes_structured_step_artifacts(tmp_path):
         mcts_bootstrap_max_steps=1,
         mcts_expand_actions_per_step=1,
         artifact_dir=artifact_dir,
+        save_verified_candidate_cif=True,
     )
 
     assert best_seq == final_seq == "AYY"
@@ -2566,6 +2567,14 @@ def test_esmfold2_pipeline_writes_structured_step_artifacts(tmp_path):
     assert soft_steps == []
     assert any(event["stage"] == "stage_b" and event["sequence"] == "AYY" for event in candidates)
     assert candidates[-1]["loss_dict"]["total"] == pytest.approx(0.10)
+    assert all(event["structure_status"] == "ok" for event in candidates)
+    assert all(
+        (artifact_dir / event["structure_cif"]).is_file()
+        for event in candidates
+    )
+    assert not list(
+        (artifact_dir / "verified_candidate_cif").glob("*.pdb")
+    )
     assert any(node["stage"] == "stage_a" and node["parent_node_id"] is None for node in nodes)
     assert any(node["stage"] == "stage_b" and node["sequence"] == "AYY" for node in nodes)
     assert any(edge["stage"] == "stage_a" and edge["edits"] for edge in edges)

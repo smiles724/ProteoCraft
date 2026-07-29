@@ -708,6 +708,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--esmfold2_artifact_dir", type=str, default=None,
                        help="ESMFold2 每步结构化记录目录；默认写入 output_dir/esmfold2_artifacts")
+    parser.add_argument(
+        "--esmfold2_save_verified_candidate_cif",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help=(
+            "是否为每个 ESMFold2 full-verifier 候选保存 mmCIF；"
+            "默认 false，不生成 PDB"
+        ),
+    )
     parser.add_argument("--esmfold2_stagea_handoff_checkpoint_interval", type=int, default=10,
                        help="Stage A handoff checkpoint 保存间隔；默认每 10 step，0 表示仅保存最终 handoff")
     parser.add_argument("--esmfold2_resume_handoff_checkpoint", type=str, default=None,
@@ -1481,6 +1490,9 @@ def main(argv=None):
                 mutable_mask=esmfold2_mutable_mask,
                 hotspot_params=hotspot_params,
                 artifact_dir=esmfold2_artifact_dir,
+                save_verified_candidate_cif=(
+                    args.esmfold2_save_verified_candidate_cif
+                ),
                 esmfold2_initial_logits_checkpoint=(
                     args.esmfold2_initial_logits_checkpoint
                 ),
@@ -1504,6 +1516,9 @@ def main(argv=None):
                     mutable_mask=esmfold2_mutable_mask,
                     hotspot_params=hotspot_params,
                     artifact_dir=esmfold2_artifact_dir,
+                    save_verified_candidate_cif=(
+                        args.esmfold2_save_verified_candidate_cif
+                    ),
                     esmfold2_initial_logits_checkpoint=(
                         args.esmfold2_initial_logits_checkpoint
                     ),
@@ -1559,6 +1574,9 @@ def main(argv=None):
                 mutable_mask=esmfold2_mutable_mask,
                 hotspot_params=hotspot_params,
                 artifact_dir=esmfold2_artifact_dir,
+                save_verified_candidate_cif=(
+                    args.esmfold2_save_verified_candidate_cif
+                ),
                 esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
                 esmfold2_stagea_soft_steps=args.esmfold2_stagea_soft_steps,
                 esmfold2_stagea_tree_children=args.esmfold2_stagea_tree_children,

@@ -55,6 +55,7 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.stageb_max_mutations_per_seq == 1
     assert args.esmfold2_logit_init_mode == "official_exact"
     assert args.esmfold2_initial_logits_checkpoint is None
+    assert args.esmfold2_save_verified_candidate_cif is False
     assert args.esmfold2_proposal_load_internal_esmc is True
     assert args.esmfold2_proposal_lm_dropout == pytest.approx(0.5)
     assert args.esmfold2_force_proposal_lm_dropout is True
@@ -548,6 +549,7 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     assert captured["esmfold2_initial_logits_checkpoint"] == str(
         tmp_path / "initial_logits.pt"
     )
+    assert captured["save_verified_candidate_cif"] is False
     assert captured["esmfold2_stagea_soft_steps"] == 30
     assert captured["esmfold2_stagea_tree_children"] == 2
     assert captured["esmfold2_stagea_root_selection_mode"] == "hierarchical_ucb"
