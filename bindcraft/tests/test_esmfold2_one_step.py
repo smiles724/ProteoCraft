@@ -23,6 +23,29 @@ def _features() -> dict[str, torch.Tensor]:
     }
 
 
+def _three_chain_features() -> dict[str, torch.Tensor]:
+    return {
+        "token_attention_mask": torch.ones(1, 4, dtype=torch.bool),
+        "asym_id": torch.tensor([[0, 1, 2, 2]]),
+        "atom_attention_mask": torch.ones(1, 4, dtype=torch.bool),
+        "atom_to_token": torch.tensor([[0, 1, 2, 3]]),
+        "distogram_atom_idx": torch.tensor([[0, 1, 2, 3]]),
+        "residue_index": torch.tensor([[0, 0, 0, 1]]),
+    }
+
+
+def _context_uncertain_pae_logits() -> torch.Tensor:
+    logits = torch.full((1, 4, 4, 64), -20.0)
+    logits[..., 0] = 20.0
+    with torch.no_grad():
+        for binder_index in (2, 3):
+            logits[0, binder_index, 1, :] = -20.0
+            logits[0, binder_index, 1, 63] = 20.0
+            logits[0, 1, binder_index, :] = -20.0
+            logits[0, 1, binder_index, 63] = 20.0
+    return logits.requires_grad_(True)
+
+
 def test_common_loss_weights_match_protenix_subset_without_pde():
     assert set(ESMFOLD2_COMMON_LOSS_WEIGHTS) == {
         "plddt",
@@ -191,6 +214,68 @@ def test_common_losses_respect_binder_mutable_mask():
     assert coordinates.grad is not None
 
 
+def test_tcr_common_pae_excludes_non_target_context_chain():
+    weights = {name: 0.0 for name in ESMFOLD2_COMMON_LOSS_WEIGHTS}
+    weights["pae"] = 1.0
+    common = {
+        "coordinates": torch.zeros(1, 4, 3),
+        "plddt_logits": torch.zeros(1, 4, 50),
+        "distogram_logits": torch.zeros(1, 4, 4, 128),
+        "features": _three_chain_features(),
+        "binder_length": 2,
+        "target_chain_roles": ("target", "scaffold"),
+        "weights": weights,
+    }
+
+    tcr_total, tcr_losses = compute_esmfold2_common_losses(
+        **common,
+        pae_logits=_context_uncertain_pae_logits(),
+        task_type="tcr",
+    )
+    cdr_total, cdr_losses = compute_esmfold2_common_losses(
+        **common,
+        pae_logits=_context_uncertain_pae_logits(),
+        task_type="cdr_redesign",
+    )
+    legacy_total, legacy_losses = compute_esmfold2_common_losses(
+        **common,
+        pae_logits=_context_uncertain_pae_logits(),
+    )
+
+    assert tcr_losses["pae"] < cdr_losses["pae"]
+    assert tcr_total.item() < 0.05
+    assert cdr_total.item() > 0.25
+    assert cdr_total.item() == pytest.approx(legacy_total.item())
+    assert cdr_losses["pae"].item() == pytest.approx(
+        legacy_losses["pae"].item()
+    )
+
+
+def test_denovo_common_pae_preserves_default_behavior():
+    weights = {name: 0.0 for name in ESMFOLD2_COMMON_LOSS_WEIGHTS}
+    weights["pae"] = 1.0
+    common = {
+        "coordinates": torch.zeros(1, 4, 3),
+        "plddt_logits": torch.zeros(1, 4, 50),
+        "pae_logits": torch.randn(1, 4, 4, 64),
+        "distogram_logits": torch.zeros(1, 4, 4, 128),
+        "features": _features(),
+        "binder_length": 2,
+        "weights": weights,
+    }
+
+    default_total, default_losses = compute_esmfold2_common_losses(**common)
+    denovo_total, denovo_losses = compute_esmfold2_common_losses(
+        **common,
+        task_type="denovo",
+    )
+
+    assert denovo_total.item() == pytest.approx(default_total.item())
+    assert denovo_losses["pae"].item() == pytest.approx(
+        default_losses["pae"].item()
+    )
+
+
 def test_common_losses_localize_one_step_ipae_to_hotspot():
     coordinates = torch.randn(1, 4, 3, requires_grad=True)
     plddt_logits = torch.zeros(1, 4, 50, requires_grad=True)
@@ -231,6 +316,103 @@ def test_common_losses_localize_one_step_ipae_to_hotspot():
     total.backward()
     assert pae_logits.grad is not None
     assert torch.isfinite(pae_logits.grad).all()
+
+
+def test_tcr_hotspot_indices_use_all_target_chain_offsets():
+    weights = {name: 0.0 for name in ESMFOLD2_COMMON_LOSS_WEIGHTS}
+    weights["i_pae"] = 1.0
+    common = {
+        "coordinates": torch.zeros(1, 4, 3),
+        "plddt_logits": torch.zeros(1, 4, 50),
+        "pae_logits": torch.zeros(1, 4, 4, 64),
+        "distogram_logits": torch.zeros(1, 4, 4, 128),
+        "features": _three_chain_features(),
+        "binder_length": 2,
+        "task_type": "tcr",
+        "target_chain_roles": ("scaffold", "target"),
+        "weights": weights,
+        "hotspot_weight": 0.5,
+    }
+
+    total, losses = compute_esmfold2_common_losses(
+        **common,
+        hotspot_params={"target_hotspot_concat_indices": [1]},
+    )
+
+    assert torch.isfinite(total)
+    assert torch.isfinite(losses["i_pae_hotspot"])
+    with pytest.raises(ValueError, match="role=target"):
+        compute_esmfold2_common_losses(
+            **common,
+            hotspot_params={"target_hotspot_concat_indices": [0]},
+        )
+
+
+def test_cdr_hotspot_indices_preserve_target_only_mapping():
+    weights = {name: 0.0 for name in ESMFOLD2_COMMON_LOSS_WEIGHTS}
+    weights["i_pae"] = 1.0
+    common = {
+        "coordinates": torch.zeros(1, 4, 3),
+        "plddt_logits": torch.zeros(1, 4, 50),
+        "pae_logits": torch.zeros(1, 4, 4, 64),
+        "distogram_logits": torch.zeros(1, 4, 4, 128),
+        "features": _three_chain_features(),
+        "binder_length": 2,
+        "task_type": "cdr_redesign",
+        "target_chain_roles": ("scaffold", "target"),
+        "weights": weights,
+        "hotspot_weight": 0.5,
+    }
+
+    total, losses = compute_esmfold2_common_losses(
+        **common,
+        hotspot_params={"target_hotspot_concat_indices": [0]},
+    )
+
+    assert torch.isfinite(total)
+    assert torch.isfinite(losses["i_pae_hotspot"])
+    with pytest.raises(ValueError, match="out of range"):
+        compute_esmfold2_common_losses(
+            **common,
+            hotspot_params={"target_hotspot_concat_indices": [1]},
+        )
+
+
+def test_tcr_interface_clash_includes_non_selected_target_chain():
+    weights = {name: 0.0 for name in ESMFOLD2_COMMON_LOSS_WEIGHTS}
+    weights["i_clash"] = 1.0
+    common = {
+        "coordinates": torch.tensor(
+            [
+                [
+                    [100.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [0.5, 0.0, 0.0],
+                    [20.0, 0.0, 0.0],
+                ]
+            ]
+        ),
+        "plddt_logits": torch.zeros(1, 4, 50),
+        "pae_logits": torch.zeros(1, 4, 4, 64),
+        "distogram_logits": torch.zeros(1, 4, 4, 128),
+        "features": _three_chain_features(),
+        "binder_length": 2,
+        "target_chain_roles": ("target", "scaffold"),
+        "weights": weights,
+    }
+
+    tcr_total, tcr_losses = compute_esmfold2_common_losses(
+        **common,
+        task_type="tcr",
+    )
+    cdr_total, cdr_losses = compute_esmfold2_common_losses(
+        **common,
+        task_type="cdr_redesign",
+    )
+
+    assert tcr_losses["i_clash"] > 0.0
+    assert cdr_losses["i_clash"] == pytest.approx(0.0)
+    assert tcr_total > cdr_total
 
 
 def test_common_losses_reject_out_of_range_hotspot():

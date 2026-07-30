@@ -153,6 +153,10 @@ def _normalize_target_roles(
     return normalized
 
 
+def _is_tcr_task(task_type: Optional[str]) -> bool:
+    return str(task_type or "").strip().lower().replace("-", "_") == "tcr"
+
+
 def _token_masks(
     features: Mapping[str, torch.Tensor],
     *,
@@ -183,12 +187,12 @@ def _token_masks(
         n_target_chains=len(chain_ids),
     )
     target_mask = torch.zeros_like(token_mask)
-    external_scaffold_mask = torch.zeros_like(token_mask)
+    target_context_mask = torch.zeros_like(token_mask)
     for chain_id, role in zip(chain_ids, roles):
         if role == "target":
             target_mask |= token_mask & (asym_id == chain_id)
         else:
-            external_scaffold_mask |= token_mask & (asym_id == chain_id)
+            target_context_mask |= token_mask & (asym_id == chain_id)
 
     design_mask = binder_mask.clone()
     if binder_mutable_mask is not None:
@@ -207,13 +211,16 @@ def _token_masks(
             raise ValueError("binder_mutable_mask selects no residues")
 
     binder_scaffold_mask = binder_mask & ~design_mask
-    scaffold_mask = external_scaffold_mask | binder_scaffold_mask
+    scaffold_mask = target_context_mask | binder_scaffold_mask
     return {
         "token": token_mask,
         "asym_id": asym_id,
         "binder": binder_mask,
         "design": design_mask,
         "target": target_mask,
+        "target_context": target_context_mask,
+        "all_target": target_mask | target_context_mask,
+        "binder_scaffold": binder_scaffold_mask,
         "scaffold": scaffold_mask,
     }
 
@@ -221,6 +228,8 @@ def _token_masks(
 def _hotspot_token_mask(
     masks: Mapping[str, torch.Tensor],
     hotspot_params: Optional[Mapping[str, Any]],
+    *,
+    task_type: Optional[str] = None,
 ) -> Optional[torch.Tensor]:
     """Map target-concatenated hotspot indices onto ESMFold2 token indices."""
 
@@ -230,7 +239,13 @@ def _hotspot_token_mask(
     if not concat_indices:
         return None
 
-    target_indices = masks["target"].nonzero(as_tuple=True)[0]
+    # TCR hotspot indices refer to the original alpha+beta concatenation, even
+    # when only one chain has role=target. Other tasks retain the established
+    # target-only indexing contract.
+    hotspot_index_mask = (
+        masks["all_target"] if _is_tcr_task(task_type) else masks["target"]
+    )
+    target_indices = hotspot_index_mask.nonzero(as_tuple=True)[0]
     normalized = [int(index) for index in concat_indices]
     invalid = [
         index
@@ -249,7 +264,16 @@ def _hotspot_token_mask(
         device=target_indices.device,
         dtype=torch.long,
     )
-    hotspot_mask[target_indices[hotspot_indices]] = True
+    hotspot_token_indices = target_indices[hotspot_indices]
+    invalid_roles = hotspot_token_indices[
+        ~masks["target"][hotspot_token_indices]
+    ]
+    if invalid_roles.numel() > 0:
+        raise ValueError(
+            "hotspot target concat indices must belong to a chain with "
+            "role=target"
+        )
+    hotspot_mask[hotspot_token_indices] = True
     return hotspot_mask
 
 
@@ -346,6 +370,7 @@ def compute_esmfold2_common_losses(
     distogram_logits: torch.Tensor,
     features: Mapping[str, torch.Tensor],
     binder_length: int,
+    task_type: Optional[str] = None,
     target_chain_roles: Optional[Sequence[str]] = None,
     binder_mutable_mask: Optional[Sequence[bool]] = None,
     distogram_losses: Optional[Mapping[str, torch.Tensor]] = None,
@@ -368,7 +393,11 @@ def compute_esmfold2_common_losses(
     )
     device = coordinates.device
     masks = {key: value.to(device) for key, value in masks.items()}
-    hotspot_mask = _hotspot_token_mask(masks, hotspot_params)
+    hotspot_mask = _hotspot_token_mask(
+        masks,
+        hotspot_params,
+        task_type=task_type,
+    )
     resolved_hotspot_weight = float(hotspot_weight)
     resolved_hotspot_mode = str(hotspot_interface_mode).strip().lower()
     if resolved_hotspot_weight < 0.0:
@@ -393,6 +422,7 @@ def compute_esmfold2_common_losses(
     design_atom_mask = atom_mask & masks["design"][atom_to_token]
     binder_atom_mask = atom_mask & masks["binder"][atom_to_token]
     target_atom_mask = atom_mask & masks["target"][atom_to_token]
+    all_target_atom_mask = atom_mask & masks["all_target"][atom_to_token]
     scaffold_atom_mask = atom_mask & masks["scaffold"][atom_to_token]
     local_redesign = bool((masks["design"] != masks["binder"]).any().item())
     has_scaffold = bool(masks["scaffold"].any().item())
@@ -407,13 +437,17 @@ def compute_esmfold2_common_losses(
     pae = 0.5 * (pae + pae.transpose(-1, -2))
     design = masks["design"]
     binder = masks["binder"]
+    # In TCR design, the non-selected alpha/beta chain is target context, not
+    # the binder's immutable framework. Keep it in the full structure and clash
+    # masks, but do not ask the binder-internal PAE objective to optimize it.
+    pae_scaffold_mask = (
+        masks["binder_scaffold"]
+        if _is_tcr_task(task_type)
+        else masks["scaffold"]
+    )
     intra_pair_mask = (
-        design.unsqueeze(-1) & design.unsqueeze(-2)
-        if not (local_redesign or has_scaffold)
-        else (
-            (design.unsqueeze(-1) & design.unsqueeze(-2))
-            | (design.unsqueeze(-1) & masks["scaffold"].unsqueeze(-2))
-        )
+        (design.unsqueeze(-1) & design.unsqueeze(-2))
+        | (design.unsqueeze(-1) & pae_scaffold_mask.unsqueeze(-2))
     )
     inter_pair_mask = design.unsqueeze(-1) & masks["target"].unsqueeze(-2)
 
@@ -464,12 +498,29 @@ def compute_esmfold2_common_losses(
         residue_index=residue_index,
     )
 
-    clash_a = design_atom_mask if (local_redesign or has_scaffold) else binder_atom_mask
-    clash_b = (
-        design_atom_mask | scaffold_atom_mask
-        if (local_redesign or has_scaffold)
-        else binder_atom_mask
-    )
+    if _is_tcr_task(task_type):
+        if local_redesign:
+            binder_scaffold_atom_mask = (
+                atom_mask & masks["binder_scaffold"][atom_to_token]
+            )
+            clash_a = design_atom_mask
+            clash_b = design_atom_mask | binder_scaffold_atom_mask
+        else:
+            clash_a = binder_atom_mask
+            clash_b = binder_atom_mask
+        interface_clash_target = all_target_atom_mask
+    else:
+        clash_a = (
+            design_atom_mask
+            if (local_redesign or has_scaffold)
+            else binder_atom_mask
+        )
+        clash_b = (
+            design_atom_mask | scaffold_atom_mask
+            if (local_redesign or has_scaffold)
+            else binder_atom_mask
+        )
+        interface_clash_target = target_atom_mask
     losses["clash"] = compute_soft_clash_loss(
         coords,
         binder_atom_mask,
@@ -484,12 +535,12 @@ def compute_esmfold2_common_losses(
     losses["i_clash"] = compute_soft_clash_loss(
         coords,
         binder_atom_mask,
-        target_atom_mask,
+        interface_clash_target,
         atom_to_token,
         residue_index,
         mode="inter",
         atom_mask_a=design_atom_mask if (local_redesign or has_scaffold) else binder_atom_mask,
-        atom_mask_b=target_atom_mask,
+        atom_mask_b=interface_clash_target,
         detach_b=True,
         exclude_bonded=False,
     )
