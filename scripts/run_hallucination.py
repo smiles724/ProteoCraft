@@ -51,6 +51,29 @@ from bindcraft.hallucination.profile_loader import (
 from bindcraft.utils import LOSS_WEIGHT_PRESETS
 
 
+ESMFOLD2_VERIFIER_DEFAULTS_BY_TASK = {
+    "tcr": (4, 50),
+}
+ESMFOLD2_VERIFIER_DEFAULT = (20, 200)
+
+
+def resolve_esmfold2_verifier_precision_defaults(args):
+    """Apply task-aware verifier defaults while preserving explicit values."""
+
+    task_type = str(args.esmfold2_task_type).strip().lower()
+    default_loops, default_sampling_steps = (
+        ESMFOLD2_VERIFIER_DEFAULTS_BY_TASK.get(
+            task_type,
+            ESMFOLD2_VERIFIER_DEFAULT,
+        )
+    )
+    if args.esmfold2_verifier_num_loops is None:
+        args.esmfold2_verifier_num_loops = default_loops
+    if args.esmfold2_verifier_num_sampling_steps is None:
+        args.esmfold2_verifier_num_sampling_steps = default_sampling_steps
+    return args
+
+
 def setup_logging(log_file: str = None, level: str = "INFO"):
     lvl = getattr(logging, level.upper(), logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -727,10 +750,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help="恢复 handoff 时用当前 verifier 配置重新验证 root；verifier 配置改变时必须启用",
     )
-    parser.add_argument("--esmfold2_verifier_num_loops", type=int, default=20,
-                       help="ESMFold2 verifier full fold loop 数（默认：20；smoke test 可显式调小）")
-    parser.add_argument("--esmfold2_verifier_num_sampling_steps", type=int, default=200,
-                       help="ESMFold2 verifier diffusion sampling steps（默认：200；smoke test 可显式调小）")
+    parser.add_argument(
+        "--esmfold2_verifier_num_loops",
+        type=int,
+        default=None,
+        help=(
+            "ESMFold2 verifier full fold loop 数；"
+            "默认 TCR=4，其他任务=20，可显式覆盖"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_verifier_num_sampling_steps",
+        type=int,
+        default=None,
+        help=(
+            "ESMFold2 verifier diffusion sampling steps；"
+            "默认 TCR=50，其他任务=200，可显式覆盖"
+        ),
+    )
     parser.add_argument("--esmfold2_proposal_num_loops", type=int, default=1,
                        help="ESMFold2 proposal distogram forward loop 数（默认：1）")
     parser.add_argument("--esmfold2_proposal_num_sampling_steps", type=int, default=1,
@@ -1214,6 +1251,7 @@ def parse_args_with_profile(argv=None):
             parser.error(str(exc))
 
     args = parser.parse_args(raw_argv)
+    resolve_esmfold2_verifier_precision_defaults(args)
     args.launch_profile_name = profile_name
     args.launch_profile_path = (
         None if profile_path is None else str(profile_path)

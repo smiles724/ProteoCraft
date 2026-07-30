@@ -97,6 +97,32 @@ def test_explicit_cli_value_overrides_launch_profile():
     assert args.esmfold2_one_step_diffusion_weight == pytest.approx(0.5)
 
 
+def test_tcr_uses_low_precision_verifier_defaults():
+    args = _parse_profile(
+        "esmfold2_d",
+        "--esmfold2_task_type",
+        "tcr",
+    )
+
+    assert args.esmfold2_verifier_num_loops == 4
+    assert args.esmfold2_verifier_num_sampling_steps == 50
+
+
+def test_tcr_explicit_verifier_precision_overrides_task_defaults():
+    args = _parse_profile(
+        "esmfold2_d",
+        "--esmfold2_task_type",
+        "tcr",
+        "--esmfold2_verifier_num_loops",
+        "20",
+        "--esmfold2_verifier_num_sampling_steps",
+        "200",
+    )
+
+    assert args.esmfold2_verifier_num_loops == 20
+    assert args.esmfold2_verifier_num_sampling_steps == 200
+
+
 def test_no_profile_preserves_existing_cli_defaults():
     args, parser = parse_args_with_profile(["--target", "ACDEFG"])
 

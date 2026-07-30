@@ -366,6 +366,35 @@ def test_runtime_hotspot_verifier_combines_full_structure_distance_with_global_l
     assert result.summary_confidence["hotspot_heavy_atom_covered_count_5a"] == 1
 
 
+def test_runtime_tracks_hotspot_geometry_without_adding_hotspot_reward():
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(
+            hotspot_verify_weight=0.0,
+            hotspot_verify_too_close_weight=0.0,
+            hotspot_verify_near_cutoff=5.0,
+            hotspot_verify_far_cutoff=20.0,
+        ),
+        device="cpu",
+        verifier_model=object(),
+        input_builder=FakeGeometryInputBuilder(),
+        protein_input_cls=FakeProteinInput,
+        structure_prediction_input_cls=FakeStructurePredictionInput,
+    )
+
+    result = backend.verify(
+        binder_seq="YYY",
+        target_seq="AAAA",
+        seed=7,
+        hotspot_params={"target_hotspot_concat_indices": [0, 2]},
+    )
+
+    assert result.total_loss == pytest.approx(0.17)
+    assert result.loss_dict["esm_verify_loss"] == pytest.approx(0.17)
+    assert result.loss_dict["hotspot_verify_distance_loss"] == pytest.approx(0.5)
+    assert result.summary_confidence["hotspot_heavy_atom_coverage"] == pytest.approx(0.5)
+    assert result.summary_confidence["hotspot_heavy_atom_covered_count"] == 1
+
+
 def test_runtime_hotspot_verifier_supports_current_molecular_complex_output():
     backend = ESMFold2RuntimeBackend(
         config=ESMFold2ProposalConfig(

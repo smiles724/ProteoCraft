@@ -36,8 +36,6 @@ defaults:
   esmfold2_proposal_lm_dropout: 0.5
   esmfold2_force_proposal_lm_dropout: true
   esmfold2_lambda_esmc: auto
-  esmfold2_verifier_num_loops: 20
-  esmfold2_verifier_num_sampling_steps: 200
   esmfold2_verifier_loss_mode: aligned_common
   esmfold2_one_step_diffusion: true
   esmfold2_one_step_diffusion_tau: 2.0

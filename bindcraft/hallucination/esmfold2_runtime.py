@@ -985,7 +985,15 @@ class ESMFold2RuntimeBackend:
             self.config.hotspot_verify_too_close_weight
         )
         hotspot_metrics: dict[str, Any] = {}
-        if hotspot_verify_weight > 0.0 or hotspot_too_close_weight > 0.0:
+        hotspot_indices = _normalize_target_hotspot_indices(
+            hotspot_params,
+            target_length=sum(len(sequence) for sequence in targets),
+        )
+        if (
+            hotspot_indices
+            or hotspot_verify_weight > 0.0
+            or hotspot_too_close_weight > 0.0
+        ):
             hotspot_metrics = _hotspot_structure_metrics(
                 fold_result.complex,
                 target_sequences=targets,
