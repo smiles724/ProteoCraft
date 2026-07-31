@@ -56,7 +56,7 @@ AUTO_ESMC_LAMBDA_BY_TASK = {
 class ESMFold2ProposalConfig:
     """Configuration for the first ESMFold2 Stage-A proposal backend."""
 
-    experimental_model_name: str = "biohub/ESMFold2-Experimental"
+    experimental_model_name: str = "biohub/ESMFold2-Experimental-Fast"
     verifier_model_name: str = "biohub/ESMFold2"
     verifier_num_loops: int = 20
     verifier_num_sampling_steps: int = 200
@@ -72,11 +72,11 @@ class ESMFold2ProposalConfig:
     proposal_load_internal_esmc: bool = True
     proposal_lm_dropout: Optional[float] = 0.5
     force_proposal_lm_dropout: bool = True
-    one_step_diffusion_enabled: bool = False
-    one_step_diffusion_tau: float = 4.0
-    one_step_diffusion_weight: float = 1.0
-    one_step_diffusion_rg_weight: float = 0.3
-    one_step_diffusion_interval: int = 0
+    one_step_diffusion_enabled: bool = True
+    one_step_diffusion_tau: float = 2.0
+    one_step_diffusion_weight: float = 0.25
+    one_step_diffusion_rg_weight: float = 0.1
+    one_step_diffusion_interval: int = 5
     one_step_diffusion_recycle_coordinates: bool = False
     one_step_diffusion_hotspot_enabled: bool = False
     distogram_hotspot_enabled: bool = True

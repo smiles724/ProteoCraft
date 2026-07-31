@@ -280,7 +280,9 @@ def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     assert default_config.soft_steps == 30
     assert default_config.proposal_lm_dropout == pytest.approx(0.5)
     assert default_config.force_proposal_lm_dropout is True
-    assert default_config.experimental_model_name.endswith("ESMFold2-Experimental")
+    assert default_config.experimental_model_name.endswith(
+        "ESMFold2-Experimental-Fast"
+    )
     assert default_config.hotspot_weight == pytest.approx(0.0)
     assert default_config.hotspot_satisfied_proposal_weight == pytest.approx(0.0)
     assert default_config.hotspot_cutoff == pytest.approx(8.0)
@@ -290,11 +292,11 @@ def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     assert default_config.hotspot_verify_far_cutoff == pytest.approx(20.0)
     assert default_config.hotspot_verify_min_distance == pytest.approx(2.5)
     assert default_config.hotspot_verify_too_close_weight == pytest.approx(0.0)
-    assert default_config.one_step_diffusion_enabled is False
-    assert default_config.one_step_diffusion_tau == pytest.approx(4.0)
-    assert default_config.one_step_diffusion_weight == pytest.approx(1.0)
-    assert default_config.one_step_diffusion_rg_weight == pytest.approx(0.3)
-    assert default_config.one_step_diffusion_interval == 0
+    assert default_config.one_step_diffusion_enabled is True
+    assert default_config.one_step_diffusion_tau == pytest.approx(2.0)
+    assert default_config.one_step_diffusion_weight == pytest.approx(0.25)
+    assert default_config.one_step_diffusion_rg_weight == pytest.approx(0.1)
+    assert default_config.one_step_diffusion_interval == 5
     assert default_config.one_step_diffusion_recycle_coordinates is False
     assert default_config.one_step_diffusion_hotspot_enabled is False
     assert default_config.distogram_hotspot_enabled is True
@@ -354,13 +356,17 @@ def test_proposal_config_validates_one_step_diffusion_parameters():
         ValueError,
         match="positive one_step_diffusion_interval",
     ):
-        ESMFold2ProposalConfig(one_step_diffusion_interval=5)
+        ESMFold2ProposalConfig(
+            one_step_diffusion_enabled=False,
+            one_step_diffusion_interval=5,
+        )
     with pytest.raises(
         ValueError,
         match="one_step_diffusion_recycle_coordinates",
     ):
         ESMFold2ProposalConfig(
             one_step_diffusion_recycle_coordinates=True,
+            one_step_diffusion_interval=0,
         )
     with pytest.raises(ValueError, match="verifier_loss_mode"):
         ESMFold2ProposalConfig(verifier_loss_mode="unknown")

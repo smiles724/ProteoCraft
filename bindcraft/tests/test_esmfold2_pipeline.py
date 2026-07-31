@@ -1204,6 +1204,8 @@ def test_stagea_argmax_child_preserves_raw_logits_and_only_two_children_enter_tr
         mcts_strategy="stage_a_only",
         mcts_handoff_top_k=2,
         esmfold2_stagea_tree_children=2,
+        esmfold2_stagea_root_selection_mode="global_ucb",
+        esmfold2_stagea_min_root_expansions=0,
         esmfold2_stagea_handoff_checkpoint_interval=0,
         artifact_dir=artifact_dir,
     )

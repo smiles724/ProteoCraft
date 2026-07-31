@@ -507,8 +507,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="模型 backend：protenix 保持原有 V1/V2 流程；esmfold2 启用 ESMFold2 第一版闭环")
     parser.add_argument("--esmfold2_verifier_model", type=str, default="biohub/ESMFold2",
                        help="ESMFold2 verifier 模型名（仅 --model_backend esmfold2 使用）")
-    parser.add_argument("--esmfold2_experimental_model", type=str, default="biohub/ESMFold2-Experimental",
-                       help="ESMFold2Experimental proposal 模型名（仅 --model_backend esmfold2 使用）")
+    parser.add_argument("--esmfold2_experimental_model", type=str, default="biohub/ESMFold2-Experimental-Fast",
+                       help="ESMFold2Experimental proposal 模型名（默认：biohub/ESMFold2-Experimental-Fast；仅 --model_backend esmfold2 使用）")
     parser.add_argument("--esmfold2_soft_steps", type=int, default=None,
                        help="兼容旧脚本：同时设置 ESMFold2 Stage A / Stage B 的 soft gradient update 步数")
     parser.add_argument("--esmfold2_stagea_soft_steps", type=int, default=None,
@@ -538,19 +538,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--esmfold2_stagea_root_selection_mode",
         type=str,
         choices=["global_ucb", "hierarchical_ucb"],
-        default="global_ucb",
+        default="hierarchical_ucb",
         help=(
             "ESMFold2 Stage A root/node 选择方式；global_ucb 保留原全树 UCB，"
-            "hierarchical_ucb 先选 root 再在其子树内选 node"
+            "hierarchical_ucb 先选 root 再在其子树内选 node（默认）"
         ),
     )
     parser.add_argument(
         "--esmfold2_stagea_min_root_expansions",
         type=int,
-        default=0,
+        default=2,
         help=(
             "hierarchical_ucb 下每个 Phase0 root 在自适应选择前至少获得的 "
-            "outer-step 扩展次数（默认 0，旧行为不受影响）"
+            "outer-step 扩展次数（默认：2）"
         ),
     )
     parser.add_argument(
@@ -781,40 +781,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--esmfold2_one_step_diffusion",
         type=lambda x: x.lower() == "true",
-        default=False,
+        default=True,
         help=(
-            "是否启用可微 ESMFold2 one-step diffusion；默认 false。"
-            "interval=0 时保持旧行为，在全部 soft steps 后额外更新一次"
+            "是否启用可微 ESMFold2 one-step diffusion；默认 true。"
+            "默认每 5 个 soft steps 联合更新一次"
         ),
     )
     parser.add_argument(
         "--esmfold2_one_step_diffusion_tau",
         type=float,
-        default=4.0,
-        help="ESMFold2 one-step diffusion 固定噪声尺度 tau（默认：4.0）",
+        default=2.0,
+        help="ESMFold2 one-step diffusion 固定噪声尺度 tau（默认：2.0）",
     )
     parser.add_argument(
         "--esmfold2_one_step_diffusion_weight",
         type=float,
-        default=1.0,
-        help="归一化 one-step diffusion gradient 的组合权重（默认：1.0）",
+        default=0.25,
+        help="归一化 one-step diffusion gradient 的组合权重（默认：0.25）",
     )
     parser.add_argument(
         "--esmfold2_one_step_diffusion_rg_weight",
         type=float,
-        default=0.3,
+        default=0.1,
         help=(
             "one-step diffusion common loss 中 Rg/compactness 项的权重"
-            "（默认：0.3，保持原有行为）"
+            "（默认：0.1）"
         ),
     )
     parser.add_argument(
         "--esmfold2_one_step_diffusion_interval",
         type=int,
-        default=0,
+        default=5,
         help=(
             "在 soft optimization 内每隔多少步联合加入一次 one-step "
-            "diffusion；0 表示保持旧行为，在全部 soft steps 后额外更新一次"
+            "diffusion（默认：5）；0 表示仅在全部 soft steps 后额外更新一次"
         ),
     )
     parser.add_argument(
@@ -987,13 +987,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcts_max_nodes", type=int, default=5000, help="MCTS 树最大节点数（默认：5000）")
     parser.add_argument("--mcts_tau_fixed", type=float, default=4.0, help="MCTS 固定扩散 tau（默认：4.0）")
     parser.add_argument("--mcts_num_beams", type=int, default=8, help="MCTS Phase0 根节点数 / beam（默认：8）")
-    parser.add_argument("--mcts_strategy", type=str, default="two_stage",
+    parser.add_argument("--mcts_strategy", type=str, default=None,
                        choices=["legacy", "stage_a_only", "strict", "two_stage", "continuous_stage_a", "raw_lineage_stage_a", "best_of_n", "best_of_n_chunked"],
                        help=(
                            "搜索策略：best_of_n 运行独立连续轨迹且不使用 MCTS；"
                            "best_of_n_chunked 将 --n_steps 总 outer-step 预算"
                            "均分给独立分段轨迹，不做逐步 verifier 选择；"
-                           "其余为 StageA/两阶段 MCTS 模式（默认：two_stage）"
+                           "其余为 StageA/两阶段 MCTS 模式；默认按 backend 解析："
+                           "Protenix=two_stage，ESMFold2=stage_a_only"
                        ))
     parser.add_argument("--mcts_bootstrap_steps", type=int, default=50,
                        help="two_stage: StageA 原版 MCTS 至少运行步数（默认：50）")
@@ -1071,6 +1072,10 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
         if parser is not None:
             parser.error(message)
         raise ValueError(message)
+    if getattr(args, "mcts_strategy", None) is None:
+        args.mcts_strategy = (
+            "stage_a_only" if backend == "esmfold2" else "two_stage"
+        )
     if backend == "esmfold2" and getattr(args, "mode", None) != "mcts":
         message = "ESMFold2 backend first version only supports --mode mcts"
         if parser is not None:
