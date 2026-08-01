@@ -36,7 +36,7 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_stagea_root_selection_mode == "hierarchical_ucb"
     assert args.esmfold2_stagea_min_root_expansions == 2
     assert args.esmfold2_stagea_preserve_soft_state is True
-    assert args.esmfold2_stagea_cumulative_annealing is True
+    assert args.esmfold2_stagea_cumulative_annealing is False
     assert args.esmfold2_stagea_annealing_horizon == 150
     assert args.esmfold2_stagea_soft_anchor_margin == pytest.approx(0.1)
     assert args.esmfold2_stagea_paired_verifier_seed is True
@@ -93,6 +93,109 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_hotspot_verify_near_cutoff == pytest.approx(8.0)
     assert args.esmfold2_hotspot_verify_far_cutoff == pytest.approx(20.0)
     assert args.esmfold2_hotspot_verify_too_close_weight == pytest.approx(0.0)
+
+
+def test_esmfold2_stagea_mutation_fraction_is_optional_and_validated():
+    args, parser = _parse(
+        [
+            "--model_backend",
+            "esmfold2",
+            "--mode",
+            "mcts",
+            "--esmfold2_stagea_mutation_fraction",
+            "0.2",
+        ]
+    )
+    assert resolve_model_backend(args, parser) == "esmfold2"
+    assert args.esmfold2_stagea_mutation_fraction == pytest.approx(0.2)
+
+    bad_args, bad_parser = _parse(
+        [
+            "--model_backend",
+            "esmfold2",
+            "--mode",
+            "mcts",
+            "--esmfold2_stagea_mutation_fraction",
+            "1.1",
+        ]
+    )
+    with pytest.raises(SystemExit):
+        resolve_model_backend(bad_args, bad_parser)
+
+
+def test_load_esmfold2_backend_forwards_cli_learning_rate(monkeypatch):
+    args, parser = _parse(
+        [
+            "--model_backend",
+            "esmfold2",
+            "--mode",
+            "mcts",
+            "--learning_rate",
+            "0.037",
+        ]
+    )
+    resolve_model_backend(args, parser)
+    run_hallucination_script.resolve_esmfold2_verifier_precision_defaults(args)
+    run_hallucination_script.resolve_esmfold2_hotspot_defaults(
+        args,
+        model_backend="esmfold2",
+        hotspot_params=None,
+    )
+    captured = {}
+
+    class FakeRuntimeBackend:
+        def __init__(self, *, config, device, task_type):
+            captured["config"] = config
+            captured["device"] = device
+            captured["task_type"] = task_type
+
+    monkeypatch.setattr(
+        "bindcraft.hallucination.esmfold2_runtime.ESMFold2RuntimeBackend",
+        FakeRuntimeBackend,
+    )
+
+    backend = run_hallucination_script.load_esmfold2_backend(args, device="cpu")
+
+    assert isinstance(backend, FakeRuntimeBackend)
+    assert captured["config"].learning_rate == pytest.approx(0.037)
+    assert captured["device"] == "cpu"
+    assert captured["task_type"] == "denovo"
+
+
+def test_load_esmfold2_backend_forwards_esmc_activation_checkpointing(monkeypatch):
+    args, parser = _parse(
+        [
+            "--model_backend",
+            "esmfold2",
+            "--mode",
+            "mcts",
+            "--esmfold2_esmc_activation_checkpointing",
+            "true",
+        ]
+    )
+    resolve_model_backend(args, parser)
+    run_hallucination_script.resolve_esmfold2_verifier_precision_defaults(args)
+    run_hallucination_script.resolve_esmfold2_hotspot_defaults(
+        args,
+        model_backend="esmfold2",
+        hotspot_params=None,
+    )
+    captured = {}
+
+    class FakeRuntimeBackend:
+        def __init__(self, *, config, device, task_type):
+            captured["config"] = config
+            captured["device"] = device
+            captured["task_type"] = task_type
+
+    monkeypatch.setattr(
+        "bindcraft.hallucination.esmfold2_runtime.ESMFold2RuntimeBackend",
+        FakeRuntimeBackend,
+    )
+
+    run_hallucination_script.load_esmfold2_backend(args, device="cpu")
+
+    assert captured["config"].esmc_activation_checkpointing is True
 
 
 def test_esmfold2_one_step_interval_options_parse_explicitly():

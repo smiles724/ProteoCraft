@@ -139,6 +139,9 @@ def build_hallucination_command(
         "t_sample": "t_sample",
         "max_mutations_per_seq": "max_mutations_per_seq",
         "stagea_max_mutations_per_seq": "stagea_max_mutations_per_seq",
+        "esmfold2_stagea_mutation_fraction": (
+            "esmfold2_stagea_mutation_fraction"
+        ),
         "stageb_max_mutations_per_seq": "stageb_max_mutations_per_seq",
         "mcts_num_beams": "mcts_num_beams",
         "mcts_strategy": "mcts_strategy",

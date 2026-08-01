@@ -278,6 +278,7 @@ def test_normalized_gradient_tensor_matches_official_eff_length_scaling():
 def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     default_config = ESMFold2ProposalConfig(lambda_esmc="auto")
     assert default_config.soft_steps == 30
+    assert default_config.learning_rate == pytest.approx(0.05)
     assert default_config.proposal_lm_dropout == pytest.approx(0.5)
     assert default_config.force_proposal_lm_dropout is True
     assert default_config.experimental_model_name.endswith(
@@ -344,6 +345,7 @@ def test_proposal_config_validates_hotspot_verifier_parameters():
 
 
 def test_proposal_config_validates_one_step_diffusion_parameters():
+    assert ESMFold2ProposalConfig().esmc_activation_checkpointing is False
     with pytest.raises(ValueError, match="one_step_diffusion_tau"):
         ESMFold2ProposalConfig(one_step_diffusion_tau=0.0)
     with pytest.raises(ValueError, match="one_step_diffusion_weight"):
@@ -419,6 +421,47 @@ def test_logit_delta_candidates_prepend_full_argmax_sequence():
     assert candidates[0] == "AYF"
     assert len(candidates) == 3
     assert all(seq[0] == "A" for seq in candidates)
+
+
+def test_logit_delta_fraction_samples_distinct_mutable_positions():
+    aa_to_idx = {aa: idx for idx, aa in enumerate(ESM_AA_ORDER)}
+    before = torch.zeros(10, 20)
+    after = before.clone()
+    for position in range(10):
+        after[position, aa_to_idx["Y"]] = float(20 - position)
+
+    torch.manual_seed(4)
+    candidates = propose_sequences_from_logit_delta(
+        before,
+        after,
+        current_seq="A" * 10,
+        mutable_mask=[False, False] + [True] * 8,
+        K_top=2,
+        B_candidates=20,
+        T_sample=1.0,
+        max_mutations_per_seq=1,
+        mutation_fraction=0.5,
+    )
+
+    mutation_counts = [
+        sum(left != right for left, right in zip("A" * 10, sequence))
+        for sequence in candidates
+    ]
+    assert max(mutation_counts) == 4
+    assert all(count <= 4 for count in mutation_counts)
+    assert all(sequence[:2] == "AA" for sequence in candidates)
+
+
+@pytest.mark.parametrize("fraction", [0.0, -0.1, 1.1, float("nan")])
+def test_logit_delta_fraction_rejects_invalid_values(fraction):
+    logits = torch.zeros(2, 20)
+    with pytest.raises(ValueError, match="mutation_fraction"):
+        propose_sequences_from_logit_delta(
+            logits,
+            logits,
+            current_seq="AA",
+            mutation_fraction=fraction,
+        )
 
 
 def test_esmfold2_action_group_routing_uses_native_loss_terms():

@@ -437,12 +437,14 @@ def _write_candidate_artifact(
     action_group: Optional[str] = None,
 ) -> None:
     sequence = str(result.binder_seq)
+    edits = _sequence_edits(parent_sequence, sequence) if parent_sequence else []
     recorder.write_candidate(
         stage=stage,
         step=step,
         parent_sequence=parent_sequence,
         sequence=sequence,
-        edits=_sequence_edits(parent_sequence, sequence) if parent_sequence else [],
+        edits=edits,
+        mutation_count=len(edits),
         action_group=action_group,
         total_loss=float(result.total_loss),
         loss_dict=_loss_dict_for_artifact(result),
@@ -830,9 +832,15 @@ def _call_backend_propose(
     temperature_step_offset: int = 0,
     temperature_total_steps: Optional[int] = None,
     preserve_proposal_logits: bool = False,
+    mutation_fraction: Optional[float] = None,
     **kwargs: Any,
 ) -> ESMFold2ProposalBatch:
     propose_kwargs = dict(kwargs)
+    if (
+        mutation_fraction is not None
+        and _callable_accepts_argument(backend.propose, "mutation_fraction")
+    ):
+        propose_kwargs["mutation_fraction"] = mutation_fraction
     if _callable_accepts_argument(backend.propose, "proposal_logits"):
         propose_kwargs["proposal_logits"] = (
             proposal_logits.detach().clone() if proposal_logits is not None else None
@@ -3756,6 +3764,7 @@ def run_esmfold2_mcts_hallucination(
     T_sample: float = 1.0,
     max_mutations_per_seq: int = 3,
     stagea_max_mutations_per_seq: Optional[int] = None,
+    esmfold2_stagea_mutation_fraction: Optional[float] = None,
     stageb_max_mutations_per_seq: Optional[int] = None,
     num_beams: int = 8,
     init_binder_seq: Optional[str] = None,
@@ -3783,7 +3792,7 @@ def run_esmfold2_mcts_hallucination(
     esmfold2_stagea_root_selection_mode: str = "hierarchical_ucb",
     esmfold2_stagea_min_root_expansions: int = 2,
     esmfold2_stagea_preserve_soft_state: bool = True,
-    esmfold2_stagea_cumulative_annealing: bool = True,
+    esmfold2_stagea_cumulative_annealing: bool = False,
     esmfold2_stagea_annealing_horizon: int = 150,
     esmfold2_stagea_soft_anchor_margin: float = 0.1,
     esmfold2_stagea_paired_verifier_seed: bool = True,
@@ -3832,6 +3841,16 @@ def run_esmfold2_mcts_hallucination(
         if stagea_max_mutations_per_seq is not None
         else max_mutations_per_seq
     )
+    stagea_mutation_fraction = (
+        float(esmfold2_stagea_mutation_fraction)
+        if esmfold2_stagea_mutation_fraction is not None
+        else None
+    )
+    if stagea_mutation_fraction is not None and (
+        not math.isfinite(stagea_mutation_fraction)
+        or not 0.0 < stagea_mutation_fraction <= 1.0
+    ):
+        raise ValueError("esmfold2_stagea_mutation_fraction must be in (0, 1]")
     stageb_max_mutations = (
         max(int(stageb_max_mutations_per_seq), 1)
         if stageb_max_mutations_per_seq is not None
@@ -3869,6 +3888,18 @@ def run_esmfold2_mcts_hallucination(
         else None
     )
     mutable_mask = _normalize_mutable_mask(mutable_mask, L_binder)
+    stagea_mutable_residue_count = sum(bool(value) for value in mutable_mask)
+    if stagea_mutation_fraction is not None:
+        stagea_max_mutations = (
+            max(
+                1,
+                math.ceil(
+                    stagea_mutation_fraction * stagea_mutable_residue_count
+                ),
+            )
+            if stagea_mutable_residue_count > 0
+            else 0
+        )
     hotspot_params = dict(hotspot_params) if hotspot_params else None
     hotspot_indices = [
         int(index)
@@ -4284,14 +4315,10 @@ def run_esmfold2_mcts_hallucination(
     best_result = phase0_results[0]
     best_seq = str(best_result.binder_seq)
     best_loss = float(best_result.total_loss)
-    if resume_state is None:
-        best_logits = _anchor_proposal_logits(
-            proposal_logits_by_sequence.get(best_seq),
-            best_seq,
-            mutable_mask,
-        ).detach().cpu().clone()
-    else:
-        best_logits = proposal_logits_by_sequence[best_seq].detach().cpu().clone()
+    # Phase0 sequences are already row-wise argmaxes of their own logits.
+    # Preserve official_free/exact uncertainty verbatim so handoff, resume,
+    # and final polish do not silently re-anchor mutable positions to 2.0.
+    best_logits = proposal_logits_by_sequence[best_seq].detach().cpu().clone()
     proposal_logits_by_sequence[best_seq] = best_logits
     losses_history: List[float] = (
         [float(value) for value in resume_state["losses_history"]]
@@ -4329,6 +4356,8 @@ def run_esmfold2_mcts_hallucination(
                 "B_candidates": B_candidates,
                 "T_sample": T_sample,
                 "stagea_max_mutations_per_seq": stagea_max_mutations,
+                "stagea_mutation_fraction": stagea_mutation_fraction,
+                "stagea_mutable_residue_count": stagea_mutable_residue_count,
                 "num_beams": num_beams,
                 "mcts_C": mcts_C,
                 "mcts_max_nodes": mcts_max_nodes,
@@ -4867,6 +4896,7 @@ def run_esmfold2_mcts_hallucination(
             B_candidates=B_candidates,
             T_sample=T_sample,
             max_mutations_per_seq=stagea_max_mutations,
+            mutation_fraction=stagea_mutation_fraction,
             seed=proposal_seed,
             action_group=None,
             mutable_mask=mutable_mask,
@@ -5048,6 +5078,9 @@ def run_esmfold2_mcts_hallucination(
             soft_step_end=temperature_step_offset + stagea_soft_step_count,
             temperature_total_steps=temperature_total_steps,
             preserve_soft_state=stagea_preserve_soft_state,
+            stagea_mutation_fraction=stagea_mutation_fraction,
+            stagea_mutable_residue_count=stagea_mutable_residue_count,
+            stagea_sampled_mutation_cap=stagea_max_mutations,
             round_best_loss=float(round_best.total_loss),
             global_best_loss=best_loss,
             best_sequence=best_seq,

@@ -1090,6 +1090,7 @@ class ESMFold2RuntimeBackend:
         B_candidates: int,
         T_sample: float,
         max_mutations_per_seq: int,
+        mutation_fraction: Optional[float] = None,
         seed: Optional[int] = None,
         mutable_mask: Optional[Sequence[bool]] = None,
         action_group: Optional[str] = None,
@@ -1133,6 +1134,7 @@ class ESMFold2RuntimeBackend:
                 B_candidates=B_candidates,
                 T_sample=T_sample,
                 max_mutations_per_seq=max_mutations_per_seq,
+                mutation_fraction=mutation_fraction,
                 include_logit_candidates=(action_group is None),
             )
         candidates = list(dict.fromkeys([*confidence_sequences, *candidates]))
@@ -2526,12 +2528,38 @@ class ESMFold2RuntimeBackend:
                     dtype=torch.bfloat16,
                     enabled=device.type == "cuda",
                 ):
-                    hidden, *_ = self.esmc_model.esmc.transformer(
-                        chunk @ self.esmc_model.esmc.embed.weight.to(chunk.dtype),
-                        sequence_id=None,
-                        layers_to_collect=[],
-                        output_attentions=False,
+                    embedded = chunk @ self.esmc_model.esmc.embed.weight.to(
+                        chunk.dtype
                     )
+                    if self.config.esmc_activation_checkpointing:
+                        from torch.utils.checkpoint import checkpoint
+
+                        transformer = self.esmc_model.esmc.transformer
+                        hidden = embedded
+                        for block in transformer.blocks:
+                            def block_forward(
+                                value: torch.Tensor,
+                                current_block: Any = block,
+                            ) -> torch.Tensor:
+                                return current_block(
+                                    value,
+                                    None,
+                                    output_attentions=False,
+                                )[0]
+
+                            hidden = checkpoint(
+                                block_forward,
+                                hidden,
+                                use_reentrant=False,
+                            )
+                        hidden = transformer.norm(hidden)
+                    else:
+                        hidden, *_ = self.esmc_model.esmc.transformer(
+                            embedded,
+                            sequence_id=None,
+                            layers_to_collect=[],
+                            output_attentions=False,
+                        )
                     logits = self.esmc_model.lm_head(hidden)
                 log_probs = logits.log_softmax(dim=-1)[:, 1:-1, 4:24]
                 nlls = -(log_probs * target_weights.to(log_probs.dtype).unsqueeze(0)).sum(dim=-1)

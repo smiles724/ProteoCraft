@@ -61,12 +61,13 @@ class ESMFold2ProposalConfig:
     verifier_num_loops: int = 20
     verifier_num_sampling_steps: int = 200
     soft_steps: int = 30
-    learning_rate: float = 0.1
+    learning_rate: float = 0.05
     temperature_min: float = 1e-2
     temperature_max: float = 1.0
     lambda_esmc: Union[str, float] = "auto"
     esmc_n_passes: int = 4
     esmc_batch_size: int = 4
+    esmc_activation_checkpointing: bool = False
     num_loops: int = 1
     num_sampling_steps: int = 1
     proposal_load_internal_esmc: bool = True
@@ -970,6 +971,7 @@ def propose_sequences_from_logit_delta(
     B_candidates: int = 8,
     T_sample: float = 1.0,
     max_mutations_per_seq: int = 3,
+    mutation_fraction: Optional[float] = None,
     include_logit_candidates: bool = False,
 ) -> list[str]:
     """Generate discrete candidate sequences from ESMFold2 soft-logit updates.
@@ -1009,12 +1011,51 @@ def propose_sequences_from_logit_delta(
         current_seq=current_seq,
         mutable_mask=mutable_mask,
     ).detach().cpu()
-    delta_like = _scores_to_gradient_like_matrix(scores)
-    positions, new_aas, benefits = select_top_k_mutations(
-        delta_like,
-        current_indices,
-        K_top,
-    )
+    if mutation_fraction is None:
+        delta_like = _scores_to_gradient_like_matrix(scores)
+        positions, new_aas, benefits = select_top_k_mutations(
+            delta_like,
+            current_indices,
+            K_top,
+        )
+        sampled_mutation_cap = int(max_mutations_per_seq)
+    else:
+        fraction = float(mutation_fraction)
+        if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
+            raise ValueError("mutation_fraction must be in (0, 1]")
+
+        mutable = _as_bool_mask(mutable_mask, len(current_seq)).cpu()
+        mutable_count = int(mutable.sum().item())
+        sampled_mutation_cap = (
+            max(1, math.ceil(fraction * mutable_count))
+            if mutable_count > 0
+            else 0
+        )
+
+        # Fraction-based experiments count distinct residue positions. Keep only
+        # the strongest amino-acid edit per mutable residue before sampling.
+        best_benefits, best_aas = scores.max(dim=-1)
+        valid_positions = torch.nonzero(
+            mutable & torch.isfinite(best_benefits),
+            as_tuple=False,
+        ).flatten()
+        if valid_positions.numel() == 0:
+            positions = torch.empty(0, dtype=torch.long)
+            new_aas = torch.empty(0, dtype=torch.long)
+            benefits = torch.empty(0, dtype=scores.dtype)
+        else:
+            position_benefits = best_benefits[valid_positions]
+            pool_size = min(
+                int(valid_positions.numel()),
+                max(int(K_top), int(sampled_mutation_cap)),
+            )
+            top_benefits, top_indices = torch.topk(
+                position_benefits,
+                pool_size,
+            )
+            positions = valid_positions[top_indices]
+            new_aas = best_aas[positions]
+            benefits = top_benefits
     if positions.numel() == 0:
         while len(candidates) < int(B_candidates):
             candidates.append(current_seq)
@@ -1027,7 +1068,7 @@ def propose_sequences_from_logit_delta(
         benefits,
         B_candidates,
         T_sample,
-        max_mutations_per_seq,
+        sampled_mutation_cap,
     )
 
     def indices_to_sequence(indices: Sequence[int]) -> str:

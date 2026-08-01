@@ -36,6 +36,7 @@ import os
 import sys
 import argparse
 import logging
+import math
 import torch
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -410,9 +411,13 @@ def load_esmfold2_backend(
         verifier_num_loops=args.esmfold2_verifier_num_loops,
         verifier_num_sampling_steps=args.esmfold2_verifier_num_sampling_steps,
         soft_steps=stagea_soft_steps,
+        learning_rate=args.learning_rate,
         temperature_min=args.esmfold2_temperature_min,
         temperature_max=args.esmfold2_temperature_max,
         lambda_esmc=args.esmfold2_lambda_esmc,
+        esmc_activation_checkpointing=(
+            args.esmfold2_esmc_activation_checkpointing
+        ),
         num_loops=args.esmfold2_proposal_num_loops,
         num_sampling_steps=args.esmfold2_proposal_num_sampling_steps,
         proposal_load_internal_esmc=args.esmfold2_proposal_load_internal_esmc,
@@ -565,8 +570,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--esmfold2_stagea_cumulative_annealing",
         type=lambda x: x.lower() == "true",
-        default=True,
-        help="Stage A 是否沿 MCTS 路径累计温度退火进度（默认：true）",
+        default=False,
+        help="Stage A 是否沿 MCTS 路径累计温度退火进度（默认：false）",
     )
     parser.add_argument(
         "--esmfold2_stagea_annealing_horizon",
@@ -774,6 +779,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2 proposal distogram forward diffusion steps（默认：1）")
     parser.add_argument("--esmfold2_proposal_load_internal_esmc", type=lambda x: x.lower() == "true", default=True,
                        help="是否为 ESMFold2Experimental proposal model 加载内部 ESMC（官方 binder design 为 true）")
+    parser.add_argument(
+        "--esmfold2_esmc_activation_checkpointing",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help="ESMC sequence-prior 是否逐层 activation checkpoint（默认：false）",
+    )
     parser.add_argument("--esmfold2_proposal_lm_dropout", type=float, default=0.5,
                        help="ESMFold2Experimental proposal LM dropout；官方 binder design inversion/proposal 使用 0.5")
     parser.add_argument("--esmfold2_force_proposal_lm_dropout", type=lambda x: x.lower() == "true", default=True,
@@ -969,6 +980,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="每条序列的最大突变数（默认：3）")
     parser.add_argument("--stagea_max_mutations_per_seq", type=int, default=None,
                        help="ESMFold2/两阶段搜索 StageA 每条候选最大突变数；默认沿用 --max_mutations_per_seq")
+    parser.add_argument(
+        "--esmfold2_stagea_mutation_fraction",
+        type=float,
+        default=None,
+        help=(
+            "ESMFold2 StageA sampled candidate 的最大唯一突变位点比例，"
+            "按 mutable mask 长度计算；argmax candidate 不受此限制"
+        ),
+    )
     parser.add_argument("--stageb_max_mutations_per_seq", type=int, default=None,
                        help="ESMFold2/两阶段搜索 StageB 每条候选最大突变数；默认沿用 --max_mutations_per_seq")
     parser.add_argument("--use_annealing", type=lambda x: x.lower() == "true", default=True,
@@ -1159,6 +1179,14 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             raise ValueError(message)
         if getattr(args, "stageb_max_mutations_per_seq", None) is None:
             args.stageb_max_mutations_per_seq = 1
+        if args.esmfold2_stagea_mutation_fraction is not None and (
+            not math.isfinite(args.esmfold2_stagea_mutation_fraction)
+            or not 0.0 < args.esmfold2_stagea_mutation_fraction <= 1.0
+        ):
+            message = "--esmfold2_stagea_mutation_fraction must be in (0, 1]"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
         if getattr(args, "mcts_handoff_top_k", None) is None:
             args.mcts_handoff_top_k = 2
         if args.esmfold2_stageb_rerank_pool_size <= 0:
@@ -1599,6 +1627,9 @@ def main(argv=None):
                 T_sample=args.t_sample,
                 max_mutations_per_seq=args.max_mutations_per_seq,
                 stagea_max_mutations_per_seq=args.stagea_max_mutations_per_seq,
+                esmfold2_stagea_mutation_fraction=(
+                    args.esmfold2_stagea_mutation_fraction
+                ),
                 stageb_max_mutations_per_seq=args.stageb_max_mutations_per_seq,
                 num_beams=args.mcts_num_beams,
                 init_binder_seq=args.init_binder_seq,
@@ -1858,6 +1889,10 @@ def main(argv=None):
             f.write(f"ESMFold2 Resume Handoff Checkpoint: {args.esmfold2_resume_handoff_checkpoint or 'NONE'}\n")
             f.write(f"ESMFold2 Resume Reverify Roots: {args.esmfold2_resume_reverify_roots}\n")
             f.write(f"ESMFold2 Proposal Load Internal ESMC: {args.esmfold2_proposal_load_internal_esmc}\n")
+            f.write(
+                "ESMFold2 ESMC Activation Checkpointing: "
+                f"{args.esmfold2_esmc_activation_checkpointing}\n"
+            )
             f.write(f"ESMFold2 Proposal LM Dropout: {args.esmfold2_proposal_lm_dropout}\n")
             f.write(f"ESMFold2 Force Proposal LM Dropout: {args.esmfold2_force_proposal_lm_dropout}\n")
             f.write(f"ESMFold2 Track Proposal Confidence: {args.esmfold2_track_proposal_confidence}\n")

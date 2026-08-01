@@ -1332,6 +1332,38 @@ def test_stagea_cumulative_annealing_follows_selected_node_soft_depth(tmp_path):
     assert [event["soft_step_end"] for event in stagea_events] == [30, 60]
 
 
+def test_stagea_defaults_to_independent_outer_step_annealing():
+    backend = FakeESMFold2Backend()
+
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=2,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=2,
+        T_sample=1.0,
+        max_mutations_per_seq=1,
+        seed=7,
+        mcts_C=0.0,
+        mcts_strategy="stage_a_only",
+        esmfold2_stagea_soft_steps=30,
+        esmfold2_stagea_preserve_soft_state=True,
+        esmfold2_stagea_handoff_checkpoint_interval=0,
+    )
+
+    assert [call["temperature_step_offset"] for call in backend.propose_calls] == [
+        0,
+        0,
+    ]
+    assert [call["temperature_total_steps"] for call in backend.propose_calls] == [
+        None,
+        None,
+    ]
+
+
 def test_raw_lineage_stagea_keeps_logits_continuous_and_defers_verifier():
     class RawLineageBackend(FakeESMFold2Backend):
         def continuous_design(self, **kwargs):
@@ -1788,6 +1820,41 @@ def test_esmfold2_official_exact_roots_use_direct_torch_seed():
     seq, logits = states[0]
     assert seq == expected_seq
     assert torch.allclose(logits, expected_logits, equal_nan=False)
+
+
+def test_official_exact_phase0_handoff_preserves_free_logits(tmp_path):
+    expected_sequence, expected_logits = _make_phase0_seed_states(
+        None,
+        num_beams=1,
+        L_binder=3,
+        seed=42,
+        mutable_mask=[True, True, True],
+        logit_init_mode="official_exact",
+    )[0]
+    artifact_dir = tmp_path / "artifacts"
+
+    run_esmfold2_mcts_hallucination(
+        backend=FakeESMFold2Backend(),
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=0,
+        num_beams=1,
+        seed=42,
+        mcts_strategy="stage_a_only",
+        esmfold2_logit_init_mode="official_exact",
+        artifact_dir=artifact_dir,
+    )
+
+    payload = torch.load(
+        artifact_dir / "handoff_checkpoints" / "stagea_handoff_final.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    entry = payload["handoff_entries"][0]
+    assert entry["result"]["binder_seq"] == expected_sequence
+    assert torch.equal(entry["proposal_logits"], expected_logits)
+    finite_logits = entry["proposal_logits"][torch.isfinite(entry["proposal_logits"])]
+    assert finite_logits.abs().max().item() < 0.1
 
 
 def test_initial_logits_checkpoint_directory_restores_exact_phase0_roots(tmp_path):
@@ -2380,6 +2447,34 @@ def test_esmfold2_two_stage_uses_separate_stagea_and_stageb_mutation_budgets():
     assert backend.propose_calls[0]["action_group"] is None
     assert backend.propose_calls[0]["max_mutations_per_seq"] == 6
     assert backend.propose_calls[1]["action_group"] == "interface_formation"
+    assert backend.propose_calls[1]["max_mutations_per_seq"] == 1
+
+
+def test_esmfold2_stagea_fraction_uses_mutable_length_and_leaves_stageb_unchanged():
+    backend = FakeESMFold2Backend()
+
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=10,
+        N_steps=3,
+        num_beams=1,
+        init_binder_seq="A" * 10,
+        mutable_mask=[False, False] + [True] * 8,
+        K_top=4,
+        B_candidates=2,
+        T_sample=1.0,
+        max_mutations_per_seq=3,
+        esmfold2_stagea_mutation_fraction=0.5,
+        stageb_max_mutations_per_seq=1,
+        seed=7,
+        mcts_strategy="two_stage",
+        mcts_bootstrap_steps=1,
+        mcts_bootstrap_max_steps=1,
+        mcts_expand_actions_per_step=1,
+    )
+
+    assert backend.propose_calls[0]["max_mutations_per_seq"] == 4
     assert backend.propose_calls[1]["max_mutations_per_seq"] == 1
 
 
