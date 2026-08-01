@@ -142,6 +142,12 @@ def build_hallucination_command(
         "esmfold2_stagea_mutation_fraction": (
             "esmfold2_stagea_mutation_fraction"
         ),
+        "esmfold2_stagea_candidate_strategy": (
+            "esmfold2_stagea_candidate_strategy"
+        ),
+        "esmfold2_stagea_include_argmax_candidate": (
+            "esmfold2_stagea_include_argmax_candidate"
+        ),
         "stageb_max_mutations_per_seq": "stageb_max_mutations_per_seq",
         "mcts_num_beams": "mcts_num_beams",
         "mcts_strategy": "mcts_strategy",

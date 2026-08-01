@@ -89,6 +89,9 @@ class FakeESMFold2Backend:
         B_candidates,
         T_sample,
         max_mutations_per_seq,
+        mutation_fraction=None,
+        candidate_strategy=None,
+        include_argmax_candidate=None,
         seed=None,
         action_group=None,
         mutable_mask=None,
@@ -109,6 +112,9 @@ class FakeESMFold2Backend:
                 "action_group": action_group,
                 "mutable_mask": mutable_mask,
                 "max_mutations_per_seq": max_mutations_per_seq,
+                "mutation_fraction": mutation_fraction,
+                "candidate_strategy": candidate_strategy,
+                "include_argmax_candidate": include_argmax_candidate,
                 "proposal_logits": proposal_logits.detach().clone() if proposal_logits is not None else None,
                 "hotspot_params": hotspot_params,
                 "track_confidence_override": track_confidence_override,
@@ -2466,6 +2472,8 @@ def test_esmfold2_stagea_fraction_uses_mutable_length_and_leaves_stageb_unchange
         T_sample=1.0,
         max_mutations_per_seq=3,
         esmfold2_stagea_mutation_fraction=0.5,
+        esmfold2_stagea_candidate_strategy="positive_score",
+        esmfold2_stagea_include_argmax_candidate=False,
         stageb_max_mutations_per_seq=1,
         seed=7,
         mcts_strategy="two_stage",
@@ -2475,7 +2483,13 @@ def test_esmfold2_stagea_fraction_uses_mutable_length_and_leaves_stageb_unchange
     )
 
     assert backend.propose_calls[0]["max_mutations_per_seq"] == 4
+    assert backend.propose_calls[0]["mutation_fraction"] == pytest.approx(0.5)
+    assert backend.propose_calls[0]["candidate_strategy"] == "positive_score"
+    assert backend.propose_calls[0]["include_argmax_candidate"] is False
     assert backend.propose_calls[1]["max_mutations_per_seq"] == 1
+    assert backend.propose_calls[1]["mutation_fraction"] is None
+    assert backend.propose_calls[1]["candidate_strategy"] is None
+    assert backend.propose_calls[1]["include_argmax_candidate"] is None
 
 
 def test_esmfold2_two_stage_uses_separate_stagea_and_stageb_soft_steps():

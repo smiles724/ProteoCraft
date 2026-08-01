@@ -986,7 +986,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "ESMFold2 StageA sampled candidate 的最大唯一突变位点比例，"
-            "按 mutable mask 长度计算；argmax candidate 不受此限制"
+            "按 mutable mask 长度计算"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_candidate_strategy",
+        type=str,
+        choices=["legacy", "positive_score"],
+        default="legacy",
+        help=(
+            "StageA 离散候选策略；positive_score 仅使用正 logit-delta "
+            "突变，并要求设置 mutation fraction（默认：legacy）"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_include_argmax_candidate",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help=(
+            "StageA 是否加入不受突变比例限制的 logits argmax 候选"
+            "（默认：true）"
         ),
     )
     parser.add_argument("--stageb_max_mutations_per_seq", type=int, default=None,
@@ -1184,6 +1203,17 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             or not 0.0 < args.esmfold2_stagea_mutation_fraction <= 1.0
         ):
             message = "--esmfold2_stagea_mutation_fraction must be in (0, 1]"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if (
+            args.esmfold2_stagea_candidate_strategy == "positive_score"
+            and args.esmfold2_stagea_mutation_fraction is None
+        ):
+            message = (
+                "--esmfold2_stagea_candidate_strategy positive_score requires "
+                "--esmfold2_stagea_mutation_fraction"
+            )
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
@@ -1630,6 +1660,12 @@ def main(argv=None):
                 esmfold2_stagea_mutation_fraction=(
                     args.esmfold2_stagea_mutation_fraction
                 ),
+                esmfold2_stagea_candidate_strategy=(
+                    args.esmfold2_stagea_candidate_strategy
+                ),
+                esmfold2_stagea_include_argmax_candidate=(
+                    args.esmfold2_stagea_include_argmax_candidate
+                ),
                 stageb_max_mutations_per_seq=args.stageb_max_mutations_per_seq,
                 num_beams=args.mcts_num_beams,
                 init_binder_seq=args.init_binder_seq,
@@ -1881,6 +1917,14 @@ def main(argv=None):
                 f"{args.esmfold2_initial_logits_checkpoint or 'NONE'}\n"
             )
             f.write(f"ESMFold2 Mutable Mask: {args.esmfold2_mutable_mask or 'ALL'}\n")
+            f.write(
+                "ESMFold2 StageA Candidate Strategy: "
+                f"{args.esmfold2_stagea_candidate_strategy}\n"
+            )
+            f.write(
+                "ESMFold2 StageA Include Argmax Candidate: "
+                f"{args.esmfold2_stagea_include_argmax_candidate}\n"
+            )
             f.write(
                 "ESMFold2 Target Chain Roles: "
                 f"{args.esmfold2_target_chain_roles or 'ALL_TARGET'}\n"

@@ -435,6 +435,7 @@ def _write_candidate_artifact(
     parent_sequence: Optional[str],
     result: Any,
     action_group: Optional[str] = None,
+    proposal_metadata: Optional[Mapping[str, Any]] = None,
 ) -> None:
     sequence = str(result.binder_seq)
     edits = _sequence_edits(parent_sequence, sequence) if parent_sequence else []
@@ -446,6 +447,7 @@ def _write_candidate_artifact(
         edits=edits,
         mutation_count=len(edits),
         action_group=action_group,
+        proposal_metadata=dict(proposal_metadata or {}),
         total_loss=float(result.total_loss),
         loss_dict=_loss_dict_for_artifact(result),
         summary_confidence=_summary_for_artifact(result),
@@ -833,6 +835,8 @@ def _call_backend_propose(
     temperature_total_steps: Optional[int] = None,
     preserve_proposal_logits: bool = False,
     mutation_fraction: Optional[float] = None,
+    candidate_strategy: Optional[str] = None,
+    include_argmax_candidate: Optional[bool] = None,
     **kwargs: Any,
 ) -> ESMFold2ProposalBatch:
     propose_kwargs = dict(kwargs)
@@ -841,6 +845,21 @@ def _call_backend_propose(
         and _callable_accepts_argument(backend.propose, "mutation_fraction")
     ):
         propose_kwargs["mutation_fraction"] = mutation_fraction
+    if (
+        candidate_strategy is not None
+        and _callable_accepts_argument(backend.propose, "candidate_strategy")
+    ):
+        propose_kwargs["candidate_strategy"] = str(candidate_strategy)
+    if (
+        include_argmax_candidate is not None
+        and _callable_accepts_argument(
+            backend.propose,
+            "include_argmax_candidate",
+        )
+    ):
+        propose_kwargs["include_argmax_candidate"] = bool(
+            include_argmax_candidate
+        )
     if _callable_accepts_argument(backend.propose, "proposal_logits"):
         propose_kwargs["proposal_logits"] = (
             proposal_logits.detach().clone() if proposal_logits is not None else None
@@ -3765,6 +3784,8 @@ def run_esmfold2_mcts_hallucination(
     max_mutations_per_seq: int = 3,
     stagea_max_mutations_per_seq: Optional[int] = None,
     esmfold2_stagea_mutation_fraction: Optional[float] = None,
+    esmfold2_stagea_candidate_strategy: str = "legacy",
+    esmfold2_stagea_include_argmax_candidate: bool = True,
     stageb_max_mutations_per_seq: Optional[int] = None,
     num_beams: int = 8,
     init_binder_seq: Optional[str] = None,
@@ -3851,6 +3872,25 @@ def run_esmfold2_mcts_hallucination(
         or not 0.0 < stagea_mutation_fraction <= 1.0
     ):
         raise ValueError("esmfold2_stagea_mutation_fraction must be in (0, 1]")
+    stagea_candidate_strategy = str(
+        esmfold2_stagea_candidate_strategy or "legacy"
+    ).strip().lower()
+    if stagea_candidate_strategy not in {"legacy", "positive_score"}:
+        raise ValueError(
+            "esmfold2_stagea_candidate_strategy must be 'legacy' or "
+            "'positive_score'"
+        )
+    if (
+        stagea_candidate_strategy == "positive_score"
+        and stagea_mutation_fraction is None
+    ):
+        raise ValueError(
+            "positive_score StageA candidate strategy requires "
+            "esmfold2_stagea_mutation_fraction"
+        )
+    stagea_include_argmax_candidate = bool(
+        esmfold2_stagea_include_argmax_candidate
+    )
     stageb_max_mutations = (
         max(int(stageb_max_mutations_per_seq), 1)
         if stageb_max_mutations_per_seq is not None
@@ -4357,6 +4397,10 @@ def run_esmfold2_mcts_hallucination(
                 "T_sample": T_sample,
                 "stagea_max_mutations_per_seq": stagea_max_mutations,
                 "stagea_mutation_fraction": stagea_mutation_fraction,
+                "stagea_candidate_strategy": stagea_candidate_strategy,
+                "stagea_include_argmax_candidate": (
+                    stagea_include_argmax_candidate
+                ),
                 "stagea_mutable_residue_count": stagea_mutable_residue_count,
                 "num_beams": num_beams,
                 "mcts_C": mcts_C,
@@ -4897,6 +4941,8 @@ def run_esmfold2_mcts_hallucination(
             T_sample=T_sample,
             max_mutations_per_seq=stagea_max_mutations,
             mutation_fraction=stagea_mutation_fraction,
+            candidate_strategy=stagea_candidate_strategy,
+            include_argmax_candidate=stagea_include_argmax_candidate,
             seed=proposal_seed,
             action_group=None,
             mutable_mask=mutable_mask,
@@ -4936,6 +4982,13 @@ def run_esmfold2_mcts_hallucination(
             0,
         )
         candidates = list(dict.fromkeys(candidates))[:candidate_limit]
+        proposal_metadata_by_sequence = {
+            str(item.get("sequence")): dict(item)
+            for item in list(
+                getattr(proposal_batch, "candidate_metadata", []) or []
+            )
+            if item.get("sequence")
+        }
         if not candidates:
             logger.warning("ESM StageA step %d: no candidates from backend", step)
             losses_history.append(best_loss)
@@ -4963,6 +5016,7 @@ def run_esmfold2_mcts_hallucination(
                 step=step,
                 parent_sequence=current_seq,
                 result=result,
+                proposal_metadata=proposal_metadata_by_sequence.get(cand_seq),
             )
 
         tree_results = _select_stagea_tree_results(
@@ -5079,8 +5133,16 @@ def run_esmfold2_mcts_hallucination(
             temperature_total_steps=temperature_total_steps,
             preserve_soft_state=stagea_preserve_soft_state,
             stagea_mutation_fraction=stagea_mutation_fraction,
+            stagea_candidate_strategy=stagea_candidate_strategy,
+            stagea_include_argmax_candidate=stagea_include_argmax_candidate,
             stagea_mutable_residue_count=stagea_mutable_residue_count,
             stagea_sampled_mutation_cap=stagea_max_mutations,
+            proposal_diagnostics=dict(
+                getattr(proposal_batch, "proposal_diagnostics", {}) or {}
+            ),
+            proposal_candidate_metadata=list(
+                getattr(proposal_batch, "candidate_metadata", []) or []
+            ),
             round_best_loss=float(round_best.total_loss),
             global_best_loss=best_loss,
             best_sequence=best_seq,

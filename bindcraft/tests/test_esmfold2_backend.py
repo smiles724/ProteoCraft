@@ -5,6 +5,7 @@ from bindcraft.hallucination.esmfold2_backend import (
     CYS_INDEX,
     ESM_AA_ORDER,
     ESMFold2ProposalConfig,
+    build_logit_delta_candidate_batch,
     build_esm_verifier_result,
     build_gradient_mask,
     combine_normalized_gradients,
@@ -450,6 +451,103 @@ def test_logit_delta_fraction_samples_distinct_mutable_positions():
     assert max(mutation_counts) == 4
     assert all(count <= 4 for count in mutation_counts)
     assert all(sequence[:2] == "AA" for sequence in candidates)
+
+
+def test_positive_score_candidates_use_fixed_count_and_disable_raw_argmax():
+    aa_to_idx = {aa: idx for idx, aa in enumerate(ESM_AA_ORDER)}
+    before = torch.zeros(10, 20)
+    after = before.clone()
+    for position in range(2, 10):
+        after[position, aa_to_idx["Y"]] = float(20 - position)
+        after[position, aa_to_idx["F"]] = float(10 - position) + 0.5
+
+    torch.manual_seed(7)
+    batch = build_logit_delta_candidate_batch(
+        before,
+        after,
+        current_seq="A" * 10,
+        mutable_mask=[False, False] + [True] * 8,
+        K_top=2,
+        B_candidates=8,
+        T_sample=1.0,
+        mutation_fraction=0.5,
+        include_logit_candidates=False,
+        candidate_strategy="positive_score",
+    )
+
+    assert len(batch.sequences) >= 2
+    assert all(
+        sum(left != right for left, right in zip("A" * 10, sequence)) == 4
+        for sequence in batch.sequences
+    )
+    assert batch.sequences[0] == "AAYYYYAAAA"
+    assert all(sequence[:2] == "AA" for sequence in batch.sequences)
+    assert all(sequence != "AA" + "Y" * 8 for sequence in batch.sequences)
+    assert batch.candidate_metadata[0]["source"] == "positive_score_topk"
+    assert all(
+        item["mutation_count"] == 4 for item in batch.candidate_metadata
+    )
+    assert batch.diagnostics["positive_position_count"] == 8
+    assert batch.diagnostics["mutation_cap"] == 4
+    assert batch.diagnostics["actual_mutation_count"] == 4
+
+
+def test_positive_score_candidates_do_not_force_nonpositive_mutations():
+    aa_to_idx = {aa: idx for idx, aa in enumerate(ESM_AA_ORDER)}
+    before = torch.zeros(8, 20)
+    after = before.clone()
+    after[2, aa_to_idx["Y"]] = 3.0
+    after[5, aa_to_idx["F"]] = 2.0
+    after[6, aa_to_idx["W"]] = -2.0
+
+    batch = build_logit_delta_candidate_batch(
+        before,
+        after,
+        current_seq="A" * 8,
+        mutable_mask=[True] * 8,
+        B_candidates=8,
+        mutation_fraction=0.5,
+        include_logit_candidates=False,
+        candidate_strategy="positive_score",
+    )
+
+    assert batch.sequences == ["AAYAAFAA"]
+    assert batch.diagnostics["positive_position_count"] == 2
+    assert batch.diagnostics["mutation_cap"] == 4
+    assert batch.diagnostics["actual_mutation_count"] == 2
+
+
+def test_positive_score_argmax_control_is_explicit_and_unrestricted():
+    aa_to_idx = {aa: idx for idx, aa in enumerate(ESM_AA_ORDER)}
+    before = torch.zeros(6, 20)
+    after = before.clone()
+    after[:, aa_to_idx["Y"]] = 3.0
+
+    batch = build_logit_delta_candidate_batch(
+        before,
+        after,
+        current_seq="A" * 6,
+        B_candidates=4,
+        mutation_fraction=0.5,
+        include_logit_candidates=True,
+        candidate_strategy="positive_score",
+    )
+
+    assert batch.sequences[0] == "Y" * 6
+    assert batch.candidate_metadata[0]["source"] == "unrestricted_argmax"
+    assert batch.candidate_metadata[0]["mutation_count"] == 6
+    assert batch.candidate_metadata[1]["mutation_count"] == 3
+
+
+def test_positive_score_strategy_requires_mutation_fraction():
+    logits = torch.zeros(2, 20)
+    with pytest.raises(ValueError, match="requires mutation_fraction"):
+        propose_sequences_from_logit_delta(
+            logits,
+            logits,
+            current_seq="AA",
+            candidate_strategy="positive_score",
+        )
 
 
 @pytest.mark.parametrize("fraction", [0.0, -0.1, 1.1, float("nan")])

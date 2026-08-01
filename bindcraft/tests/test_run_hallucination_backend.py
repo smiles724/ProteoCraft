@@ -104,10 +104,16 @@ def test_esmfold2_stagea_mutation_fraction_is_optional_and_validated():
             "mcts",
             "--esmfold2_stagea_mutation_fraction",
             "0.2",
+            "--esmfold2_stagea_candidate_strategy",
+            "positive_score",
+            "--esmfold2_stagea_include_argmax_candidate",
+            "false",
         ]
     )
     assert resolve_model_backend(args, parser) == "esmfold2"
     assert args.esmfold2_stagea_mutation_fraction == pytest.approx(0.2)
+    assert args.esmfold2_stagea_candidate_strategy == "positive_score"
+    assert args.esmfold2_stagea_include_argmax_candidate is False
 
     bad_args, bad_parser = _parse(
         [
@@ -121,6 +127,19 @@ def test_esmfold2_stagea_mutation_fraction_is_optional_and_validated():
     )
     with pytest.raises(SystemExit):
         resolve_model_backend(bad_args, bad_parser)
+
+    missing_args, missing_parser = _parse(
+        [
+            "--model_backend",
+            "esmfold2",
+            "--mode",
+            "mcts",
+            "--esmfold2_stagea_candidate_strategy",
+            "positive_score",
+        ]
+    )
+    with pytest.raises(SystemExit):
+        resolve_model_backend(missing_args, missing_parser)
 
 
 def test_load_esmfold2_backend_forwards_cli_learning_rate(monkeypatch):

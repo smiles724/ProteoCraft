@@ -28,6 +28,7 @@ from bindcraft.hallucination.esmfold2_backend import (
     ESMFOLD2_ACTION_GROUP_PROPOSAL_LOSS_KEYS,
     ESM_AA_ORDER,
     anchor_binder_logits_to_sequence,
+    build_logit_delta_candidate_batch,
     build_esm_verifier_result,
     build_gradient_mask,
     combine_normalized_gradients,
@@ -35,7 +36,6 @@ from bindcraft.hallucination.esmfold2_backend import (
     init_binder_logits,
     logit_delta_mutation_scores,
     normalized_gradient_tensor,
-    propose_sequences_from_logit_delta,
     resolve_lambda_esmc,
     sequence_from_logits_argmax,
 )
@@ -1091,6 +1091,8 @@ class ESMFold2RuntimeBackend:
         T_sample: float,
         max_mutations_per_seq: int,
         mutation_fraction: Optional[float] = None,
+        candidate_strategy: str = "legacy",
+        include_argmax_candidate: Optional[bool] = None,
         seed: Optional[int] = None,
         mutable_mask: Optional[Sequence[bool]] = None,
         action_group: Optional[str] = None,
@@ -1124,8 +1126,13 @@ class ESMFold2RuntimeBackend:
             preserve_proposal_logits=preserve_proposal_logits,
         )
         confidence_sequences = self._top_confidence_sequences(confidence_candidates)
+        include_logit_candidates = (
+            action_group is None
+            if include_argmax_candidate is None
+            else bool(include_argmax_candidate) and action_group is None
+        )
         with _seed_context(seed):
-            candidates = propose_sequences_from_logit_delta(
+            discrete_batch = build_logit_delta_candidate_batch(
                 logits_before,
                 logits_after,
                 current_seq=current_seq,
@@ -1135,15 +1142,57 @@ class ESMFold2RuntimeBackend:
                 T_sample=T_sample,
                 max_mutations_per_seq=max_mutations_per_seq,
                 mutation_fraction=mutation_fraction,
-                include_logit_candidates=(action_group is None),
+                include_logit_candidates=include_logit_candidates,
+                candidate_strategy=candidate_strategy,
             )
-        candidates = list(dict.fromkeys([*confidence_sequences, *candidates]))
+        # The positive-score experiment requires every returned sequence to
+        # obey the same mutation-count contract. Confidence snapshots are
+        # retained for diagnostics, but cannot enter this candidate pool.
+        returned_confidence_sequences = (
+            [] if str(candidate_strategy).strip().lower() == "positive_score"
+            else confidence_sequences
+        )
+        candidates = list(
+            dict.fromkeys(
+                [*returned_confidence_sequences, *discrete_batch.sequences]
+            )
+        )
+        metadata_by_sequence = {
+            str(item.get("sequence")): dict(item)
+            for item in discrete_batch.candidate_metadata
+            if item.get("sequence")
+        }
+        for sequence in returned_confidence_sequences:
+            metadata_by_sequence.setdefault(
+                str(sequence),
+                {
+                    "sequence": str(sequence),
+                    "source": "proposal_confidence",
+                },
+            )
+        candidate_metadata = [
+            metadata_by_sequence.get(
+                sequence,
+                {"sequence": sequence, "source": "unknown"},
+            )
+            for sequence in candidates
+        ]
+        proposal_diagnostics = dict(discrete_batch.diagnostics)
+        proposal_diagnostics["confidence_candidate_count"] = len(
+            confidence_sequences
+        )
+        proposal_diagnostics["returned_confidence_candidate_count"] = len(
+            returned_confidence_sequences
+        )
+        proposal_diagnostics["returned_candidate_count"] = len(candidates)
         return ESMFold2ProposalBatch(
             sequences=candidates,
             logits_before=logits_before,
             logits_after=logits_after,
             confidence_candidates=confidence_candidates,
             soft_step_metrics=soft_step_metrics,
+            candidate_metadata=candidate_metadata,
+            proposal_diagnostics=proposal_diagnostics,
         )
 
     def continuous_design(
