@@ -31,6 +31,7 @@ from bindcraft.hallucination.esmfold2_backend import (
     anchor_binder_logits_to_sequence,
     init_binder_logits,
     logit_delta_mutation_scores,
+    minimally_align_binder_logits_to_sequence,
     select_esmfold2_action_group,
     sequence_from_logits_argmax,
     softly_anchor_mutation_logits,
@@ -5278,9 +5279,35 @@ def run_esmfold2_mcts_hallucination(
         _annotate_stageb_quality_floor(result, branch_quality_floor)
         strict_tree.store_verifier_result(result)
         handoff_logits = proposal_logits_by_sequence.get(str(result.binder_seq))
+        if handoff_logits is None:
+            stageb_root_logits = _initial_proposal_logits(
+                str(result.binder_seq),
+                mutable_mask,
+            )
+            alignment_changed_positions = None
+        else:
+            stageb_root_logits = minimally_align_binder_logits_to_sequence(
+                handoff_logits,
+                str(result.binder_seq),
+                mutable_mask,
+            )
+            source_handoff_logits = (
+                handoff_logits[0]
+                if handoff_logits.ndim == 3
+                else handoff_logits
+            ).detach().cpu()
+            alignment_changed_positions = sum(
+                not torch.equal(source_handoff_logits[pos], stageb_root_logits[pos])
+                for pos in range(int(L_binder))
+            )
+        logger.info(
+            "ESM StageB handoff root rank=%d minimal_logit_alignment_changed_positions=%s",
+            idx + 1,
+            str(alignment_changed_positions),
+        )
         root_node = strict_tree.add_root_node(
             sequence=result.binder_seq,
-            logits=_anchor_proposal_logits(handoff_logits, result.binder_seq, mutable_mask),
+            logits=stageb_root_logits,
             L_real=result.total_loss,
             coordinate=result.coordinate,
             loss_vector=result.loss_dict,
@@ -5288,6 +5315,9 @@ def run_esmfold2_mcts_hallucination(
             status_flags={
                 "esm_stage": "handoff",
                 "handoff_rank": idx + 1,
+                "minimal_logit_alignment_changed_positions": (
+                    alignment_changed_positions
+                ),
                 ESMFOLD2_STAGEB_QUALITY_FLOOR_KEY: branch_quality_floor,
             },
         )

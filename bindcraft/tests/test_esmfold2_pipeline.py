@@ -10,8 +10,8 @@ from bindcraft.hallucination.esmfold2_backend import (
     AA_TO_ESM_IDX,
     ESM_AA_ORDER,
     ESMFold2ProposalBatch,
-    anchor_binder_logits_to_sequence,
     build_esm_verifier_result,
+    minimally_align_binder_logits_to_sequence,
 )
 from bindcraft.hallucination.mcts_legacy import LegacyMCTSTree
 from bindcraft.hallucination.esmfold2_pipeline import (
@@ -2757,7 +2757,7 @@ def test_stagea_handoff_checkpoint_is_saved_and_resumes_directly_into_stageb(tmp
     assert resumed_backend.verify_calls == []
     assert resumed_backend.propose_calls
     assert all(call["action_group"] is not None for call in resumed_backend.propose_calls)
-    expected_logits = anchor_binder_logits_to_sequence(saved_logits, "AYY")
+    expected_logits = minimally_align_binder_logits_to_sequence(saved_logits, "AYY")
     assert torch.equal(
         resumed_backend.propose_calls[0]["proposal_logits"],
         expected_logits,

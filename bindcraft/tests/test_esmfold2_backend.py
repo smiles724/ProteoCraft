@@ -13,6 +13,7 @@ from bindcraft.hallucination.esmfold2_backend import (
     esm_temperature,
     init_binder_logits,
     logit_delta_mutation_scores,
+    minimally_align_binder_logits_to_sequence,
     normalized_gradient_tensor,
     propose_sequences_from_logit_delta,
     resolve_esm_verifier_loss,
@@ -42,6 +43,73 @@ def test_soft_mutation_anchor_changes_only_explicit_edit_positions():
     y_idx = ESM_AA_ORDER.index("Y")
     finite_before = logits[1][torch.isfinite(logits[1])]
     assert anchored[1, y_idx] == pytest.approx(float(finite_before.max()) + 0.1)
+
+
+def test_minimal_sequence_alignment_preserves_matching_soft_logits_below_two():
+    logits = torch.full((2, len(ESM_AA_ORDER)), -1.0)
+    logits[:, CYS_INDEX] = float("-inf")
+    logits[0, ESM_AA_ORDER.index("A")] = 0.2
+    logits[1, ESM_AA_ORDER.index("Y")] = 0.3
+
+    aligned = minimally_align_binder_logits_to_sequence(
+        logits,
+        "AY",
+        mutable_mask=[True, True],
+    )
+
+    assert torch.equal(aligned, logits)
+
+
+def test_minimal_sequence_alignment_changes_only_mismatched_rows():
+    logits = torch.full((2, len(ESM_AA_ORDER)), -1.0)
+    logits[:, CYS_INDEX] = float("-inf")
+    a_idx = ESM_AA_ORDER.index("A")
+    v_idx = ESM_AA_ORDER.index("V")
+    y_idx = ESM_AA_ORDER.index("Y")
+    logits[0, a_idx] = 1.2
+    logits[0, v_idx] = 3.4
+    logits[1, y_idx] = 0.3
+
+    aligned = minimally_align_binder_logits_to_sequence(
+        logits,
+        "AY",
+        mutable_mask=[True, True],
+        anchor_margin=0.1,
+    )
+
+    assert aligned[0, a_idx] == pytest.approx(3.5)
+    assert torch.equal(aligned[0, 1:], logits[0, 1:])
+    assert torch.equal(aligned[1], logits[1])
+
+
+def test_minimal_sequence_alignment_breaks_argmax_ties():
+    logits = torch.full((1, len(ESM_AA_ORDER)), -1.0)
+    logits[:, CYS_INDEX] = float("-inf")
+    a_idx = ESM_AA_ORDER.index("A")
+    v_idx = ESM_AA_ORDER.index("V")
+    logits[0, a_idx] = 1.0
+    logits[0, v_idx] = 1.0
+
+    aligned = minimally_align_binder_logits_to_sequence(logits, "A")
+
+    assert aligned[0, a_idx] == pytest.approx(1.1)
+    assert ESM_AA_ORDER[int(aligned[0].argmax().item())] == "A"
+
+
+def test_minimal_sequence_alignment_keeps_fixed_positions_hard_constrained():
+    logits = torch.zeros(2, len(ESM_AA_ORDER))
+    logits[:, CYS_INDEX] = float("-inf")
+    y_idx = ESM_AA_ORDER.index("Y")
+
+    aligned = minimally_align_binder_logits_to_sequence(
+        logits,
+        "YA",
+        mutable_mask=[False, True],
+    )
+
+    assert aligned[0, y_idx] == pytest.approx(10.0)
+    assert ESM_AA_ORDER[int(aligned[0].argmax().item())] == "Y"
+    assert aligned[1, ESM_AA_ORDER.index("A")] == pytest.approx(0.1)
 
 
 def test_verifier_loss_requires_pair_chain_iptm_without_global_fallback():

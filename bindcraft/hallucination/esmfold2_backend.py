@@ -690,6 +690,79 @@ def anchor_binder_logits_to_sequence(
     return anchored.detach().cpu().clone()
 
 
+def minimally_align_binder_logits_to_sequence(
+    logits: torch.Tensor,
+    sequence: str,
+    mutable_mask: Optional[Sequence[bool]] = None,
+    *,
+    fixed_logit: float = 10.0,
+    anchor_margin: float = 0.1,
+    suppress_cys: bool = True,
+) -> torch.Tensor:
+    """Align a verified sequence while preserving its saved soft-logit state.
+
+    Mutable rows that already select the verified residue are left unchanged.
+    Only mismatched or tied rows are lifted just above their strongest allowed
+    competitor. Fixed rows retain the existing hard sequence constraint.
+    """
+
+    if logits.ndim == 3:
+        if logits.shape[0] != 1:
+            raise ValueError("node-local ESM logits must have batch size 1")
+        logits_2d = logits[0]
+    elif logits.ndim == 2:
+        logits_2d = logits
+    else:
+        raise ValueError("node-local ESM logits must have shape [L, 20] or [1, L, 20]")
+
+    sequence = str(sequence)
+    length = len(sequence)
+    if logits_2d.shape != (length, len(ESM_AA_ORDER)):
+        raise ValueError(
+            f"logits shape {tuple(logits_2d.shape)} does not match sequence shape "
+            f"({length}, {len(ESM_AA_ORDER)})"
+        )
+    if float(anchor_margin) <= 0.0:
+        raise ValueError("anchor_margin must be positive")
+
+    aligned = logits_2d.detach().clone()
+    sequence_idx = _sequence_indices(sequence).to(device=aligned.device)
+    mutable = _as_bool_mask(mutable_mask, length, device=aligned.device)
+
+    for pos in range(length):
+        aa_idx = int(sequence_idx[pos].item())
+        if not bool(mutable[pos].item()):
+            aligned[pos, :] = 0.0
+            if suppress_cys:
+                aligned[pos, CYS_INDEX] = float("-inf")
+            aligned[pos, aa_idx] = float(fixed_logit)
+            continue
+        if suppress_cys and aa_idx == CYS_INDEX:
+            raise ValueError("cysteine mutations are disabled for ESMFold2 proposals")
+
+        row = aligned[pos]
+        if suppress_cys:
+            row[CYS_INDEX] = float("-inf")
+        competitor_mask = torch.ones(
+            len(ESM_AA_ORDER),
+            dtype=torch.bool,
+            device=row.device,
+        )
+        competitor_mask[aa_idx] = False
+        competitors = row[competitor_mask]
+        finite_competitors = competitors[torch.isfinite(competitors)]
+        competitor_max = (
+            float(finite_competitors.max().item())
+            if finite_competitors.numel()
+            else 0.0
+        )
+        current = float(row[aa_idx].item())
+        if not torch.isfinite(row[aa_idx]) or current <= competitor_max:
+            row[aa_idx] = competitor_max + float(anchor_margin)
+
+    return aligned.detach().cpu().clone()
+
+
 def softly_anchor_mutation_logits(
     logits: torch.Tensor,
     parent_sequence: str,
