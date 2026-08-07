@@ -27,13 +27,56 @@ from bindcraft.hallucination.esmfold2_pipeline import (
     _load_initial_logits_checkpoint_states,
     _make_phase0_seed_states,
     _make_stageb_proposals,
+    _minimally_align_proposal_logits,
     _rerank_stageb_candidates_with_preview,
     _select_stageb_actions_by_group_quota,
     _select_stageb_tree_expansions,
     _select_stagea_tree_results,
+    _stagea_child_logits,
     _stageb_guarded_rank,
     _stageb_preview_objective,
 )
+
+
+def test_minimal_proposal_alignment_preserves_existing_soft_logits():
+    logits = torch.zeros(3, len(ESM_AA_ORDER))
+    logits[0, AA_TO_ESM_IDX["A"]] = 0.4
+    logits[1, AA_TO_ESM_IDX["F"]] = 0.8
+    logits[1, AA_TO_ESM_IDX["Y"]] = 0.2
+    logits[2, AA_TO_ESM_IDX["A"]] = 0.6
+
+    aligned = _minimally_align_proposal_logits(logits, "AYA", None)
+
+    assert aligned[0, AA_TO_ESM_IDX["A"]] == pytest.approx(0.4)
+    assert aligned[1, AA_TO_ESM_IDX["Y"]] == pytest.approx(0.9)
+    assert aligned[2, AA_TO_ESM_IDX["A"]] == pytest.approx(0.6)
+    assert float(aligned[1, AA_TO_ESM_IDX["Y"]]) < 2.0
+
+
+def test_stagea_soft_state_minimally_aligns_every_mismatched_row():
+    logits = torch.zeros(3, len(ESM_AA_ORDER))
+    logits[0, AA_TO_ESM_IDX["F"]] = 0.8
+    logits[0, AA_TO_ESM_IDX["A"]] = 0.1
+    logits[1, AA_TO_ESM_IDX["F"]] = 1.0
+    logits[1, AA_TO_ESM_IDX["Y"]] = 0.2
+    logits[2, AA_TO_ESM_IDX["A"]] = 0.4
+
+    aligned = _stagea_child_logits(
+        logits_after=logits,
+        parent_sequence="AAA",
+        child_sequence="AYA",
+        argmax_sequence=None,
+        mutable_mask=None,
+        preserve_soft_state=True,
+        soft_anchor_margin=0.1,
+    )
+
+    assert aligned[0, AA_TO_ESM_IDX["A"]] == pytest.approx(0.9)
+    assert aligned[1, AA_TO_ESM_IDX["Y"]] == pytest.approx(1.1)
+    assert aligned[2, AA_TO_ESM_IDX["A"]] == pytest.approx(0.4)
+    assert "".join(
+        ESM_AA_ORDER[int(index)] for index in aligned.argmax(dim=-1)
+    ) == "AYA"
 
 
 class FakeESMFold2Backend:
@@ -2456,6 +2499,32 @@ def test_esmfold2_two_stage_uses_separate_stagea_and_stageb_mutation_budgets():
     assert backend.propose_calls[1]["max_mutations_per_seq"] == 1
 
 
+def test_esmfold2_two_stage_accepts_explicit_stageb_verifier_seed():
+    backend = FakeESMFold2Backend()
+
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=3,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=2,
+        seed=7,
+        mcts_strategy="two_stage",
+        mcts_bootstrap_steps=1,
+        mcts_bootstrap_max_steps=1,
+        mcts_expand_actions_per_step=1,
+        esmfold2_stagea_verifier_seed=111,
+        esmfold2_stageb_verifier_seed=222,
+    )
+
+    verify_seeds = [call[2] for call in backend.verify_calls]
+    assert 111 in verify_seeds
+    assert 222 in verify_seeds
+
+
 def test_esmfold2_stagea_fraction_uses_mutable_length_and_leaves_stageb_unchanged():
     backend = FakeESMFold2Backend()
 
@@ -2765,6 +2834,64 @@ def test_stagea_handoff_checkpoint_is_saved_and_resumes_directly_into_stageb(tmp
 
     summary = json.loads((tmp_path / "stageb_resume" / "run_summary.json").read_text())
     assert summary["resumed_from_stagea_handoff"] == str(checkpoint_path.resolve())
+
+
+def test_stagea_handoff_checkpoint_can_continue_stagea(tmp_path):
+    source_artifacts = tmp_path / "stagea_source"
+    run_esmfold2_mcts_hallucination(
+        backend=FakeESMFold2Backend(),
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=2,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=2,
+        seed=7,
+        mcts_strategy="stage_a_only",
+        artifact_dir=source_artifacts,
+    )
+    checkpoint_path = (
+        source_artifacts / "handoff_checkpoints" / "stagea_handoff_final.pt"
+    )
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    handoff = payload["handoff_entries"][0]
+    handoff_sequence = str(handoff["result"]["binder_seq"])
+    saved_logits = handoff["proposal_logits"].clone()
+    wrong_aa = "F" if handoff_sequence[0] != "F" else "Y"
+    saved_logits[0].zero_()
+    saved_logits[0, AA_TO_ESM_IDX[wrong_aa]] = 1.0
+    handoff["proposal_logits"] = saved_logits
+    torch.save(payload, checkpoint_path)
+
+    resumed_backend = FakeESMFold2Backend()
+    _, _, losses = run_esmfold2_mcts_hallucination(
+        backend=resumed_backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=4,
+        num_beams=1,
+        K_top=4,
+        B_candidates=2,
+        seed=7,
+        mcts_strategy="stage_a_only",
+        artifact_dir=tmp_path / "stagea_resume",
+        esmfold2_resume_handoff_checkpoint=checkpoint_path,
+        esmfold2_resume_reverify_roots=True,
+    )
+
+    assert len(losses) == 4
+    assert resumed_backend.propose_calls
+    assert all(call["action_group"] is None for call in resumed_backend.propose_calls)
+    assert [call["global_step"] for call in resumed_backend.propose_calls] == [2, 3]
+    expected_logits = minimally_align_binder_logits_to_sequence(
+        saved_logits,
+        handoff_sequence,
+    )
+    assert torch.equal(
+        resumed_backend.propose_calls[0]["proposal_logits"],
+        expected_logits,
+    )
 
 
 def test_stagea_handoff_checkpoint_rejects_mismatched_target(tmp_path):

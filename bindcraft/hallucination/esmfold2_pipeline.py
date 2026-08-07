@@ -675,6 +675,20 @@ def _anchor_proposal_logits(
     )
 
 
+def _minimally_align_proposal_logits(
+    logits: Optional[torch.Tensor],
+    sequence: str,
+    mutable_mask: Optional[Sequence[bool]],
+) -> torch.Tensor:
+    if logits is None:
+        return _initial_proposal_logits(sequence, mutable_mask)
+    return minimally_align_binder_logits_to_sequence(
+        logits,
+        str(sequence),
+        mutable_mask=mutable_mask,
+    )
+
+
 def _select_stagea_tree_results(
     round_results: Sequence[Any],
     *,
@@ -728,12 +742,10 @@ def _stagea_child_logits(
     if argmax_sequence is not None and str(child_sequence) == str(argmax_sequence):
         return logits_after.detach().cpu().clone()
     if preserve_soft_state:
-        return softly_anchor_mutation_logits(
+        return _minimally_align_proposal_logits(
             logits_after,
-            parent_sequence=str(parent_sequence),
-            child_sequence=str(child_sequence),
-            mutable_mask=mutable_mask,
-            anchor_margin=soft_anchor_margin,
+            str(child_sequence),
+            mutable_mask,
         )
     return _anchor_proposal_logits(logits_after, child_sequence, mutable_mask)
 
@@ -3831,6 +3843,7 @@ def run_esmfold2_mcts_hallucination(
     esmfold2_stageb_min_pair_chain_iptm: float = 0.0,
     esmfold2_stageb_handoff_quality_tolerance: float = 0.05,
     esmfold2_stageb_paired_verifier_seed: bool = True,
+    esmfold2_stageb_verifier_seed: Optional[int] = None,
     esmfold2_final_polish: bool = False,
     esmfold2_stagea_handoff_checkpoint_interval: int = 10,
     esmfold2_resume_handoff_checkpoint: Optional[Union[str, os.PathLike[str]]] = None,
@@ -3924,7 +3937,11 @@ def run_esmfold2_mcts_hallucination(
         else None
     )
     stageb_shared_verify_seed = (
-        _stable_seed(seed, "esm_stageb_paired_verify", target_key)
+        (
+            int(esmfold2_stageb_verifier_seed)
+            if esmfold2_stageb_verifier_seed is not None
+            else _stable_seed(seed, "esm_stageb_paired_verify", target_key)
+        )
         if bool(esmfold2_stageb_paired_verifier_seed)
         else None
     )
@@ -4102,8 +4119,14 @@ def run_esmfold2_mcts_hallucination(
     checkpoint_interval = int(esmfold2_stagea_handoff_checkpoint_interval)
     if checkpoint_interval < 0:
         raise ValueError("esmfold2_stagea_handoff_checkpoint_interval must be non-negative")
-    if esmfold2_resume_handoff_checkpoint is not None and strategy != "two_stage":
-        raise ValueError("StageA handoff checkpoints can only resume into two_stage MCTS")
+    if (
+        esmfold2_resume_handoff_checkpoint is not None
+        and strategy not in {"stage_a_only", "two_stage"}
+    ):
+        raise ValueError(
+            "StageA handoff checkpoints can only resume into stage_a_only "
+            "or two_stage MCTS"
+        )
     if (
         esmfold2_initial_logits_checkpoint is not None
         and esmfold2_resume_handoff_checkpoint is not None
@@ -4143,7 +4166,7 @@ def run_esmfold2_mcts_hallucination(
         if completed_steps >= N_steps:
             raise ValueError(
                 "N_steps must exceed the checkpoint's completed StageA steps "
-                f"({completed_steps}) so StageB has at least one step"
+                f"({completed_steps}) so the resumed search has at least one step"
             )
         if not esmfold2_resume_reverify_roots:
             for entry in resume_state["handoff_entries"]:
@@ -4205,8 +4228,9 @@ def run_esmfold2_mcts_hallucination(
         )
     if resume_state is not None:
         logger.info(
-            "Resuming StageB from StageA handoff checkpoint: %s "
+            "Resuming %s from StageA handoff checkpoint: %s "
             "(completed_stagea_steps=%d reverify_roots=%s verifier_contract_matches=%s)",
+            "StageA" if strategy == "stage_a_only" else "StageB",
             resume_state["checkpoint_path"],
             int(resume_state["completed_stagea_steps"]),
             bool(esmfold2_resume_reverify_roots),
@@ -4279,7 +4303,11 @@ def run_esmfold2_mcts_hallucination(
         phase0_states = [
             (
                 str(entry["result"]["binder_seq"]),
-                entry["proposal_logits"].detach().cpu().clone(),
+                _minimally_align_proposal_logits(
+                    entry["proposal_logits"].detach().cpu().clone(),
+                    str(entry["result"]["binder_seq"]),
+                    mutable_mask,
+                ),
             )
             for entry in resume_state["handoff_entries"]
         ]
@@ -4292,7 +4320,11 @@ def run_esmfold2_mcts_hallucination(
     phase0_artifact_stage = "handoff_resume" if resume_state is not None else "phase0"
     for idx, (binder_seq, _) in enumerate(phase0_states):
         phase0_verify_seed = (
-            stageb_shared_verify_seed
+            stagea_shared_verify_seed
+            if resume_state is not None
+            and strategy == "stage_a_only"
+            and stagea_paired_verifier_seed
+            else stageb_shared_verify_seed
             if resume_state is not None and stageb_paired_verifier_seed
             else (
                 stagea_shared_verify_seed
@@ -4899,11 +4931,17 @@ def run_esmfold2_mcts_hallucination(
         )
         return best_seq, str(round_best.binder_seq), losses_history
 
-    if resume_state is not None:
+    if resume_state is not None and strategy == "two_stage":
+        stagea_start_step = 0
         stagea_steps = 0
+    elif resume_state is not None:
+        stagea_start_step = int(resume_state["completed_stagea_steps"])
+        stagea_steps = N_steps
     elif strategy == "stage_a_only":
+        stagea_start_step = 0
         stagea_steps = N_steps
     else:
+        stagea_start_step = 0
         min_bootstrap = max(int(mcts_bootstrap_steps), 0)
         max_bootstrap = max(int(mcts_bootstrap_max_steps), min_bootstrap)
         stagea_steps = min(N_steps, max_bootstrap)
@@ -4914,7 +4952,7 @@ def run_esmfold2_mcts_hallucination(
 
     stagea_best = best_loss
     stagea_stale = 0
-    for step in range(stagea_steps):
+    for step in range(stagea_start_step, stagea_steps):
         selected_node = tree.select()
         root_selection = tree.last_selection
         current_seq = selected_node.sequence
@@ -5059,7 +5097,7 @@ def run_esmfold2_mcts_hallucination(
                             if argmax_sequence is not None
                             and str(node.sequence) == str(argmax_sequence)
                             else (
-                                "local_soft_anchor"
+                                "minimal_sequence_alignment"
                                 if stagea_preserve_soft_state
                                 else "full_anchor"
                             )
@@ -5305,6 +5343,7 @@ def run_esmfold2_mcts_hallucination(
             idx + 1,
             str(alignment_changed_positions),
         )
+        proposal_logits_by_sequence[str(result.binder_seq)] = stageb_root_logits
         root_node = strict_tree.add_root_node(
             sequence=result.binder_seq,
             logits=stageb_root_logits,
@@ -5371,7 +5410,11 @@ def run_esmfold2_mcts_hallucination(
             quality_floor=final_quality_floor,
         ),
     )
-    _remember_global_best(best_by_guarded)
+    _remember_global_best(
+        best_by_guarded,
+        logits=proposal_logits_by_sequence.get(str(best_by_guarded.binder_seq)),
+        anchor_logits=False,
+    )
 
     for step in range(len(losses_history), N_steps):
         selection = strict_tree.select_decision()
@@ -5598,7 +5641,7 @@ def run_esmfold2_mcts_hallucination(
         }
         for node in new_nodes:
             proposal = proposal_by_sequence.get(str(node.sequence))
-            node.logits = _anchor_proposal_logits(
+            node.logits = _minimally_align_proposal_logits(
                 getattr(proposal, "proposal_logits", None),
                 node.sequence,
                 mutable_mask,
@@ -5613,6 +5656,7 @@ def run_esmfold2_mcts_hallucination(
                     step_created=step,
                     extra={
                         "source": "stage_b_expand",
+                        "soft_state_kind": "minimal_sequence_alignment",
                         "action_id": None if action is None else int(action.action_id),
                         "action_group": None if action is None else str(action.action_group),
                     },
@@ -5717,7 +5761,16 @@ def run_esmfold2_mcts_hallucination(
                     if guarded_action is None
                     else getattr(guarded_action.proposal, "proposal_logits", None)
                 )
-                _remember_global_best(best_by_guarded, logits=guarded_logits)
+                guarded_logits = _minimally_align_proposal_logits(
+                    guarded_logits,
+                    str(best_by_guarded.binder_seq),
+                    mutable_mask,
+                )
+                _remember_global_best(
+                    best_by_guarded,
+                    logits=guarded_logits,
+                    anchor_logits=False,
+                )
         losses_history.append(best_loss)
         parent_pair_chain = 1.0 - float(
             selected_node.loss_vector["pair_chain_iptm_loss"]

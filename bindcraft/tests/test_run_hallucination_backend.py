@@ -57,6 +57,8 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_stageb_min_pair_chain_iptm == pytest.approx(0.0)
     assert args.esmfold2_stageb_handoff_quality_tolerance == pytest.approx(0.05)
     assert args.esmfold2_stageb_paired_verifier_seed is True
+    assert args.esmfold2_stageb_verifier_seed is None
+    assert args.esmfold2_stagea_include_argmax_candidate is True
     assert args.stageb_max_mutations_per_seq == 1
     assert args.esmfold2_logit_init_mode == "official_exact"
     assert args.esmfold2_initial_logits_checkpoint is None
@@ -711,6 +713,7 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     assert captured["esmfold2_stageb_min_pair_chain_iptm"] == pytest.approx(0.25)
     assert captured["esmfold2_stageb_handoff_quality_tolerance"] == pytest.approx(0.05)
     assert captured["esmfold2_stageb_paired_verifier_seed"] is True
+    assert captured["esmfold2_stageb_verifier_seed"] is None
     assert captured["esmfold2_stagea_handoff_checkpoint_interval"] == 10
     assert captured["esmfold2_resume_handoff_checkpoint"] is None
     assert captured["esmfold2_resume_reverify_roots"] is False

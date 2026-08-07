@@ -706,6 +706,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help="Stage B 是否让所有 sequence 使用同一个 run-level verifier seed（默认：true）",
     )
+    parser.add_argument(
+        "--esmfold2_stageb_verifier_seed",
+        type=int,
+        default=None,
+        help="Stage B paired verifier 的显式 seed；默认按 run seed 和 target 派生",
+    )
     parser.add_argument("--esmfold2_lambda_esmc", type=str, default="auto",
                        help="ESMC sequence prior 权重；auto 按任务类型选择，或传入数值字符串")
     parser.add_argument("--esmfold2_task_type", type=str, default="denovo",
@@ -1264,8 +1270,15 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
-        if args.esmfold2_resume_handoff_checkpoint and args.mcts_strategy not in {"two_stage", "strict"}:
-            message = "--esmfold2_resume_handoff_checkpoint requires --mcts_strategy two_stage"
+        if args.esmfold2_resume_handoff_checkpoint and args.mcts_strategy not in {
+            "stage_a_only",
+            "two_stage",
+            "strict",
+        }:
+            message = (
+                "--esmfold2_resume_handoff_checkpoint requires --mcts_strategy "
+                "stage_a_only or two_stage"
+            )
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
@@ -1714,6 +1727,7 @@ def main(argv=None):
                 esmfold2_stageb_min_pair_chain_iptm=args.esmfold2_stageb_min_pair_chain_iptm,
                 esmfold2_stageb_handoff_quality_tolerance=args.esmfold2_stageb_handoff_quality_tolerance,
                 esmfold2_stageb_paired_verifier_seed=args.esmfold2_stageb_paired_verifier_seed,
+                esmfold2_stageb_verifier_seed=args.esmfold2_stageb_verifier_seed,
                 esmfold2_final_polish=args.esmfold2_final_polish,
                 esmfold2_stagea_handoff_checkpoint_interval=args.esmfold2_stagea_handoff_checkpoint_interval,
                 esmfold2_resume_handoff_checkpoint=args.esmfold2_resume_handoff_checkpoint,
@@ -1908,6 +1922,10 @@ def main(argv=None):
             f.write(
                 "ESMFold2 Stage B Paired Verifier Seed: "
                 f"{args.esmfold2_stageb_paired_verifier_seed}\n"
+            )
+            f.write(
+                "ESMFold2 Stage B Verifier Seed: "
+                f"{args.esmfold2_stageb_verifier_seed or 'AUTO'}\n"
             )
             f.write(f"ESMFold2 Lambda ESMC: {args.esmfold2_lambda_esmc}\n")
             f.write(f"ESMFold2 Task Type: {args.esmfold2_task_type}\n")
