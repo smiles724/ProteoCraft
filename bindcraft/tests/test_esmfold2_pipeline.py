@@ -2485,6 +2485,8 @@ def test_esmfold2_two_stage_uses_separate_stagea_and_stageb_mutation_budgets():
         T_sample=1.0,
         max_mutations_per_seq=3,
         stagea_max_mutations_per_seq=6,
+        esmfold2_stagea_mutation_fraction=None,
+        esmfold2_stagea_candidate_strategy="legacy",
         stageb_max_mutations_per_seq=1,
         seed=7,
         mcts_strategy="two_stage",
@@ -2523,6 +2525,44 @@ def test_esmfold2_two_stage_accepts_explicit_stageb_verifier_seed():
     verify_seeds = [call[2] for call in backend.verify_calls]
     assert 111 in verify_seeds
     assert 222 in verify_seeds
+
+
+def test_esmfold2_stagea_defaults_to_positive_score_half_fraction_and_argmax():
+    backend = FakeESMFold2Backend()
+
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=4,
+        N_steps=1,
+        num_beams=1,
+        init_binder_seq="AAAA",
+        K_top=4,
+        B_candidates=2,
+        seed=7,
+        mcts_strategy="stage_a_only",
+    )
+
+    proposal = backend.propose_calls[0]
+    assert proposal["mutation_fraction"] == pytest.approx(0.5)
+    assert proposal["candidate_strategy"] == "positive_score"
+    assert proposal["include_argmax_candidate"] is True
+    assert proposal["max_mutations_per_seq"] == 2
+
+
+def test_esmfold2_positive_score_still_requires_a_mutation_fraction():
+    with pytest.raises(ValueError, match="requires esmfold2_stagea_mutation_fraction"):
+        run_esmfold2_mcts_hallucination(
+            backend=FakeESMFold2Backend(),
+            target_seq="TTTT",
+            L_binder=4,
+            N_steps=1,
+            num_beams=1,
+            init_binder_seq="AAAA",
+            esmfold2_stagea_mutation_fraction=None,
+            esmfold2_stagea_candidate_strategy="positive_score",
+            mcts_strategy="stage_a_only",
+        )
 
 
 def test_esmfold2_stagea_fraction_uses_mutable_length_and_leaves_stageb_unchanged():

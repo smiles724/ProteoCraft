@@ -71,6 +71,9 @@ def test_esmfold2_d_profile_matches_formal_method_defaults():
     assert args.esmfold2_stagea_min_root_expansions == 2
     assert args.esmfold2_stagea_preserve_soft_state is True
     assert args.esmfold2_stagea_cumulative_annealing is False
+    assert args.esmfold2_stagea_mutation_fraction == pytest.approx(0.5)
+    assert args.esmfold2_stagea_candidate_strategy == "positive_score"
+    assert args.esmfold2_stagea_include_argmax_candidate is True
     assert args.esmfold2_one_step_diffusion is True
     assert args.esmfold2_one_step_diffusion_interval == 5
     assert args.esmfold2_one_step_diffusion_tau == pytest.approx(2.0)

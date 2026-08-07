@@ -989,20 +989,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--esmfold2_stagea_mutation_fraction",
         type=float,
-        default=None,
+        default=0.5,
         help=(
             "ESMFold2 StageA sampled candidate 的最大唯一突变位点比例，"
-            "按 mutable mask 长度计算"
+            "按 mutable mask 长度计算（默认：0.5）"
         ),
     )
     parser.add_argument(
         "--esmfold2_stagea_candidate_strategy",
         type=str,
         choices=["legacy", "positive_score"],
-        default="legacy",
+        default="positive_score",
         help=(
             "StageA 离散候选策略；positive_score 仅使用正 logit-delta "
-            "突变，并要求设置 mutation fraction（默认：legacy）"
+            "突变，并要求设置 mutation fraction（默认：positive_score）"
         ),
     )
     parser.add_argument(

@@ -58,6 +58,8 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_stageb_handoff_quality_tolerance == pytest.approx(0.05)
     assert args.esmfold2_stageb_paired_verifier_seed is True
     assert args.esmfold2_stageb_verifier_seed is None
+    assert args.esmfold2_stagea_mutation_fraction == pytest.approx(0.5)
+    assert args.esmfold2_stagea_candidate_strategy == "positive_score"
     assert args.esmfold2_stagea_include_argmax_candidate is True
     assert args.stageb_max_mutations_per_seq == 1
     assert args.esmfold2_logit_init_mode == "official_exact"
@@ -97,7 +99,7 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_hotspot_verify_too_close_weight == pytest.approx(0.0)
 
 
-def test_esmfold2_stagea_mutation_fraction_is_optional_and_validated():
+def test_esmfold2_stagea_mutation_fraction_is_configurable_and_validated():
     args, parser = _parse(
         [
             "--model_backend",
@@ -129,20 +131,6 @@ def test_esmfold2_stagea_mutation_fraction_is_optional_and_validated():
     )
     with pytest.raises(SystemExit):
         resolve_model_backend(bad_args, bad_parser)
-
-    missing_args, missing_parser = _parse(
-        [
-            "--model_backend",
-            "esmfold2",
-            "--mode",
-            "mcts",
-            "--esmfold2_stagea_candidate_strategy",
-            "positive_score",
-        ]
-    )
-    with pytest.raises(SystemExit):
-        resolve_model_backend(missing_args, missing_parser)
-
 
 def test_load_esmfold2_backend_forwards_cli_learning_rate(monkeypatch):
     args, parser = _parse(
