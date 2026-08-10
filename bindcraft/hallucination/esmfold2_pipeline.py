@@ -1276,7 +1276,14 @@ class _ESMFold2StageBMCTSTree(MCTSTree):
 
 def _normalize_prior_mode(mode: Optional[str]) -> str:
     normalized = str(mode or "full").strip().lower()
-    if normalized not in {"full", "uniform", "no_gradient", "no_group", "no_sequence"}:
+    if normalized not in {
+        "full",
+        "uniform",
+        "no_gradient",
+        "no_group",
+        "no_group_matched_compute",
+        "no_sequence",
+    }:
         return "full"
     return normalized
 
@@ -1287,9 +1294,50 @@ def _apply_stageb_group_prior_mode(
     group_priors: Dict[str, float],
 ) -> Tuple[str, Dict[str, float]]:
     prior_mode = _normalize_prior_mode(prior_mode)
-    if prior_mode in {"uniform", "no_group"}:
+    if prior_mode in {"uniform", "no_group", "no_group_matched_compute"}:
         return "unrouted", {"unrouted": 1.0}
     return action_group, group_priors or {action_group: 1.0}
+
+
+def _stageb_proposal_call_specs(
+    group_budgets: Mapping[str, int],
+    prior_mode: str,
+) -> List[Tuple[str, int, str]]:
+    """Return proposal calls while preserving the legacy modes exactly."""
+
+    calls = [
+        (str(group), int(budget), str(group))
+        for group, budget in group_budgets.items()
+        if int(budget) > 0
+    ]
+    if _normalize_prior_mode(prior_mode) != "no_group_matched_compute":
+        return calls
+
+    total_budget = sum(budget for _, budget, _ in calls)
+    if total_budget <= 0:
+        return []
+    replica_count = min(3, total_budget)
+    base_budget, remainder = divmod(total_budget, replica_count)
+    return [
+        (
+            "unrouted",
+            base_budget + (1 if replica_index < remainder else 0),
+            f"unrouted_replica_{replica_index}",
+        )
+        for replica_index in range(replica_count)
+    ]
+
+
+def _deduplicate_actions_by_sequence(actions: Sequence[Any]) -> List[Any]:
+    unique = []
+    seen = set()
+    for action in actions:
+        sequence = str(getattr(action, "sequence", ""))
+        if not sequence or sequence in seen:
+            continue
+        seen.add(sequence)
+        unique.append(action)
+    return unique
 
 
 def _stageb_result_pair_chain_iptm(result: Any) -> float:
@@ -3370,6 +3418,25 @@ def _stageb_preview_objective(
         key = "intra_contact_loss"
     elif normalized_group == "compactness_repair":
         key = "glob_loss"
+    elif normalized_group == "unrouted":
+        intra = _finite_float(preview.get("intra_contact_loss"))
+        inter_key = (
+            "effective_inter_contact_loss"
+            if localized and "effective_inter_contact_loss" in preview
+            else "inter_contact_loss"
+        )
+        inter = _finite_float(preview.get(inter_key))
+        glob = _finite_float(preview.get("glob_loss"))
+        if intra is None or inter is None or glob is None:
+            raise ValueError(
+                "Preview output is missing unified-loss components for 'unrouted'"
+            )
+        value = 0.5 * intra + 0.5 * inter + 0.2 * glob
+        if not localized:
+            hotspot_contact = _finite_float(preview.get("hotspot_contact_loss"))
+            if hotspot_contact is not None:
+                value += max(float(hotspot_weight), 0.0) * hotspot_contact
+        return float(value)
     else:
         raise ValueError(f"Unsupported ESMFold2 Stage-B action group: {action_group!r}")
 
@@ -5464,6 +5531,10 @@ def run_esmfold2_mcts_hallucination(
             stageb_rerank_pool_size if stageb_discrete_rerank else 0,
         )
         group_budgets = _allocate_group_budgets(group_priors, proposal_pool_budget)
+        proposal_call_specs = _stageb_proposal_call_specs(
+            group_budgets,
+            mcts_prior_mode,
+        )
         proposal_pool: List[ESMFold2MutationProposal] = []
         rerank_preview_cache: Dict[str, Dict[str, float]] = {}
         rerank_seed = _stable_seed(
@@ -5473,7 +5544,7 @@ def run_esmfold2_mcts_hallucination(
             current_seq,
             step,
         )
-        for group_name, group_budget in group_budgets.items():
+        for group_name, group_budget, proposal_seed_label in proposal_call_specs:
             proposal_batch = _call_backend_propose(
                 backend,
                 current_seq=current_seq,
@@ -5483,7 +5554,14 @@ def run_esmfold2_mcts_hallucination(
                 B_candidates=group_budget,
                 T_sample=T_sample,
                 max_mutations_per_seq=stageb_max_mutations,
-                seed=_stable_seed(seed, "esm_stageb_propose", target_key, current_seq, step, group_name),
+                seed=_stable_seed(
+                    seed,
+                    "esm_stageb_propose",
+                    target_key,
+                    current_seq,
+                    step,
+                    proposal_seed_label,
+                ),
                 action_group=group_name,
                 mutable_mask=mutable_mask,
                 proposal_logits=selected_node.logits,
@@ -5544,6 +5622,8 @@ def run_esmfold2_mcts_hallucination(
             continue
 
         registered_actions = strict_tree.register_action_proposals(selected_node, proposal_pool)
+        if _normalize_prior_mode(mcts_prior_mode) == "no_group_matched_compute":
+            registered_actions = _deduplicate_actions_by_sequence(registered_actions)
         verifier_actions, verifier_group_quotas = _select_stageb_actions_by_group_quota(
             strict_tree,
             selected_node,
@@ -5810,8 +5890,15 @@ def run_esmfold2_mcts_hallucination(
             group_scores=dict(routing.get("group_scores", {})),
             group_priors=group_priors,
             group_budgets=group_budgets,
+            proposal_call_budgets={
+                seed_label: budget
+                for _, budget, seed_label in proposal_call_specs
+            },
             verifier_group_quotas=verifier_group_quotas,
             generated_group_counts=generated_group_counts,
+            generated_unique_candidate_count=len(
+                {str(proposal.sequence) for proposal in proposal_pool}
+            ),
             verified_group_counts=_count_items(verified_action_groups),
             selected_group_counts=_count_items(
                 [str(action.action_group) for action in tree_actions]

@@ -1054,8 +1054,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcts_expand_actions_per_step", type=int, default=None,
                        help="MCTS StageB 每步最多扩展并验证的 action 数（Protenix 默认 2；ESMFold2 默认 4）")
     parser.add_argument("--mcts_prior_mode", type=str, default="full",
-                       choices=["full", "uniform", "no_gradient", "no_group", "no_sequence"],
-                       help="MCTS StageB prior 消融模式（默认：full，保持当前完整逻辑）")
+                       choices=[
+                           "full",
+                           "uniform",
+                           "no_gradient",
+                           "no_group",
+                           "no_group_matched_compute",
+                           "no_sequence",
+                       ],
+                       help=("MCTS StageB prior 消融模式（默认：full；"
+                             "no_group_matched_compute 用三条 unified-loss proposal "
+                             "对齐 Full StageB 的 proposal 计算量）"))
     parser.add_argument("--mcts_proposal_method", type=str, default="one_step_fixed",
                        choices=["one_step_fixed", "one_step_adaptive", "two_step_truncated"],
                        help="MCTS StageB proposal 消融方法（默认：one_step_fixed，保持当前逻辑）")

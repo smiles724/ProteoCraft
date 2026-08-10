@@ -23,6 +23,8 @@ from bindcraft.hallucination.esmfold2_pipeline import (
     _ESMFold2StageBMCTSTree,
     _allocate_chunked_best_of_n_steps,
     _allocate_group_budgets,
+    _deduplicate_actions_by_sequence,
+    _stageb_proposal_call_specs,
     _hotspot_proposal_weight_for_verified_state,
     _load_initial_logits_checkpoint_states,
     _make_phase0_seed_states,
@@ -556,6 +558,33 @@ def test_stageb_group_budget_keeps_every_repair_group_represented():
     }
 
 
+def test_stageb_matched_no_group_uses_three_equal_compute_calls():
+    specs = _stageb_proposal_call_specs(
+        {"unrouted": 20},
+        "no_group_matched_compute",
+    )
+
+    assert [group for group, _, _ in specs] == ["unrouted"] * 3
+    assert [budget for _, budget, _ in specs] == [7, 7, 6]
+    assert len({seed_label for _, _, seed_label in specs}) == 3
+    assert sum(budget for _, budget, _ in specs) == 20
+
+
+def test_stageb_matched_no_group_deduplicates_registered_actions():
+    actions = [
+        SimpleNamespace(action_id=0, sequence="AAA"),
+        SimpleNamespace(action_id=0, sequence="AAA"),
+        SimpleNamespace(action_id=1, sequence="AYA"),
+    ]
+
+    unique = _deduplicate_actions_by_sequence(actions)
+
+    assert [(item.action_id, item.sequence) for item in unique] == [
+        (0, "AAA"),
+        (1, "AYA"),
+    ]
+
+
 def test_stageb_verifier_selection_applies_group_quotas_before_action_ranking():
     class FakeTree:
         @staticmethod
@@ -746,6 +775,19 @@ def test_stageb_preview_objective_matches_group_and_localized_hotspot():
         hotspot_weight=0.5,
         hotspot_interface_mode="localized",
     ) == pytest.approx(0.55)
+
+    assert _stageb_preview_objective(
+        preview,
+        action_group="unrouted",
+        hotspot_weight=0.5,
+        hotspot_interface_mode="localized",
+    ) == pytest.approx(0.36)
+    assert _stageb_preview_objective(
+        preview,
+        action_group="unrouted",
+        hotspot_weight=0.5,
+        hotspot_interface_mode="additive",
+    ) == pytest.approx(0.76)
 
 
 def test_stageb_discrete_rerank_uses_paired_seed_and_parent_delta():
