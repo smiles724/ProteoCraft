@@ -694,6 +694,55 @@ def test_runtime_propose_candidate_sampling_is_reproducible_for_fixed_seed():
     assert first == second
 
 
+def test_positive_score_runtime_excludes_unbounded_confidence_candidates(
+    monkeypatch,
+):
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(),
+        device="cpu",
+        verifier_model=object(),
+        input_builder=FakeInputBuilder(),
+        protein_input_cls=FakeProteinInput,
+        structure_prediction_input_cls=FakeStructurePredictionInput,
+    )
+    before = torch.zeros(4, 20)
+    after = before.clone()
+    after[0, AA_TO_ESM_IDX["Y"]] = 4.0
+    after[1, AA_TO_ESM_IDX["F"]] = 3.0
+    monkeypatch.setattr(
+        backend,
+        "_run_soft_update_with_tracking",
+        lambda **kwargs: (
+            before,
+            after,
+            [{"sequence": "YYYY", "confidence_score": 1.0}],
+            [],
+        ),
+    )
+
+    batch = backend.propose(
+        current_seq="AAAA",
+        target_seq="TTTT",
+        global_step=0,
+        K_top=10,
+        B_candidates=8,
+        T_sample=1.0,
+        max_mutations_per_seq=3,
+        mutation_fraction=0.25,
+        candidate_strategy="positive_score",
+        include_argmax_candidate=False,
+        seed=17,
+    )
+
+    assert "YYYY" not in batch.sequences
+    assert all(
+        sum(a != b for a, b in zip("AAAA", sequence)) == 1
+        for sequence in batch.sequences
+    )
+    assert batch.proposal_diagnostics["confidence_candidate_count"] == 1
+    assert batch.proposal_diagnostics["returned_confidence_candidate_count"] == 0
+
+
 def test_runtime_propose_can_continue_from_saved_proposal_logits():
     aa_to_idx = {aa: idx for idx, aa in enumerate("ARNDCQEGHILKMFPSTWYV")}
     saved_logits = torch.zeros(3, 20)
@@ -751,6 +800,8 @@ def test_runtime_continuous_design_records_soft_step_metrics(monkeypatch):
             lambda_esmc=0.0,
             num_loops=1,
             num_sampling_steps=1,
+            one_step_diffusion_enabled=False,
+            one_step_diffusion_interval=0,
         ),
         device="cpu",
         experimental_model=object(),
@@ -1001,6 +1052,8 @@ def test_runtime_continuous_design_logs_multichain_hotspot_metrics(monkeypatch):
             num_sampling_steps=1,
             hotspot_weight=0.3,
             hotspot_cutoff=8.0,
+            one_step_diffusion_enabled=False,
+            one_step_diffusion_interval=0,
         ),
         device="cpu",
         experimental_model=object(),
@@ -1048,6 +1101,8 @@ def test_runtime_can_disable_only_distogram_hotspot(monkeypatch):
             num_sampling_steps=1,
             hotspot_weight=0.5,
             hotspot_cutoff=8.0,
+            one_step_diffusion_enabled=False,
+            one_step_diffusion_interval=0,
             hotspot_interface_mode="localized",
             distogram_hotspot_enabled=False,
         ),
@@ -1095,6 +1150,8 @@ def test_runtime_continuous_design_accepts_multiple_target_chains(monkeypatch):
             lambda_esmc=0.0,
             num_loops=1,
             num_sampling_steps=1,
+            one_step_diffusion_enabled=False,
+            one_step_diffusion_interval=0,
         ),
         device="cpu",
         experimental_model=object(),

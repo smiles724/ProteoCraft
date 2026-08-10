@@ -10,8 +10,8 @@ from bindcraft.hallucination.esmfold2_backend import (
     AA_TO_ESM_IDX,
     ESM_AA_ORDER,
     ESMFold2ProposalBatch,
-    anchor_binder_logits_to_sequence,
     build_esm_verifier_result,
+    minimally_align_binder_logits_to_sequence,
 )
 from bindcraft.hallucination.mcts_legacy import LegacyMCTSTree
 from bindcraft.hallucination.esmfold2_pipeline import (
@@ -23,17 +23,62 @@ from bindcraft.hallucination.esmfold2_pipeline import (
     _ESMFold2StageBMCTSTree,
     _allocate_chunked_best_of_n_steps,
     _allocate_group_budgets,
+    _deduplicate_actions_by_sequence,
+    _stageb_proposal_call_specs,
     _hotspot_proposal_weight_for_verified_state,
     _load_initial_logits_checkpoint_states,
     _make_phase0_seed_states,
     _make_stageb_proposals,
+    _minimally_align_proposal_logits,
     _rerank_stageb_candidates_with_preview,
     _select_stageb_actions_by_group_quota,
     _select_stageb_tree_expansions,
     _select_stagea_tree_results,
+    _stagea_child_logits,
     _stageb_guarded_rank,
     _stageb_preview_objective,
 )
+
+
+def test_minimal_proposal_alignment_preserves_existing_soft_logits():
+    logits = torch.zeros(3, len(ESM_AA_ORDER))
+    logits[0, AA_TO_ESM_IDX["A"]] = 0.4
+    logits[1, AA_TO_ESM_IDX["F"]] = 0.8
+    logits[1, AA_TO_ESM_IDX["Y"]] = 0.2
+    logits[2, AA_TO_ESM_IDX["A"]] = 0.6
+
+    aligned = _minimally_align_proposal_logits(logits, "AYA", None)
+
+    assert aligned[0, AA_TO_ESM_IDX["A"]] == pytest.approx(0.4)
+    assert aligned[1, AA_TO_ESM_IDX["Y"]] == pytest.approx(0.9)
+    assert aligned[2, AA_TO_ESM_IDX["A"]] == pytest.approx(0.6)
+    assert float(aligned[1, AA_TO_ESM_IDX["Y"]]) < 2.0
+
+
+def test_stagea_soft_state_minimally_aligns_every_mismatched_row():
+    logits = torch.zeros(3, len(ESM_AA_ORDER))
+    logits[0, AA_TO_ESM_IDX["F"]] = 0.8
+    logits[0, AA_TO_ESM_IDX["A"]] = 0.1
+    logits[1, AA_TO_ESM_IDX["F"]] = 1.0
+    logits[1, AA_TO_ESM_IDX["Y"]] = 0.2
+    logits[2, AA_TO_ESM_IDX["A"]] = 0.4
+
+    aligned = _stagea_child_logits(
+        logits_after=logits,
+        parent_sequence="AAA",
+        child_sequence="AYA",
+        argmax_sequence=None,
+        mutable_mask=None,
+        preserve_soft_state=True,
+        soft_anchor_margin=0.1,
+    )
+
+    assert aligned[0, AA_TO_ESM_IDX["A"]] == pytest.approx(0.9)
+    assert aligned[1, AA_TO_ESM_IDX["Y"]] == pytest.approx(1.1)
+    assert aligned[2, AA_TO_ESM_IDX["A"]] == pytest.approx(0.4)
+    assert "".join(
+        ESM_AA_ORDER[int(index)] for index in aligned.argmax(dim=-1)
+    ) == "AYA"
 
 
 class FakeESMFold2Backend:
@@ -89,6 +134,9 @@ class FakeESMFold2Backend:
         B_candidates,
         T_sample,
         max_mutations_per_seq,
+        mutation_fraction=None,
+        candidate_strategy=None,
+        include_argmax_candidate=None,
         seed=None,
         action_group=None,
         mutable_mask=None,
@@ -109,6 +157,9 @@ class FakeESMFold2Backend:
                 "action_group": action_group,
                 "mutable_mask": mutable_mask,
                 "max_mutations_per_seq": max_mutations_per_seq,
+                "mutation_fraction": mutation_fraction,
+                "candidate_strategy": candidate_strategy,
+                "include_argmax_candidate": include_argmax_candidate,
                 "proposal_logits": proposal_logits.detach().clone() if proposal_logits is not None else None,
                 "hotspot_params": hotspot_params,
                 "track_confidence_override": track_confidence_override,
@@ -507,6 +558,33 @@ def test_stageb_group_budget_keeps_every_repair_group_represented():
     }
 
 
+def test_stageb_matched_no_group_uses_three_equal_compute_calls():
+    specs = _stageb_proposal_call_specs(
+        {"unrouted": 20},
+        "no_group_matched_compute",
+    )
+
+    assert [group for group, _, _ in specs] == ["unrouted"] * 3
+    assert [budget for _, budget, _ in specs] == [7, 7, 6]
+    assert len({seed_label for _, _, seed_label in specs}) == 3
+    assert sum(budget for _, budget, _ in specs) == 20
+
+
+def test_stageb_matched_no_group_deduplicates_registered_actions():
+    actions = [
+        SimpleNamespace(action_id=0, sequence="AAA"),
+        SimpleNamespace(action_id=0, sequence="AAA"),
+        SimpleNamespace(action_id=1, sequence="AYA"),
+    ]
+
+    unique = _deduplicate_actions_by_sequence(actions)
+
+    assert [(item.action_id, item.sequence) for item in unique] == [
+        (0, "AAA"),
+        (1, "AYA"),
+    ]
+
+
 def test_stageb_verifier_selection_applies_group_quotas_before_action_ranking():
     class FakeTree:
         @staticmethod
@@ -697,6 +775,19 @@ def test_stageb_preview_objective_matches_group_and_localized_hotspot():
         hotspot_weight=0.5,
         hotspot_interface_mode="localized",
     ) == pytest.approx(0.55)
+
+    assert _stageb_preview_objective(
+        preview,
+        action_group="unrouted",
+        hotspot_weight=0.5,
+        hotspot_interface_mode="localized",
+    ) == pytest.approx(0.36)
+    assert _stageb_preview_objective(
+        preview,
+        action_group="unrouted",
+        hotspot_weight=0.5,
+        hotspot_interface_mode="additive",
+    ) == pytest.approx(0.76)
 
 
 def test_stageb_discrete_rerank_uses_paired_seed_and_parent_delta():
@@ -1204,6 +1295,8 @@ def test_stagea_argmax_child_preserves_raw_logits_and_only_two_children_enter_tr
         mcts_strategy="stage_a_only",
         mcts_handoff_top_k=2,
         esmfold2_stagea_tree_children=2,
+        esmfold2_stagea_root_selection_mode="global_ucb",
+        esmfold2_stagea_min_root_expansions=0,
         esmfold2_stagea_handoff_checkpoint_interval=0,
         artifact_dir=artifact_dir,
     )
@@ -1328,6 +1421,38 @@ def test_stagea_cumulative_annealing_follows_selected_node_soft_depth(tmp_path):
     stagea_events = [event for event in trajectory if event["stage"] == "stage_a"]
     assert [event["soft_step_start"] for event in stagea_events] == [0, 30]
     assert [event["soft_step_end"] for event in stagea_events] == [30, 60]
+
+
+def test_stagea_defaults_to_independent_outer_step_annealing():
+    backend = FakeESMFold2Backend()
+
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=2,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=2,
+        T_sample=1.0,
+        max_mutations_per_seq=1,
+        seed=7,
+        mcts_C=0.0,
+        mcts_strategy="stage_a_only",
+        esmfold2_stagea_soft_steps=30,
+        esmfold2_stagea_preserve_soft_state=True,
+        esmfold2_stagea_handoff_checkpoint_interval=0,
+    )
+
+    assert [call["temperature_step_offset"] for call in backend.propose_calls] == [
+        0,
+        0,
+    ]
+    assert [call["temperature_total_steps"] for call in backend.propose_calls] == [
+        None,
+        None,
+    ]
 
 
 def test_raw_lineage_stagea_keeps_logits_continuous_and_defers_verifier():
@@ -1786,6 +1911,41 @@ def test_esmfold2_official_exact_roots_use_direct_torch_seed():
     seq, logits = states[0]
     assert seq == expected_seq
     assert torch.allclose(logits, expected_logits, equal_nan=False)
+
+
+def test_official_exact_phase0_handoff_preserves_free_logits(tmp_path):
+    expected_sequence, expected_logits = _make_phase0_seed_states(
+        None,
+        num_beams=1,
+        L_binder=3,
+        seed=42,
+        mutable_mask=[True, True, True],
+        logit_init_mode="official_exact",
+    )[0]
+    artifact_dir = tmp_path / "artifacts"
+
+    run_esmfold2_mcts_hallucination(
+        backend=FakeESMFold2Backend(),
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=0,
+        num_beams=1,
+        seed=42,
+        mcts_strategy="stage_a_only",
+        esmfold2_logit_init_mode="official_exact",
+        artifact_dir=artifact_dir,
+    )
+
+    payload = torch.load(
+        artifact_dir / "handoff_checkpoints" / "stagea_handoff_final.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    entry = payload["handoff_entries"][0]
+    assert entry["result"]["binder_seq"] == expected_sequence
+    assert torch.equal(entry["proposal_logits"], expected_logits)
+    finite_logits = entry["proposal_logits"][torch.isfinite(entry["proposal_logits"])]
+    assert finite_logits.abs().max().item() < 0.1
 
 
 def test_initial_logits_checkpoint_directory_restores_exact_phase0_roots(tmp_path):
@@ -2367,6 +2527,8 @@ def test_esmfold2_two_stage_uses_separate_stagea_and_stageb_mutation_budgets():
         T_sample=1.0,
         max_mutations_per_seq=3,
         stagea_max_mutations_per_seq=6,
+        esmfold2_stagea_mutation_fraction=None,
+        esmfold2_stagea_candidate_strategy="legacy",
         stageb_max_mutations_per_seq=1,
         seed=7,
         mcts_strategy="two_stage",
@@ -2379,6 +2541,106 @@ def test_esmfold2_two_stage_uses_separate_stagea_and_stageb_mutation_budgets():
     assert backend.propose_calls[0]["max_mutations_per_seq"] == 6
     assert backend.propose_calls[1]["action_group"] == "interface_formation"
     assert backend.propose_calls[1]["max_mutations_per_seq"] == 1
+
+
+def test_esmfold2_two_stage_accepts_explicit_stageb_verifier_seed():
+    backend = FakeESMFold2Backend()
+
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=3,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=2,
+        seed=7,
+        mcts_strategy="two_stage",
+        mcts_bootstrap_steps=1,
+        mcts_bootstrap_max_steps=1,
+        mcts_expand_actions_per_step=1,
+        esmfold2_stagea_verifier_seed=111,
+        esmfold2_stageb_verifier_seed=222,
+    )
+
+    verify_seeds = [call[2] for call in backend.verify_calls]
+    assert 111 in verify_seeds
+    assert 222 in verify_seeds
+
+
+def test_esmfold2_stagea_defaults_to_positive_score_half_fraction_and_argmax():
+    backend = FakeESMFold2Backend()
+
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=4,
+        N_steps=1,
+        num_beams=1,
+        init_binder_seq="AAAA",
+        K_top=4,
+        B_candidates=2,
+        seed=7,
+        mcts_strategy="stage_a_only",
+    )
+
+    proposal = backend.propose_calls[0]
+    assert proposal["mutation_fraction"] == pytest.approx(0.5)
+    assert proposal["candidate_strategy"] == "positive_score"
+    assert proposal["include_argmax_candidate"] is True
+    assert proposal["max_mutations_per_seq"] == 2
+
+
+def test_esmfold2_positive_score_still_requires_a_mutation_fraction():
+    with pytest.raises(ValueError, match="requires esmfold2_stagea_mutation_fraction"):
+        run_esmfold2_mcts_hallucination(
+            backend=FakeESMFold2Backend(),
+            target_seq="TTTT",
+            L_binder=4,
+            N_steps=1,
+            num_beams=1,
+            init_binder_seq="AAAA",
+            esmfold2_stagea_mutation_fraction=None,
+            esmfold2_stagea_candidate_strategy="positive_score",
+            mcts_strategy="stage_a_only",
+        )
+
+
+def test_esmfold2_stagea_fraction_uses_mutable_length_and_leaves_stageb_unchanged():
+    backend = FakeESMFold2Backend()
+
+    run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=10,
+        N_steps=3,
+        num_beams=1,
+        init_binder_seq="A" * 10,
+        mutable_mask=[False, False] + [True] * 8,
+        K_top=4,
+        B_candidates=2,
+        T_sample=1.0,
+        max_mutations_per_seq=3,
+        esmfold2_stagea_mutation_fraction=0.5,
+        esmfold2_stagea_candidate_strategy="positive_score",
+        esmfold2_stagea_include_argmax_candidate=False,
+        stageb_max_mutations_per_seq=1,
+        seed=7,
+        mcts_strategy="two_stage",
+        mcts_bootstrap_steps=1,
+        mcts_bootstrap_max_steps=1,
+        mcts_expand_actions_per_step=1,
+    )
+
+    assert backend.propose_calls[0]["max_mutations_per_seq"] == 4
+    assert backend.propose_calls[0]["mutation_fraction"] == pytest.approx(0.5)
+    assert backend.propose_calls[0]["candidate_strategy"] == "positive_score"
+    assert backend.propose_calls[0]["include_argmax_candidate"] is False
+    assert backend.propose_calls[1]["max_mutations_per_seq"] == 1
+    assert backend.propose_calls[1]["mutation_fraction"] is None
+    assert backend.propose_calls[1]["candidate_strategy"] is None
+    assert backend.propose_calls[1]["include_argmax_candidate"] is None
 
 
 def test_esmfold2_two_stage_uses_separate_stagea_and_stageb_soft_steps():
@@ -2646,7 +2908,7 @@ def test_stagea_handoff_checkpoint_is_saved_and_resumes_directly_into_stageb(tmp
     assert resumed_backend.verify_calls == []
     assert resumed_backend.propose_calls
     assert all(call["action_group"] is not None for call in resumed_backend.propose_calls)
-    expected_logits = anchor_binder_logits_to_sequence(saved_logits, "AYY")
+    expected_logits = minimally_align_binder_logits_to_sequence(saved_logits, "AYY")
     assert torch.equal(
         resumed_backend.propose_calls[0]["proposal_logits"],
         expected_logits,
@@ -2654,6 +2916,64 @@ def test_stagea_handoff_checkpoint_is_saved_and_resumes_directly_into_stageb(tmp
 
     summary = json.loads((tmp_path / "stageb_resume" / "run_summary.json").read_text())
     assert summary["resumed_from_stagea_handoff"] == str(checkpoint_path.resolve())
+
+
+def test_stagea_handoff_checkpoint_can_continue_stagea(tmp_path):
+    source_artifacts = tmp_path / "stagea_source"
+    run_esmfold2_mcts_hallucination(
+        backend=FakeESMFold2Backend(),
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=2,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=2,
+        seed=7,
+        mcts_strategy="stage_a_only",
+        artifact_dir=source_artifacts,
+    )
+    checkpoint_path = (
+        source_artifacts / "handoff_checkpoints" / "stagea_handoff_final.pt"
+    )
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    handoff = payload["handoff_entries"][0]
+    handoff_sequence = str(handoff["result"]["binder_seq"])
+    saved_logits = handoff["proposal_logits"].clone()
+    wrong_aa = "F" if handoff_sequence[0] != "F" else "Y"
+    saved_logits[0].zero_()
+    saved_logits[0, AA_TO_ESM_IDX[wrong_aa]] = 1.0
+    handoff["proposal_logits"] = saved_logits
+    torch.save(payload, checkpoint_path)
+
+    resumed_backend = FakeESMFold2Backend()
+    _, _, losses = run_esmfold2_mcts_hallucination(
+        backend=resumed_backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=4,
+        num_beams=1,
+        K_top=4,
+        B_candidates=2,
+        seed=7,
+        mcts_strategy="stage_a_only",
+        artifact_dir=tmp_path / "stagea_resume",
+        esmfold2_resume_handoff_checkpoint=checkpoint_path,
+        esmfold2_resume_reverify_roots=True,
+    )
+
+    assert len(losses) == 4
+    assert resumed_backend.propose_calls
+    assert all(call["action_group"] is None for call in resumed_backend.propose_calls)
+    assert [call["global_step"] for call in resumed_backend.propose_calls] == [2, 3]
+    expected_logits = minimally_align_binder_logits_to_sequence(
+        saved_logits,
+        handoff_sequence,
+    )
+    assert torch.equal(
+        resumed_backend.propose_calls[0]["proposal_logits"],
+        expected_logits,
+    )
 
 
 def test_stagea_handoff_checkpoint_rejects_mismatched_target(tmp_path):

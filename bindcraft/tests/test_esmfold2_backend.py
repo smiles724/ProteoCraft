@@ -5,6 +5,7 @@ from bindcraft.hallucination.esmfold2_backend import (
     CYS_INDEX,
     ESM_AA_ORDER,
     ESMFold2ProposalConfig,
+    build_logit_delta_candidate_batch,
     build_esm_verifier_result,
     build_gradient_mask,
     combine_normalized_gradients,
@@ -12,6 +13,7 @@ from bindcraft.hallucination.esmfold2_backend import (
     esm_temperature,
     init_binder_logits,
     logit_delta_mutation_scores,
+    minimally_align_binder_logits_to_sequence,
     normalized_gradient_tensor,
     propose_sequences_from_logit_delta,
     resolve_esm_verifier_loss,
@@ -41,6 +43,73 @@ def test_soft_mutation_anchor_changes_only_explicit_edit_positions():
     y_idx = ESM_AA_ORDER.index("Y")
     finite_before = logits[1][torch.isfinite(logits[1])]
     assert anchored[1, y_idx] == pytest.approx(float(finite_before.max()) + 0.1)
+
+
+def test_minimal_sequence_alignment_preserves_matching_soft_logits_below_two():
+    logits = torch.full((2, len(ESM_AA_ORDER)), -1.0)
+    logits[:, CYS_INDEX] = float("-inf")
+    logits[0, ESM_AA_ORDER.index("A")] = 0.2
+    logits[1, ESM_AA_ORDER.index("Y")] = 0.3
+
+    aligned = minimally_align_binder_logits_to_sequence(
+        logits,
+        "AY",
+        mutable_mask=[True, True],
+    )
+
+    assert torch.equal(aligned, logits)
+
+
+def test_minimal_sequence_alignment_changes_only_mismatched_rows():
+    logits = torch.full((2, len(ESM_AA_ORDER)), -1.0)
+    logits[:, CYS_INDEX] = float("-inf")
+    a_idx = ESM_AA_ORDER.index("A")
+    v_idx = ESM_AA_ORDER.index("V")
+    y_idx = ESM_AA_ORDER.index("Y")
+    logits[0, a_idx] = 1.2
+    logits[0, v_idx] = 3.4
+    logits[1, y_idx] = 0.3
+
+    aligned = minimally_align_binder_logits_to_sequence(
+        logits,
+        "AY",
+        mutable_mask=[True, True],
+        anchor_margin=0.1,
+    )
+
+    assert aligned[0, a_idx] == pytest.approx(3.5)
+    assert torch.equal(aligned[0, 1:], logits[0, 1:])
+    assert torch.equal(aligned[1], logits[1])
+
+
+def test_minimal_sequence_alignment_breaks_argmax_ties():
+    logits = torch.full((1, len(ESM_AA_ORDER)), -1.0)
+    logits[:, CYS_INDEX] = float("-inf")
+    a_idx = ESM_AA_ORDER.index("A")
+    v_idx = ESM_AA_ORDER.index("V")
+    logits[0, a_idx] = 1.0
+    logits[0, v_idx] = 1.0
+
+    aligned = minimally_align_binder_logits_to_sequence(logits, "A")
+
+    assert aligned[0, a_idx] == pytest.approx(1.1)
+    assert ESM_AA_ORDER[int(aligned[0].argmax().item())] == "A"
+
+
+def test_minimal_sequence_alignment_keeps_fixed_positions_hard_constrained():
+    logits = torch.zeros(2, len(ESM_AA_ORDER))
+    logits[:, CYS_INDEX] = float("-inf")
+    y_idx = ESM_AA_ORDER.index("Y")
+
+    aligned = minimally_align_binder_logits_to_sequence(
+        logits,
+        "YA",
+        mutable_mask=[False, True],
+    )
+
+    assert aligned[0, y_idx] == pytest.approx(10.0)
+    assert ESM_AA_ORDER[int(aligned[0].argmax().item())] == "Y"
+    assert aligned[1, ESM_AA_ORDER.index("A")] == pytest.approx(0.1)
 
 
 def test_verifier_loss_requires_pair_chain_iptm_without_global_fallback():
@@ -278,9 +347,12 @@ def test_normalized_gradient_tensor_matches_official_eff_length_scaling():
 def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     default_config = ESMFold2ProposalConfig(lambda_esmc="auto")
     assert default_config.soft_steps == 30
+    assert default_config.learning_rate == pytest.approx(0.05)
     assert default_config.proposal_lm_dropout == pytest.approx(0.5)
     assert default_config.force_proposal_lm_dropout is True
-    assert default_config.experimental_model_name.endswith("ESMFold2-Experimental")
+    assert default_config.experimental_model_name.endswith(
+        "ESMFold2-Experimental-Fast"
+    )
     assert default_config.hotspot_weight == pytest.approx(0.0)
     assert default_config.hotspot_satisfied_proposal_weight == pytest.approx(0.0)
     assert default_config.hotspot_cutoff == pytest.approx(8.0)
@@ -290,11 +362,11 @@ def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     assert default_config.hotspot_verify_far_cutoff == pytest.approx(20.0)
     assert default_config.hotspot_verify_min_distance == pytest.approx(2.5)
     assert default_config.hotspot_verify_too_close_weight == pytest.approx(0.0)
-    assert default_config.one_step_diffusion_enabled is False
-    assert default_config.one_step_diffusion_tau == pytest.approx(4.0)
-    assert default_config.one_step_diffusion_weight == pytest.approx(1.0)
-    assert default_config.one_step_diffusion_rg_weight == pytest.approx(0.3)
-    assert default_config.one_step_diffusion_interval == 0
+    assert default_config.one_step_diffusion_enabled is True
+    assert default_config.one_step_diffusion_tau == pytest.approx(2.0)
+    assert default_config.one_step_diffusion_weight == pytest.approx(0.25)
+    assert default_config.one_step_diffusion_rg_weight == pytest.approx(0.1)
+    assert default_config.one_step_diffusion_interval == 5
     assert default_config.one_step_diffusion_recycle_coordinates is False
     assert default_config.one_step_diffusion_hotspot_enabled is False
     assert default_config.distogram_hotspot_enabled is True
@@ -342,6 +414,7 @@ def test_proposal_config_validates_hotspot_verifier_parameters():
 
 
 def test_proposal_config_validates_one_step_diffusion_parameters():
+    assert ESMFold2ProposalConfig().esmc_activation_checkpointing is False
     with pytest.raises(ValueError, match="one_step_diffusion_tau"):
         ESMFold2ProposalConfig(one_step_diffusion_tau=0.0)
     with pytest.raises(ValueError, match="one_step_diffusion_weight"):
@@ -354,13 +427,17 @@ def test_proposal_config_validates_one_step_diffusion_parameters():
         ValueError,
         match="positive one_step_diffusion_interval",
     ):
-        ESMFold2ProposalConfig(one_step_diffusion_interval=5)
+        ESMFold2ProposalConfig(
+            one_step_diffusion_enabled=False,
+            one_step_diffusion_interval=5,
+        )
     with pytest.raises(
         ValueError,
         match="one_step_diffusion_recycle_coordinates",
     ):
         ESMFold2ProposalConfig(
             one_step_diffusion_recycle_coordinates=True,
+            one_step_diffusion_interval=0,
         )
     with pytest.raises(ValueError, match="verifier_loss_mode"):
         ESMFold2ProposalConfig(verifier_loss_mode="unknown")
@@ -413,6 +490,144 @@ def test_logit_delta_candidates_prepend_full_argmax_sequence():
     assert candidates[0] == "AYF"
     assert len(candidates) == 3
     assert all(seq[0] == "A" for seq in candidates)
+
+
+def test_logit_delta_fraction_samples_distinct_mutable_positions():
+    aa_to_idx = {aa: idx for idx, aa in enumerate(ESM_AA_ORDER)}
+    before = torch.zeros(10, 20)
+    after = before.clone()
+    for position in range(10):
+        after[position, aa_to_idx["Y"]] = float(20 - position)
+
+    torch.manual_seed(4)
+    candidates = propose_sequences_from_logit_delta(
+        before,
+        after,
+        current_seq="A" * 10,
+        mutable_mask=[False, False] + [True] * 8,
+        K_top=2,
+        B_candidates=20,
+        T_sample=1.0,
+        max_mutations_per_seq=1,
+        mutation_fraction=0.5,
+    )
+
+    mutation_counts = [
+        sum(left != right for left, right in zip("A" * 10, sequence))
+        for sequence in candidates
+    ]
+    assert max(mutation_counts) == 4
+    assert all(count <= 4 for count in mutation_counts)
+    assert all(sequence[:2] == "AA" for sequence in candidates)
+
+
+def test_positive_score_candidates_use_fixed_count_and_disable_raw_argmax():
+    aa_to_idx = {aa: idx for idx, aa in enumerate(ESM_AA_ORDER)}
+    before = torch.zeros(10, 20)
+    after = before.clone()
+    for position in range(2, 10):
+        after[position, aa_to_idx["Y"]] = float(20 - position)
+        after[position, aa_to_idx["F"]] = float(10 - position) + 0.5
+
+    torch.manual_seed(7)
+    batch = build_logit_delta_candidate_batch(
+        before,
+        after,
+        current_seq="A" * 10,
+        mutable_mask=[False, False] + [True] * 8,
+        K_top=2,
+        B_candidates=8,
+        T_sample=1.0,
+        mutation_fraction=0.5,
+        include_logit_candidates=False,
+        candidate_strategy="positive_score",
+    )
+
+    assert len(batch.sequences) >= 2
+    assert all(
+        sum(left != right for left, right in zip("A" * 10, sequence)) == 4
+        for sequence in batch.sequences
+    )
+    assert batch.sequences[0] == "AAYYYYAAAA"
+    assert all(sequence[:2] == "AA" for sequence in batch.sequences)
+    assert all(sequence != "AA" + "Y" * 8 for sequence in batch.sequences)
+    assert batch.candidate_metadata[0]["source"] == "positive_score_topk"
+    assert all(
+        item["mutation_count"] == 4 for item in batch.candidate_metadata
+    )
+    assert batch.diagnostics["positive_position_count"] == 8
+    assert batch.diagnostics["mutation_cap"] == 4
+    assert batch.diagnostics["actual_mutation_count"] == 4
+
+
+def test_positive_score_candidates_do_not_force_nonpositive_mutations():
+    aa_to_idx = {aa: idx for idx, aa in enumerate(ESM_AA_ORDER)}
+    before = torch.zeros(8, 20)
+    after = before.clone()
+    after[2, aa_to_idx["Y"]] = 3.0
+    after[5, aa_to_idx["F"]] = 2.0
+    after[6, aa_to_idx["W"]] = -2.0
+
+    batch = build_logit_delta_candidate_batch(
+        before,
+        after,
+        current_seq="A" * 8,
+        mutable_mask=[True] * 8,
+        B_candidates=8,
+        mutation_fraction=0.5,
+        include_logit_candidates=False,
+        candidate_strategy="positive_score",
+    )
+
+    assert batch.sequences == ["AAYAAFAA"]
+    assert batch.diagnostics["positive_position_count"] == 2
+    assert batch.diagnostics["mutation_cap"] == 4
+    assert batch.diagnostics["actual_mutation_count"] == 2
+
+
+def test_positive_score_argmax_control_is_explicit_and_unrestricted():
+    aa_to_idx = {aa: idx for idx, aa in enumerate(ESM_AA_ORDER)}
+    before = torch.zeros(6, 20)
+    after = before.clone()
+    after[:, aa_to_idx["Y"]] = 3.0
+
+    batch = build_logit_delta_candidate_batch(
+        before,
+        after,
+        current_seq="A" * 6,
+        B_candidates=4,
+        mutation_fraction=0.5,
+        include_logit_candidates=True,
+        candidate_strategy="positive_score",
+    )
+
+    assert batch.sequences[0] == "Y" * 6
+    assert batch.candidate_metadata[0]["source"] == "unrestricted_argmax"
+    assert batch.candidate_metadata[0]["mutation_count"] == 6
+    assert batch.candidate_metadata[1]["mutation_count"] == 3
+
+
+def test_positive_score_strategy_requires_mutation_fraction():
+    logits = torch.zeros(2, 20)
+    with pytest.raises(ValueError, match="requires mutation_fraction"):
+        propose_sequences_from_logit_delta(
+            logits,
+            logits,
+            current_seq="AA",
+            candidate_strategy="positive_score",
+        )
+
+
+@pytest.mark.parametrize("fraction", [0.0, -0.1, 1.1, float("nan")])
+def test_logit_delta_fraction_rejects_invalid_values(fraction):
+    logits = torch.zeros(2, 20)
+    with pytest.raises(ValueError, match="mutation_fraction"):
+        propose_sequences_from_logit_delta(
+            logits,
+            logits,
+            current_seq="AA",
+            mutation_fraction=fraction,
+        )
 
 
 def test_esmfold2_action_group_routing_uses_native_loss_terms():

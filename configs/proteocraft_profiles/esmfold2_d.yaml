@@ -28,6 +28,9 @@ defaults:
   esmfold2_stagea_min_root_expansions: 2
   esmfold2_stagea_preserve_soft_state: true
   esmfold2_stagea_cumulative_annealing: false
+  esmfold2_stagea_mutation_fraction: 0.5
+  esmfold2_stagea_candidate_strategy: positive_score
+  esmfold2_stagea_include_argmax_candidate: true
   esmfold2_stagea_paired_verifier_seed: true
   esmfold2_logit_init_mode: official_exact
   esmfold2_proposal_num_loops: 1

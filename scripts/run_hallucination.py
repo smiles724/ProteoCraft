@@ -36,6 +36,7 @@ import os
 import sys
 import argparse
 import logging
+import math
 import torch
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -410,9 +411,13 @@ def load_esmfold2_backend(
         verifier_num_loops=args.esmfold2_verifier_num_loops,
         verifier_num_sampling_steps=args.esmfold2_verifier_num_sampling_steps,
         soft_steps=stagea_soft_steps,
+        learning_rate=args.learning_rate,
         temperature_min=args.esmfold2_temperature_min,
         temperature_max=args.esmfold2_temperature_max,
         lambda_esmc=args.esmfold2_lambda_esmc,
+        esmc_activation_checkpointing=(
+            args.esmfold2_esmc_activation_checkpointing
+        ),
         num_loops=args.esmfold2_proposal_num_loops,
         num_sampling_steps=args.esmfold2_proposal_num_sampling_steps,
         proposal_load_internal_esmc=args.esmfold2_proposal_load_internal_esmc,
@@ -507,8 +512,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="模型 backend：protenix 保持原有 V1/V2 流程；esmfold2 启用 ESMFold2 第一版闭环")
     parser.add_argument("--esmfold2_verifier_model", type=str, default="biohub/ESMFold2",
                        help="ESMFold2 verifier 模型名（仅 --model_backend esmfold2 使用）")
-    parser.add_argument("--esmfold2_experimental_model", type=str, default="biohub/ESMFold2-Experimental",
-                       help="ESMFold2Experimental proposal 模型名（仅 --model_backend esmfold2 使用）")
+    parser.add_argument("--esmfold2_experimental_model", type=str, default="biohub/ESMFold2-Experimental-Fast",
+                       help="ESMFold2Experimental proposal 模型名（默认：biohub/ESMFold2-Experimental-Fast；仅 --model_backend esmfold2 使用）")
     parser.add_argument("--esmfold2_soft_steps", type=int, default=None,
                        help="兼容旧脚本：同时设置 ESMFold2 Stage A / Stage B 的 soft gradient update 步数")
     parser.add_argument("--esmfold2_stagea_soft_steps", type=int, default=None,
@@ -538,19 +543,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--esmfold2_stagea_root_selection_mode",
         type=str,
         choices=["global_ucb", "hierarchical_ucb"],
-        default="global_ucb",
+        default="hierarchical_ucb",
         help=(
             "ESMFold2 Stage A root/node 选择方式；global_ucb 保留原全树 UCB，"
-            "hierarchical_ucb 先选 root 再在其子树内选 node"
+            "hierarchical_ucb 先选 root 再在其子树内选 node（默认）"
         ),
     )
     parser.add_argument(
         "--esmfold2_stagea_min_root_expansions",
         type=int,
-        default=0,
+        default=2,
         help=(
             "hierarchical_ucb 下每个 Phase0 root 在自适应选择前至少获得的 "
-            "outer-step 扩展次数（默认 0，旧行为不受影响）"
+            "outer-step 扩展次数（默认：2）"
         ),
     )
     parser.add_argument(
@@ -565,8 +570,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--esmfold2_stagea_cumulative_annealing",
         type=lambda x: x.lower() == "true",
-        default=True,
-        help="Stage A 是否沿 MCTS 路径累计温度退火进度（默认：true）",
+        default=False,
+        help="Stage A 是否沿 MCTS 路径累计温度退火进度（默认：false）",
     )
     parser.add_argument(
         "--esmfold2_stagea_annealing_horizon",
@@ -701,6 +706,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help="Stage B 是否让所有 sequence 使用同一个 run-level verifier seed（默认：true）",
     )
+    parser.add_argument(
+        "--esmfold2_stageb_verifier_seed",
+        type=int,
+        default=None,
+        help="Stage B paired verifier 的显式 seed；默认按 run seed 和 target 派生",
+    )
     parser.add_argument("--esmfold2_lambda_esmc", type=str, default="auto",
                        help="ESMC sequence prior 权重；auto 按任务类型选择，或传入数值字符串")
     parser.add_argument("--esmfold2_task_type", type=str, default="denovo",
@@ -774,6 +785,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2 proposal distogram forward diffusion steps（默认：1）")
     parser.add_argument("--esmfold2_proposal_load_internal_esmc", type=lambda x: x.lower() == "true", default=True,
                        help="是否为 ESMFold2Experimental proposal model 加载内部 ESMC（官方 binder design 为 true）")
+    parser.add_argument(
+        "--esmfold2_esmc_activation_checkpointing",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help="ESMC sequence-prior 是否逐层 activation checkpoint（默认：false）",
+    )
     parser.add_argument("--esmfold2_proposal_lm_dropout", type=float, default=0.5,
                        help="ESMFold2Experimental proposal LM dropout；官方 binder design inversion/proposal 使用 0.5")
     parser.add_argument("--esmfold2_force_proposal_lm_dropout", type=lambda x: x.lower() == "true", default=True,
@@ -781,40 +798,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--esmfold2_one_step_diffusion",
         type=lambda x: x.lower() == "true",
-        default=False,
+        default=True,
         help=(
-            "是否启用可微 ESMFold2 one-step diffusion；默认 false。"
-            "interval=0 时保持旧行为，在全部 soft steps 后额外更新一次"
+            "是否启用可微 ESMFold2 one-step diffusion；默认 true。"
+            "默认每 5 个 soft steps 联合更新一次"
         ),
     )
     parser.add_argument(
         "--esmfold2_one_step_diffusion_tau",
         type=float,
-        default=4.0,
-        help="ESMFold2 one-step diffusion 固定噪声尺度 tau（默认：4.0）",
+        default=2.0,
+        help="ESMFold2 one-step diffusion 固定噪声尺度 tau（默认：2.0）",
     )
     parser.add_argument(
         "--esmfold2_one_step_diffusion_weight",
         type=float,
-        default=1.0,
-        help="归一化 one-step diffusion gradient 的组合权重（默认：1.0）",
+        default=0.25,
+        help="归一化 one-step diffusion gradient 的组合权重（默认：0.25）",
     )
     parser.add_argument(
         "--esmfold2_one_step_diffusion_rg_weight",
         type=float,
-        default=0.3,
+        default=0.1,
         help=(
             "one-step diffusion common loss 中 Rg/compactness 项的权重"
-            "（默认：0.3，保持原有行为）"
+            "（默认：0.1）"
         ),
     )
     parser.add_argument(
         "--esmfold2_one_step_diffusion_interval",
         type=int,
-        default=0,
+        default=5,
         help=(
             "在 soft optimization 内每隔多少步联合加入一次 one-step "
-            "diffusion；0 表示保持旧行为，在全部 soft steps 后额外更新一次"
+            "diffusion（默认：5）；0 表示仅在全部 soft steps 后额外更新一次"
         ),
     )
     parser.add_argument(
@@ -969,6 +986,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="每条序列的最大突变数（默认：3）")
     parser.add_argument("--stagea_max_mutations_per_seq", type=int, default=None,
                        help="ESMFold2/两阶段搜索 StageA 每条候选最大突变数；默认沿用 --max_mutations_per_seq")
+    parser.add_argument(
+        "--esmfold2_stagea_mutation_fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "ESMFold2 StageA sampled candidate 的最大唯一突变位点比例，"
+            "按 mutable mask 长度计算（默认：0.5）"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_candidate_strategy",
+        type=str,
+        choices=["legacy", "positive_score"],
+        default="positive_score",
+        help=(
+            "StageA 离散候选策略；positive_score 仅使用正 logit-delta "
+            "突变，并要求设置 mutation fraction（默认：positive_score）"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_include_argmax_candidate",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help=(
+            "StageA 是否加入不受突变比例限制的 logits argmax 候选"
+            "（默认：true）"
+        ),
+    )
     parser.add_argument("--stageb_max_mutations_per_seq", type=int, default=None,
                        help="ESMFold2/两阶段搜索 StageB 每条候选最大突变数；默认沿用 --max_mutations_per_seq")
     parser.add_argument("--use_annealing", type=lambda x: x.lower() == "true", default=True,
@@ -987,13 +1032,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcts_max_nodes", type=int, default=5000, help="MCTS 树最大节点数（默认：5000）")
     parser.add_argument("--mcts_tau_fixed", type=float, default=4.0, help="MCTS 固定扩散 tau（默认：4.0）")
     parser.add_argument("--mcts_num_beams", type=int, default=8, help="MCTS Phase0 根节点数 / beam（默认：8）")
-    parser.add_argument("--mcts_strategy", type=str, default="two_stage",
+    parser.add_argument("--mcts_strategy", type=str, default=None,
                        choices=["legacy", "stage_a_only", "strict", "two_stage", "continuous_stage_a", "raw_lineage_stage_a", "best_of_n", "best_of_n_chunked"],
                        help=(
                            "搜索策略：best_of_n 运行独立连续轨迹且不使用 MCTS；"
                            "best_of_n_chunked 将 --n_steps 总 outer-step 预算"
                            "均分给独立分段轨迹，不做逐步 verifier 选择；"
-                           "其余为 StageA/两阶段 MCTS 模式（默认：two_stage）"
+                           "其余为 StageA/两阶段 MCTS 模式；默认按 backend 解析："
+                           "Protenix=two_stage，ESMFold2=stage_a_only"
                        ))
     parser.add_argument("--mcts_bootstrap_steps", type=int, default=50,
                        help="two_stage: StageA 原版 MCTS 至少运行步数（默认：50）")
@@ -1008,8 +1054,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcts_expand_actions_per_step", type=int, default=None,
                        help="MCTS StageB 每步最多扩展并验证的 action 数（Protenix 默认 2；ESMFold2 默认 4）")
     parser.add_argument("--mcts_prior_mode", type=str, default="full",
-                       choices=["full", "uniform", "no_gradient", "no_group", "no_sequence"],
-                       help="MCTS StageB prior 消融模式（默认：full，保持当前完整逻辑）")
+                       choices=[
+                           "full",
+                           "uniform",
+                           "no_gradient",
+                           "no_group",
+                           "no_group_matched_compute",
+                           "no_sequence",
+                       ],
+                       help=("MCTS StageB prior 消融模式（默认：full；"
+                             "no_group_matched_compute 用三条 unified-loss proposal "
+                             "对齐 Full StageB 的 proposal 计算量）"))
     parser.add_argument("--mcts_proposal_method", type=str, default="one_step_fixed",
                        choices=["one_step_fixed", "one_step_adaptive", "two_step_truncated"],
                        help="MCTS StageB proposal 消融方法（默认：one_step_fixed，保持当前逻辑）")
@@ -1071,6 +1126,10 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
         if parser is not None:
             parser.error(message)
         raise ValueError(message)
+    if getattr(args, "mcts_strategy", None) is None:
+        args.mcts_strategy = (
+            "stage_a_only" if backend == "esmfold2" else "two_stage"
+        )
     if backend == "esmfold2" and getattr(args, "mode", None) != "mcts":
         message = "ESMFold2 backend first version only supports --mode mcts"
         if parser is not None:
@@ -1154,6 +1213,25 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             raise ValueError(message)
         if getattr(args, "stageb_max_mutations_per_seq", None) is None:
             args.stageb_max_mutations_per_seq = 1
+        if args.esmfold2_stagea_mutation_fraction is not None and (
+            not math.isfinite(args.esmfold2_stagea_mutation_fraction)
+            or not 0.0 < args.esmfold2_stagea_mutation_fraction <= 1.0
+        ):
+            message = "--esmfold2_stagea_mutation_fraction must be in (0, 1]"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if (
+            args.esmfold2_stagea_candidate_strategy == "positive_score"
+            and args.esmfold2_stagea_mutation_fraction is None
+        ):
+            message = (
+                "--esmfold2_stagea_candidate_strategy positive_score requires "
+                "--esmfold2_stagea_mutation_fraction"
+            )
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
         if getattr(args, "mcts_handoff_top_k", None) is None:
             args.mcts_handoff_top_k = 2
         if args.esmfold2_stageb_rerank_pool_size <= 0:
@@ -1201,8 +1279,15 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
-        if args.esmfold2_resume_handoff_checkpoint and args.mcts_strategy not in {"two_stage", "strict"}:
-            message = "--esmfold2_resume_handoff_checkpoint requires --mcts_strategy two_stage"
+        if args.esmfold2_resume_handoff_checkpoint and args.mcts_strategy not in {
+            "stage_a_only",
+            "two_stage",
+            "strict",
+        }:
+            message = (
+                "--esmfold2_resume_handoff_checkpoint requires --mcts_strategy "
+                "stage_a_only or two_stage"
+            )
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
@@ -1594,6 +1679,15 @@ def main(argv=None):
                 T_sample=args.t_sample,
                 max_mutations_per_seq=args.max_mutations_per_seq,
                 stagea_max_mutations_per_seq=args.stagea_max_mutations_per_seq,
+                esmfold2_stagea_mutation_fraction=(
+                    args.esmfold2_stagea_mutation_fraction
+                ),
+                esmfold2_stagea_candidate_strategy=(
+                    args.esmfold2_stagea_candidate_strategy
+                ),
+                esmfold2_stagea_include_argmax_candidate=(
+                    args.esmfold2_stagea_include_argmax_candidate
+                ),
                 stageb_max_mutations_per_seq=args.stageb_max_mutations_per_seq,
                 num_beams=args.mcts_num_beams,
                 init_binder_seq=args.init_binder_seq,
@@ -1642,6 +1736,7 @@ def main(argv=None):
                 esmfold2_stageb_min_pair_chain_iptm=args.esmfold2_stageb_min_pair_chain_iptm,
                 esmfold2_stageb_handoff_quality_tolerance=args.esmfold2_stageb_handoff_quality_tolerance,
                 esmfold2_stageb_paired_verifier_seed=args.esmfold2_stageb_paired_verifier_seed,
+                esmfold2_stageb_verifier_seed=args.esmfold2_stageb_verifier_seed,
                 esmfold2_final_polish=args.esmfold2_final_polish,
                 esmfold2_stagea_handoff_checkpoint_interval=args.esmfold2_stagea_handoff_checkpoint_interval,
                 esmfold2_resume_handoff_checkpoint=args.esmfold2_resume_handoff_checkpoint,
@@ -1837,6 +1932,10 @@ def main(argv=None):
                 "ESMFold2 Stage B Paired Verifier Seed: "
                 f"{args.esmfold2_stageb_paired_verifier_seed}\n"
             )
+            f.write(
+                "ESMFold2 Stage B Verifier Seed: "
+                f"{args.esmfold2_stageb_verifier_seed or 'AUTO'}\n"
+            )
             f.write(f"ESMFold2 Lambda ESMC: {args.esmfold2_lambda_esmc}\n")
             f.write(f"ESMFold2 Task Type: {args.esmfold2_task_type}\n")
             f.write(f"ESMFold2 Logit Init Mode: {args.esmfold2_logit_init_mode}\n")
@@ -1846,6 +1945,14 @@ def main(argv=None):
             )
             f.write(f"ESMFold2 Mutable Mask: {args.esmfold2_mutable_mask or 'ALL'}\n")
             f.write(
+                "ESMFold2 StageA Candidate Strategy: "
+                f"{args.esmfold2_stagea_candidate_strategy}\n"
+            )
+            f.write(
+                "ESMFold2 StageA Include Argmax Candidate: "
+                f"{args.esmfold2_stagea_include_argmax_candidate}\n"
+            )
+            f.write(
                 "ESMFold2 Target Chain Roles: "
                 f"{args.esmfold2_target_chain_roles or 'ALL_TARGET'}\n"
             )
@@ -1853,6 +1960,10 @@ def main(argv=None):
             f.write(f"ESMFold2 Resume Handoff Checkpoint: {args.esmfold2_resume_handoff_checkpoint or 'NONE'}\n")
             f.write(f"ESMFold2 Resume Reverify Roots: {args.esmfold2_resume_reverify_roots}\n")
             f.write(f"ESMFold2 Proposal Load Internal ESMC: {args.esmfold2_proposal_load_internal_esmc}\n")
+            f.write(
+                "ESMFold2 ESMC Activation Checkpointing: "
+                f"{args.esmfold2_esmc_activation_checkpointing}\n"
+            )
             f.write(f"ESMFold2 Proposal LM Dropout: {args.esmfold2_proposal_lm_dropout}\n")
             f.write(f"ESMFold2 Force Proposal LM Dropout: {args.esmfold2_force_proposal_lm_dropout}\n")
             f.write(f"ESMFold2 Track Proposal Confidence: {args.esmfold2_track_proposal_confidence}\n")
