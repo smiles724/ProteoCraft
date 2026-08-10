@@ -363,7 +363,9 @@ def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     assert default_config.hotspot_verify_min_distance == pytest.approx(2.5)
     assert default_config.hotspot_verify_too_close_weight == pytest.approx(0.0)
     assert default_config.one_step_diffusion_enabled is True
+    assert default_config.one_step_diffusion_mode == "reference_noising"
     assert default_config.one_step_diffusion_tau == pytest.approx(2.0)
+    assert default_config.one_step_diffusion_truncated_num_sampling_steps == 50
     assert default_config.one_step_diffusion_weight == pytest.approx(0.25)
     assert default_config.one_step_diffusion_rg_weight == pytest.approx(0.1)
     assert default_config.one_step_diffusion_interval == 5
@@ -417,6 +419,12 @@ def test_proposal_config_validates_one_step_diffusion_parameters():
     assert ESMFold2ProposalConfig().esmc_activation_checkpointing is False
     with pytest.raises(ValueError, match="one_step_diffusion_tau"):
         ESMFold2ProposalConfig(one_step_diffusion_tau=0.0)
+    with pytest.raises(ValueError, match="one_step_diffusion_mode"):
+        ESMFold2ProposalConfig(one_step_diffusion_mode="unknown")
+    with pytest.raises(ValueError, match="truncated_num_sampling_steps"):
+        ESMFold2ProposalConfig(
+            one_step_diffusion_truncated_num_sampling_steps=1
+        )
     with pytest.raises(ValueError, match="one_step_diffusion_weight"):
         ESMFold2ProposalConfig(one_step_diffusion_weight=-0.1)
     with pytest.raises(ValueError, match="one_step_diffusion_rg_weight"):
@@ -438,6 +446,14 @@ def test_proposal_config_validates_one_step_diffusion_parameters():
         ESMFold2ProposalConfig(
             one_step_diffusion_recycle_coordinates=True,
             one_step_diffusion_interval=0,
+        )
+    with pytest.raises(
+        ValueError,
+        match="only supported by reference_noising",
+    ):
+        ESMFold2ProposalConfig(
+            one_step_diffusion_mode="truncated_trajectory",
+            one_step_diffusion_recycle_coordinates=True,
         )
     with pytest.raises(ValueError, match="verifier_loss_mode"):
         ESMFold2ProposalConfig(verifier_loss_mode="unknown")

@@ -2539,6 +2539,13 @@ def run_esmfold2_chunked_best_of_n(
     uses_verifier_feedback = continuation_policy == "verifier_best"
     one_step_config = {
         "enabled": one_step_enabled,
+        "mode": str(
+            getattr(
+                backend_config,
+                "one_step_diffusion_mode",
+                "reference_noising",
+            )
+        ),
         "interval": int(
             getattr(backend_config, "one_step_diffusion_interval", 0)
         ),
@@ -2550,6 +2557,13 @@ def run_esmfold2_chunked_best_of_n(
         ),
         "rg_weight": float(
             getattr(backend_config, "one_step_diffusion_rg_weight", 0.0)
+        ),
+        "truncated_num_sampling_steps": int(
+            getattr(
+                backend_config,
+                "one_step_diffusion_truncated_num_sampling_steps",
+                50,
+            )
         ),
         "recycle_coordinates": bool(
             getattr(
@@ -2652,9 +2666,14 @@ def run_esmfold2_chunked_best_of_n(
         ),
         "logits_carry_policy": "raw_argmax_unanchored",
         "reference_coordinate_policy": (
-            "initial_full_verifier_coordinates_and_features_fixed"
+            "unused_truncated_trajectory"
             if one_step_enabled
-            else "unused"
+            and one_step_config["mode"] == "truncated_trajectory"
+            else (
+                "initial_full_verifier_coordinates_and_features_fixed"
+                if one_step_enabled
+                else "unused"
+            )
         ),
         "verifier_loss_mode": str(
             getattr(backend_config, "verifier_loss_mode", "pair_chain_iptm")

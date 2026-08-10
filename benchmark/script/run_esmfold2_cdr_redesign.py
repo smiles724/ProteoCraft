@@ -182,6 +182,10 @@ def build_hallucination_command(
         "esmfold2_force_proposal_lm_dropout": "esmfold2_force_proposal_lm_dropout",
         "esmfold2_one_step_diffusion": "esmfold2_one_step_diffusion",
         "esmfold2_one_step_diffusion_tau": "esmfold2_one_step_diffusion_tau",
+        "esmfold2_one_step_diffusion_mode": "esmfold2_one_step_diffusion_mode",
+        "esmfold2_one_step_truncated_num_sampling_steps": (
+            "esmfold2_one_step_truncated_num_sampling_steps"
+        ),
         "esmfold2_one_step_diffusion_weight": "esmfold2_one_step_diffusion_weight",
         "esmfold2_one_step_diffusion_rg_weight": "esmfold2_one_step_diffusion_rg_weight",
         "esmfold2_one_step_diffusion_interval": "esmfold2_one_step_diffusion_interval",

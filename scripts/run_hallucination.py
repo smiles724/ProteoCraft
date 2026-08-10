@@ -424,7 +424,11 @@ def load_esmfold2_backend(
         proposal_lm_dropout=args.esmfold2_proposal_lm_dropout,
         force_proposal_lm_dropout=args.esmfold2_force_proposal_lm_dropout,
         one_step_diffusion_enabled=args.esmfold2_one_step_diffusion,
+        one_step_diffusion_mode=args.esmfold2_one_step_diffusion_mode,
         one_step_diffusion_tau=args.esmfold2_one_step_diffusion_tau,
+        one_step_diffusion_truncated_num_sampling_steps=(
+            args.esmfold2_one_step_truncated_num_sampling_steps
+        ),
         one_step_diffusion_weight=args.esmfold2_one_step_diffusion_weight,
         one_step_diffusion_rg_weight=(
             args.esmfold2_one_step_diffusion_rg_weight
@@ -805,10 +809,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--esmfold2_one_step_diffusion_mode",
+        choices=("reference_noising", "truncated_trajectory"),
+        default="reference_noising",
+        help=(
+            "One-step 坐标来源：reference_noising 使用 verifier 结构加噪；"
+            "truncated_trajectory 从标准高噪声初态无梯度采样到 tau"
+        ),
+    )
+    parser.add_argument(
         "--esmfold2_one_step_diffusion_tau",
         type=float,
         default=2.0,
         help="ESMFold2 one-step diffusion 固定噪声尺度 tau（默认：2.0）",
+    )
+    parser.add_argument(
+        "--esmfold2_one_step_truncated_num_sampling_steps",
+        type=int,
+        default=50,
+        help=(
+            "truncated_trajectory 构造官方 Karras schedule 的采样步数"
+            "（默认：50）"
+        ),
     )
     parser.add_argument(
         "--esmfold2_one_step_diffusion_weight",
@@ -1461,6 +1483,13 @@ def main(argv=None):
         )
     if (
         model_backend == "esmfold2"
+        and args.esmfold2_one_step_truncated_num_sampling_steps <= 1
+    ):
+        parser.error(
+            "--esmfold2_one_step_truncated_num_sampling_steps must be greater than 1"
+        )
+    if (
+        model_backend == "esmfold2"
         and args.esmfold2_one_step_diffusion_interval < 0
     ):
         parser.error(
@@ -1474,6 +1503,15 @@ def main(argv=None):
         parser.error(
             "--esmfold2_one_step_diffusion_interval > 0 requires "
             "--esmfold2_one_step_diffusion true"
+        )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_one_step_recycle_coordinates
+        and args.esmfold2_one_step_diffusion_mode != "reference_noising"
+    ):
+        parser.error(
+            "--esmfold2_one_step_recycle_coordinates is only supported by "
+            "reference_noising mode"
         )
     if (
         model_backend == "esmfold2"
@@ -1979,8 +2017,16 @@ def main(argv=None):
                 f"{args.esmfold2_one_step_diffusion}\n"
             )
             f.write(
+                "ESMFold2 One-step Diffusion Mode: "
+                f"{args.esmfold2_one_step_diffusion_mode}\n"
+            )
+            f.write(
                 "ESMFold2 One-step Diffusion Tau: "
                 f"{args.esmfold2_one_step_diffusion_tau}\n"
+            )
+            f.write(
+                "ESMFold2 One-step Truncated Sampling Steps: "
+                f"{args.esmfold2_one_step_truncated_num_sampling_steps}\n"
             )
             f.write(
                 "ESMFold2 One-step Diffusion Weight: "

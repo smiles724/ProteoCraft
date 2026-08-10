@@ -47,6 +47,7 @@ from bindcraft.hallucination.esmfold2_one_step import (
     compute_esmfold2_common_losses,
     remap_reference_coordinates,
     run_esmfold2_one_step_diffusion,
+    run_esmfold2_truncated_diffusion,
 )
 
 
@@ -1553,32 +1554,51 @@ class ESMFold2RuntimeBackend:
         current_seq: str,
         mutable_mask: Optional[Sequence[bool]],
         target_chain_roles: Sequence[str],
-        reference_coordinates: torch.Tensor,
+        reference_coordinates: Optional[torch.Tensor],
         reference_features: Optional[Mapping[str, torch.Tensor]],
         diffusion_seed: Optional[int],
         hotspot_params: Optional[Dict[str, Any]],
         effective_hotspot_weight: float,
     ) -> Dict[str, Any]:
-        source_features = reference_features
-        if source_features is None:
-            source_features = self._prepare_sequence_atom_features(
-                targets,
-                current_seq,
+        one_step_mode = str(self.config.one_step_diffusion_mode).strip().lower()
+        if one_step_mode == "truncated_trajectory":
+            one_step = run_esmfold2_truncated_diffusion(
+                model=self.experimental_model,
+                captured=fold_result["_captured"],
+                features=fold_result["_features"],
+                tau=float(self.config.one_step_diffusion_tau),
+                seed=diffusion_seed,
+                num_sampling_steps=int(
+                    self.config.one_step_diffusion_truncated_num_sampling_steps
+                ),
+            )
+            source_coordinates = one_step["source_coordinates"]
+        else:
+            if reference_coordinates is None:
+                raise ValueError(
+                    "reference_noising one-step diffusion requires verifier coordinates"
+                )
+            source_features = reference_features
+            if source_features is None:
+                source_features = self._prepare_sequence_atom_features(
+                    targets,
+                    current_seq,
+                    seed=diffusion_seed,
+                )
+            remapped_reference = remap_reference_coordinates(
+                reference_coordinates,
+                source_features=source_features,
+                destination_features=fold_result["_features"],
+            )
+            one_step = run_esmfold2_one_step_diffusion(
+                model=self.experimental_model,
+                captured=fold_result["_captured"],
+                features=fold_result["_features"],
+                reference_coordinates=remapped_reference,
+                tau=float(self.config.one_step_diffusion_tau),
                 seed=diffusion_seed,
             )
-        remapped_reference = remap_reference_coordinates(
-            reference_coordinates,
-            source_features=source_features,
-            destination_features=fold_result["_features"],
-        )
-        one_step = run_esmfold2_one_step_diffusion(
-            model=self.experimental_model,
-            captured=fold_result["_captured"],
-            features=fold_result["_features"],
-            reference_coordinates=remapped_reference,
-            tau=float(self.config.one_step_diffusion_tau),
-            seed=diffusion_seed,
-        )
+            source_coordinates = remapped_reference
         diffusion_total, diffusion_losses = compute_esmfold2_common_losses(
             coordinates=one_step["coordinates"],
             plddt_logits=one_step["plddt_logits"],
@@ -1611,7 +1631,7 @@ class ESMFold2RuntimeBackend:
         diffusion_grad = torch.autograd.grad(diffusion_total, logits)[0]
 
         denoised_sample = _first_coordinate_sample(one_step["coordinates"])
-        reference_sample = _first_coordinate_sample(remapped_reference).to(
+        reference_sample = _first_coordinate_sample(source_coordinates).to(
             device=denoised_sample.device,
             dtype=denoised_sample.dtype,
         )
@@ -1633,6 +1653,8 @@ class ESMFold2RuntimeBackend:
             "coordinates": one_step["coordinates"],
             "features": fold_result["_features"],
             "reference_rmsd": coordinate_rmsd,
+            "mode": one_step_mode,
+            "truncated_steps": int(one_step.get("truncated_steps", 0)),
         }
 
     def _run_soft_update_impl(
@@ -1777,7 +1799,12 @@ class ESMFold2RuntimeBackend:
             if one_step_enabled
             else ()
         )
-        if one_step_enabled and reference_coordinates is None:
+        one_step_mode = str(self.config.one_step_diffusion_mode).strip().lower()
+        if (
+            one_step_enabled
+            and one_step_mode == "reference_noising"
+            and reference_coordinates is None
+        ):
             raise ValueError(
                 "ESMFold2 one-step diffusion requires coordinates from the "
                 "selected verifier node"
@@ -2028,6 +2055,12 @@ class ESMFold2RuntimeBackend:
                         "one_step_diffusion_tau": float(
                             self.config.one_step_diffusion_tau
                         ),
+                        "one_step_diffusion_mode": str(
+                            scheduled_one_step.get("mode", one_step_mode)
+                        ),
+                        "one_step_diffusion_truncated_steps": int(
+                            scheduled_one_step.get("truncated_steps", 0)
+                        ),
                         "one_step_diffusion_weight": float(
                             self.config.one_step_diffusion_weight
                         ),
@@ -2141,54 +2174,22 @@ class ESMFold2RuntimeBackend:
                     )
                 esmc_grad = torch.autograd.grad(esmc_loss.mean(), logits)[0]
 
-            one_step = run_esmfold2_one_step_diffusion(
-                model=self.experimental_model,
-                captured=fold_result["_captured"],
-                features=fold_result["_features"],
-                reference_coordinates=remap_reference_coordinates(
-                    reference_coordinates,
-                    source_features=self._prepare_sequence_atom_features(
-                        targets,
-                        current_seq,
-                        seed=diffusion_seed,
-                    ),
-                    destination_features=fold_result["_features"],
-                ),
-                tau=float(self.config.one_step_diffusion_tau),
-                seed=diffusion_seed,
-            )
-            diffusion_total, diffusion_losses = compute_esmfold2_common_losses(
-                coordinates=one_step["coordinates"],
-                plddt_logits=one_step["plddt_logits"],
-                pae_logits=one_step["pae_logits"],
-                distogram_logits=fold_result["distogram_logits"],
-                features=fold_result["_features"],
-                binder_length=len(current_seq),
-                task_type=self.task_type,
+            one_step = self._one_step_diffusion_gradient(
+                logits=logits,
+                fold_result=fold_result,
+                targets=targets,
+                current_seq=current_seq,
+                mutable_mask=mutable_mask,
                 target_chain_roles=target_chain_roles,
-                binder_mutable_mask=mutable_mask,
-                distogram_losses=None,
-                weights={
-                    "con": 0.0,
-                    "i_con": 0.0,
-                    "helix": 0.0,
-                    "rg": float(self.config.one_step_diffusion_rg_weight),
-                },
-                hotspot_params=(
-                    hotspot_params
-                    if self.config.one_step_diffusion_hotspot_enabled
-                    else None
-                ),
-                hotspot_weight=(
-                    effective_hotspot_weight
-                    if self.config.one_step_diffusion_hotspot_enabled
-                    else 0.0
-                ),
-                hotspot_interface_mode=str(
-                    self.config.hotspot_interface_mode
-                ),
+                reference_coordinates=reference_coordinates,
+                reference_features=reference_features,
+                diffusion_seed=diffusion_seed,
+                hotspot_params=hotspot_params,
+                effective_hotspot_weight=effective_hotspot_weight,
             )
-            diffusion_grad = torch.autograd.grad(diffusion_total, logits)[0]
+            diffusion_total = one_step["total"]
+            diffusion_losses = one_step["losses"]
+            diffusion_grad = one_step["gradient"]
             combined_grad = combine_normalized_gradients(
                 structure_grad,
                 esmc_grad,
@@ -2216,6 +2217,10 @@ class ESMFold2RuntimeBackend:
                 "one_step_diffusion_used_recycled_coordinates": False,
                 "one_step_diffusion_tau": float(
                     self.config.one_step_diffusion_tau
+                ),
+                "one_step_diffusion_mode": str(one_step["mode"]),
+                "one_step_diffusion_truncated_steps": int(
+                    one_step["truncated_steps"]
                 ),
                 "one_step_diffusion_weight": float(
                     self.config.one_step_diffusion_weight

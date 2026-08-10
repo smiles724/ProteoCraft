@@ -74,7 +74,9 @@ class ESMFold2ProposalConfig:
     proposal_lm_dropout: Optional[float] = 0.5
     force_proposal_lm_dropout: bool = True
     one_step_diffusion_enabled: bool = True
+    one_step_diffusion_mode: str = "reference_noising"
     one_step_diffusion_tau: float = 2.0
+    one_step_diffusion_truncated_num_sampling_steps: int = 50
     one_step_diffusion_weight: float = 0.25
     one_step_diffusion_rg_weight: float = 0.1
     one_step_diffusion_interval: int = 5
@@ -172,6 +174,16 @@ class ESMFold2ProposalConfig:
                 raise ValueError("proposal_lm_dropout must be in [0, 1)")
         if float(self.one_step_diffusion_tau) <= 0.0:
             raise ValueError("one_step_diffusion_tau must be positive")
+        one_step_mode = str(self.one_step_diffusion_mode).strip().lower()
+        if one_step_mode not in {"reference_noising", "truncated_trajectory"}:
+            raise ValueError(
+                "one_step_diffusion_mode must be 'reference_noising' or "
+                "'truncated_trajectory'"
+            )
+        if int(self.one_step_diffusion_truncated_num_sampling_steps) <= 1:
+            raise ValueError(
+                "one_step_diffusion_truncated_num_sampling_steps must be greater than 1"
+            )
         if float(self.one_step_diffusion_weight) < 0.0:
             raise ValueError("one_step_diffusion_weight must be non-negative")
         if float(self.one_step_diffusion_rg_weight) < 0.0:
@@ -200,6 +212,14 @@ class ESMFold2ProposalConfig:
             raise ValueError(
                 "one_step_diffusion_recycle_coordinates requires a positive "
                 "one_step_diffusion_interval"
+            )
+        if (
+            bool(self.one_step_diffusion_recycle_coordinates)
+            and one_step_mode != "reference_noising"
+        ):
+            raise ValueError(
+                "one_step_diffusion_recycle_coordinates is only supported by "
+                "reference_noising mode"
             )
         verifier_loss_mode = str(self.verifier_loss_mode).strip().lower()
         if verifier_loss_mode not in {"pair_chain_iptm", "aligned_common"}:

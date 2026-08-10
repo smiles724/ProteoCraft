@@ -774,6 +774,62 @@ def remap_reference_coordinates(
     return destination
 
 
+def _diffusion_atom_inputs(
+    features: Mapping[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from transformers.models.esmfold2.modeling_esmfold2_common import (
+        CHAR_VOCAB_SIZE,
+        MAX_ATOMIC_NUMBER,
+    )
+
+    atom_mask = features["atom_attention_mask"].bool()
+    atom_mask_f = atom_mask.float()
+    ref_element = F.one_hot(
+        features["ref_element"].long(),
+        num_classes=MAX_ATOMIC_NUMBER,
+    ).float()
+    ref_element = ref_element * atom_mask_f.unsqueeze(-1)
+    ref_atom_name_chars = F.one_hot(
+        features["ref_atom_name_chars"].long(),
+        num_classes=CHAR_VOCAB_SIZE,
+    ).float()
+    ref_atom_name_chars = (
+        ref_atom_name_chars * atom_mask_f.unsqueeze(-1).unsqueeze(-1)
+    )
+    atom_to_token = features["atom_to_token"].long() * atom_mask.long()
+    return atom_mask, ref_element, ref_atom_name_chars, atom_to_token
+
+
+def _one_step_confidence(
+    *,
+    model: Any,
+    captured: Mapping[str, torch.Tensor],
+    features: Mapping[str, torch.Tensor],
+    coordinates: torch.Tensor,
+    atom_mask: torch.Tensor,
+    atom_to_token: torch.Tensor,
+) -> Mapping[str, torch.Tensor]:
+    confidence_head = getattr(model, "confidence_head", None)
+    if confidence_head is None:
+        raise RuntimeError(
+            "ESMFold2 one-step diffusion requires an Experimental model with a confidence head"
+        )
+    return confidence_head(
+        s_inputs=captured["s_inputs"],
+        z=captured["z_trunk"].float(),
+        x_pred=coordinates,
+        distogram_atom_idx=features["distogram_atom_idx"],
+        token_attention_mask=features["token_attention_mask"],
+        atom_to_token=atom_to_token,
+        atom_attention_mask=atom_mask,
+        asym_id=features["asym_id"],
+        mol_type=features["mol_type"],
+        num_diffusion_samples=1,
+        relative_position_encoding=captured["relative_position_encoding"],
+        token_bonds_encoding=captured.get("token_bonds_encoding"),
+    )
+
+
 def run_esmfold2_one_step_diffusion(
     *,
     model: Any,
@@ -794,12 +850,9 @@ def run_esmfold2_one_step_diffusion(
             f"Failed to capture ESMFold2 proposal intermediates: {missing}"
         )
 
-    from transformers.models.esmfold2.modeling_esmfold2_common import (
-        CHAR_VOCAB_SIZE,
-        MAX_ATOMIC_NUMBER,
+    atom_mask, ref_element, ref_atom_name_chars, atom_to_token = (
+        _diffusion_atom_inputs(features)
     )
-
-    atom_mask = features["atom_attention_mask"].bool()
     x_clean = scatter_reference_coordinates(
         reference_coordinates.to(
             device=atom_mask.device,
@@ -817,22 +870,6 @@ def run_esmfold2_one_step_diffusion(
                 torch.cuda.manual_seed_all(int(seed))
         noise = torch.randn_like(x_clean)
     x_noisy = x_clean.detach() + float(tau) * noise
-
-    ref_element = F.one_hot(
-        features["ref_element"].long(),
-        num_classes=MAX_ATOMIC_NUMBER,
-    ).float()
-    ref_atom_name_chars = F.one_hot(
-        features["ref_atom_name_chars"].long(),
-        num_classes=CHAR_VOCAB_SIZE,
-    ).float()
-    atom_mask_f = atom_mask.float()
-    ref_element = ref_element * atom_mask_f.unsqueeze(-1)
-    ref_atom_name_chars = (
-        ref_atom_name_chars
-        * atom_mask_f.unsqueeze(-1).unsqueeze(-1)
-    )
-    atom_to_token = features["atom_to_token"].long() * atom_mask.long()
 
     diffusion_module = model.structure_head.diffusion_module
     diffusion_output = diffusion_module(
@@ -866,27 +903,189 @@ def run_esmfold2_one_step_diffusion(
     if x_denoised is None:
         raise RuntimeError("ESMFold2 diffusion module returned no denoised coordinates")
 
-    confidence_head = getattr(model, "confidence_head", None)
-    if confidence_head is None:
-        raise RuntimeError(
-            "ESMFold2 one-step diffusion requires an Experimental model with a confidence head"
-        )
-    confidence = confidence_head(
-        s_inputs=captured["s_inputs"],
-        z=captured["z_trunk"].float(),
-        x_pred=x_denoised,
-        distogram_atom_idx=features["distogram_atom_idx"],
-        token_attention_mask=features["token_attention_mask"],
+    confidence = _one_step_confidence(
+        model=model,
+        captured=captured,
+        features=features,
+        coordinates=x_denoised,
+        atom_mask=atom_mask,
         atom_to_token=atom_to_token,
-        atom_attention_mask=atom_mask,
-        asym_id=features["asym_id"],
-        mol_type=features["mol_type"],
-        num_diffusion_samples=1,
-        relative_position_encoding=captured["relative_position_encoding"],
-        token_bonds_encoding=captured.get("token_bonds_encoding"),
     )
     return {
         "coordinates": x_denoised,
         "plddt_logits": confidence["plddt_logits"],
         "pae_logits": confidence["pae_logits"],
+    }
+
+
+def run_esmfold2_truncated_diffusion(
+    *,
+    model: Any,
+    captured: Mapping[str, torch.Tensor],
+    features: Mapping[str, torch.Tensor],
+    tau: float,
+    seed: Optional[int],
+    num_sampling_steps: int,
+    max_inference_sigma: float = 256.0,
+) -> Dict[str, torch.Tensor | int | float]:
+    """Run a no-grad reverse trajectory to tau, then one differentiable denoise."""
+
+    if float(tau) <= 0.0:
+        raise ValueError("ESMFold2 truncated diffusion tau must be positive")
+    if int(num_sampling_steps) <= 1:
+        raise ValueError("num_sampling_steps must be greater than 1")
+    if float(tau) >= float(max_inference_sigma):
+        raise ValueError("tau must be smaller than max_inference_sigma")
+    required = {"s_inputs", "relative_position_encoding", "z_trunk"}
+    missing = sorted(required - set(captured))
+    if missing:
+        raise RuntimeError(
+            f"Failed to capture ESMFold2 proposal intermediates: {missing}"
+        )
+
+    atom_mask, ref_element, ref_atom_name_chars, atom_to_token = (
+        _diffusion_atom_inputs(features)
+    )
+    structure_head = model.structure_head
+    diffusion_module = structure_head.diffusion_module
+    device = captured["s_inputs"].device
+    target_batch = int(captured["s_inputs"].shape[0])
+    n_atoms = int(atom_to_token.shape[1])
+
+    schedule = structure_head.inference_noise_schedule(
+        int(num_sampling_steps),
+        device,
+    )
+    schedule = schedule[schedule <= float(max_inference_sigma)]
+    schedule = F.pad(schedule, (1, 0), value=float(max_inference_sigma))
+    tau_tensor = torch.tensor(float(tau), device=device, dtype=torch.float32)
+    truncated_schedule = torch.cat((schedule[schedule > tau_tensor], tau_tensor[None]))
+    if truncated_schedule.numel() < 2:
+        raise RuntimeError("truncated diffusion schedule contains no reverse step")
+
+    atom_mask_f = atom_mask.float()
+    lam = float(structure_head.noise_scale)
+    eta = float(structure_head.step_scale)
+    gammas = torch.where(
+        truncated_schedule > float(structure_head.gamma_min),
+        torch.full_like(truncated_schedule, float(structure_head.gamma_0)),
+        torch.zeros_like(truncated_schedule),
+    )
+    step_pairs = list(
+        zip(
+            truncated_schedule[:-1],
+            truncated_schedule[1:],
+            gammas[1:],
+        )
+    )
+    devices = [device.index or 0] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices, enabled=True):
+        if seed is not None:
+            torch.manual_seed(int(seed))
+            if device.type == "cuda":
+                torch.cuda.manual_seed_all(int(seed))
+        with torch.no_grad():
+            x = truncated_schedule[0] * torch.randn(
+                target_batch,
+                n_atoms,
+                3,
+                device=device,
+                dtype=torch.float32,
+            )
+            inference_cache: dict[str, torch.Tensor] = {}
+            for sigma_tm, sigma_t, gamma in step_pairs:
+                x, _ = structure_head._center_random_augmentation(x, atom_mask_f)
+                sigma_tm_value = float(sigma_tm.item())
+                t_hat_value = sigma_tm_value * (1.0 + float(gamma.item()))
+                eps_std = lam * max(
+                    t_hat_value**2 - sigma_tm_value**2,
+                    0.0,
+                ) ** 0.5
+                x_noisy = x + eps_std * torch.randn_like(x)
+                diffusion_output = diffusion_module(
+                    x_noisy=x_noisy,
+                    t_hat=torch.full(
+                        (target_batch,),
+                        t_hat_value,
+                        device=device,
+                        dtype=torch.float32,
+                    ),
+                    ref_pos=features["ref_pos"],
+                    ref_charge=features["ref_charge"],
+                    ref_mask=atom_mask,
+                    ref_element=ref_element,
+                    ref_atom_name_chars=ref_atom_name_chars,
+                    ref_space_uid=features["ref_space_uid"],
+                    tok_idx=atom_to_token,
+                    s_inputs=captured["s_inputs"],
+                    s_trunk=None,
+                    z_trunk=captured["z_trunk"].float(),
+                    relative_position_encoding=captured["relative_position_encoding"],
+                    asym_id=features["asym_id"],
+                    residue_index=features["residue_index"],
+                    entity_id=features["entity_id"],
+                    token_index=features["token_index"],
+                    sym_id=features["sym_id"],
+                    token_attention_mask=features["token_attention_mask"],
+                    num_diffusion_samples=1,
+                    return_token_repr=True,
+                    inference_cache=inference_cache,
+                )
+                x_denoised = diffusion_output["x_denoised"]
+                x_noisy = structure_head._weighted_rigid_align(
+                    x_noisy.float(),
+                    x_denoised.float(),
+                    atom_mask_f,
+                    atom_mask_f,
+                ).to(dtype=x_denoised.dtype)
+                t_hat_safe = max(t_hat_value, torch.finfo(torch.float32).eps)
+                derivative = (x_noisy - x_denoised) / t_hat_safe
+                x = x_noisy + eta * (float(sigma_t.item()) - t_hat_value) * derivative
+            x_tau = x.detach()
+
+    diffusion_output = diffusion_module(
+        x_noisy=x_tau,
+        t_hat=torch.full(
+            (target_batch,),
+            float(tau),
+            device=device,
+            dtype=torch.float32,
+        ),
+        ref_pos=features["ref_pos"],
+        ref_charge=features["ref_charge"],
+        ref_mask=atom_mask,
+        ref_element=ref_element,
+        ref_atom_name_chars=ref_atom_name_chars,
+        ref_space_uid=features["ref_space_uid"],
+        tok_idx=atom_to_token,
+        s_inputs=captured["s_inputs"],
+        s_trunk=None,
+        z_trunk=captured["z_trunk"].float(),
+        relative_position_encoding=captured["relative_position_encoding"],
+        asym_id=features["asym_id"],
+        residue_index=features["residue_index"],
+        entity_id=features["entity_id"],
+        token_index=features["token_index"],
+        sym_id=features["sym_id"],
+        token_attention_mask=features["token_attention_mask"],
+        num_diffusion_samples=1,
+    )
+    x_denoised = diffusion_output["x_denoised"]
+    if x_denoised is None:
+        raise RuntimeError("ESMFold2 diffusion module returned no denoised coordinates")
+    confidence = _one_step_confidence(
+        model=model,
+        captured=captured,
+        features=features,
+        coordinates=x_denoised,
+        atom_mask=atom_mask,
+        atom_to_token=atom_to_token,
+    )
+    return {
+        "coordinates": x_denoised,
+        "source_coordinates": x_tau,
+        "plddt_logits": confidence["plddt_logits"],
+        "pae_logits": confidence["pae_logits"],
+        "truncated_steps": len(step_pairs),
+        "tau": float(tau),
     }
