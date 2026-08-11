@@ -83,3 +83,38 @@ cases:
     target_chains: [C]
     scaffold_chains: [A, D]
     cdr_motif: CASRPGLAGGRPEQYF
+  - id: ALGRRIPPV_alpha
+    fasta_path: A6scaffold_ALGRRIPPV.fasta
+    template_path: A6scaffold_ALGRRIPPV.cif
+    binder_chain: D
+    target_chains: [C]
+    scaffold_chains: [A, E]
+    cdr_motif: CAVTTDSWGKLQF
+  - id: YLNPRVARI_beta
+    fasta_path: A6scaffold_YLNPRVARI.fasta
+    template_path: A6scaffold_YLNPRVARI.cif
+    binder_chain: E
+    target_chains: [C]
+    scaffold_chains: [A, D]
+    cdr_motif: CASRPGLAGGRPEQYF
+  - id: YLNPRVARI_alpha
+    fasta_path: A6scaffold_YLNPRVARI.fasta
+    template_path: A6scaffold_YLNPRVARI.cif
+    binder_chain: D
+    target_chains: [C]
+    scaffold_chains: [A, E]
+    cdr_motif: CAVTTDSWGKLQF
+  - id: KLNPRIPRI_beta
+    fasta_path: A6scaffold_KLNPRIPRI.fasta
+    template_path: A6scaffold_KLNPRIPRI.cif
+    binder_chain: E
+    target_chains: [C]
+    scaffold_chains: [A, D]
+    cdr_motif: CASRPGLAGGRPEQYF
+  - id: KLNPRIPRI_alpha
+    fasta_path: A6scaffold_KLNPRIPRI.fasta
+    template_path: A6scaffold_KLNPRIPRI.cif
+    binder_chain: D
+    target_chains: [C]
+    scaffold_chains: [A, E]
+    cdr_motif: CAVTTDSWGKLQF
