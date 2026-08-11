@@ -15,7 +15,7 @@ import inspect
 import random
 from contextlib import contextmanager
 from functools import lru_cache
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -25,7 +25,7 @@ from bindcraft.hallucination.esmfold2_backend import (
     AA_TO_ESM_IDX,
     ESMFold2ProposalBatch,
     ESMFold2ProposalConfig,
-    ESMFOLD2_ACTION_GROUP_LOSS_KEYS,
+    ESMFOLD2_ACTION_GROUP_PROPOSAL_LOSS_KEYS,
     ESM_AA_ORDER,
     anchor_binder_logits_to_sequence,
     build_esm_verifier_result,
@@ -34,9 +34,19 @@ from bindcraft.hallucination.esmfold2_backend import (
     esm_temperature,
     init_binder_logits,
     logit_delta_mutation_scores,
+    normalized_gradient_tensor,
     propose_sequences_from_logit_delta,
     resolve_lambda_esmc,
     sequence_from_logits_argmax,
+)
+from bindcraft.hallucination.esmfold2_one_step import (
+    ESMFOLD2_LEGACY_VERIFIER_LOSS_WEIGHTS,
+    ESMFOLD2_VERIFIER_LOSS_WEIGHTS,
+    capture_experimental_trunk_state,
+    compute_esmfold2_bounded_verifier_losses,
+    compute_esmfold2_common_losses,
+    remap_reference_coordinates,
+    run_esmfold2_one_step_diffusion,
 )
 
 
@@ -85,6 +95,83 @@ def _as_float(value: Any) -> Optional[float]:
     return scalar
 
 
+def _scheduled_one_step_soft_steps(
+    *,
+    soft_steps: int,
+    interval: int,
+) -> tuple[int, ...]:
+    """Return one-based soft steps that receive a joint diffusion update."""
+
+    if int(soft_steps) <= 0:
+        raise ValueError("soft_steps must be positive")
+    if int(interval) <= 0:
+        return ()
+    return tuple(
+        step
+        for step in range(1, int(soft_steps) + 1)
+        if step % int(interval) == 0 or step == int(soft_steps)
+    )
+
+
+def _first_coordinate_sample(coordinates: torch.Tensor) -> torch.Tensor:
+    if coordinates.ndim == 4:
+        return coordinates[0, 0]
+    if coordinates.ndim == 3:
+        return coordinates[0]
+    if coordinates.ndim == 2:
+        return coordinates
+    raise ValueError(
+        "coordinates must have shape [A,3], [B,A,3], or [B,S,A,3]"
+    )
+
+
+def _fold_result_coordinates(fold_result: Any) -> Optional[torch.Tensor]:
+    complex_obj = getattr(fold_result, "complex", None)
+    atom_positions = getattr(complex_obj, "atom_positions", None)
+    if atom_positions is None:
+        return None
+    coordinates = torch.as_tensor(atom_positions, dtype=torch.float32)
+    if coordinates.ndim != 2 or coordinates.shape[-1] != 3:
+        raise ValueError("ESMFold2 decoded atom positions must have shape [A, 3]")
+    return coordinates.unsqueeze(0)
+
+
+def _validate_decoded_coordinate_layout(
+    coordinate: Optional[torch.Tensor],
+    atom_attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Ensure decoded coordinates follow the valid-atom order of raw features."""
+
+    if coordinate is None:
+        raise RuntimeError("ESMFold2 verifier did not return decoded coordinates")
+    atom_mask = atom_attention_mask.bool()
+    if atom_mask.ndim == 2:
+        atom_mask = atom_mask[0]
+    if atom_mask.ndim != 1:
+        raise ValueError("atom_attention_mask must have shape [A] or [1,A]")
+    expected_real_atoms = int(atom_mask.sum().item())
+    if coordinate.ndim != 3 or coordinate.shape[0] != 1:
+        raise ValueError("decoded coordinates must have shape [1,A_valid,3]")
+    if coordinate.shape[1] != expected_real_atoms:
+        raise RuntimeError(
+            "ESMFold2 decoded coordinate layout is inconsistent with "
+            f"the verifier atom mask: decoded={coordinate.shape[1]}, "
+            f"expected_valid={expected_real_atoms}"
+        )
+    return coordinate
+
+
+def _tensor_loss_dict_to_float(
+    losses: Mapping[str, Any],
+) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for key, value in losses.items():
+        scalar = _as_float(value)
+        if scalar is not None:
+            result[str(key)] = scalar
+    return result
+
+
 def _callable_accepts_argument(func: Callable[..., Any], name: str) -> bool:
     """Return True when a callable can accept a keyword argument."""
 
@@ -109,35 +196,85 @@ def _target_sequences(target_seq: Union[str, Sequence[str]]) -> list[str]:
     return [str(seq).strip() for seq in target_seq if str(seq).strip()]
 
 
+def _normalize_target_chain_roles(
+    target_chain_roles: Optional[Sequence[str]],
+    *,
+    n_target_chains: int,
+) -> tuple[str, ...]:
+    if n_target_chains <= 0:
+        raise ValueError("ESMFold2 requires at least one target chain")
+    if target_chain_roles is None:
+        return ("target",) * int(n_target_chains)
+    roles = tuple(str(role).strip().lower() for role in target_chain_roles)
+    if len(roles) != int(n_target_chains):
+        raise ValueError(
+            "target_chain_roles length must match the number of non-binder chains: "
+            f"{len(roles)} != {n_target_chains}"
+        )
+    invalid_roles = sorted(set(roles) - {"target", "scaffold"})
+    if invalid_roles:
+        raise ValueError(
+            "target_chain_roles only supports target/scaffold; "
+            f"got {invalid_roles}"
+        )
+    if "target" not in roles:
+        raise ValueError("target_chain_roles must contain at least one target")
+    return roles
+
+
 def _mean_target_to_binder_pair_iptm(
     pair_chains_iptm: Any,
     *,
     n_target_chains: int,
+    target_chain_roles: Optional[Sequence[str]] = None,
+    selected_role: str = "target",
 ) -> Optional[float]:
     if pair_chains_iptm is None:
+        return None
+    roles = _normalize_target_chain_roles(
+        target_chain_roles,
+        n_target_chains=n_target_chains,
+    )
+    selected_indices = [
+        index for index, role in enumerate(roles) if role == str(selected_role)
+    ]
+    if not selected_indices:
         return None
     tensor = torch.as_tensor(pair_chains_iptm).detach().float()
     if tensor.ndim == 3:
         if tensor.shape[1] <= n_target_chains or tensor.shape[2] <= n_target_chains:
             return None
         binder_idx = n_target_chains
-        values = tensor[:, :n_target_chains, binder_idx]
+        values = tensor[:, selected_indices, binder_idx]
         if values.numel() == 0:
             return None
         return _as_float(values)
     if tensor.ndim != 2 or tensor.shape[0] <= n_target_chains or tensor.shape[1] <= n_target_chains:
         return None
     binder_idx = n_target_chains
-    values = tensor[:n_target_chains, binder_idx]
+    values = tensor[selected_indices, binder_idx]
     if values.numel() == 0:
         return None
     return _as_float(values)
 
 
-def _midpoint_bins(device: torch.device) -> torch.Tensor:
-    boundaries = torch.linspace(2.0, 52.0, 127, device=device)
-    lower = torch.tensor([1.0], device=device)
-    upper = torch.tensor([57.0], device=device)
+def _midpoint_bins(
+    device: torch.device,
+    *,
+    num_bins: int = 128,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    if int(num_bins) < 2:
+        raise ValueError("num_bins must be at least 2")
+    boundaries = torch.linspace(
+        2.0,
+        52.0,
+        int(num_bins) - 1,
+        device=device,
+        dtype=dtype,
+    )
+    lower = torch.tensor([1.0], device=device, dtype=dtype)
+    upper = torch.tensor([57.0], device=device, dtype=dtype)
     expanded = torch.cat((lower, boundaries, upper))
     return (expanded[:-1] + expanded[1:]) / 2.0
 
@@ -182,11 +319,385 @@ def _contact_loss(
     return _masked_average(per_residue, mask=chain_mask)
 
 
-def _structure_losses(distogram_logits: torch.Tensor, binder_length: int) -> dict[str, torch.Tensor]:
-    bin_distance = _midpoint_bins(distogram_logits.device)
+def _normalize_target_hotspot_indices(
+    hotspot_params: Optional[Dict[str, Any]],
+    *,
+    target_length: int,
+) -> list[int]:
+    """Validate target-relative concatenated hotspot indices."""
+
+    raw_indices: Any = (hotspot_params or {}).get("target_hotspot_concat_indices")
+    if raw_indices is None:
+        return []
+    if isinstance(raw_indices, torch.Tensor):
+        values = raw_indices.detach().cpu().flatten().tolist()
+    elif isinstance(raw_indices, (int, str)):
+        values = [raw_indices]
+    else:
+        values = list(raw_indices)
+
+    indices: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        if isinstance(value, bool):
+            raise ValueError("hotspot indices must be integers, not booleans")
+        try:
+            index = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid hotspot index: {value!r}") from exc
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError(f"invalid non-integer hotspot index: {value!r}")
+        if index < 0 or index >= int(target_length):
+            raise ValueError(
+                f"hotspot target concat index {index} is out of range for target_length={target_length}"
+            )
+        if index not in seen:
+            seen.add(index)
+            indices.append(index)
+    return indices
+
+
+def _binder_structure_metrics(
+    fold_result: Any,
+    *,
+    binder_length: int,
+) -> dict[str, float]:
+    """Extract binder-local confidence and compactness from a full prediction."""
+
+    binder_length = int(binder_length)
+    if binder_length <= 0:
+        raise ValueError("binder_length must be positive")
+
+    metrics: dict[str, float] = {}
+    plddt = getattr(fold_result, "plddt", None)
+    if plddt is not None:
+        values = torch.as_tensor(plddt).detach().float().reshape(-1)
+        if values.numel() >= binder_length:
+            binder_values = values[-binder_length:]
+            binder_values = binder_values[torch.isfinite(binder_values)]
+            if binder_values.numel() == binder_length:
+                metrics["binder_plddt"] = float(binder_values.mean().item())
+
+    complex_obj = getattr(fold_result, "complex", None)
+    residue_centers: list[torch.Tensor] = []
+    if complex_obj is not None and all(
+        hasattr(complex_obj, name)
+        for name in ("sequence", "atom_positions", "atom_elements", "token_to_atoms")
+    ):
+        token_count = len(complex_obj.sequence)
+        if token_count >= binder_length:
+            positions = torch.as_tensor(complex_obj.atom_positions, dtype=torch.float32)
+            token_to_atoms = torch.as_tensor(complex_obj.token_to_atoms, dtype=torch.long)
+            elements = list(complex_obj.atom_elements)
+            for token_index in range(token_count - binder_length, token_count):
+                atom_start, atom_end = map(int, token_to_atoms[token_index].tolist())
+                heavy_mask = []
+                for element in elements[atom_start:atom_end]:
+                    if isinstance(element, bytes):
+                        element = element.decode(errors="ignore")
+                    heavy_mask.append(str(element).strip().upper() != "H")
+                token_positions = positions[atom_start:atom_end]
+                if heavy_mask:
+                    token_positions = token_positions[
+                        torch.as_tensor(heavy_mask, dtype=torch.bool)
+                    ]
+                if token_positions.numel() > 0:
+                    residue_centers.append(token_positions.mean(dim=0))
+    elif complex_obj is not None and all(
+        hasattr(complex_obj, name) for name in ("atom37_positions", "atom37_mask")
+    ):
+        positions = torch.as_tensor(complex_obj.atom37_positions, dtype=torch.float32)
+        atom_mask = torch.as_tensor(complex_obj.atom37_mask, dtype=torch.bool)
+        if positions.shape[0] >= binder_length:
+            for residue_positions, residue_mask in zip(
+                positions[-binder_length:], atom_mask[-binder_length:]
+            ):
+                if residue_mask.numel() > 1 and bool(residue_mask[1].item()):
+                    residue_centers.append(residue_positions[1])
+                elif residue_mask.any():
+                    residue_centers.append(residue_positions[residue_mask].mean(dim=0))
+
+    if len(residue_centers) == binder_length:
+        centers = torch.stack(residue_centers, dim=0)
+        centroid = centers.mean(dim=0)
+        rg = torch.sqrt(torch.square(centers - centroid).sum(dim=-1).mean())
+        rg_threshold = 2.38 * (binder_length**0.365)
+        rg_excess = max(float(rg.item()) / max(float(rg_threshold), 1.0e-8) - 1.0, 0.0)
+        metrics.update(
+            {
+                "binder_radius_gyration": float(rg.item()),
+                "binder_radius_gyration_threshold": float(rg_threshold),
+                "binder_rg_excess": float(rg_excess),
+            }
+        )
+    return metrics
+
+
+def _hotspot_structure_metrics(
+    complex_obj: Any,
+    *,
+    target_sequences: Sequence[str],
+    hotspot_params: Optional[Dict[str, Any]],
+    near_cutoff: float,
+    far_cutoff: float,
+    min_safe_distance: float = 0.0,
+) -> dict[str, Any]:
+    """Measure hotspot-to-binder distances from an ESMFold2 full structure."""
+
+    if float(near_cutoff) < 0.0:
+        raise ValueError("hotspot verifier near cutoff must be non-negative")
+    if float(far_cutoff) <= float(near_cutoff):
+        raise ValueError("hotspot verifier far cutoff must exceed near cutoff")
+    if float(min_safe_distance) < 0.0:
+        raise ValueError(
+            "hotspot verifier minimum safe distance must be non-negative"
+        )
+    if float(min_safe_distance) > float(near_cutoff):
+        raise ValueError(
+            "hotspot verifier minimum safe distance must not exceed near cutoff"
+        )
+    n_target_chains = len(target_sequences)
+    expected_target_lengths = [len(sequence) for sequence in target_sequences]
+    expected_target_length = sum(expected_target_lengths)
+    hotspot_indices = _normalize_target_hotspot_indices(
+        hotspot_params,
+        target_length=expected_target_length,
+    )
+    if not hotspot_indices:
+        raise ValueError(
+            "hotspot-aware verifier requires target_hotspot_concat_indices"
+        )
+
+    molecular_fields = (
+        "atom_positions",
+        "atom_elements",
+        "token_to_atoms",
+        "chain_id",
+        "sequence",
+    )
+    protein_fields = ("chain_boundaries", "atom37_positions", "atom37_mask")
+    if all(hasattr(complex_obj, name) for name in molecular_fields):
+        token_count = len(complex_obj.sequence)
+        chain_ids = list(complex_obj.chain_id)
+        if len(chain_ids) != token_count:
+            raise ValueError("ESMFold2 MolecularComplex chain_id length mismatch")
+        boundaries: list[tuple[int, int]] = []
+        if chain_ids:
+            chain_start = 0
+            for token_index in range(1, token_count):
+                if chain_ids[token_index] != chain_ids[token_index - 1]:
+                    boundaries.append((chain_start, token_index))
+                    chain_start = token_index
+            boundaries.append((chain_start, token_count))
+        if len(boundaries) <= n_target_chains:
+            raise ValueError(
+                "ESMFold2 MolecularComplex does not contain the expected binder chain"
+            )
+        observed_target_lengths = [
+            boundaries[index][1] - boundaries[index][0]
+            for index in range(n_target_chains)
+        ]
+        if observed_target_lengths != expected_target_lengths:
+            raise ValueError(
+                "ESMFold2 verifier target chain lengths do not match input: "
+                f"expected={expected_target_lengths}, observed={observed_target_lengths}"
+            )
+
+        positions = torch.as_tensor(complex_obj.atom_positions, dtype=torch.float32)
+        token_to_atoms = torch.as_tensor(complex_obj.token_to_atoms, dtype=torch.long)
+        elements = list(complex_obj.atom_elements)
+
+        def token_heavy_atoms(token_index: int) -> torch.Tensor:
+            atom_start, atom_end = map(int, token_to_atoms[token_index].tolist())
+            heavy_mask = []
+            for element in elements[atom_start:atom_end]:
+                if isinstance(element, bytes):
+                    element = element.decode(errors="ignore")
+                heavy_mask.append(str(element).strip().upper() != "H")
+            return positions[atom_start:atom_end][
+                torch.as_tensor(heavy_mask, dtype=torch.bool)
+            ]
+
+        target_residue_indices = [
+            residue_index
+            for chain_index in range(n_target_chains)
+            for residue_index in range(*boundaries[chain_index])
+        ]
+        binder_start, binder_end = boundaries[n_target_chains]
+        binder_atom_groups = [
+            token_heavy_atoms(token_index)
+            for token_index in range(binder_start, binder_end)
+        ]
+        nonempty_binder_atoms = [
+            atoms for atoms in binder_atom_groups if atoms.numel() > 0
+        ]
+        binder_atoms = (
+            torch.cat(nonempty_binder_atoms, dim=0)
+            if nonempty_binder_atoms
+            else torch.zeros((0, 3), dtype=torch.float32)
+        )
+
+        def hotspot_atoms(hotspot_index: int) -> torch.Tensor:
+            return token_heavy_atoms(target_residue_indices[hotspot_index])
+
+    elif all(hasattr(complex_obj, name) for name in protein_fields):
+        boundaries = [tuple(map(int, bounds)) for bounds in complex_obj.chain_boundaries]
+        if len(boundaries) <= n_target_chains:
+            raise ValueError(
+                "ESMFold2 ProteinComplex does not contain the expected binder chain"
+            )
+        observed_target_lengths = [
+            boundaries[index][1] - boundaries[index][0]
+            for index in range(n_target_chains)
+        ]
+        if observed_target_lengths != expected_target_lengths:
+            raise ValueError(
+                "ESMFold2 verifier target chain lengths do not match input: "
+                f"expected={expected_target_lengths}, observed={observed_target_lengths}"
+            )
+        target_residue_indices = [
+            residue_index
+            for chain_index in range(n_target_chains)
+            for residue_index in range(*boundaries[chain_index])
+        ]
+        positions = torch.as_tensor(complex_obj.atom37_positions, dtype=torch.float32)
+        atom_mask = torch.as_tensor(complex_obj.atom37_mask, dtype=torch.bool)
+        binder_start, binder_end = boundaries[n_target_chains]
+        binder_positions = positions[binder_start:binder_end]
+        binder_mask = atom_mask[binder_start:binder_end]
+        binder_atoms = binder_positions[binder_mask]
+
+        def hotspot_atoms(hotspot_index: int) -> torch.Tensor:
+            residue_index = target_residue_indices[hotspot_index]
+            return positions[residue_index][atom_mask[residue_index]]
+
+    else:
+        raise ValueError(
+            "ESMFold2 verifier structure is neither a supported MolecularComplex "
+            "nor ProteinComplex"
+        )
+
+    if binder_atoms.numel() == 0:
+        raise ValueError("ESMFold2 verifier binder chain has no predicted atoms")
+
+    minimum_distances: list[float] = []
+    for hotspot_index in hotspot_indices:
+        residue_atoms = hotspot_atoms(hotspot_index)
+        if residue_atoms.numel() == 0:
+            raise ValueError(
+                f"ESMFold2 verifier hotspot residue {hotspot_index} has no predicted atoms"
+            )
+        minimum_distances.append(
+            float(torch.cdist(residue_atoms, binder_atoms).min().item())
+        )
+
+    distance_tensor = torch.tensor(minimum_distances, dtype=torch.float32)
+    distance_loss = torch.clamp(
+        (distance_tensor - float(near_cutoff))
+        / (float(far_cutoff) - float(near_cutoff)),
+        min=0.0,
+        max=1.0,
+    ).mean()
+    too_close_loss = torch.clamp(
+        (float(min_safe_distance) - distance_tensor)
+        / max(float(min_safe_distance), 1.0e-8),
+        min=0.0,
+        max=1.0,
+    ).max()
+    covered_count = int((distance_tensor <= float(near_cutoff)).sum().item())
+    strict_covered_count = int((distance_tensor <= 5.0).sum().item())
+    hotspot_count = len(hotspot_indices)
+    return {
+        "hotspot_verify_distance_loss": float(distance_loss.item()),
+        "hotspot_too_close_loss": float(too_close_loss.item()),
+        "hotspot_mean_min_heavy_atom_distance": float(distance_tensor.mean().item()),
+        "hotspot_heavy_atom_coverage": covered_count / hotspot_count,
+        "hotspot_heavy_atom_covered_count": covered_count,
+        "hotspot_heavy_atom_coverage_5a": strict_covered_count / hotspot_count,
+        "hotspot_heavy_atom_covered_count_5a": strict_covered_count,
+        "hotspot_count": hotspot_count,
+        "hotspot_verify_near_cutoff": float(near_cutoff),
+        "hotspot_verify_far_cutoff": float(far_cutoff),
+        "hotspot_verify_min_distance": float(min_safe_distance),
+        "hotspot_min_heavy_atom_distances": minimum_distances,
+    }
+
+
+def _structure_losses(
+    distogram_logits: torch.Tensor,
+    binder_length: int,
+    *,
+    target_chain_lengths: Optional[Sequence[int]] = None,
+    target_chain_roles: Optional[Sequence[str]] = None,
+    binder_mutable_mask: Optional[Sequence[bool]] = None,
+    hotspot_params: Optional[Dict[str, Any]] = None,
+    hotspot_weight: float = 0.0,
+    hotspot_cutoff: float = 8.0,
+    hotspot_interface_mode: str = "additive",
+) -> dict[str, torch.Tensor]:
+    bin_distance = _midpoint_bins(
+        distogram_logits.device,
+        num_bins=distogram_logits.shape[-1],
+        dtype=distogram_logits.dtype,
+    )
     full_len = distogram_logits.shape[1]
-    is_binder = torch.ones(full_len, device=distogram_logits.device)
-    is_binder[:-binder_length] *= 0.0
+    target_length = int(full_len) - int(binder_length)
+    if target_length <= 0:
+        raise ValueError(
+            f"distogram length {full_len} must exceed binder_length {binder_length}"
+        )
+    if float(hotspot_weight) < 0.0:
+        raise ValueError("hotspot_weight must be non-negative")
+    if float(hotspot_cutoff) <= 0.0:
+        raise ValueError("hotspot_cutoff must be positive")
+    hotspot_interface_mode = str(hotspot_interface_mode).strip().lower()
+    if hotspot_interface_mode not in {"additive", "localized"}:
+        raise ValueError(
+            "hotspot_interface_mode must be 'additive' or 'localized'"
+        )
+    if hotspot_interface_mode == "localized" and float(hotspot_weight) > 1.0:
+        raise ValueError(
+            "localized hotspot_interface_mode requires hotspot_weight in [0, 1]"
+        )
+    if target_chain_lengths is None:
+        target_chain_lengths = (target_length,)
+    chain_lengths = tuple(int(length) for length in target_chain_lengths)
+    if any(length <= 0 for length in chain_lengths):
+        raise ValueError("target_chain_lengths must contain positive lengths")
+    if sum(chain_lengths) != target_length:
+        raise ValueError(
+            "target_chain_lengths must sum to the non-binder residue count: "
+            f"{sum(chain_lengths)} != {target_length}"
+        )
+    roles = _normalize_target_chain_roles(
+        target_chain_roles,
+        n_target_chains=len(chain_lengths),
+    )
+
+    is_binder = torch.zeros(full_len, device=distogram_logits.device)
+    is_binder[-binder_length:] = 1.0
+    is_design = is_binder.clone()
+    if binder_mutable_mask is not None:
+        mutable = torch.as_tensor(
+            binder_mutable_mask,
+            dtype=torch.bool,
+            device=distogram_logits.device,
+        ).reshape(-1)
+        if mutable.numel() != int(binder_length):
+            raise ValueError(
+                "binder_mutable_mask length must match binder_length: "
+                f"{mutable.numel()} != {binder_length}"
+            )
+        if not bool(mutable.any().item()):
+            raise ValueError("binder_mutable_mask must select at least one residue")
+        is_design[-binder_length:] = mutable.to(dtype=is_design.dtype)
+
+    is_true_target = torch.zeros(full_len, device=distogram_logits.device)
+    offset = 0
+    for chain_length, role in zip(chain_lengths, roles):
+        if role == "target":
+            is_true_target[offset : offset + chain_length] = 1.0
+        offset += chain_length
 
     intra = _contact_loss(
         distogram_logits,
@@ -203,8 +714,8 @@ def _structure_losses(distogram_logits: torch.Tensor, binder_length: int) -> dic
         num_contacts=1,
         min_sep=0,
         cutoff=22.0,
-        chain_mask=1 - is_binder,
-        binder_mask=is_binder,
+        chain_mask=is_true_target,
+        binder_mask=is_design,
     )
 
     binder_disto = distogram_logits[:, -binder_length:, -binder_length:, :]
@@ -217,13 +728,64 @@ def _structure_losses(distogram_logits: torch.Tensor, binder_length: int) -> dic
     rg_th = 2.38 * (n**0.365)
     glob = F.elu(rg_term - rg_th)
 
-    total = 0.5 * intra + 0.5 * inter + 0.2 * glob
-    return {
+    base_total = 0.5 * intra + 0.5 * inter + 0.2 * glob
+    losses = {
         "intra_contact_loss": intra,
         "inter_contact_loss": inter,
         "glob_loss": glob,
-        "total_loss": total,
+        "total_loss": base_total,
     }
+    hotspot_indices = _normalize_target_hotspot_indices(
+        hotspot_params,
+        target_length=target_length,
+    )
+    if float(hotspot_weight) > 0.0 and not hotspot_indices:
+        raise ValueError(
+            "positive hotspot_weight requires target_hotspot_concat_indices"
+        )
+    if hotspot_indices:
+        invalid_hotspots = [
+            index
+            for index in hotspot_indices
+            if not bool(is_true_target[index].item())
+        ]
+        if invalid_hotspots:
+            raise ValueError(
+                "hotspot indices must belong to chains with role=target; "
+                f"invalid indices={invalid_hotspots}"
+            )
+        hotspot_mask = torch.zeros(full_len, device=distogram_logits.device)
+        hotspot_mask[torch.as_tensor(hotspot_indices, device=distogram_logits.device)] = 1.0
+        hotspot_contact = _contact_loss(
+            distogram_logits,
+            bin_distance,
+            num_contacts=1,
+            min_sep=0,
+            cutoff=float(hotspot_cutoff),
+            chain_mask=hotspot_mask,
+            binder_mask=is_design,
+        )
+        weighted_hotspot = float(hotspot_weight) * hotspot_contact
+        if hotspot_interface_mode == "localized":
+            effective_inter = (
+                (1.0 - float(hotspot_weight)) * inter
+                + float(hotspot_weight) * hotspot_contact
+            )
+            total_loss = 0.5 * intra + 0.5 * effective_inter + 0.2 * glob
+        else:
+            effective_inter = inter
+            total_loss = base_total + weighted_hotspot
+        losses.update(
+            {
+                "base_structure_loss": base_total,
+                "hotspot_contact_loss": hotspot_contact,
+                "hotspot_weighted_contribution": weighted_hotspot,
+                "hotspot_objective_adjustment": total_loss - base_total,
+                "effective_inter_contact_loss": effective_inter,
+                "total_loss": total_loss,
+            }
+        )
+    return losses
 
 
 def _stageb_structure_loss(
@@ -231,20 +793,42 @@ def _stageb_structure_loss(
     action_group: Optional[str],
     *,
     group_weight: float = 1.0,
+    hotspot_interface_mode: str = "additive",
 ) -> tuple[torch.Tensor, str]:
     base_loss = losses["total_loss"]
-    weights = ESMFOLD2_ACTION_GROUP_LOSS_KEYS.get(str(action_group or ""), {})
+    if action_group is None:
+        return base_loss, "total_loss"
+
+    weights = ESMFOLD2_ACTION_GROUP_PROPOSAL_LOSS_KEYS.get(str(action_group), {})
+    if not weights:
+        return base_loss, "total_loss"
     selected = []
     proposal_loss = None
     for key, weight in weights.items():
-        if key not in losses:
+        loss_key = key
+        if (
+            key == "inter_contact_loss"
+            and str(hotspot_interface_mode).strip().lower() == "localized"
+            and "effective_inter_contact_loss" in losses
+        ):
+            loss_key = "effective_inter_contact_loss"
+        if loss_key not in losses:
             continue
-        term = float(weight) * losses[key]
+        term = float(weight) * losses[loss_key]
         proposal_loss = term if proposal_loss is None else proposal_loss + term
-        selected.append(key)
+        selected.append(loss_key)
     if proposal_loss is None:
-        return base_loss, "total_loss"
-    return base_loss + float(group_weight) * proposal_loss, "total_loss+" + "+".join(selected)
+        raise ValueError(f"No proposal loss is available for action group {action_group!r}")
+
+    proposal_loss = float(group_weight) * proposal_loss
+    hotspot_is_already_in_interface = (
+        str(action_group) == "interface_formation"
+        and str(hotspot_interface_mode).strip().lower() == "localized"
+    )
+    if not hotspot_is_already_in_interface and "hotspot_weighted_contribution" in losses:
+        proposal_loss = proposal_loss + losses["hotspot_weighted_contribution"]
+        selected.append("hotspot_weighted_contribution")
+    return proposal_loss, "+".join(selected)
 
 
 class ESMFold2RuntimeBackend:
@@ -277,30 +861,223 @@ class ESMFold2RuntimeBackend:
         self.verifier_num_loops = int(config.verifier_num_loops)
         self.verifier_num_sampling_steps = int(config.verifier_num_sampling_steps)
 
+    def _fold_verifier_with_raw_output(
+        self,
+        input_spec: Any,
+        *,
+        seed: Optional[int],
+    ) -> tuple[Any, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Mirror the official input-builder fold while retaining raw tensors."""
+
+        from esm.models.esmfold2.processor import _lm_dropout_context
+
+        features, chain_infos = self.input_builder.prepare_input(
+            input_spec,
+            seed=seed,
+            device=self.verifier_model.device,
+        )
+        with torch.no_grad(), _seed_context(seed), _lm_dropout_context(
+            self.verifier_model,
+            0.3,
+        ):
+            output = self.verifier_model(
+                **features,
+                num_loops=self.verifier_num_loops,
+                num_sampling_steps=self.verifier_num_sampling_steps,
+                num_diffusion_samples=1,
+                early_exit=False,
+                msa_max_depth=1024,
+                msa_column_mask_rate=0.1,
+                msa_subsample_at_inference=True,
+            )
+        fold_result = self.input_builder.decode(
+            output,
+            features,
+            chain_infos,
+            num_diffusion_samples=1,
+            complex_id="esmfold2_verify",
+        )
+        return fold_result, features, output
+
+    def prepare_verifier_reference_features(
+        self,
+        *,
+        binder_seq: str,
+        target_seq: Union[str, Sequence[str]],
+        seed: Optional[int] = None,
+    ) -> dict[str, torch.Tensor]:
+        """Build the atom identity layout paired with verifier coordinates."""
+
+        self._ensure_verifier_loaded()
+        targets = _target_sequences(target_seq)
+        input_spec = self._build_structure_input(targets, binder_seq)
+        features, _ = self.input_builder.prepare_input(
+            input_spec,
+            seed=seed,
+            device=self.verifier_model.device,
+        )
+        required = (
+            "atom_attention_mask",
+            "atom_to_token",
+            "ref_atom_name_chars",
+            "ref_element",
+            "ref_pos",
+        )
+        missing = [name for name in required if name not in features]
+        if missing:
+            raise ValueError(
+                "ESMFold2 verifier reference features are missing: "
+                + ", ".join(missing)
+            )
+        return {
+            name: features[name].detach().clone()
+            for name in required
+        }
+
     def verify(
         self,
         *,
         binder_seq: str,
         target_seq: Union[str, Sequence[str]],
         seed: Optional[int] = None,
+        hotspot_params: Optional[Dict[str, Any]] = None,
     ):
         self._ensure_verifier_loaded()
         targets = _target_sequences(target_seq)
-        input_spec = self._build_structure_input(targets, binder_seq)
-        fold_result = self.input_builder.fold(
-            self.verifier_model,
-            input_spec,
-            num_loops=self.verifier_num_loops,
-            num_sampling_steps=self.verifier_num_sampling_steps,
-            num_diffusion_samples=1,
-            seed=seed,
-            complex_id="esmfold2_verify",
+        target_chain_roles = _normalize_target_chain_roles(
+            self.config.target_chain_roles,
+            n_target_chains=len(targets),
         )
-        summary = self._summary_from_fold_result(fold_result, n_target_chains=len(targets))
+        input_spec = self._build_structure_input(targets, binder_seq)
+        verifier_loss_mode = str(self.config.verifier_loss_mode).strip().lower()
+        raw_features: Optional[dict[str, torch.Tensor]] = None
+        raw_output: Optional[dict[str, torch.Tensor]] = None
+        if verifier_loss_mode == "aligned_common":
+            fold_result, raw_features, raw_output = (
+                self._fold_verifier_with_raw_output(
+                    input_spec,
+                    seed=seed,
+                )
+            )
+        else:
+            fold_result = self.input_builder.fold(
+                self.verifier_model,
+                input_spec,
+                num_loops=self.verifier_num_loops,
+                num_sampling_steps=self.verifier_num_sampling_steps,
+                num_diffusion_samples=1,
+                seed=seed,
+                complex_id="esmfold2_verify",
+            )
+        summary = self._summary_from_fold_result(
+            fold_result,
+            n_target_chains=len(targets),
+            target_chain_roles=target_chain_roles,
+        )
+        summary.update(
+            _binder_structure_metrics(
+                fold_result,
+                binder_length=len(binder_seq),
+            )
+        )
+        hotspot_verify_weight = float(self.config.hotspot_verify_weight)
+        hotspot_too_close_weight = float(
+            self.config.hotspot_verify_too_close_weight
+        )
+        hotspot_metrics: dict[str, Any] = {}
+        hotspot_indices = _normalize_target_hotspot_indices(
+            hotspot_params,
+            target_length=sum(len(sequence) for sequence in targets),
+        )
+        if (
+            hotspot_indices
+            or hotspot_verify_weight > 0.0
+            or hotspot_too_close_weight > 0.0
+        ):
+            hotspot_metrics = _hotspot_structure_metrics(
+                fold_result.complex,
+                target_sequences=targets,
+                hotspot_params=hotspot_params,
+                near_cutoff=float(self.config.hotspot_verify_near_cutoff),
+                far_cutoff=float(self.config.hotspot_verify_far_cutoff),
+                min_safe_distance=float(
+                    self.config.hotspot_verify_min_distance
+                ),
+            )
+            summary.update(hotspot_metrics)
+        coordinate = _fold_result_coordinates(fold_result)
+        aligned_loss_dict = None
+        raw_common_loss_dict: dict[str, float] = {}
+        plddt_logits = None
+        if raw_features is not None and raw_output is not None:
+            plddt_logits = raw_output["plddt_logits"].detach().float().cpu()
+            coordinate = _validate_decoded_coordinate_layout(
+                coordinate,
+                raw_features["atom_attention_mask"],
+            )
+            distogram_losses = _structure_losses(
+                raw_output["distogram_logits"],
+                len(binder_seq),
+                target_chain_lengths=[len(sequence) for sequence in targets],
+                target_chain_roles=target_chain_roles,
+                binder_mutable_mask=self.config.binder_mutable_mask,
+                hotspot_params=None,
+                hotspot_weight=0.0,
+                hotspot_cutoff=float(self.config.hotspot_cutoff),
+                hotspot_interface_mode="additive",
+            )
+            _, raw_common_losses = compute_esmfold2_common_losses(
+                coordinates=raw_output["sample_atom_coords"],
+                plddt_logits=raw_output["plddt_logits"],
+                pae_logits=raw_output["pae_logits"],
+                distogram_logits=raw_output["distogram_logits"],
+                features=raw_features,
+                binder_length=len(binder_seq),
+                task_type=self.task_type,
+                target_chain_roles=target_chain_roles,
+                binder_mutable_mask=self.config.binder_mutable_mask,
+                distogram_losses=distogram_losses,
+                weights=ESMFOLD2_LEGACY_VERIFIER_LOSS_WEIGHTS,
+            )
+            raw_common_loss_dict = _tensor_loss_dict_to_float(raw_common_losses)
+            _, aligned_loss_dict = compute_esmfold2_bounded_verifier_losses(
+                summary,
+                weights=ESMFOLD2_VERIFIER_LOSS_WEIGHTS,
+            )
+            summary["esm_verify_loss_weights"] = dict(
+                ESMFOLD2_VERIFIER_LOSS_WEIGHTS
+            )
+            summary["esm_verify_score_version"] = "bounded_pair_v1"
+            summary["esm_verify_raw_common_loss"] = raw_common_loss_dict["total"]
+            summary["esm_verify_raw_common_loss_weights"] = dict(
+                ESMFOLD2_LEGACY_VERIFIER_LOSS_WEIGHTS
+            )
+            summary["esm_verify_bounded_loss"] = aligned_loss_dict["total"]
+        raw_common_diagnostics = {
+            f"raw_common_{key}": value
+            for key, value in raw_common_loss_dict.items()
+        }
         return build_esm_verifier_result(
             binder_seq=binder_seq,
             target_seq=target_seq,
             summary_confidence=summary,
+            coordinate=coordinate,
+            plddt_logits=plddt_logits,
+            extra_loss_dict={
+                **raw_common_diagnostics,
+                **{
+                    key: value
+                    for key, value in hotspot_metrics.items()
+                    if not isinstance(value, list)
+                },
+            },
+            hotspot_verify_loss=hotspot_metrics.get("hotspot_verify_distance_loss"),
+            hotspot_verify_weight=hotspot_verify_weight,
+            hotspot_too_close_loss=hotspot_metrics.get(
+                "hotspot_too_close_loss"
+            ),
+            hotspot_too_close_weight=hotspot_too_close_weight,
+            aligned_loss_dict=aligned_loss_dict,
         )
 
     def propose(
@@ -317,8 +1094,15 @@ class ESMFold2RuntimeBackend:
         mutable_mask: Optional[Sequence[bool]] = None,
         action_group: Optional[str] = None,
         proposal_logits: Optional[torch.Tensor] = None,
+        reference_coordinates: Optional[torch.Tensor] = None,
+        reference_features: Optional[Mapping[str, torch.Tensor]] = None,
+        hotspot_params: Optional[Dict[str, Any]] = None,
+        hotspot_weight_override: Optional[float] = None,
         track_confidence_override: Optional[bool] = None,
         soft_steps_override: Optional[int] = None,
+        temperature_step_offset: int = 0,
+        temperature_total_steps: Optional[int] = None,
+        preserve_proposal_logits: bool = False,
     ) -> ESMFold2ProposalBatch:
         logits_before, logits_after, confidence_candidates, soft_step_metrics = self._run_soft_update_with_tracking(
             current_seq=current_seq,
@@ -328,21 +1112,29 @@ class ESMFold2RuntimeBackend:
             mutable_mask=mutable_mask,
             action_group=action_group,
             proposal_logits=proposal_logits,
+            reference_coordinates=reference_coordinates,
+            reference_features=reference_features,
+            hotspot_params=hotspot_params,
+            hotspot_weight_override=hotspot_weight_override,
             track_confidence_override=track_confidence_override,
             soft_steps_override=soft_steps_override,
+            temperature_step_offset=temperature_step_offset,
+            temperature_total_steps=temperature_total_steps,
+            preserve_proposal_logits=preserve_proposal_logits,
         )
         confidence_sequences = self._top_confidence_sequences(confidence_candidates)
-        candidates = propose_sequences_from_logit_delta(
-            logits_before,
-            logits_after,
-            current_seq=current_seq,
-            mutable_mask=mutable_mask,
-            K_top=K_top,
-            B_candidates=B_candidates,
-            T_sample=T_sample,
-            max_mutations_per_seq=max_mutations_per_seq,
-            include_logit_candidates=(action_group is None),
-        )
+        with _seed_context(seed):
+            candidates = propose_sequences_from_logit_delta(
+                logits_before,
+                logits_after,
+                current_seq=current_seq,
+                mutable_mask=mutable_mask,
+                K_top=K_top,
+                B_candidates=B_candidates,
+                T_sample=T_sample,
+                max_mutations_per_seq=max_mutations_per_seq,
+                include_logit_candidates=(action_group is None),
+            )
         candidates = list(dict.fromkeys([*confidence_sequences, *candidates]))
         return ESMFold2ProposalBatch(
             sequences=candidates,
@@ -361,8 +1153,15 @@ class ESMFold2RuntimeBackend:
         seed: Optional[int] = None,
         mutable_mask: Optional[Sequence[bool]] = None,
         proposal_logits: Optional[torch.Tensor] = None,
+        reference_coordinates: Optional[torch.Tensor] = None,
+        reference_features: Optional[Mapping[str, torch.Tensor]] = None,
+        hotspot_params: Optional[Dict[str, Any]] = None,
+        hotspot_weight_override: Optional[float] = None,
         track_confidence_override: Optional[bool] = None,
         soft_steps_override: Optional[int] = None,
+        temperature_step_offset: int = 0,
+        temperature_total_steps: Optional[int] = None,
+        preserve_proposal_logits: bool = False,
     ) -> ESMFold2ProposalBatch:
         """Run one continuous ESMFold2 soft-logit trajectory and discretize it.
 
@@ -378,8 +1177,15 @@ class ESMFold2RuntimeBackend:
             mutable_mask=mutable_mask,
             action_group=None,
             proposal_logits=proposal_logits,
+            reference_coordinates=reference_coordinates,
+            reference_features=reference_features,
+            hotspot_params=hotspot_params,
+            hotspot_weight_override=hotspot_weight_override,
             track_confidence_override=track_confidence_override,
             soft_steps_override=soft_steps_override,
+            temperature_step_offset=temperature_step_offset,
+            temperature_total_steps=temperature_total_steps,
+            preserve_proposal_logits=preserve_proposal_logits,
         )
         sequence = sequence_from_logits_argmax(
             logits_after,
@@ -401,25 +1207,54 @@ class ESMFold2RuntimeBackend:
         binder_seq: str,
         target_seq: Union[str, Sequence[str]],
         seed: Optional[int] = None,
+        hotspot_params: Optional[Dict[str, Any]] = None,
     ) -> dict[str, float]:
-        """Compute lightweight distogram losses for Stage-B routing diagnostics.
+        """Compute optional lightweight distogram diagnostics for a binder.
 
-        This uses the same Experimental proposal trunk as the mutation-gradient
-        path, but with the current discrete binder as a one-hot design.  The
-        output is merged into the verified node only for routing; it does not
-        replace the full ESMFold2 verifier score.
+        Stage-B routing uses full-verifier metrics.  This method remains
+        available for explicit diagnostics and does not mutate verifier state.
         """
 
         self._ensure_proposal_models_loaded()
+        targets = _target_sequences(target_seq)
+        explicit_target_chain_roles = self.config.target_chain_roles
         design = self._sequence_to_design_one_hot(binder_seq)
         fold_result = self._fold_distogram(
             target_seq=target_seq,
             design=design,
             seed=seed,
         )
-        losses = _structure_losses(fold_result["distogram_logits"], len(binder_seq))
+        losses = _structure_losses(
+            fold_result["distogram_logits"],
+            len(binder_seq),
+            target_chain_lengths=(
+                [len(sequence) for sequence in targets]
+                if explicit_target_chain_roles is not None
+                else None
+            ),
+            target_chain_roles=explicit_target_chain_roles,
+            binder_mutable_mask=(
+                self.config.binder_mutable_mask
+                if explicit_target_chain_roles is not None
+                else None
+            ),
+            hotspot_params=hotspot_params,
+            hotspot_weight=(
+                float(self.config.hotspot_weight)
+                if self.config.distogram_hotspot_enabled
+                else 0.0
+            ),
+            hotspot_cutoff=float(self.config.hotspot_cutoff),
+            hotspot_interface_mode=str(self.config.hotspot_interface_mode),
+        )
         output: dict[str, float] = {}
-        for key in ("intra_contact_loss", "inter_contact_loss", "glob_loss"):
+        for key in (
+            "intra_contact_loss",
+            "inter_contact_loss",
+            "effective_inter_contact_loss",
+            "glob_loss",
+            "hotspot_contact_loss",
+        ):
             value = losses.get(key)
             scalar = _as_float(value)
             if scalar is not None:
@@ -517,14 +1352,51 @@ class ESMFold2RuntimeBackend:
         )
         return self.structure_prediction_input_cls(sequences=proteins)
 
-    def _summary_from_fold_result(self, fold_result: Any, *, n_target_chains: int) -> dict[str, Any]:
+    def _prepare_sequence_atom_features(
+        self,
+        targets: Sequence[str],
+        binder_seq: str,
+        *,
+        seed: Optional[int],
+    ) -> dict[str, torch.Tensor]:
+        """Build the atom identity layout for a discrete parent sequence."""
+
+        from esm.models.esmfold2 import prepare_esmfold2_input
+
+        input_spec = self._build_structure_input(targets, binder_seq)
+        with _seed_context(seed):
+            features, _ = prepare_esmfold2_input(input_spec, seed=seed)
+        return {
+            key: value.unsqueeze(0)
+            for key, value in features.items()
+            if isinstance(value, torch.Tensor)
+        }
+
+    def _summary_from_fold_result(
+        self,
+        fold_result: Any,
+        *,
+        n_target_chains: int,
+        target_chain_roles: Optional[Sequence[str]] = None,
+    ) -> dict[str, Any]:
         summary: dict[str, Any] = {}
+        roles = _normalize_target_chain_roles(
+            target_chain_roles,
+            n_target_chains=n_target_chains,
+        )
         plddt = _as_float(getattr(fold_result, "plddt", None))
         ptm = _as_float(getattr(fold_result, "ptm", None))
         iptm = _as_float(getattr(fold_result, "iptm", None))
         pair_chain = _mean_target_to_binder_pair_iptm(
             getattr(fold_result, "pair_chains_iptm", None),
             n_target_chains=n_target_chains,
+            target_chain_roles=roles,
+        )
+        scaffold_pair_chain = _mean_target_to_binder_pair_iptm(
+            getattr(fold_result, "pair_chains_iptm", None),
+            n_target_chains=n_target_chains,
+            target_chain_roles=roles,
+            selected_role="scaffold",
         )
         if plddt is not None:
             summary["plddt"] = plddt
@@ -534,9 +1406,16 @@ class ESMFold2RuntimeBackend:
             summary["iptm"] = iptm
         if pair_chain is not None:
             summary["pair_chain_iptm"] = pair_chain
+        if scaffold_pair_chain is not None:
+            summary["scaffold_binder_pair_chain_iptm"] = scaffold_pair_chain
+        summary["target_chain_roles"] = list(roles)
         complex_obj = getattr(fold_result, "complex", None)
-        if complex_obj is not None and hasattr(complex_obj, "to_mmcif_string"):
-            summary["mmcif"] = complex_obj.to_mmcif_string()
+        if complex_obj is not None:
+            if hasattr(complex_obj, "to_mmcif"):
+                summary["mmcif"] = complex_obj.to_mmcif()
+            elif hasattr(complex_obj, "to_mmcif_string"):
+                # Compatibility with older ESM SDK result objects.
+                summary["mmcif"] = complex_obj.to_mmcif_string()
         return summary
 
     def _run_soft_update(
@@ -549,6 +1428,11 @@ class ESMFold2RuntimeBackend:
         mutable_mask: Optional[Sequence[bool]],
         action_group: Optional[str],
         proposal_logits: Optional[torch.Tensor],
+        reference_coordinates: Optional[torch.Tensor] = None,
+        reference_features: Optional[Mapping[str, torch.Tensor]] = None,
+        hotspot_params: Optional[Dict[str, Any]] = None,
+        hotspot_weight_override: Optional[float] = None,
+        preserve_proposal_logits: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         logits_before, logits_after, _, _ = self._run_soft_update_impl(
             current_seq=current_seq,
@@ -558,7 +1442,12 @@ class ESMFold2RuntimeBackend:
             mutable_mask=mutable_mask,
             action_group=action_group,
             proposal_logits=proposal_logits,
+            reference_coordinates=reference_coordinates,
+            reference_features=reference_features,
+            hotspot_params=hotspot_params,
+            hotspot_weight_override=hotspot_weight_override,
             track_confidence=False,
+            preserve_proposal_logits=preserve_proposal_logits,
         )
         return logits_before, logits_after
 
@@ -572,8 +1461,15 @@ class ESMFold2RuntimeBackend:
         mutable_mask: Optional[Sequence[bool]],
         action_group: Optional[str],
         proposal_logits: Optional[torch.Tensor],
+        reference_coordinates: Optional[torch.Tensor],
+        reference_features: Optional[Mapping[str, torch.Tensor]],
+        hotspot_params: Optional[Dict[str, Any]],
+        hotspot_weight_override: Optional[float] = None,
         track_confidence_override: Optional[bool] = None,
         soft_steps_override: Optional[int] = None,
+        temperature_step_offset: int = 0,
+        temperature_total_steps: Optional[int] = None,
+        preserve_proposal_logits: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]], List[Dict[str, Any]]]:
         track_confidence = bool(getattr(self.config, "track_proposal_confidence", False))
         if track_confidence_override is not None:
@@ -586,9 +1482,107 @@ class ESMFold2RuntimeBackend:
             mutable_mask=mutable_mask,
             action_group=action_group,
             proposal_logits=proposal_logits,
+            reference_coordinates=reference_coordinates,
+            reference_features=reference_features,
+            hotspot_params=hotspot_params,
+            hotspot_weight_override=hotspot_weight_override,
             track_confidence=track_confidence,
             soft_steps_override=soft_steps_override,
+            temperature_step_offset=temperature_step_offset,
+            temperature_total_steps=temperature_total_steps,
+            preserve_proposal_logits=preserve_proposal_logits,
         )
+
+    def _one_step_diffusion_gradient(
+        self,
+        *,
+        logits: torch.Tensor,
+        fold_result: Mapping[str, Any],
+        targets: Sequence[str],
+        current_seq: str,
+        mutable_mask: Optional[Sequence[bool]],
+        target_chain_roles: Sequence[str],
+        reference_coordinates: torch.Tensor,
+        reference_features: Optional[Mapping[str, torch.Tensor]],
+        diffusion_seed: Optional[int],
+        hotspot_params: Optional[Dict[str, Any]],
+        effective_hotspot_weight: float,
+    ) -> Dict[str, Any]:
+        source_features = reference_features
+        if source_features is None:
+            source_features = self._prepare_sequence_atom_features(
+                targets,
+                current_seq,
+                seed=diffusion_seed,
+            )
+        remapped_reference = remap_reference_coordinates(
+            reference_coordinates,
+            source_features=source_features,
+            destination_features=fold_result["_features"],
+        )
+        one_step = run_esmfold2_one_step_diffusion(
+            model=self.experimental_model,
+            captured=fold_result["_captured"],
+            features=fold_result["_features"],
+            reference_coordinates=remapped_reference,
+            tau=float(self.config.one_step_diffusion_tau),
+            seed=diffusion_seed,
+        )
+        diffusion_total, diffusion_losses = compute_esmfold2_common_losses(
+            coordinates=one_step["coordinates"],
+            plddt_logits=one_step["plddt_logits"],
+            pae_logits=one_step["pae_logits"],
+            distogram_logits=fold_result["distogram_logits"],
+            features=fold_result["_features"],
+            binder_length=len(current_seq),
+            task_type=self.task_type,
+            target_chain_roles=target_chain_roles,
+            binder_mutable_mask=mutable_mask,
+            distogram_losses=None,
+            weights={
+                "con": 0.0,
+                "i_con": 0.0,
+                "helix": 0.0,
+                "rg": float(self.config.one_step_diffusion_rg_weight),
+            },
+            hotspot_params=(
+                hotspot_params
+                if self.config.one_step_diffusion_hotspot_enabled
+                else None
+            ),
+            hotspot_weight=(
+                effective_hotspot_weight
+                if self.config.one_step_diffusion_hotspot_enabled
+                else 0.0
+            ),
+            hotspot_interface_mode=str(self.config.hotspot_interface_mode),
+        )
+        diffusion_grad = torch.autograd.grad(diffusion_total, logits)[0]
+
+        denoised_sample = _first_coordinate_sample(one_step["coordinates"])
+        reference_sample = _first_coordinate_sample(remapped_reference).to(
+            device=denoised_sample.device,
+            dtype=denoised_sample.dtype,
+        )
+        atom_mask = fold_result["_features"]["atom_attention_mask"]
+        if atom_mask.ndim > 1:
+            atom_mask = atom_mask[0]
+        atom_mask = atom_mask.to(device=denoised_sample.device).bool()
+        coordinate_rmsd = torch.sqrt(
+            torch.square(
+                denoised_sample[atom_mask] - reference_sample[atom_mask]
+            )
+            .sum(dim=-1)
+            .mean()
+        )
+        return {
+            "gradient": diffusion_grad,
+            "total": diffusion_total,
+            "losses": diffusion_losses,
+            "coordinates": one_step["coordinates"],
+            "features": fold_result["_features"],
+            "reference_rmsd": coordinate_rmsd,
+        }
 
     def _run_soft_update_impl(
         self,
@@ -600,8 +1594,15 @@ class ESMFold2RuntimeBackend:
         mutable_mask: Optional[Sequence[bool]],
         action_group: Optional[str],
         proposal_logits: Optional[torch.Tensor],
+        reference_coordinates: Optional[torch.Tensor],
+        reference_features: Optional[Mapping[str, torch.Tensor]],
+        hotspot_params: Optional[Dict[str, Any]],
+        hotspot_weight_override: Optional[float],
         track_confidence: bool,
         soft_steps_override: Optional[int] = None,
+        temperature_step_offset: int = 0,
+        temperature_total_steps: Optional[int] = None,
+        preserve_proposal_logits: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]], List[Dict[str, Any]]]:
         if self.soft_update_fn is not None:
             kwargs = dict(
@@ -616,16 +1617,75 @@ class ESMFold2RuntimeBackend:
                 kwargs["proposal_logits"] = proposal_logits
             if _callable_accepts_argument(self.soft_update_fn, "soft_steps_override"):
                 kwargs["soft_steps_override"] = soft_steps_override
+            if _callable_accepts_argument(
+                self.soft_update_fn, "temperature_step_offset"
+            ):
+                kwargs["temperature_step_offset"] = temperature_step_offset
+            if _callable_accepts_argument(
+                self.soft_update_fn, "temperature_total_steps"
+            ):
+                kwargs["temperature_total_steps"] = temperature_total_steps
+            if _callable_accepts_argument(
+                self.soft_update_fn, "preserve_proposal_logits"
+            ):
+                kwargs["preserve_proposal_logits"] = preserve_proposal_logits
+            if _callable_accepts_argument(self.soft_update_fn, "hotspot_params"):
+                kwargs["hotspot_params"] = hotspot_params
+            if _callable_accepts_argument(
+                self.soft_update_fn, "hotspot_weight_override"
+            ):
+                kwargs["hotspot_weight_override"] = hotspot_weight_override
             logits_before, logits_after = self.soft_update_fn(**kwargs)
             return logits_before, logits_after, [], []
 
         targets = _target_sequences(target_seq)
+        explicit_target_chain_roles = self.config.target_chain_roles
+        target_chain_roles = _normalize_target_chain_roles(
+            explicit_target_chain_roles,
+            n_target_chains=len(targets),
+        )
+        configured_mutable_mask = self.config.binder_mutable_mask
+        if configured_mutable_mask is not None:
+            configured_mutable_mask = tuple(
+                bool(value) for value in configured_mutable_mask
+            )
+            if len(configured_mutable_mask) != len(current_seq):
+                raise ValueError(
+                    "configured binder_mutable_mask length does not match current sequence"
+                )
+            if mutable_mask is None:
+                mutable_mask = configured_mutable_mask
+            elif tuple(bool(value) for value in mutable_mask) != configured_mutable_mask:
+                raise ValueError(
+                    "runtime mutable_mask does not match configured binder_mutable_mask"
+                )
         self._ensure_proposal_models_loaded()
+        effective_hotspot_weight = (
+            float(self.config.hotspot_weight)
+            if hotspot_weight_override is None
+            else float(hotspot_weight_override)
+        )
+        if effective_hotspot_weight < 0.0:
+            raise ValueError("hotspot_weight_override must be non-negative")
+        if (
+            str(self.config.hotspot_interface_mode).strip().lower()
+            == "localized"
+            and effective_hotspot_weight > 1.0
+        ):
+            raise ValueError(
+                "localized hotspot_weight_override must be in [0, 1]"
+            )
+        effective_distogram_hotspot_weight = (
+            effective_hotspot_weight
+            if self.config.distogram_hotspot_enabled
+            else 0.0
+        )
 
         logits = self._init_current_sequence_logits(
             current_seq,
             mutable_mask=mutable_mask,
             proposal_logits=proposal_logits,
+            preserve_proposal_logits=preserve_proposal_logits,
         )
         logits_before = logits.detach().clone()[0]
         gradient_mask = build_gradient_mask(
@@ -645,12 +1705,49 @@ class ESMFold2RuntimeBackend:
         )
         if soft_steps <= 0:
             raise ValueError("ESMFold2 soft steps must be positive")
+        temperature_step_offset = int(temperature_step_offset)
+        if temperature_step_offset < 0:
+            raise ValueError("temperature_step_offset must be non-negative")
+        resolved_temperature_total_steps = (
+            int(temperature_total_steps)
+            if temperature_total_steps is not None
+            else soft_steps
+        )
+        if resolved_temperature_total_steps <= 0:
+            raise ValueError("temperature_total_steps must be positive")
+
+        one_step_enabled = bool(self.config.one_step_diffusion_enabled)
+        one_step_interval = int(self.config.one_step_diffusion_interval)
+        scheduled_one_step_steps = set(
+            _scheduled_one_step_soft_steps(
+                soft_steps=soft_steps,
+                interval=one_step_interval,
+            )
+            if one_step_enabled
+            else ()
+        )
+        if one_step_enabled and reference_coordinates is None:
+            raise ValueError(
+                "ESMFold2 one-step diffusion requires coordinates from the "
+                "selected verifier node"
+            )
+        recycle_one_step_coordinates = bool(
+            self.config.one_step_diffusion_recycle_coordinates
+        )
+        recycled_reference_coordinates: Optional[torch.Tensor] = None
+        recycled_reference_features: Optional[Mapping[str, torch.Tensor]] = None
+        one_step_injection_count = 0
 
         for local_step in range(soft_steps):
             optimizer.zero_grad()
+            one_based_soft_step = local_step + 1
+            run_scheduled_one_step = (
+                one_based_soft_step in scheduled_one_step_steps
+            )
+            temperature_step = temperature_step_offset + local_step
             temperature = esm_temperature(
-                local_step,
-                total_steps=soft_steps,
+                temperature_step,
+                total_steps=resolved_temperature_total_steps,
                 temperature_min=float(self.config.temperature_min),
                 temperature_max=float(self.config.temperature_max),
             )
@@ -676,6 +1773,7 @@ class ESMFold2RuntimeBackend:
                     if should_track_confidence
                     else int(self.config.num_sampling_steps)
                 ),
+                capture_diffusion_state=run_scheduled_one_step,
             )
             if should_track_confidence:
                 record = self._proposal_confidence_record(
@@ -689,13 +1787,36 @@ class ESMFold2RuntimeBackend:
                 )
                 if record is not None:
                     confidence_candidates.append(record)
-            losses = _structure_losses(fold_result["distogram_logits"], len(current_seq))
+            losses = _structure_losses(
+                fold_result["distogram_logits"],
+                len(current_seq),
+                target_chain_lengths=(
+                    [len(sequence) for sequence in targets]
+                    if explicit_target_chain_roles is not None
+                    else None
+                ),
+                target_chain_roles=explicit_target_chain_roles,
+                binder_mutable_mask=(
+                    mutable_mask
+                    if explicit_target_chain_roles is not None
+                    else None
+                ),
+                hotspot_params=hotspot_params,
+                hotspot_weight=effective_distogram_hotspot_weight,
+                hotspot_cutoff=float(self.config.hotspot_cutoff),
+                hotspot_interface_mode=str(self.config.hotspot_interface_mode),
+            )
             structure_loss, _ = _stageb_structure_loss(
                 losses,
                 action_group,
                 group_weight=getattr(self.config, "stageb_group_weight", 1.0),
+                hotspot_interface_mode=str(self.config.hotspot_interface_mode),
             )
-            structure_grad = torch.autograd.grad(structure_loss.mean(), logits)[0]
+            structure_grad = torch.autograd.grad(
+                structure_loss.mean(),
+                logits,
+                retain_graph=run_scheduled_one_step,
+            )[0]
 
             esmc_grad = None
             if lambda_esmc != 0.0:
@@ -708,38 +1829,387 @@ class ESMFold2RuntimeBackend:
                     )
                 esmc_grad = torch.autograd.grad(esmc_loss.mean(), logits)[0]
 
-            logits.grad = combine_normalized_gradients(
+            combined_grad = combine_normalized_gradients(
                 structure_grad,
                 esmc_grad,
                 gradient_mask=gradient_mask,
                 lambda_esmc=lambda_esmc,
             )
+            scheduled_one_step: Optional[Dict[str, Any]] = None
+            if run_scheduled_one_step:
+                diffusion_seed = (
+                    None
+                    if seed is None
+                    else int(seed)
+                    + int(global_step)
+                    + one_based_soft_step
+                    + 100_003
+                )
+                use_recycled_reference = bool(
+                    recycle_one_step_coordinates
+                    and recycled_reference_coordinates is not None
+                    and recycled_reference_features is not None
+                )
+                scheduled_one_step = self._one_step_diffusion_gradient(
+                    logits=logits,
+                    fold_result=fold_result,
+                    targets=targets,
+                    current_seq=current_seq,
+                    mutable_mask=mutable_mask,
+                    target_chain_roles=target_chain_roles,
+                    reference_coordinates=(
+                        recycled_reference_coordinates
+                        if use_recycled_reference
+                        else reference_coordinates
+                    ),
+                    reference_features=(
+                        recycled_reference_features
+                        if use_recycled_reference
+                        else reference_features
+                    ),
+                    diffusion_seed=diffusion_seed,
+                    hotspot_params=hotspot_params,
+                    effective_hotspot_weight=effective_hotspot_weight,
+                )
+                combined_grad = combined_grad + float(
+                    self.config.one_step_diffusion_weight
+                ) * normalized_gradient_tensor(
+                    scheduled_one_step["gradient"],
+                    gradient_mask,
+                )
+                if recycle_one_step_coordinates:
+                    recycled_reference_coordinates = scheduled_one_step[
+                        "coordinates"
+                    ].detach()
+                    recycled_reference_features = {
+                        key: (
+                            value.detach()
+                            if isinstance(value, torch.Tensor)
+                            else value
+                        )
+                        for key, value in scheduled_one_step["features"].items()
+                    }
+                one_step_injection_count += 1
+            logits.grad = combined_grad * gradient_mask
             for group in optimizer.param_groups:
                 group["lr"] = float(self.config.learning_rate) * temperature
             optimizer.step()
             structure_total = losses["total_loss"]
             combined_total = structure_total + (esmc_loss if lambda_esmc != 0.0 else 0.0)
-            soft_step_metrics.append(
-                {
-                    "global_step": int(global_step),
-                    "local_step": int(local_step),
-                    "temperature": float(temperature),
-                    "proposal_loss_source": _stageb_structure_loss(
-                        losses,
-                        action_group,
-                        group_weight=getattr(self.config, "stageb_group_weight", 1.0),
-                    )[1],
-                    "intra_contact_loss": _as_float(losses.get("intra_contact_loss")),
-                    "inter_contact_loss": _as_float(losses.get("inter_contact_loss")),
-                    "glob_loss": _as_float(losses.get("glob_loss")),
-                    "structure_total_loss": _as_float(structure_total),
-                    "plm_loss": None if lambda_esmc == 0.0 else _as_float(esmc_loss),
-                    "total_loss": _as_float(combined_total),
-                    "backprop_loss": _as_float(structure_loss),
-                    "lambda_esmc": float(lambda_esmc),
-                    "confidence_tracked": bool(should_track_confidence),
-                }
+            argmax_sequence = sequence_from_logits_argmax(
+                logits.detach()[0],
+                current_seq=current_seq,
+                mutable_mask=mutable_mask,
             )
+            metrics = {
+                "global_step": int(global_step),
+                "local_step": int(local_step),
+                "temperature_step": int(temperature_step),
+                "temperature_total_steps": int(resolved_temperature_total_steps),
+                "temperature": float(temperature),
+                "argmax_sequence": argmax_sequence,
+                "proposal_loss_source": _stageb_structure_loss(
+                    losses,
+                    action_group,
+                    group_weight=getattr(self.config, "stageb_group_weight", 1.0),
+                    hotspot_interface_mode=str(self.config.hotspot_interface_mode),
+                )[1],
+                "intra_contact_loss": _as_float(losses.get("intra_contact_loss")),
+                "inter_contact_loss": _as_float(losses.get("inter_contact_loss")),
+                "glob_loss": _as_float(losses.get("glob_loss")),
+                "structure_total_loss": _as_float(structure_total),
+                "plm_loss": None if lambda_esmc == 0.0 else _as_float(esmc_loss),
+                "total_loss": _as_float(combined_total),
+                "backprop_loss": _as_float(structure_loss),
+                "lambda_esmc": float(lambda_esmc),
+                "confidence_tracked": bool(should_track_confidence),
+            }
+            if "hotspot_contact_loss" in losses:
+                metrics.update(
+                    {
+                        "base_structure_loss": _as_float(losses.get("base_structure_loss")),
+                        "hotspot_contact_loss": _as_float(losses.get("hotspot_contact_loss")),
+                        "hotspot_weight": effective_distogram_hotspot_weight,
+                        "distogram_hotspot_enabled": bool(
+                            self.config.distogram_hotspot_enabled
+                        ),
+                        "distogram_hotspot_weight": float(
+                            effective_distogram_hotspot_weight
+                        ),
+                        "hotspot_weight_configured": float(
+                            self.config.hotspot_weight
+                        ),
+                        "hotspot_attraction_suppressed": bool(
+                            effective_distogram_hotspot_weight
+                            < float(self.config.hotspot_weight)
+                        ),
+                        "hotspot_cutoff": float(self.config.hotspot_cutoff),
+                        "hotspot_interface_mode": str(
+                            self.config.hotspot_interface_mode
+                        ),
+                        "hotspot_weighted_contribution": _as_float(
+                            losses.get("hotspot_weighted_contribution")
+                        ),
+                        "hotspot_objective_adjustment": _as_float(
+                            losses.get("hotspot_objective_adjustment")
+                        ),
+                        "effective_inter_contact_loss": _as_float(
+                            losses.get("effective_inter_contact_loss")
+                        ),
+                    }
+                )
+            if scheduled_one_step is not None:
+                metrics.update(
+                    {
+                        "one_step_diffusion": True,
+                        "one_step_diffusion_schedule": "interval",
+                        "one_step_diffusion_interval": int(one_step_interval),
+                        "one_step_diffusion_injection_index": int(
+                            one_step_injection_count
+                        ),
+                        "one_step_diffusion_recycle_coordinates": bool(
+                            recycle_one_step_coordinates
+                        ),
+                        "one_step_diffusion_used_recycled_coordinates": bool(
+                            recycle_one_step_coordinates
+                            and one_step_injection_count > 1
+                        ),
+                        "one_step_diffusion_tau": float(
+                            self.config.one_step_diffusion_tau
+                        ),
+                        "one_step_diffusion_weight": float(
+                            self.config.one_step_diffusion_weight
+                        ),
+                        "one_step_diffusion_rg_weight": float(
+                            self.config.one_step_diffusion_rg_weight
+                        ),
+                        "one_step_diffusion_hotspot_enabled": bool(
+                            self.config.one_step_diffusion_hotspot_enabled
+                            and hotspot_params is not None
+                        ),
+                        "one_step_diffusion_hotspot_weight": float(
+                            effective_hotspot_weight
+                            if self.config.one_step_diffusion_hotspot_enabled
+                            else 0.0
+                        ),
+                        "one_step_diffusion_hotspot_interface_mode": str(
+                            self.config.hotspot_interface_mode
+                        ),
+                        "distogram_hotspot_enabled": bool(
+                            self.config.distogram_hotspot_enabled
+                        ),
+                        "distogram_hotspot_weight": float(
+                            effective_distogram_hotspot_weight
+                        ),
+                        "one_step_diffusion_loss": _as_float(
+                            scheduled_one_step["total"]
+                        ),
+                        "one_step_diffusion_reference_rmsd": _as_float(
+                            scheduled_one_step["reference_rmsd"]
+                        ),
+                    }
+                )
+                for name, value in scheduled_one_step["losses"].items():
+                    metrics[f"diffusion_{name}_loss"] = _as_float(value)
+                if "rg" in scheduled_one_step["losses"]:
+                    metrics["diffusion_rg_weighted_contribution"] = _as_float(
+                        scheduled_one_step["losses"]["rg"]
+                        * float(self.config.one_step_diffusion_rg_weight)
+                    )
+            if (
+                local_step == 0
+                or local_step == soft_steps - 1
+                or (local_step + 1) % 10 == 0
+            ):
+                metrics["logits_snapshot"] = logits.detach().clone()[0].cpu()
+            soft_step_metrics.append(metrics)
+
+        if one_step_enabled and one_step_interval == 0:
+            optimizer.zero_grad()
+            final_temperature = esm_temperature(
+                min(
+                    temperature_step_offset + soft_steps,
+                    resolved_temperature_total_steps - 1,
+                ),
+                total_steps=resolved_temperature_total_steps,
+                temperature_min=float(self.config.temperature_min),
+                temperature_max=float(self.config.temperature_max),
+            )
+            design = F.softmax(logits / final_temperature, dim=-1)
+            diffusion_seed = (
+                None
+                if seed is None
+                else int(seed) + int(global_step) + soft_steps + 100_003
+            )
+            fold_result = self._fold_distogram(
+                target_seq=targets,
+                design=design,
+                seed=diffusion_seed,
+                calculate_confidence=False,
+                num_loops=int(self.config.num_loops),
+                num_sampling_steps=int(self.config.num_sampling_steps),
+                capture_diffusion_state=True,
+            )
+            losses = _structure_losses(
+                fold_result["distogram_logits"],
+                len(current_seq),
+                target_chain_lengths=(
+                    [len(sequence) for sequence in targets]
+                    if explicit_target_chain_roles is not None
+                    else None
+                ),
+                target_chain_roles=explicit_target_chain_roles,
+                binder_mutable_mask=(
+                    mutable_mask if explicit_target_chain_roles is not None else None
+                ),
+                hotspot_params=hotspot_params,
+                hotspot_weight=effective_distogram_hotspot_weight,
+                hotspot_cutoff=float(self.config.hotspot_cutoff),
+                hotspot_interface_mode=str(self.config.hotspot_interface_mode),
+            )
+            structure_loss, proposal_loss_source = _stageb_structure_loss(
+                losses,
+                action_group,
+                group_weight=getattr(self.config, "stageb_group_weight", 1.0),
+                hotspot_interface_mode=str(self.config.hotspot_interface_mode),
+            )
+            structure_grad = torch.autograd.grad(
+                structure_loss.mean(),
+                logits,
+                retain_graph=True,
+            )[0]
+
+            esmc_loss = None
+            esmc_grad = None
+            if lambda_esmc != 0.0:
+                score_mask = gradient_mask.sum(dim=-1) > 0
+                with _seed_context(diffusion_seed):
+                    esmc_loss = self._compute_esmc_pseudoperplexity(
+                        F.softmax(logits / final_temperature, dim=-1),
+                        score_mask=score_mask,
+                    )
+                esmc_grad = torch.autograd.grad(esmc_loss.mean(), logits)[0]
+
+            one_step = run_esmfold2_one_step_diffusion(
+                model=self.experimental_model,
+                captured=fold_result["_captured"],
+                features=fold_result["_features"],
+                reference_coordinates=remap_reference_coordinates(
+                    reference_coordinates,
+                    source_features=self._prepare_sequence_atom_features(
+                        targets,
+                        current_seq,
+                        seed=diffusion_seed,
+                    ),
+                    destination_features=fold_result["_features"],
+                ),
+                tau=float(self.config.one_step_diffusion_tau),
+                seed=diffusion_seed,
+            )
+            diffusion_total, diffusion_losses = compute_esmfold2_common_losses(
+                coordinates=one_step["coordinates"],
+                plddt_logits=one_step["plddt_logits"],
+                pae_logits=one_step["pae_logits"],
+                distogram_logits=fold_result["distogram_logits"],
+                features=fold_result["_features"],
+                binder_length=len(current_seq),
+                task_type=self.task_type,
+                target_chain_roles=target_chain_roles,
+                binder_mutable_mask=mutable_mask,
+                distogram_losses=None,
+                weights={
+                    "con": 0.0,
+                    "i_con": 0.0,
+                    "helix": 0.0,
+                    "rg": float(self.config.one_step_diffusion_rg_weight),
+                },
+                hotspot_params=(
+                    hotspot_params
+                    if self.config.one_step_diffusion_hotspot_enabled
+                    else None
+                ),
+                hotspot_weight=(
+                    effective_hotspot_weight
+                    if self.config.one_step_diffusion_hotspot_enabled
+                    else 0.0
+                ),
+                hotspot_interface_mode=str(
+                    self.config.hotspot_interface_mode
+                ),
+            )
+            diffusion_grad = torch.autograd.grad(diffusion_total, logits)[0]
+            combined_grad = combine_normalized_gradients(
+                structure_grad,
+                esmc_grad,
+                gradient_mask=gradient_mask,
+                lambda_esmc=lambda_esmc,
+            )
+            combined_grad = combined_grad + float(
+                self.config.one_step_diffusion_weight
+            ) * normalized_gradient_tensor(diffusion_grad, gradient_mask)
+            logits.grad = combined_grad * gradient_mask
+            for group in optimizer.param_groups:
+                group["lr"] = float(self.config.learning_rate) * final_temperature
+            optimizer.step()
+
+            one_step_metrics: Dict[str, Any] = {
+                "global_step": int(global_step),
+                "local_step": int(soft_steps),
+                "temperature": float(final_temperature),
+                "proposal_loss_source": proposal_loss_source,
+                "one_step_diffusion": True,
+                "one_step_diffusion_schedule": "legacy_final_only",
+                "one_step_diffusion_interval": 0,
+                "one_step_diffusion_injection_index": 1,
+                "one_step_diffusion_recycle_coordinates": False,
+                "one_step_diffusion_used_recycled_coordinates": False,
+                "one_step_diffusion_tau": float(
+                    self.config.one_step_diffusion_tau
+                ),
+                "one_step_diffusion_weight": float(
+                    self.config.one_step_diffusion_weight
+                ),
+                "one_step_diffusion_rg_weight": float(
+                    self.config.one_step_diffusion_rg_weight
+                ),
+                "one_step_diffusion_hotspot_enabled": bool(
+                    self.config.one_step_diffusion_hotspot_enabled
+                    and hotspot_params is not None
+                ),
+                "one_step_diffusion_hotspot_weight": float(
+                    effective_hotspot_weight
+                    if self.config.one_step_diffusion_hotspot_enabled
+                    else 0.0
+                ),
+                "one_step_diffusion_hotspot_interface_mode": str(
+                    self.config.hotspot_interface_mode
+                ),
+                "distogram_hotspot_enabled": bool(
+                    self.config.distogram_hotspot_enabled
+                ),
+                "distogram_hotspot_weight": float(
+                    effective_distogram_hotspot_weight
+                ),
+                "one_step_diffusion_loss": _as_float(diffusion_total),
+                "structure_total_loss": _as_float(losses["total_loss"]),
+                "backprop_loss": _as_float(structure_loss),
+                "plm_loss": None if esmc_loss is None else _as_float(esmc_loss),
+                "lambda_esmc": float(lambda_esmc),
+                "argmax_sequence": sequence_from_logits_argmax(
+                    logits.detach()[0],
+                    current_seq=current_seq,
+                    mutable_mask=mutable_mask,
+                ),
+                "logits_snapshot": logits.detach().clone()[0].cpu(),
+            }
+            for name, value in diffusion_losses.items():
+                one_step_metrics[f"diffusion_{name}_loss"] = _as_float(value)
+            if "rg" in diffusion_losses:
+                one_step_metrics["diffusion_rg_weighted_contribution"] = _as_float(
+                    diffusion_losses["rg"]
+                    * float(self.config.one_step_diffusion_rg_weight)
+                )
+            soft_step_metrics.append(one_step_metrics)
 
         return (
             logits_before.detach().cpu(),
@@ -829,10 +2299,11 @@ class ESMFold2RuntimeBackend:
         *,
         mutable_mask: Optional[Sequence[bool]],
         proposal_logits: Optional[torch.Tensor] = None,
+        preserve_proposal_logits: bool = False,
     ) -> torch.Tensor:
         if proposal_logits is not None:
             current_seq = str(current_seq)
-            if (
+            if preserve_proposal_logits or (
                 sequence_from_logits_argmax(
                     proposal_logits,
                     current_seq=current_seq,
@@ -880,6 +2351,7 @@ class ESMFold2RuntimeBackend:
         calculate_confidence: bool = False,
         num_loops: Optional[int] = None,
         num_sampling_steps: Optional[int] = None,
+        capture_diffusion_state: bool = False,
     ) -> dict[str, Any]:
         from esm.models.esmfold2 import ProteinInput, StructurePredictionInput, prepare_esmfold2_input
 
@@ -888,6 +2360,10 @@ class ESMFold2RuntimeBackend:
             raise ValueError("ESMFold2 target sequence is empty")
         if len(targets) + 1 > len(CHAIN_IDS):
             raise ValueError("Too many chains for first ESMFold2 backend")
+        target_chain_roles = _normalize_target_chain_roles(
+            self.config.target_chain_roles,
+            n_target_chains=len(targets),
+        )
         target_one_hot = torch.cat(
             [self._sequence_to_folding_one_hot(sequence) for sequence in targets],
             dim=1,
@@ -914,15 +2390,36 @@ class ESMFold2RuntimeBackend:
             }
             inputs["res_type_soft"] = torch.cat((target_one_hot, padded_design), dim=1)
 
-            output = self.experimental_model(
-                **inputs,
-                num_diffusion_samples=1,
-                num_sampling_steps=int(num_sampling_steps or self.config.num_sampling_steps),
-                num_loops=int(num_loops or self.config.num_loops),
-                calculate_confidence=bool(calculate_confidence),
-                seed=seed,
-            )
+            if capture_diffusion_state:
+                with capture_experimental_trunk_state(
+                    self.experimental_model
+                ) as captured:
+                    output = self.experimental_model(
+                        **inputs,
+                        num_diffusion_samples=1,
+                        num_sampling_steps=int(
+                            num_sampling_steps or self.config.num_sampling_steps
+                        ),
+                        num_loops=int(num_loops or self.config.num_loops),
+                        calculate_confidence=bool(calculate_confidence),
+                        seed=seed,
+                    )
+            else:
+                captured = {}
+                output = self.experimental_model(
+                    **inputs,
+                    num_diffusion_samples=1,
+                    num_sampling_steps=int(
+                        num_sampling_steps or self.config.num_sampling_steps
+                    ),
+                    num_loops=int(num_loops or self.config.num_loops),
+                    calculate_confidence=bool(calculate_confidence),
+                    seed=seed,
+                )
         result: dict[str, Any] = {"distogram_logits": output["distogram_logits"]}
+        if capture_diffusion_state:
+            result["_features"] = inputs
+            result["_captured"] = dict(captured)
         for key in ("iptm", "ptm", "plddt", "pair_chain_iptm"):
             if key in output:
                 result[key] = output.get(key)
@@ -930,7 +2427,16 @@ class ESMFold2RuntimeBackend:
             result["pair_chain_iptm"] = _mean_target_to_binder_pair_iptm(
                 output.get("pair_chains_iptm"),
                 n_target_chains=len(targets),
+                target_chain_roles=target_chain_roles,
             )
+            scaffold_pair_chain = _mean_target_to_binder_pair_iptm(
+                output.get("pair_chains_iptm"),
+                n_target_chains=len(targets),
+                target_chain_roles=target_chain_roles,
+                selected_role="scaffold",
+            )
+            if scaffold_pair_chain is not None:
+                result["scaffold_binder_pair_chain_iptm"] = scaffold_pair_chain
         return result
 
     @lru_cache(maxsize=1)

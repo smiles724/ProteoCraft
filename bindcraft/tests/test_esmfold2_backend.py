@@ -17,36 +17,61 @@ from bindcraft.hallucination.esmfold2_backend import (
     resolve_esm_verifier_loss,
     resolve_lambda_esmc,
     select_esmfold2_action_group,
+    softly_anchor_mutation_logits,
 )
 from bindcraft.hallucination.mcts_controller import MCTSTree
 
 
-def test_verifier_loss_prefers_pair_chain_iptm_and_falls_back_to_iptm():
+def test_soft_mutation_anchor_changes_only_explicit_edit_positions():
+    logits = torch.arange(3 * len(ESM_AA_ORDER), dtype=torch.float32).reshape(
+        3, len(ESM_AA_ORDER)
+    )
+    logits[:, CYS_INDEX] = float("-inf")
+
+    anchored = softly_anchor_mutation_logits(
+        logits,
+        parent_sequence="AAA",
+        child_sequence="AYA",
+        mutable_mask=[True, True, True],
+        anchor_margin=0.1,
+    )
+
+    assert torch.equal(anchored[0], logits[0])
+    assert torch.equal(anchored[2], logits[2])
+    y_idx = ESM_AA_ORDER.index("Y")
+    finite_before = logits[1][torch.isfinite(logits[1])]
+    assert anchored[1, y_idx] == pytest.approx(float(finite_before.max()) + 0.1)
+
+
+def test_verifier_loss_requires_pair_chain_iptm_without_global_fallback():
     loss, source = resolve_esm_verifier_loss(
         {"pair_chain_iptm": 0.82, "iptm": 0.10}
     )
     assert loss == pytest.approx(0.18)
     assert source == "pair_chain_iptm"
 
-    fallback_loss, fallback_source = resolve_esm_verifier_loss({"iptm": 0.73})
-    assert fallback_loss == pytest.approx(0.27)
-    assert fallback_source == "iptm"
-
-    with pytest.raises(ValueError):
-        resolve_esm_verifier_loss({"ptm": 0.8})
+    with pytest.raises(ValueError, match="pair-chain iPTM"):
+        resolve_esm_verifier_loss({"iptm": 0.73})
 
 
 def test_verifier_result_is_compatible_with_mcts_cache_contract():
     result = build_esm_verifier_result(
         binder_seq="ALY",
         target_seq="TARGET",
-        summary_confidence={"pair_chain_iptm": 0.75, "plddt": 0.91},
+        summary_confidence={
+            "pair_chain_iptm": 0.75,
+            "plddt": 0.91,
+            "binder_plddt": 0.88,
+            "binder_rg_excess": 0.12,
+        },
         coordinate=torch.zeros(1, 8, 3),
     )
 
     assert result.total_loss == pytest.approx(0.25)
     assert result.loss_dict["esm_verify_loss"] == pytest.approx(0.25)
     assert result.loss_dict["pair_chain_iptm_loss"] == pytest.approx(0.25)
+    assert result.loss_dict["binder_confidence_loss"] == pytest.approx(0.12)
+    assert result.loss_dict["binder_rg_excess_loss"] == pytest.approx(0.12)
     assert "interface_loss" not in result.loss_dict
     assert result.summary_confidence["esm_verify_source"] == "pair_chain_iptm"
 
@@ -55,6 +80,94 @@ def test_verifier_result_is_compatible_with_mcts_cache_contract():
     assert cached.binder_seq == "ALY"
     assert cached.total_loss == pytest.approx(0.25)
     assert cached.coordinate.shape == (1, 8, 3)
+
+
+def test_verifier_result_combines_global_and_hotspot_losses_without_overwriting_global_metric():
+    result = build_esm_verifier_result(
+        binder_seq="ALY",
+        target_seq="TARGET",
+        summary_confidence={"pair_chain_iptm": 0.75},
+        hotspot_verify_loss=0.6,
+        hotspot_verify_weight=0.2,
+        extra_loss_dict={"hotspot_mean_min_heavy_atom_distance": 14.0},
+    )
+
+    assert result.total_loss == pytest.approx(0.37)
+    assert result.loss_dict["pair_chain_iptm_loss"] == pytest.approx(0.25)
+    assert result.loss_dict["esm_verify_global_loss"] == pytest.approx(0.25)
+    assert result.loss_dict["hotspot_verify_distance_loss"] == pytest.approx(0.6)
+    assert result.loss_dict["hotspot_verify_weighted_contribution"] == pytest.approx(0.12)
+    assert result.loss_dict["hotspot_mean_min_heavy_atom_distance"] == pytest.approx(14.0)
+    assert result.summary_confidence["esm_verify_loss"] == pytest.approx(0.37)
+
+
+def test_verifier_result_can_use_aligned_common_loss_without_losing_pair_metric():
+    result = build_esm_verifier_result(
+        binder_seq="ALY",
+        target_seq="TARGET",
+        summary_confidence={"pair_chain_iptm": 0.75},
+        aligned_loss_dict={
+            "total": 0.42,
+            "plddt": 0.12,
+            "i_pae": 0.20,
+        },
+        hotspot_verify_loss=0.5,
+        hotspot_verify_weight=0.2,
+    )
+
+    assert result.total_loss == pytest.approx(0.52)
+    assert result.loss_dict["pair_chain_iptm_loss"] == pytest.approx(0.25)
+    assert result.loss_dict["esm_verify_global_loss"] == pytest.approx(0.42)
+    assert result.loss_dict["plddt"] == pytest.approx(0.12)
+    assert result.summary_confidence["esm_verify_source"] == "esmfold2_aligned_common"
+
+
+def test_verifier_result_adds_hotspot_too_close_penalty():
+    result = build_esm_verifier_result(
+        binder_seq="ALY",
+        target_seq="TARGET",
+        summary_confidence={"pair_chain_iptm": 0.75},
+        hotspot_verify_loss=0.0,
+        hotspot_verify_weight=0.2,
+        hotspot_too_close_loss=0.4,
+        hotspot_too_close_weight=0.25,
+    )
+
+    assert result.total_loss == pytest.approx(0.35)
+    assert result.loss_dict["pair_chain_iptm_loss"] == pytest.approx(0.25)
+    assert result.loss_dict["hotspot_too_close_loss"] == pytest.approx(0.4)
+    assert result.loss_dict[
+        "hotspot_too_close_weighted_contribution"
+    ] == pytest.approx(0.1)
+
+
+def test_zero_hotspot_verify_weight_preserves_legacy_verifier_result_shape():
+    result = build_esm_verifier_result(
+        binder_seq="ALY",
+        target_seq="TARGET",
+        summary_confidence={"pair_chain_iptm": 0.75},
+        hotspot_verify_loss=0.6,
+        hotspot_verify_weight=0.0,
+    )
+
+    assert result.total_loss == pytest.approx(0.25)
+    assert set(result.loss_dict) == {
+        "total",
+        "esm_verify_loss",
+        "pair_chain_iptm_loss",
+    }
+    assert "hotspot_verify_distance_loss" not in result.summary_confidence
+
+    with pytest.raises(
+        ValueError,
+        match="positive hotspot_verify_weight requires hotspot_verify_loss",
+    ):
+        build_esm_verifier_result(
+            binder_seq="ALY",
+            target_seq="TARGET",
+            summary_confidence={"pair_chain_iptm": 0.75},
+            hotspot_verify_weight=0.2,
+        )
 
 
 def test_init_logits_and_gradient_mask_keep_fixed_positions_out_of_optimization():
@@ -167,7 +280,27 @@ def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     assert default_config.soft_steps == 30
     assert default_config.proposal_lm_dropout == pytest.approx(0.5)
     assert default_config.force_proposal_lm_dropout is True
-    assert default_config.experimental_model_name.endswith("ESMFold2-Experimental")
+    assert default_config.experimental_model_name.endswith(
+        "ESMFold2-Experimental-Fast"
+    )
+    assert default_config.hotspot_weight == pytest.approx(0.0)
+    assert default_config.hotspot_satisfied_proposal_weight == pytest.approx(0.0)
+    assert default_config.hotspot_cutoff == pytest.approx(8.0)
+    assert default_config.hotspot_interface_mode == "additive"
+    assert default_config.hotspot_verify_weight == pytest.approx(0.0)
+    assert default_config.hotspot_verify_near_cutoff == pytest.approx(8.0)
+    assert default_config.hotspot_verify_far_cutoff == pytest.approx(20.0)
+    assert default_config.hotspot_verify_min_distance == pytest.approx(2.5)
+    assert default_config.hotspot_verify_too_close_weight == pytest.approx(0.0)
+    assert default_config.one_step_diffusion_enabled is True
+    assert default_config.one_step_diffusion_tau == pytest.approx(2.0)
+    assert default_config.one_step_diffusion_weight == pytest.approx(0.25)
+    assert default_config.one_step_diffusion_rg_weight == pytest.approx(0.1)
+    assert default_config.one_step_diffusion_interval == 5
+    assert default_config.one_step_diffusion_recycle_coordinates is False
+    assert default_config.one_step_diffusion_hotspot_enabled is False
+    assert default_config.distogram_hotspot_enabled is True
+    assert default_config.verifier_loss_mode == "pair_chain_iptm"
 
     config = ESMFold2ProposalConfig(soft_steps=3, lambda_esmc="auto")
     assert config.soft_steps == 3
@@ -175,6 +308,68 @@ def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     last = esm_temperature(2, total_steps=3)
     assert first > last
     assert last >= 1e-2
+
+
+def test_proposal_config_rejects_negative_hotspot_weight():
+    with pytest.raises(ValueError, match="hotspot_weight must be non-negative"):
+        ESMFold2ProposalConfig(hotspot_weight=-0.1)
+
+
+def test_proposal_config_rejects_nonpositive_hotspot_cutoff():
+    with pytest.raises(ValueError, match="hotspot_cutoff must be positive"):
+        ESMFold2ProposalConfig(hotspot_cutoff=0.0)
+
+
+def test_proposal_config_validates_hotspot_interface_mode():
+    with pytest.raises(ValueError, match="hotspot_interface_mode"):
+        ESMFold2ProposalConfig(hotspot_interface_mode="unknown")
+    with pytest.raises(ValueError, match="hotspot_weight in"):
+        ESMFold2ProposalConfig(
+            hotspot_interface_mode="localized",
+            hotspot_weight=1.1,
+        )
+
+
+def test_proposal_config_validates_hotspot_verifier_parameters():
+    with pytest.raises(ValueError, match="hotspot_verify_weight must be non-negative"):
+        ESMFold2ProposalConfig(hotspot_verify_weight=-0.1)
+    with pytest.raises(
+        ValueError,
+        match="hotspot_verify_far_cutoff must be greater",
+    ):
+        ESMFold2ProposalConfig(
+            hotspot_verify_near_cutoff=5.0,
+            hotspot_verify_far_cutoff=5.0,
+        )
+
+
+def test_proposal_config_validates_one_step_diffusion_parameters():
+    with pytest.raises(ValueError, match="one_step_diffusion_tau"):
+        ESMFold2ProposalConfig(one_step_diffusion_tau=0.0)
+    with pytest.raises(ValueError, match="one_step_diffusion_weight"):
+        ESMFold2ProposalConfig(one_step_diffusion_weight=-0.1)
+    with pytest.raises(ValueError, match="one_step_diffusion_rg_weight"):
+        ESMFold2ProposalConfig(one_step_diffusion_rg_weight=-0.1)
+    with pytest.raises(ValueError, match="one_step_diffusion_interval"):
+        ESMFold2ProposalConfig(one_step_diffusion_interval=-1)
+    with pytest.raises(
+        ValueError,
+        match="positive one_step_diffusion_interval",
+    ):
+        ESMFold2ProposalConfig(
+            one_step_diffusion_enabled=False,
+            one_step_diffusion_interval=5,
+        )
+    with pytest.raises(
+        ValueError,
+        match="one_step_diffusion_recycle_coordinates",
+    ):
+        ESMFold2ProposalConfig(
+            one_step_diffusion_recycle_coordinates=True,
+            one_step_diffusion_interval=0,
+        )
+    with pytest.raises(ValueError, match="verifier_loss_mode"):
+        ESMFold2ProposalConfig(verifier_loss_mode="unknown")
 
 
 def test_logit_delta_candidates_reuse_stage_a_topk_sampling_contract():
@@ -230,9 +425,8 @@ def test_esmfold2_action_group_routing_uses_native_loss_terms():
     interface = select_esmfold2_action_group(
         {
             "pair_chain_iptm_loss": 0.7,
-            "inter_contact_loss": 0.6,
-            "intra_contact_loss": 0.1,
-            "glob_loss": 0.05,
+            "binder_confidence_loss": 0.1,
+            "binder_rg_excess_loss": 0.05,
         }
     )
     assert interface["action_group"] == "interface_formation"
@@ -243,29 +437,27 @@ def test_esmfold2_action_group_routing_uses_native_loss_terms():
     compact = select_esmfold2_action_group(
         {
             "pair_chain_iptm_loss": 0.1,
-            "inter_contact_loss": 0.1,
-            "intra_contact_loss": 0.1,
-            "glob_loss": 1.2,
+            "binder_confidence_loss": 0.1,
+            "binder_rg_excess_loss": 0.9,
         }
     )
     assert compact["action_group"] == "compactness_repair"
 
-    priors = compute_esmfold2_action_group_priors({}, temperature=1.0)
-    assert priors == {"unrouted": 1.0}
+    with pytest.raises(ValueError, match="full-verifier metrics"):
+        compute_esmfold2_action_group_priors({}, temperature=1.0)
 
 
-def test_esmfold2_routing_normalizes_large_contact_losses_before_group_mean():
+def test_esmfold2_routing_uses_only_bounded_full_verifier_residuals():
     routing = select_esmfold2_action_group(
         {
             "pair_chain_iptm_loss": 0.95,
-            "inter_contact_loss": 5.0,
             "binder_confidence_loss": 0.2,
-            "intra_contact_loss": 0.2,
-            "glob_loss": 0.2,
+            "binder_rg_excess_loss": 1.2,
         }
     )
 
     assert routing["group_scores"]["interface_formation"] <= 1.0
     assert routing["group_scores"]["core_stabilization"] <= 1.0
     assert routing["group_scores"]["compactness_repair"] <= 1.0
-    assert routing["group_terms"]["interface_formation"]["inter_contact_loss"]["normalized"] == pytest.approx(1.0)
+    assert routing["group_terms"]["interface_formation"]["pair_chain_iptm_loss"]["normalized"] == pytest.approx(0.95)
+    assert routing["group_terms"]["compactness_repair"]["binder_rg_excess_loss"]["normalized"] == pytest.approx(1.0)

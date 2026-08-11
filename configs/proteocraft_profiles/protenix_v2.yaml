@@ -1,0 +1,33 @@
+schema_version: 1
+name: protenix_v2
+description: ProteoCraft MCTS with the Protenix V2 checkpoint.
+
+defaults:
+  mode: mcts
+  model_backend: protenix
+  model_name: protenix-v2
+  binder_length: 120
+  n_steps: 150
+  learning_rate: 0.05
+  tau_noise: 4.0
+  dtype: bf16
+  proposal_amp: auto
+  seed: 42
+  k_top: 10
+  b_candidates: 8
+  max_mutations_per_seq: 3
+  mcts_c: 1.0
+  mcts_max_nodes: 5000
+  mcts_tau_fixed: 4.0
+  mcts_num_beams: 8
+  mcts_strategy: two_stage
+  mcts_bootstrap_steps: 50
+  mcts_bootstrap_patience: 10
+  mcts_bootstrap_min_delta: 0.02
+  mcts_bootstrap_max_steps: 80
+  mcts_handoff_top_k: 8
+  mcts_expand_actions_per_step: 2
+  mcts_prior_mode: full
+  mcts_proposal_method: one_step_fixed
+  loss_preset: tuned
+  checkpoint_save_policy: all

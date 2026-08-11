@@ -29,34 +29,15 @@ PAIR_CHAIN_IPTM_KEYS = (
     "chain_pair_iptm",
     "binder_target_pair_iptm",
 )
-IPTM_KEYS = ("iptm", "i_ptm")
-ESMFOLD2_ACTION_GROUP_LOSS_KEYS = {
-    "interface_formation": {
-        "pair_chain_iptm_loss": 1.0,
-        "iptm_loss": 0.5,
-        "inter_contact_loss": 1.0,
-    },
-    "core_stabilization": {
-        "binder_confidence_loss": 1.0,
-        "intra_contact_loss": 1.0,
-        "global_confidence_loss": 0.5,
-    },
-    "compactness_repair": {
-        "glob_loss": 1.0,
-    },
+ESMFOLD2_ACTION_GROUP_ROUTING_KEYS = {
+    "interface_formation": "pair_chain_iptm_loss",
+    "core_stabilization": "binder_confidence_loss",
+    "compactness_repair": "binder_rg_excess_loss",
 }
-ESMFOLD2_ROUTING_LOSS_SCALES = {
-    "pair_chain_iptm_loss": 1.0,
-    "iptm_loss": 1.0,
-    "binder_confidence_loss": 1.0,
-    "global_confidence_loss": 1.0,
-    # Contact losses are distogram entropies in nats, roughly bounded by
-    # log(number_of_bins).  A scale of 5 maps the practical range to 0..1.
-    "inter_contact_loss": 5.0,
-    "intra_contact_loss": 5.0,
-    # Globularity is an ELU-shifted radius-of-gyration penalty.  Keep the same
-    # defensive scale so an outlier cannot dominate routing by itself.
-    "glob_loss": 5.0,
+ESMFOLD2_ACTION_GROUP_PROPOSAL_LOSS_KEYS = {
+    "interface_formation": {"inter_contact_loss": 1.0},
+    "core_stabilization": {"intra_contact_loss": 1.0},
+    "compactness_repair": {"glob_loss": 1.0},
 }
 AUTO_ESMC_LAMBDA_BY_TASK = {
     "denovo": 0.15,
@@ -75,7 +56,7 @@ AUTO_ESMC_LAMBDA_BY_TASK = {
 class ESMFold2ProposalConfig:
     """Configuration for the first ESMFold2 Stage-A proposal backend."""
 
-    experimental_model_name: str = "biohub/ESMFold2-Experimental"
+    experimental_model_name: str = "biohub/ESMFold2-Experimental-Fast"
     verifier_model_name: str = "biohub/ESMFold2"
     verifier_num_loops: int = 20
     verifier_num_sampling_steps: int = 200
@@ -91,6 +72,24 @@ class ESMFold2ProposalConfig:
     proposal_load_internal_esmc: bool = True
     proposal_lm_dropout: Optional[float] = 0.5
     force_proposal_lm_dropout: bool = True
+    one_step_diffusion_enabled: bool = True
+    one_step_diffusion_tau: float = 2.0
+    one_step_diffusion_weight: float = 0.25
+    one_step_diffusion_rg_weight: float = 0.1
+    one_step_diffusion_interval: int = 5
+    one_step_diffusion_recycle_coordinates: bool = False
+    one_step_diffusion_hotspot_enabled: bool = False
+    distogram_hotspot_enabled: bool = True
+    verifier_loss_mode: str = "pair_chain_iptm"
+    hotspot_weight: float = 0.0
+    hotspot_satisfied_proposal_weight: float = 0.0
+    hotspot_cutoff: float = 8.0
+    hotspot_interface_mode: str = "additive"
+    hotspot_verify_weight: float = 0.0
+    hotspot_verify_near_cutoff: float = 8.0
+    hotspot_verify_far_cutoff: float = 20.0
+    hotspot_verify_min_distance: float = 2.5
+    hotspot_verify_too_close_weight: float = 0.0
     stageb_group_weight: float = 1.0
     track_proposal_confidence: bool = False
     proposal_confidence_temperature: float = 0.05
@@ -99,6 +98,8 @@ class ESMFold2ProposalConfig:
     proposal_confidence_num_sampling_steps: int = 50
     proposal_confidence_max_candidates: int = 8
     proposal_confidence_tail_steps: int = 0
+    target_chain_roles: Optional[Tuple[str, ...]] = None
+    binder_mutable_mask: Optional[Tuple[bool, ...]] = None
 
     def __post_init__(self) -> None:
         if int(self.verifier_num_loops) <= 0:
@@ -115,10 +116,95 @@ class ESMFold2ProposalConfig:
             raise ValueError("temperature_max must be >= temperature_min")
         if float(self.stageb_group_weight) < 0.0:
             raise ValueError("stageb_group_weight must be non-negative")
+        if float(self.hotspot_weight) < 0.0:
+            raise ValueError("hotspot_weight must be non-negative")
+        if float(self.hotspot_satisfied_proposal_weight) < 0.0:
+            raise ValueError(
+                "hotspot_satisfied_proposal_weight must be non-negative"
+            )
+        if float(self.hotspot_cutoff) <= 0.0:
+            raise ValueError("hotspot_cutoff must be positive")
+        hotspot_interface_mode = str(self.hotspot_interface_mode).strip().lower()
+        if hotspot_interface_mode not in {"additive", "localized"}:
+            raise ValueError(
+                "hotspot_interface_mode must be 'additive' or 'localized'"
+            )
+        if hotspot_interface_mode == "localized" and float(self.hotspot_weight) > 1.0:
+            raise ValueError(
+                "localized hotspot_interface_mode requires hotspot_weight in [0, 1]"
+            )
+        if (
+            hotspot_interface_mode == "localized"
+            and float(self.hotspot_satisfied_proposal_weight) > 1.0
+        ):
+            raise ValueError(
+                "localized hotspot_interface_mode requires "
+                "hotspot_satisfied_proposal_weight in [0, 1]"
+            )
+        if float(self.hotspot_verify_weight) < 0.0:
+            raise ValueError("hotspot_verify_weight must be non-negative")
+        if float(self.hotspot_verify_near_cutoff) < 0.0:
+            raise ValueError("hotspot_verify_near_cutoff must be non-negative")
+        if float(self.hotspot_verify_far_cutoff) <= float(
+            self.hotspot_verify_near_cutoff
+        ):
+            raise ValueError(
+                "hotspot_verify_far_cutoff must be greater than "
+                "hotspot_verify_near_cutoff"
+            )
+        if float(self.hotspot_verify_min_distance) < 0.0:
+            raise ValueError("hotspot_verify_min_distance must be non-negative")
+        if float(self.hotspot_verify_min_distance) > float(
+            self.hotspot_verify_near_cutoff
+        ):
+            raise ValueError(
+                "hotspot_verify_min_distance must not exceed "
+                "hotspot_verify_near_cutoff"
+            )
+        if float(self.hotspot_verify_too_close_weight) < 0.0:
+            raise ValueError(
+                "hotspot_verify_too_close_weight must be non-negative"
+            )
         if self.proposal_lm_dropout is not None:
             dropout = float(self.proposal_lm_dropout)
             if dropout < 0.0 or dropout >= 1.0:
                 raise ValueError("proposal_lm_dropout must be in [0, 1)")
+        if float(self.one_step_diffusion_tau) <= 0.0:
+            raise ValueError("one_step_diffusion_tau must be positive")
+        if float(self.one_step_diffusion_weight) < 0.0:
+            raise ValueError("one_step_diffusion_weight must be non-negative")
+        if float(self.one_step_diffusion_rg_weight) < 0.0:
+            raise ValueError(
+                "one_step_diffusion_rg_weight must be non-negative"
+            )
+        if int(self.one_step_diffusion_interval) < 0:
+            raise ValueError(
+                "one_step_diffusion_interval must be non-negative"
+            )
+        if (
+            int(self.one_step_diffusion_interval) > 0
+            and not bool(self.one_step_diffusion_enabled)
+        ):
+            raise ValueError(
+                "a positive one_step_diffusion_interval requires "
+                "one_step_diffusion_enabled"
+            )
+        if (
+            bool(self.one_step_diffusion_recycle_coordinates)
+            and (
+                not bool(self.one_step_diffusion_enabled)
+                or int(self.one_step_diffusion_interval) <= 0
+            )
+        ):
+            raise ValueError(
+                "one_step_diffusion_recycle_coordinates requires a positive "
+                "one_step_diffusion_interval"
+            )
+        verifier_loss_mode = str(self.verifier_loss_mode).strip().lower()
+        if verifier_loss_mode not in {"pair_chain_iptm", "aligned_common"}:
+            raise ValueError(
+                "verifier_loss_mode must be 'pair_chain_iptm' or 'aligned_common'"
+            )
         if float(self.proposal_confidence_temperature) <= 0.0:
             raise ValueError("proposal_confidence_temperature must be positive")
         if int(self.proposal_confidence_interval) <= 0:
@@ -131,6 +217,26 @@ class ESMFold2ProposalConfig:
             raise ValueError("proposal_confidence_max_candidates must be positive")
         if int(self.proposal_confidence_tail_steps) < 0:
             raise ValueError("proposal_confidence_tail_steps must be non-negative")
+        if self.target_chain_roles is not None:
+            roles = tuple(
+                str(role).strip().lower() for role in self.target_chain_roles
+            )
+            if not roles:
+                raise ValueError("target_chain_roles cannot be empty")
+            invalid_roles = sorted(set(roles) - {"target", "scaffold"})
+            if invalid_roles:
+                raise ValueError(
+                    "target_chain_roles only supports target/scaffold; "
+                    f"got {invalid_roles}"
+                )
+            if "target" not in roles:
+                raise ValueError("target_chain_roles must contain at least one target")
+        if self.binder_mutable_mask is not None:
+            mutable_mask = tuple(bool(value) for value in self.binder_mutable_mask)
+            if not mutable_mask:
+                raise ValueError("binder_mutable_mask cannot be empty")
+            if not any(mutable_mask):
+                raise ValueError("binder_mutable_mask must select at least one residue")
 
 
 @dataclass
@@ -223,17 +329,15 @@ def resolve_esm_verifier_loss(
 ) -> Tuple[float, str]:
     """Convert ESMFold2 confidence metrics to a scalar MCTS loss.
 
-    First version uses binder-target pair-chain iPTM when available, otherwise
-    falls back to global iPTM.  The value is turned into a minimization loss as
-    ``1 - score``.
+    The search value is strictly based on binder-target pair-chain iPTM.  A
+    missing value indicates a broken chain mapping or incomplete verifier output
+    and is therefore an error rather than a reason to silently change metrics.
     """
 
     score, source = _first_finite_metric(summary_confidence, PAIR_CHAIN_IPTM_KEYS)
-    if score is None:
-        score, source = _first_finite_metric(summary_confidence, IPTM_KEYS)
     if score is None or source is None:
         raise ValueError(
-            "ESMFold2 verifier summary must contain pair-chain iPTM or iPTM"
+            "ESMFold2 verifier summary must contain binder-target pair-chain iPTM"
         )
     score = min(max(score, 0.0), 1.0)
     return 1.0 - score, source
@@ -247,22 +351,90 @@ def build_esm_verifier_result(
     coordinate: Optional[torch.Tensor] = None,
     plddt_logits: Optional[torch.Tensor] = None,
     extra_loss_dict: Optional[Mapping[str, float]] = None,
+    hotspot_verify_loss: Optional[float] = None,
+    hotspot_verify_weight: float = 0.0,
+    hotspot_too_close_loss: Optional[float] = None,
+    hotspot_too_close_weight: float = 0.0,
+    aligned_loss_dict: Optional[Mapping[str, float]] = None,
 ) -> ESMFold2VerifierResult:
     """Build a verifier result object accepted by the existing MCTS cache."""
 
-    total_loss, source = resolve_esm_verifier_loss(summary_confidence)
+    global_loss, source = resolve_esm_verifier_loss(summary_confidence)
+    resolved_aligned_losses: Dict[str, float] = {}
+    if aligned_loss_dict is not None:
+        for key, value in aligned_loss_dict.items():
+            scalar = _finite_float(value)
+            if scalar is not None:
+                resolved_aligned_losses[str(key)] = scalar
+        if "total" not in resolved_aligned_losses:
+            raise ValueError("aligned_loss_dict must contain a finite total")
+        total_loss = float(resolved_aligned_losses["total"])
+        source = "esmfold2_aligned_common"
+    else:
+        total_loss = float(global_loss)
+    base_verifier_loss = float(total_loss)
+    hotspot_loss = _finite_float(hotspot_verify_loss)
+    hotspot_weight = float(hotspot_verify_weight)
+    if hotspot_weight < 0.0:
+        raise ValueError("hotspot_verify_weight must be non-negative")
+    if hotspot_weight > 0.0 and hotspot_loss is None:
+        raise ValueError(
+            "positive hotspot_verify_weight requires hotspot_verify_loss"
+        )
+    hotspot_enabled = hotspot_loss is not None and hotspot_weight > 0.0
+    if hotspot_enabled:
+        if hotspot_loss < 0.0 or hotspot_loss > 1.0:
+            raise ValueError("hotspot_verify_loss must be in [0, 1]")
+        total_loss += hotspot_weight * hotspot_loss
+    too_close_loss = _finite_float(hotspot_too_close_loss)
+    too_close_weight = float(hotspot_too_close_weight)
+    if too_close_weight < 0.0:
+        raise ValueError("hotspot_too_close_weight must be non-negative")
+    if too_close_weight > 0.0 and too_close_loss is None:
+        raise ValueError(
+            "positive hotspot_too_close_weight requires hotspot_too_close_loss"
+        )
+    too_close_enabled = too_close_loss is not None and too_close_weight > 0.0
+    if too_close_enabled:
+        if too_close_loss < 0.0 or too_close_loss > 1.0:
+            raise ValueError("hotspot_too_close_loss must be in [0, 1]")
+        total_loss += too_close_weight * too_close_loss
     loss_dict: Dict[str, float] = {
         "total": float(total_loss),
         "esm_verify_loss": float(total_loss),
     }
-    if source in PAIR_CHAIN_IPTM_KEYS:
-        loss_dict["pair_chain_iptm_loss"] = float(total_loss)
-    elif source in IPTM_KEYS:
-        loss_dict["iptm_loss"] = float(total_loss)
-    plddt = _finite_float(summary_confidence.get("plddt"))
+    loss_dict["pair_chain_iptm_loss"] = float(global_loss)
+    if resolved_aligned_losses:
+        for key, value in resolved_aligned_losses.items():
+            if key != "total":
+                loss_dict[key] = float(value)
+    if hotspot_enabled or too_close_enabled:
+        loss_dict["esm_verify_global_loss"] = base_verifier_loss
+    if hotspot_enabled:
+        loss_dict.update(
+            {
+                "hotspot_verify_distance_loss": float(hotspot_loss),
+                "hotspot_verify_weight": hotspot_weight,
+                "hotspot_verify_weighted_contribution": hotspot_weight
+                * float(hotspot_loss),
+            }
+        )
+    if too_close_enabled:
+        loss_dict.update(
+            {
+                "hotspot_too_close_loss": float(too_close_loss),
+                "hotspot_too_close_weight": too_close_weight,
+                "hotspot_too_close_weighted_contribution": too_close_weight
+                * float(too_close_loss),
+            }
+        )
+    plddt = _finite_float(summary_confidence.get("binder_plddt"))
     if plddt is not None:
         plddt_unit = plddt / 100.0 if plddt > 1.0 else plddt
         loss_dict["binder_confidence_loss"] = 1.0 - min(max(plddt_unit, 0.0), 1.0)
+    rg_excess = _finite_float(summary_confidence.get("binder_rg_excess"))
+    if rg_excess is not None:
+        loss_dict["binder_rg_excess_loss"] = min(max(rg_excess, 0.0), 1.0)
     ptm = _finite_float(summary_confidence.get("ptm"))
     if ptm is not None:
         loss_dict["global_confidence_loss"] = 1.0 - min(max(ptm, 0.0), 1.0)
@@ -274,6 +446,30 @@ def build_esm_verifier_result(
     summary = dict(summary_confidence)
     summary["esm_verify_loss"] = float(total_loss)
     summary["esm_verify_source"] = source
+    if resolved_aligned_losses:
+        summary["esm_verify_aligned_common_loss"] = float(
+            resolved_aligned_losses["total"]
+        )
+    if hotspot_enabled or too_close_enabled:
+        summary["esm_verify_global_loss"] = base_verifier_loss
+    if hotspot_enabled:
+        summary.update(
+            {
+                "hotspot_verify_distance_loss": float(hotspot_loss),
+                "hotspot_verify_weight": hotspot_weight,
+                "hotspot_verify_weighted_contribution": hotspot_weight
+                * float(hotspot_loss),
+            }
+        )
+    if too_close_enabled:
+        summary.update(
+            {
+                "hotspot_too_close_loss": float(too_close_loss),
+                "hotspot_too_close_weight": too_close_weight,
+                "hotspot_too_close_weighted_contribution": too_close_weight
+                * float(too_close_loss),
+            }
+        )
     return ESMFold2VerifierResult(
         binder_seq=binder_seq,
         target_seq=target_seq,
@@ -285,43 +481,6 @@ def build_esm_verifier_result(
     )
 
 
-def _scaled_routing_value(key: str, value: float) -> Tuple[float, float]:
-    raw = max(float(value), 0.0)
-    scale = max(float(ESMFOLD2_ROUTING_LOSS_SCALES.get(key, 1.0)), 1.0e-8)
-    normalized = min(raw / scale, 1.0)
-    return raw, normalized
-
-
-def _weighted_group_score(
-    loss_vector: Mapping[str, Any],
-    weights: Mapping[str, float],
-) -> Tuple[Optional[float], Dict[str, Dict[str, float]]]:
-    values = []
-    weight_sum = 0.0
-    terms: Dict[str, Dict[str, float]] = {}
-    for key, weight in weights.items():
-        if key not in loss_vector:
-            continue
-        value = _finite_float(loss_vector.get(key))
-        if value is None:
-            continue
-        w = abs(float(weight))
-        if w <= 0.0:
-            continue
-        raw, normalized = _scaled_routing_value(key, float(value))
-        values.append(w * normalized)
-        weight_sum += w
-        terms[key] = {
-            "raw": raw,
-            "scale": float(ESMFOLD2_ROUTING_LOSS_SCALES.get(key, 1.0)),
-            "normalized": normalized,
-            "weight": w,
-        }
-    if not values or weight_sum <= 0.0:
-        return None, {}
-    return float(sum(values) / weight_sum), terms
-
-
 def compute_esmfold2_action_group_routing(
     loss_vector: Mapping[str, Any],
     *,
@@ -331,17 +490,27 @@ def compute_esmfold2_action_group_routing(
 
     raw_scores: Dict[str, float] = {}
     term_details: Dict[str, Dict[str, Dict[str, float]]] = {}
-    for group, weights in ESMFOLD2_ACTION_GROUP_LOSS_KEYS.items():
-        score, terms = _weighted_group_score(loss_vector, weights)
-        if score is not None:
-            raw_scores[group] = score
-            term_details[group] = terms
-    if not raw_scores:
-        return {
-            "group_priors": {"unrouted": 1.0},
-            "group_scores": {},
-            "group_terms": {},
+    missing = []
+    for group, key in ESMFOLD2_ACTION_GROUP_ROUTING_KEYS.items():
+        value = _finite_float(loss_vector.get(key))
+        if value is None:
+            missing.append(key)
+            continue
+        score = min(max(float(value), 0.0), 1.0)
+        raw_scores[group] = score
+        term_details[group] = {
+            key: {
+                "raw": float(value),
+                "scale": 1.0,
+                "normalized": score,
+                "weight": 1.0,
+            }
         }
+    if missing:
+        raise ValueError(
+            "ESMFold2 Stage-B routing requires full-verifier metrics: "
+            + ", ".join(missing)
+        )
 
     groups = list(raw_scores)
     scores = torch.tensor([raw_scores[group] for group in groups], dtype=torch.float32)
@@ -498,6 +667,67 @@ def anchor_binder_logits_to_sequence(
         if desired < row_max:
             desired = row_max + float(anchor_margin)
         row[aa_idx] = desired
+
+    return anchored.detach().cpu().clone()
+
+
+def softly_anchor_mutation_logits(
+    logits: torch.Tensor,
+    parent_sequence: str,
+    child_sequence: str,
+    mutable_mask: Optional[Sequence[bool]] = None,
+    *,
+    anchor_margin: float = 0.1,
+    suppress_cys: bool = True,
+) -> torch.Tensor:
+    """Make only explicit child mutations the argmax of their logit rows.
+
+    Stage-A mutation candidates branch from a shared soft-logit update.  A full
+    sequence anchor would rewrite every row where the candidate differs from
+    the raw argmax trajectory, discarding useful uncertainty.  This helper
+    changes only positions that differ between the verified parent and child;
+    all other mutable-position logits remain bitwise unchanged.
+    """
+
+    if logits.ndim == 3:
+        if logits.shape[0] != 1:
+            raise ValueError("node-local ESM logits must have batch size 1")
+        logits_2d = logits[0]
+    elif logits.ndim == 2:
+        logits_2d = logits
+    else:
+        raise ValueError("node-local ESM logits must have shape [L, 20] or [1, L, 20]")
+
+    parent_sequence = str(parent_sequence)
+    child_sequence = str(child_sequence)
+    if len(parent_sequence) != len(child_sequence):
+        raise ValueError("parent and child sequences must have the same length")
+    length = len(child_sequence)
+    if logits_2d.shape != (length, len(ESM_AA_ORDER)):
+        raise ValueError(
+            f"logits shape {tuple(logits_2d.shape)} does not match sequence shape "
+            f"({length}, {len(ESM_AA_ORDER)})"
+        )
+    if float(anchor_margin) <= 0.0:
+        raise ValueError("anchor_margin must be positive")
+
+    anchored = logits_2d.detach().clone()
+    mutable = _as_bool_mask(mutable_mask, length, device=anchored.device)
+    child_idx = _sequence_indices(child_sequence).to(device=anchored.device)
+
+    for pos, (parent_aa, child_aa) in enumerate(zip(parent_sequence, child_sequence)):
+        if parent_aa == child_aa:
+            continue
+        if not bool(mutable[pos].item()):
+            raise ValueError(f"child mutation at fixed binder position {pos}")
+        aa_idx = int(child_idx[pos].item())
+        if suppress_cys and aa_idx == CYS_INDEX:
+            raise ValueError("cysteine mutations are disabled for ESMFold2 proposals")
+        row = anchored[pos]
+        finite_row = row[torch.isfinite(row)]
+        row_max = float(finite_row.max().item()) if finite_row.numel() else 0.0
+        if not torch.isfinite(row[aa_idx]) or float(row[aa_idx].item()) <= row_max:
+            row[aa_idx] = row_max + float(anchor_margin)
 
     return anchored.detach().cpu().clone()
 
@@ -762,6 +992,9 @@ def propose_sequences_from_logit_delta(
     current_indices = [AA_TO_ESM_IDX[aa] for aa in current_seq]
     candidates: list[str] = []
     if include_logit_candidates:
+        # Stage A intentionally keeps this unrestricted argmax candidate: it may
+        # change every mutable position. ``max_mutations_per_seq`` only limits
+        # the sampled Top-K candidates below; it is not a global Stage-A cap.
         argmax_seq = sequence_from_logits_argmax(
             logits_after,
             current_seq=current_seq,

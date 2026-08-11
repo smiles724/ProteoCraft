@@ -43,7 +43,35 @@ sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, PROJECT_ROOT)
 
 from bindcraft.hallucination.reproducibility import set_global_seed
+from bindcraft.hallucination.profile_loader import (
+    LaunchProfileError,
+    apply_launch_profile,
+    available_launch_profiles,
+)
 from bindcraft.utils import LOSS_WEIGHT_PRESETS
+
+
+ESMFOLD2_VERIFIER_DEFAULTS_BY_TASK = {
+    "tcr": (4, 50),
+}
+ESMFOLD2_VERIFIER_DEFAULT = (20, 200)
+
+
+def resolve_esmfold2_verifier_precision_defaults(args):
+    """Apply task-aware verifier defaults while preserving explicit values."""
+
+    task_type = str(args.esmfold2_task_type).strip().lower()
+    default_loops, default_sampling_steps = (
+        ESMFOLD2_VERIFIER_DEFAULTS_BY_TASK.get(
+            task_type,
+            ESMFOLD2_VERIFIER_DEFAULT,
+        )
+    )
+    if args.esmfold2_verifier_num_loops is None:
+        args.esmfold2_verifier_num_loops = default_loops
+    if args.esmfold2_verifier_num_sampling_steps is None:
+        args.esmfold2_verifier_num_sampling_steps = default_sampling_steps
+    return args
 
 
 def setup_logging(log_file: str = None, level: str = "INFO"):
@@ -130,9 +158,14 @@ def _parse_target_hotspots_1based(raw_hotspots, target_len: int, parser: argpars
 
 
 def _build_hotspot_params(args, parser: argparse.ArgumentParser):
+    target_length = sum(
+        len(chain.strip())
+        for chain in str(args.target).split("|")
+        if chain.strip()
+    )
     residues_1based, concat_indices = _parse_target_hotspots_1based(
         args.target_hotspots,
-        len(args.target),
+        target_length,
         parser,
     )
     if not concat_indices:
@@ -141,6 +174,28 @@ def _build_hotspot_params(args, parser: argparse.ArgumentParser):
         "target_hotspot_residues_1based": residues_1based,
         "target_hotspot_concat_indices": concat_indices,
     }
+
+
+def resolve_esmfold2_hotspot_defaults(
+    args,
+    *,
+    model_backend: str,
+    hotspot_params,
+):
+    """Resolve hotspot defaults without overriding explicit CLI values."""
+    use_hotspot_defaults = model_backend == "esmfold2" and hotspot_params is not None
+    if args.esmfold2_hotspot_weight is None:
+        args.esmfold2_hotspot_weight = 0.5 if use_hotspot_defaults else 0.0
+    if args.esmfold2_hotspot_interface_mode is None:
+        args.esmfold2_hotspot_interface_mode = (
+            "localized" if use_hotspot_defaults else "additive"
+        )
+    if args.esmfold2_hotspot_verify_weight is None:
+        args.esmfold2_hotspot_verify_weight = 0.25 if use_hotspot_defaults else 0.0
+    if args.esmfold2_hotspot_verify_too_close_weight is None:
+        args.esmfold2_hotspot_verify_too_close_weight = (
+            0.25 if use_hotspot_defaults else 0.0
+        )
 
 
 def parse_esmfold2_mutable_mask(raw_mask, binder_length: int, parser: argparse.ArgumentParser):
@@ -178,6 +233,40 @@ def parse_esmfold2_mutable_mask(raw_mask, binder_length: int, parser: argparse.A
             f"但 --binder_length 为 {binder_length}。"
         )
     return mask
+
+
+def parse_esmfold2_target_chain_roles(
+    raw_roles,
+    *,
+    n_target_chains: int,
+    parser: argparse.ArgumentParser = None,
+):
+    if raw_roles is None or not str(raw_roles).strip():
+        return None
+    roles = tuple(
+        token.strip().lower()
+        for token in str(raw_roles).replace(";", ",").replace(" ", ",").split(",")
+        if token.strip()
+    )
+    error = None
+    if len(roles) != int(n_target_chains):
+        error = (
+            "--esmfold2_target_chain_roles 数量必须与 --target 中的非 binder 链数一致；"
+            f"检测到 {len(roles)} 个 role、{n_target_chains} 条链"
+        )
+    invalid = sorted(set(roles) - {"target", "scaffold"})
+    if invalid:
+        error = (
+            "--esmfold2_target_chain_roles 只能包含 target/scaffold；"
+            f"检测到: {','.join(invalid)}"
+        )
+    if "target" not in roles:
+        error = "--esmfold2_target_chain_roles 至少需要一条 target 链"
+    if error is not None:
+        if parser is not None:
+            parser.error(error)
+        raise ValueError(error)
+    return roles
 
 
 
@@ -303,7 +392,13 @@ def load_protenix_model(
     return model, configs
 
 
-def load_esmfold2_backend(args, device: str = "cuda"):
+def load_esmfold2_backend(
+    args,
+    device: str = "cuda",
+    *,
+    mutable_mask=None,
+    target_chain_roles=None,
+):
     """Lazy-load the real ESMFold2 backend only when explicitly requested."""
     from bindcraft.hallucination.esmfold2_backend import ESMFold2ProposalConfig
     from bindcraft.hallucination.esmfold2_runtime import ESMFold2RuntimeBackend
@@ -315,12 +410,31 @@ def load_esmfold2_backend(args, device: str = "cuda"):
         verifier_num_loops=args.esmfold2_verifier_num_loops,
         verifier_num_sampling_steps=args.esmfold2_verifier_num_sampling_steps,
         soft_steps=stagea_soft_steps,
+        temperature_min=args.esmfold2_temperature_min,
+        temperature_max=args.esmfold2_temperature_max,
         lambda_esmc=args.esmfold2_lambda_esmc,
         num_loops=args.esmfold2_proposal_num_loops,
         num_sampling_steps=args.esmfold2_proposal_num_sampling_steps,
         proposal_load_internal_esmc=args.esmfold2_proposal_load_internal_esmc,
         proposal_lm_dropout=args.esmfold2_proposal_lm_dropout,
         force_proposal_lm_dropout=args.esmfold2_force_proposal_lm_dropout,
+        one_step_diffusion_enabled=args.esmfold2_one_step_diffusion,
+        one_step_diffusion_tau=args.esmfold2_one_step_diffusion_tau,
+        one_step_diffusion_weight=args.esmfold2_one_step_diffusion_weight,
+        one_step_diffusion_rg_weight=(
+            args.esmfold2_one_step_diffusion_rg_weight
+        ),
+        one_step_diffusion_interval=(
+            args.esmfold2_one_step_diffusion_interval
+        ),
+        one_step_diffusion_recycle_coordinates=(
+            args.esmfold2_one_step_recycle_coordinates
+        ),
+        one_step_diffusion_hotspot_enabled=(
+            args.esmfold2_one_step_diffusion_hotspot
+        ),
+        distogram_hotspot_enabled=args.esmfold2_distogram_hotspot,
+        verifier_loss_mode=args.esmfold2_verifier_loss_mode,
         track_proposal_confidence=args.esmfold2_track_proposal_confidence,
         proposal_confidence_temperature=args.esmfold2_proposal_confidence_temperature,
         proposal_confidence_interval=args.esmfold2_proposal_confidence_interval,
@@ -328,6 +442,25 @@ def load_esmfold2_backend(args, device: str = "cuda"):
         proposal_confidence_num_sampling_steps=args.esmfold2_proposal_confidence_num_sampling_steps,
         proposal_confidence_max_candidates=args.esmfold2_proposal_confidence_max_candidates,
         proposal_confidence_tail_steps=args.esmfold2_proposal_confidence_tail_steps,
+        hotspot_weight=args.esmfold2_hotspot_weight,
+        hotspot_satisfied_proposal_weight=(
+            args.esmfold2_hotspot_satisfied_proposal_weight
+        ),
+        hotspot_cutoff=args.esmfold2_hotspot_cutoff,
+        hotspot_interface_mode=args.esmfold2_hotspot_interface_mode,
+        hotspot_verify_weight=args.esmfold2_hotspot_verify_weight,
+        hotspot_verify_near_cutoff=args.esmfold2_hotspot_verify_near_cutoff,
+        hotspot_verify_far_cutoff=args.esmfold2_hotspot_verify_far_cutoff,
+        hotspot_verify_min_distance=args.esmfold2_hotspot_verify_min_distance,
+        hotspot_verify_too_close_weight=(
+            args.esmfold2_hotspot_verify_too_close_weight
+        ),
+        target_chain_roles=target_chain_roles,
+        binder_mutable_mask=(
+            None
+            if mutable_mask is None
+            else tuple(bool(value) for value in mutable_mask)
+        ),
     )
     return ESMFold2RuntimeBackend(
         config=config,
@@ -340,6 +473,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="BindCraft v2 — Hallucination Pipeline")
 
     # === 基础参数 ===
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        help=(
+            "可选启动 profile 名称或 YAML 路径；显式 CLI 参数优先。"
+            "内置 profile: "
+            + ", ".join(available_launch_profiles())
+        ),
+    )
     parser.add_argument("--target", type=str, required=True,
                        help="Target 序列（单字母氨基酸序列）")
     parser.add_argument("--mode", type=str, default="first_order",
@@ -364,14 +507,200 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="模型 backend：protenix 保持原有 V1/V2 流程；esmfold2 启用 ESMFold2 第一版闭环")
     parser.add_argument("--esmfold2_verifier_model", type=str, default="biohub/ESMFold2",
                        help="ESMFold2 verifier 模型名（仅 --model_backend esmfold2 使用）")
-    parser.add_argument("--esmfold2_experimental_model", type=str, default="biohub/ESMFold2-Experimental",
-                       help="ESMFold2Experimental proposal 模型名（仅 --model_backend esmfold2 使用）")
+    parser.add_argument("--esmfold2_experimental_model", type=str, default="biohub/ESMFold2-Experimental-Fast",
+                       help="ESMFold2Experimental proposal 模型名（默认：biohub/ESMFold2-Experimental-Fast；仅 --model_backend esmfold2 使用）")
     parser.add_argument("--esmfold2_soft_steps", type=int, default=None,
                        help="兼容旧脚本：同时设置 ESMFold2 Stage A / Stage B 的 soft gradient update 步数")
     parser.add_argument("--esmfold2_stagea_soft_steps", type=int, default=None,
                        help="ESMFold2 Stage A 每个 MCTS 节点的 soft gradient update 步数（默认：30）")
+    parser.add_argument(
+        "--esmfold2_temperature_min",
+        type=float,
+        default=0.01,
+        help="ESMFold2 soft optimization 最低温度（默认：0.01）",
+    )
+    parser.add_argument(
+        "--esmfold2_temperature_max",
+        type=float,
+        default=1.0,
+        help="ESMFold2 soft optimization 最高温度（默认：1.0；与最低温度相等时使用固定温度）",
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_tree_children",
+        type=int,
+        default=2,
+        help=(
+            "ESMFold2 Stage A 每轮 full verify 后进入 MCTS tree 的 child 数；"
+            "默认 2（argmax soft trajectory + 其余候选中 verifier 最优者）"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_root_selection_mode",
+        type=str,
+        choices=["global_ucb", "hierarchical_ucb"],
+        default="hierarchical_ucb",
+        help=(
+            "ESMFold2 Stage A root/node 选择方式；global_ucb 保留原全树 UCB，"
+            "hierarchical_ucb 先选 root 再在其子树内选 node（默认）"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_min_root_expansions",
+        type=int,
+        default=2,
+        help=(
+            "hierarchical_ucb 下每个 Phase0 root 在自适应选择前至少获得的 "
+            "outer-step 扩展次数（默认：2）"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_preserve_soft_state",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help=(
+            "Stage A 是否保留 child 的 soft logits：argmax child 不 anchor，"
+            "mutation child 只在真实突变位做轻量 anchor（默认：true）"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_cumulative_annealing",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help="Stage A 是否沿 MCTS 路径累计温度退火进度（默认：true）",
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_annealing_horizon",
+        type=int,
+        default=150,
+        help="Stage A 路径累计温度退火的 soft-step horizon（默认：150）",
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_soft_anchor_margin",
+        type=float,
+        default=0.1,
+        help="Stage A mutation child 在突变位超过当前最大 logit 的最小 margin（默认：0.1）",
+    )
     parser.add_argument("--esmfold2_stageb_soft_steps", type=int, default=None,
-                       help="ESMFold2 Stage B 每个 MCTS 节点的 soft gradient update 步数（默认：5）")
+                       help="ESMFold2 Stage B 每个 MCTS 节点的 soft gradient update 步数（默认：20）")
+    parser.add_argument(
+        "--esmfold2_stagea_paired_verifier_seed",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help="Stage A 是否让所有 sequence 使用同一个 run-level verifier seed（默认：true）",
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_verifier_seed",
+        type=int,
+        default=None,
+        help="可选的 Stage A 固定 verifier seed；未设置时由 run seed 和 target 推导",
+    )
+    parser.add_argument(
+        "--esmfold2_raw_lineage_annealing_horizon",
+        type=int,
+        default=150,
+        help="raw_lineage_stage_a 连续退火总 soft-step 数（默认：150）",
+    )
+    parser.add_argument(
+        "--esmfold2_best_of_n",
+        type=int,
+        default=8,
+        help=(
+            "ESMFold2 Best-of-N 独立轨迹数量；continuous 模式默认 8，"
+            "chunked 对照建议显式设为 4"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_best_of_n_pass_loss_threshold",
+        type=float,
+        default=None,
+        help="可选的 Best-of-N verifier loss 通过阈值；未设置时不计算 pass@N",
+    )
+    parser.add_argument(
+        "--esmfold2_best_of_n_resume",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help="Best-of-N 是否按 trajectory 断点续跑（默认：true）",
+    )
+    parser.add_argument(
+        "--esmfold2_best_of_n_verify_candidates_per_outer_step",
+        type=int,
+        default=0,
+        help=(
+            "chunked Best-of-N 每个 outer step 生成并 full-verify 的候选数；"
+            "raw_argmax 模式只用于最终排名，verifier_best 模式还用于"
+            "选择下一轮 continuation（默认：0）"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_best_of_n_continuation_policy",
+        choices=["raw_argmax", "verifier_best"],
+        default="raw_argmax",
+        help=(
+            "chunked Best-of-N 下一轮轨迹的延续方式：raw_argmax 保留"
+            "未 anchor 的连续 logits；verifier_best 选择当前候选池中"
+            " verifier loss 最低的序列，并仅在必要时做 soft anchor"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_discrete_rerank",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help="Stage B 是否用轻量 proposal forward 重排离散单点候选（默认：true）",
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_rerank_pool_size",
+        type=int,
+        default=20,
+        help="Stage B 每步进入轻量重排序的候选池大小（默认：20）",
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_exploration_actions",
+        type=int,
+        default=1,
+        help="Stage B 每步 full verifier 保留的探索候选数（默认：1）",
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_verifier_candidates",
+        type=int,
+        default=8,
+        help="Stage B 每步送入 full verifier 的候选数（默认：8）",
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_hotspot_coverage_weight",
+        type=float,
+        default=0.25,
+        help="Stage B reward 中连续 hotspot coverage loss 的权重（默认：0.25）",
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_hotspot_distance_weight",
+        type=float,
+        default=0.25,
+        help="Stage B reward 中 hotspot 距离 loss 的权重（默认：0.25）",
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_hotspot_miss_penalty",
+        type=float,
+        default=0.0,
+        help="兼容旧实验的固定 hotspot miss penalty；V5 默认 0，改用连续 coverage loss",
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_min_pair_chain_iptm",
+        type=float,
+        default=0.0,
+        help="Stage B reward 的 pair-chain iPTM 最低门槛；0 表示关闭（默认：0）",
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_handoff_quality_tolerance",
+        type=float,
+        default=0.05,
+        help="Stage B branch 相对 handoff pair-chain iPTM 的最大允许下降（默认：0.05）",
+    )
+    parser.add_argument(
+        "--esmfold2_stageb_paired_verifier_seed",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help="Stage B 是否让所有 sequence 使用同一个 run-level verifier seed（默认：true）",
+    )
     parser.add_argument("--esmfold2_lambda_esmc", type=str, default="auto",
                        help="ESMC sequence prior 权重；auto 按任务类型选择，或传入数值字符串")
     parser.add_argument("--esmfold2_task_type", type=str, default="denovo",
@@ -380,14 +709,65 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--esmfold2_logit_init_mode", type=str, default="official_exact",
                        choices=["official_free", "official_exact", "legacy_anchor"],
                        help="ESMFold2 root logits 初始化方式；official_exact 用官方 seed 直接生成诊断初始 logits")
+    parser.add_argument(
+        "--esmfold2_initial_logits_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "ESMFold2 MCTS Phase0 初始 logits checkpoint 文件或 Best-of-N "
+            "artifact 目录；checkpoint 数量必须与 mcts_num_beams 完全一致"
+        ),
+    )
     parser.add_argument("--esmfold2_mutable_mask", type=str, default=None,
                        help="ESMFold2 可变位点 mask；长度需等于 binder_length，支持 01101 或 0,1,1,true")
+    parser.add_argument(
+        "--esmfold2_target_chain_roles",
+        type=str,
+        default=None,
+        help=(
+            "ESMFold2 非 binder 链角色，按 --target 的链顺序填写 target/scaffold；"
+            "例如 target,scaffold,scaffold。缺省时所有链均视为 target"
+        ),
+    )
     parser.add_argument("--esmfold2_artifact_dir", type=str, default=None,
                        help="ESMFold2 每步结构化记录目录；默认写入 output_dir/esmfold2_artifacts")
-    parser.add_argument("--esmfold2_verifier_num_loops", type=int, default=20,
-                       help="ESMFold2 verifier full fold loop 数（默认：20；smoke test 可显式调小）")
-    parser.add_argument("--esmfold2_verifier_num_sampling_steps", type=int, default=200,
-                       help="ESMFold2 verifier diffusion sampling steps（默认：200；smoke test 可显式调小）")
+    parser.add_argument(
+        "--esmfold2_save_verified_candidate_cif",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help=(
+            "是否为每个 ESMFold2 full-verifier 候选保存 mmCIF；"
+            "默认 false，不生成 PDB"
+        ),
+    )
+    parser.add_argument("--esmfold2_stagea_handoff_checkpoint_interval", type=int, default=10,
+                       help="Stage A handoff checkpoint 保存间隔；默认每 10 step，0 表示仅保存最终 handoff")
+    parser.add_argument("--esmfold2_resume_handoff_checkpoint", type=str, default=None,
+                       help="跳过 Phase0/Stage A，从指定 Stage A handoff checkpoint 直接运行 Stage B")
+    parser.add_argument(
+        "--esmfold2_resume_reverify_roots",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help="恢复 handoff 时用当前 verifier 配置重新验证 root；verifier 配置改变时必须启用",
+    )
+    parser.add_argument(
+        "--esmfold2_verifier_num_loops",
+        type=int,
+        default=None,
+        help=(
+            "ESMFold2 verifier full fold loop 数；"
+            "默认 TCR=4，其他任务=20，可显式覆盖"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_verifier_num_sampling_steps",
+        type=int,
+        default=None,
+        help=(
+            "ESMFold2 verifier diffusion sampling steps；"
+            "默认 TCR=50，其他任务=200，可显式覆盖"
+        ),
+    )
     parser.add_argument("--esmfold2_proposal_num_loops", type=int, default=1,
                        help="ESMFold2 proposal distogram forward loop 数（默认：1）")
     parser.add_argument("--esmfold2_proposal_num_sampling_steps", type=int, default=1,
@@ -398,8 +778,84 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2Experimental proposal LM dropout；官方 binder design inversion/proposal 使用 0.5")
     parser.add_argument("--esmfold2_force_proposal_lm_dropout", type=lambda x: x.lower() == "true", default=True,
                        help="是否在 eval/inference 状态强制启用 proposal LM dropout（官方 binder design 为 true）")
-    parser.add_argument("--esmfold2_track_proposal_confidence", type=lambda x: x.lower() == "true", default=False,
-                       help="ESMFold2 proposal 后期是否计算 confidence/iPTM 并加入候选（默认：false）")
+    parser.add_argument(
+        "--esmfold2_one_step_diffusion",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help=(
+            "是否启用可微 ESMFold2 one-step diffusion；默认 true。"
+            "默认每 5 个 soft steps 联合更新一次"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_one_step_diffusion_tau",
+        type=float,
+        default=2.0,
+        help="ESMFold2 one-step diffusion 固定噪声尺度 tau（默认：2.0）",
+    )
+    parser.add_argument(
+        "--esmfold2_one_step_diffusion_weight",
+        type=float,
+        default=0.25,
+        help="归一化 one-step diffusion gradient 的组合权重（默认：0.25）",
+    )
+    parser.add_argument(
+        "--esmfold2_one_step_diffusion_rg_weight",
+        type=float,
+        default=0.1,
+        help=(
+            "one-step diffusion common loss 中 Rg/compactness 项的权重"
+            "（默认：0.1）"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_one_step_diffusion_interval",
+        type=int,
+        default=5,
+        help=(
+            "在 soft optimization 内每隔多少步联合加入一次 one-step "
+            "diffusion（默认：5）；0 表示仅在全部 soft steps 后额外更新一次"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_one_step_recycle_coordinates",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help=(
+            "间隔式 one-step 中是否将上一次去噪坐标作为下一次的参考结构；"
+            "仅在 interval > 0 时有效"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_one_step_diffusion_hotspot",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help=(
+            "是否让 one-step diffusion 的 iPAE loss 使用 hotspot-aware "
+            "localized 聚合；默认 false，保持现有 one-step 行为"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_distogram_hotspot",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help=(
+            "是否在 ESMFold2 distogram proposal loss 中启用 hotspot；"
+            "默认 true。设为 false 可单独消融 distogram hotspot，"
+            "不会关闭 one-step diffusion hotspot 或 full-verifier hotspot"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_verifier_loss_mode",
+        choices=["pair_chain_iptm", "aligned_common"],
+        default="pair_chain_iptm",
+        help=(
+            "ESMFold2 full verifier loss：旧版 pair-chain iPTM，或不含 PDE "
+            "的 Protenix-aligned common loss；默认保留旧版"
+        ),
+    )
+    parser.add_argument("--esmfold2_track_proposal_confidence", type=lambda x: x.lower() == "true", default=None,
+                       help="ESMFold2 proposal 后期是否计算 confidence/iPTM 并加入候选（Best-of-N 默认 true，其余模式默认 false）")
     parser.add_argument("--esmfold2_proposal_confidence_temperature", type=float, default=0.05,
                        help="ESMFold2 proposal temperature 低于该值时记录 confidence/iPTM（默认：0.05）")
     parser.add_argument("--esmfold2_proposal_confidence_interval", type=int, default=1,
@@ -410,10 +866,69 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2 proposal confidence forward sampling steps（默认：50）")
     parser.add_argument("--esmfold2_proposal_confidence_max_candidates", type=int, default=8,
                        help="每次 proposal 最多把多少个 late-confidence 序列加入 verifier 候选（默认：8）")
-    parser.add_argument("--esmfold2_proposal_confidence_tail_steps", type=int, default=0,
-                       help="ESMFold2 proposal 固定记录最后 N 个 local steps；0 表示使用 temperature 阈值（默认：0）")
+    parser.add_argument("--esmfold2_proposal_confidence_tail_steps", type=int, default=None,
+                       help="ESMFold2 proposal 固定记录最后 N 个 local steps；Best-of-N 默认 20，其余模式默认 0")
     parser.add_argument("--esmfold2_final_polish", type=lambda x: x.lower() == "true", default=False,
                        help="ESMFold2 MCTS 搜索结束后是否从 best node logits 做 final continuous polish，并只在该阶段使用 late-confidence candidates（默认：false）")
+    parser.add_argument(
+        "--esmfold2_hotspot_weight",
+        type=float,
+        default=None,
+        help=(
+            "ESMFold2 proposal hotspot contact loss 权重；未显式设置时，"
+            "ESMFold2 有 hotspot 为 0.5，否则为 0.0"
+        ),
+    )
+    parser.add_argument("--esmfold2_hotspot_cutoff", type=float, default=8.0,
+                       help="ESMFold2 proposal hotspot contact 距离阈值，单位 Å（默认：8.0）")
+    parser.add_argument(
+        "--esmfold2_hotspot_satisfied_proposal_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "所有 hotspot 已在 verifier near cutoff 内命中后继续使用的 "
+            "proposal hotspot 权重（默认：0.0，停止继续拉近）"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_hotspot_interface_mode",
+        type=str,
+        choices=["additive", "localized"],
+        default=None,
+        help=(
+            "hotspot proposal 聚合方式：additive 保持旧版额外加权；"
+            "localized 用 hotspot_weight 在全局 inter 与 hotspot inter 之间插值；"
+            "未显式设置时，ESMFold2 有 hotspot 为 localized，否则为 additive"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_hotspot_verify_weight",
+        type=float,
+        default=None,
+        help=(
+            "ESMFold2 full verifier hotspot 距离 loss 权重；未显式设置时，"
+            "ESMFold2 有 hotspot 为 0.25，否则为 0.0"
+        ),
+    )
+    parser.add_argument("--esmfold2_hotspot_verify_near_cutoff", type=float, default=8.0,
+                       help="ESMFold2 hotspot verifier 满足接触的重原子距离，单位 Å（默认：8.0；同时记录严格 5 Å coverage）")
+    parser.add_argument("--esmfold2_hotspot_verify_far_cutoff", type=float, default=20.0,
+                       help="ESMFold2 hotspot verifier 距离 loss 饱和上限，单位 Å（默认：20.0）")
+    parser.add_argument(
+        "--esmfold2_hotspot_verify_min_distance",
+        type=float,
+        default=2.5,
+        help="hotspot 与 binder 的最小安全重原子距离，单位 Å（默认：2.5）",
+    )
+    parser.add_argument(
+        "--esmfold2_hotspot_verify_too_close_weight",
+        type=float,
+        default=None,
+        help=(
+            "低于最小安全距离时的 verifier 软惩罚权重；未显式设置时，"
+            "ESMFold2 有 hotspot 为 0.25，否则为 0.0"
+        ),
+    )
     parser.add_argument("--checkpoint_dir", type=str, default=None,
                        help="Checkpoint 目录；默认依次读取 --checkpoint_dir、PROTENIX_CHECKPOINT_DIR、PROTENIX_ROOT_DIR/checkpoint")
     parser.add_argument("--save_checkpoint_dir", type=str, default=None,
@@ -472,9 +987,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcts_max_nodes", type=int, default=5000, help="MCTS 树最大节点数（默认：5000）")
     parser.add_argument("--mcts_tau_fixed", type=float, default=4.0, help="MCTS 固定扩散 tau（默认：4.0）")
     parser.add_argument("--mcts_num_beams", type=int, default=8, help="MCTS Phase0 根节点数 / beam（默认：8）")
-    parser.add_argument("--mcts_strategy", type=str, default="two_stage",
-                       choices=["legacy", "stage_a_only", "strict", "two_stage", "continuous_stage_a"],
-                       help="MCTS 策略：stage_a_only 只跑 StageA / continuous_stage_a 连续 soft-logit 诊断 / legacy 兼容旧名 / strict 文档版 / two_stage 两阶段（默认：two_stage）")
+    parser.add_argument("--mcts_strategy", type=str, default=None,
+                       choices=["legacy", "stage_a_only", "strict", "two_stage", "continuous_stage_a", "raw_lineage_stage_a", "best_of_n", "best_of_n_chunked"],
+                       help=(
+                           "搜索策略：best_of_n 运行独立连续轨迹且不使用 MCTS；"
+                           "best_of_n_chunked 将 --n_steps 总 outer-step 预算"
+                           "均分给独立分段轨迹，不做逐步 verifier 选择；"
+                           "其余为 StageA/两阶段 MCTS 模式；默认按 backend 解析："
+                           "Protenix=two_stage，ESMFold2=stage_a_only"
+                       ))
     parser.add_argument("--mcts_bootstrap_steps", type=int, default=50,
                        help="two_stage: StageA 原版 MCTS 至少运行步数（默认：50）")
     parser.add_argument("--mcts_bootstrap_patience", type=int, default=10,
@@ -484,9 +1005,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcts_bootstrap_max_steps", type=int, default=80,
                        help="two_stage: StageA 最大运行步数（默认：80）")
     parser.add_argument("--mcts_handoff_top_k", type=int, default=None,
-                       help="two_stage: 交给 StageB 的 top 序列数（默认：mcts_num_beams）")
-    parser.add_argument("--mcts_expand_actions_per_step", type=int, default=2,
-                       help="MCTS StageB 每步最多扩展并验证的 action 数（默认：2）")
+                       help="two_stage: 交给 StageB 的 top 序列数（Protenix 默认 mcts_num_beams；ESMFold2 默认 4）")
+    parser.add_argument("--mcts_expand_actions_per_step", type=int, default=None,
+                       help="MCTS StageB 每步最多扩展并验证的 action 数（Protenix 默认 2；ESMFold2 默认 4）")
     parser.add_argument("--mcts_prior_mode", type=str, default="full",
                        choices=["full", "uniform", "no_gradient", "no_group", "no_sequence"],
                        help="MCTS StageB prior 消融模式（默认：full，保持当前完整逻辑）")
@@ -548,6 +1069,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def resolve_esmfold2_stage_soft_steps(args) -> tuple[int, int]:
     """Resolve ESMFold2 Stage A/B soft-step defaults with legacy compatibility."""
 
+    strategy = str(getattr(args, "mcts_strategy", "") or "").strip().lower()
     legacy_soft_steps = getattr(args, "esmfold2_soft_steps", None)
     stagea_soft_steps = getattr(args, "esmfold2_stagea_soft_steps", None)
     stageb_soft_steps = getattr(args, "esmfold2_stageb_soft_steps", None)
@@ -557,9 +1079,9 @@ def resolve_esmfold2_stage_soft_steps(args) -> tuple[int, int]:
         if stageb_soft_steps is None:
             stageb_soft_steps = legacy_soft_steps
     if stagea_soft_steps is None:
-        stagea_soft_steps = 30
+        stagea_soft_steps = 150 if strategy == "best_of_n" else 30
     if stageb_soft_steps is None:
-        stageb_soft_steps = 5
+        stageb_soft_steps = 20
     args.esmfold2_stagea_soft_steps = int(stagea_soft_steps)
     args.esmfold2_stageb_soft_steps = int(stageb_soft_steps)
     return args.esmfold2_stagea_soft_steps, args.esmfold2_stageb_soft_steps
@@ -572,6 +1094,10 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
         if parser is not None:
             parser.error(message)
         raise ValueError(message)
+    if getattr(args, "mcts_strategy", None) is None:
+        args.mcts_strategy = (
+            "stage_a_only" if backend == "esmfold2" else "two_stage"
+        )
     if backend == "esmfold2" and getattr(args, "mode", None) != "mcts":
         message = "ESMFold2 backend first version only supports --mode mcts"
         if parser is not None:
@@ -590,12 +1116,178 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
+        if args.esmfold2_stagea_tree_children <= 0:
+            message = "--esmfold2_stagea_tree_children must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_stagea_min_root_expansions < 0:
+            message = "--esmfold2_stagea_min_root_expansions must be non-negative"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_stagea_annealing_horizon <= 0:
+            message = "--esmfold2_stagea_annealing_horizon must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_stagea_soft_anchor_margin <= 0.0:
+            message = "--esmfold2_stagea_soft_anchor_margin must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_temperature_min <= 0.0:
+            message = "--esmfold2_temperature_min must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_temperature_max < args.esmfold2_temperature_min:
+            message = "--esmfold2_temperature_max must be >= --esmfold2_temperature_min"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_raw_lineage_annealing_horizon <= 0:
+            message = "--esmfold2_raw_lineage_annealing_horizon must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_best_of_n <= 0:
+            message = "--esmfold2_best_of_n must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_best_of_n_verify_candidates_per_outer_step < 0:
+            message = (
+                "--esmfold2_best_of_n_verify_candidates_per_outer_step "
+                "must be non-negative"
+            )
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_track_proposal_confidence is None:
+            args.esmfold2_track_proposal_confidence = (
+                args.mcts_strategy == "best_of_n"
+            )
+        if args.esmfold2_proposal_confidence_tail_steps is None:
+            args.esmfold2_proposal_confidence_tail_steps = (
+                20
+                if args.mcts_strategy in {"best_of_n", "raw_lineage_stage_a"}
+                else 0
+            )
+        if args.esmfold2_proposal_confidence_tail_steps < 0:
+            message = "--esmfold2_proposal_confidence_tail_steps must be non-negative"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if getattr(args, "stageb_max_mutations_per_seq", None) is None:
+            args.stageb_max_mutations_per_seq = 1
+        if getattr(args, "mcts_handoff_top_k", None) is None:
+            args.mcts_handoff_top_k = 2
+        if args.esmfold2_stageb_rerank_pool_size <= 0:
+            message = "--esmfold2_stageb_rerank_pool_size must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_stageb_exploration_actions < 0:
+            message = "--esmfold2_stageb_exploration_actions must be non-negative"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_stageb_verifier_candidates <= 0:
+            message = "--esmfold2_stageb_verifier_candidates must be positive"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_stageb_hotspot_coverage_weight < 0.0:
+            message = "--esmfold2_stageb_hotspot_coverage_weight must be non-negative"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_stageb_hotspot_distance_weight < 0.0:
+            message = "--esmfold2_stageb_hotspot_distance_weight must be non-negative"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_stageb_hotspot_miss_penalty < 0.0:
+            message = "--esmfold2_stageb_hotspot_miss_penalty must be non-negative"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if not 0.0 <= args.esmfold2_stageb_min_pair_chain_iptm <= 1.0:
+            message = "--esmfold2_stageb_min_pair_chain_iptm must be within [0, 1]"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if not 0.0 <= args.esmfold2_stageb_handoff_quality_tolerance <= 1.0:
+            message = "--esmfold2_stageb_handoff_quality_tolerance must be within [0, 1]"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_stagea_handoff_checkpoint_interval < 0:
+            message = "--esmfold2_stagea_handoff_checkpoint_interval must be non-negative"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_resume_handoff_checkpoint and args.mcts_strategy not in {"two_stage", "strict"}:
+            message = "--esmfold2_resume_handoff_checkpoint requires --mcts_strategy two_stage"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if (
+            args.esmfold2_initial_logits_checkpoint
+            and args.esmfold2_resume_handoff_checkpoint
+        ):
+            message = (
+                "--esmfold2_initial_logits_checkpoint and "
+                "--esmfold2_resume_handoff_checkpoint are mutually exclusive"
+            )
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if args.esmfold2_resume_reverify_roots and not args.esmfold2_resume_handoff_checkpoint:
+            message = (
+                "--esmfold2_resume_reverify_roots requires "
+                "--esmfold2_resume_handoff_checkpoint"
+            )
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+    if getattr(args, "mcts_expand_actions_per_step", None) is None:
+        args.mcts_expand_actions_per_step = 2
     return backend
 
 
-def main():
+def parse_args_with_profile(argv=None):
+    """Parse CLI arguments after applying an optional launch profile."""
+
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    profile_parser = argparse.ArgumentParser(add_help=False)
+    profile_parser.add_argument("--profile", type=str, default=None)
+    profile_args, _ = profile_parser.parse_known_args(raw_argv)
+
     parser = build_arg_parser()
-    args = parser.parse_args()
+    profile_path = None
+    profile_name = None
+    if profile_args.profile:
+        try:
+            profile_path, profile_name, _ = apply_launch_profile(
+                parser,
+                profile_args.profile,
+            )
+        except LaunchProfileError as exc:
+            parser.error(str(exc))
+
+    args = parser.parse_args(raw_argv)
+    resolve_esmfold2_verifier_precision_defaults(args)
+    args.launch_profile_name = profile_name
+    args.launch_profile_path = (
+        None if profile_path is None else str(profile_path)
+    )
+    return args, parser
+
+
+def main(argv=None):
+    args, parser = parse_args_with_profile(argv)
     model_backend = resolve_model_backend(args, parser)
 
     if args.init_binder_seq is not None:
@@ -613,26 +1305,169 @@ def main():
                 f"检测到非法字符: {','.join(invalid)}"
             )
     esmfold2_mutable_mask = None
+    esmfold2_target_chain_roles = None
     if model_backend == "esmfold2":
         esmfold2_mutable_mask = parse_esmfold2_mutable_mask(
             args.esmfold2_mutable_mask,
             args.binder_length,
             parser,
         )
+        esmfold2_target_chain_roles = parse_esmfold2_target_chain_roles(
+            args.esmfold2_target_chain_roles,
+            n_target_chains=len(
+                [part for part in str(args.target).split("|") if part.strip()]
+            ),
+            parser=parser,
+        )
 
     hotspot_params = _build_hotspot_params(args, parser)
+    resolve_esmfold2_hotspot_defaults(
+        args,
+        model_backend=model_backend,
+        hotspot_params=hotspot_params,
+    )
+    if args.esmfold2_hotspot_weight < 0.0:
+        parser.error("--esmfold2_hotspot_weight 必须大于等于 0")
+    if args.esmfold2_hotspot_cutoff <= 0.0:
+        parser.error("--esmfold2_hotspot_cutoff 必须大于 0")
+    if args.esmfold2_hotspot_satisfied_proposal_weight < 0.0:
+        parser.error(
+            "--esmfold2_hotspot_satisfied_proposal_weight 必须大于等于 0"
+        )
+    if (
+        args.esmfold2_hotspot_interface_mode == "localized"
+        and args.esmfold2_hotspot_weight > 1.0
+    ):
+        parser.error(
+            "--esmfold2_hotspot_interface_mode localized 时，"
+            "--esmfold2_hotspot_weight 必须位于 [0, 1]"
+        )
+    if (
+        args.esmfold2_hotspot_interface_mode == "localized"
+        and args.esmfold2_hotspot_satisfied_proposal_weight > 1.0
+    ):
+        parser.error(
+            "--esmfold2_hotspot_interface_mode localized 时，"
+            "--esmfold2_hotspot_satisfied_proposal_weight 必须位于 [0, 1]"
+        )
+    if args.esmfold2_hotspot_verify_weight < 0.0:
+        parser.error("--esmfold2_hotspot_verify_weight 必须大于等于 0")
+    if args.esmfold2_hotspot_verify_near_cutoff < 0.0:
+        parser.error("--esmfold2_hotspot_verify_near_cutoff 必须大于等于 0")
+    if (
+        args.esmfold2_hotspot_verify_far_cutoff
+        <= args.esmfold2_hotspot_verify_near_cutoff
+    ):
+        parser.error(
+            "--esmfold2_hotspot_verify_far_cutoff 必须大于 "
+            "--esmfold2_hotspot_verify_near_cutoff"
+        )
+    if args.esmfold2_hotspot_verify_min_distance < 0.0:
+        parser.error("--esmfold2_hotspot_verify_min_distance 必须大于等于 0")
+    if (
+        args.esmfold2_hotspot_verify_min_distance
+        > args.esmfold2_hotspot_verify_near_cutoff
+    ):
+        parser.error(
+            "--esmfold2_hotspot_verify_min_distance 不能大于 "
+            "--esmfold2_hotspot_verify_near_cutoff"
+        )
+    if args.esmfold2_hotspot_verify_too_close_weight < 0.0:
+        parser.error(
+            "--esmfold2_hotspot_verify_too_close_weight 必须大于等于 0"
+        )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_hotspot_weight > 0.0
+        and hotspot_params is None
+    ):
+        parser.error(
+            "--esmfold2_hotspot_weight > 0 时必须同时提供 --target_hotspots"
+        )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_hotspot_verify_weight > 0.0
+        and hotspot_params is None
+    ):
+        parser.error(
+            "--esmfold2_hotspot_verify_weight > 0 时必须同时提供 --target_hotspots"
+        )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_hotspot_verify_too_close_weight > 0.0
+        and hotspot_params is None
+    ):
+        parser.error(
+            "--esmfold2_hotspot_verify_too_close_weight > 0 时必须同时提供 "
+            "--target_hotspots"
+        )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_one_step_diffusion_interval < 0
+    ):
+        parser.error(
+            "--esmfold2_one_step_diffusion_interval must be non-negative"
+        )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_one_step_diffusion_interval > 0
+        and not args.esmfold2_one_step_diffusion
+    ):
+        parser.error(
+            "--esmfold2_one_step_diffusion_interval > 0 requires "
+            "--esmfold2_one_step_diffusion true"
+        )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_one_step_recycle_coordinates
+        and args.esmfold2_one_step_diffusion_interval <= 0
+    ):
+        parser.error(
+            "--esmfold2_one_step_recycle_coordinates true requires "
+            "--esmfold2_one_step_diffusion_interval > 0"
+        )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_one_step_diffusion_hotspot
+        and not args.esmfold2_one_step_diffusion
+    ):
+        parser.error(
+            "--esmfold2_one_step_diffusion_hotspot true requires "
+            "--esmfold2_one_step_diffusion true"
+        )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_one_step_diffusion_hotspot
+        and hotspot_params is None
+    ):
+        parser.error(
+            "--esmfold2_one_step_diffusion_hotspot true requires "
+            "--target_hotspots"
+        )
 
     setup_logging(args.log_file, level=args.log_level)
     os.makedirs(args.output_dir, exist_ok=True)
+    if args.launch_profile_path:
+        logging.info(
+            "Launch profile loaded: name=%s path=%s",
+            args.launch_profile_name,
+            args.launch_profile_path,
+        )
     set_global_seed(args.seed)
     logging.info("Random seed fixed to %s", args.seed)
     if hotspot_params is not None:
         if model_backend == "esmfold2":
             logging.info(
-                "ESMFold2 backend received target_hotspots but does not use hotspot-aware routing yet: "
-                "target_hotspots_1based=%s target_concat_indices_0based=%s",
+                "ESMFold2 hotspot contact configured: target_hotspots_1based=%s "
+                "target_concat_indices_0based=%s weight=%.4f "
+                "satisfied_weight=%.4f cutoff=%.2fA interface_mode=%s enabled=%s",
                 hotspot_params["target_hotspot_residues_1based"],
                 hotspot_params["target_hotspot_concat_indices"],
+                args.esmfold2_hotspot_weight,
+                args.esmfold2_hotspot_satisfied_proposal_weight,
+                args.esmfold2_hotspot_cutoff,
+                args.esmfold2_hotspot_interface_mode,
+                args.esmfold2_hotspot_weight > 0.0,
             )
         else:
             logging.info(
@@ -640,6 +1475,24 @@ def main():
                 hotspot_params["target_hotspot_residues_1based"],
                 hotspot_params["target_hotspot_concat_indices"],
             )
+    if model_backend == "esmfold2":
+        logging.info(
+            "ESMFold2 hotspot verifier configured: attraction_weight=%.4f "
+            "near=%.2fA far=%.2fA min_safe=%.2fA "
+            "too_close_weight=%.4f enabled=%s",
+            args.esmfold2_hotspot_verify_weight,
+            args.esmfold2_hotspot_verify_near_cutoff,
+            args.esmfold2_hotspot_verify_far_cutoff,
+            args.esmfold2_hotspot_verify_min_distance,
+            args.esmfold2_hotspot_verify_too_close_weight,
+            bool(
+                hotspot_params is not None
+                and (
+                    args.esmfold2_hotspot_verify_weight > 0.0
+                    or args.esmfold2_hotspot_verify_too_close_weight > 0.0
+                )
+            ),
+        )
     if model_backend == "esmfold2" and args.target_template_path:
         logging.info(
             "ESMFold2 backend received target_template_path but does not use templates yet: %s",
@@ -657,7 +1510,12 @@ def main():
             model_dtype=args.dtype,
         )
     else:
-        esmfold2_backend = load_esmfold2_backend(args, device=args.device)
+        esmfold2_backend = load_esmfold2_backend(
+            args,
+            device=args.device,
+            mutable_mask=esmfold2_mutable_mask,
+            target_chain_roles=esmfold2_target_chain_roles,
+        )
 
     # 组装 loss_weights: default 不覆盖；非 default preset 覆盖整套权重。
     # 单独的 --w_* 参数始终具有最高优先级。
@@ -688,40 +1546,146 @@ def main():
     }
 
     if model_backend == "esmfold2":
-        from bindcraft.hallucination.esmfold2_pipeline import run_esmfold2_mcts_hallucination
-
-        best_seq, final_seq, losses_history = run_esmfold2_mcts_hallucination(
-            backend=esmfold2_backend,
-            target_seq=args.target,
-            L_binder=args.binder_length,
-            N_steps=args.n_steps,
-            K_top=args.k_top,
-            B_candidates=args.b_candidates,
-            T_sample=args.t_sample,
-            max_mutations_per_seq=args.max_mutations_per_seq,
-            stagea_max_mutations_per_seq=args.stagea_max_mutations_per_seq,
-            stageb_max_mutations_per_seq=args.stageb_max_mutations_per_seq,
-            num_beams=args.mcts_num_beams,
-            init_binder_seq=args.init_binder_seq,
-            mcts_C=args.mcts_c,
-            mcts_max_nodes=args.mcts_max_nodes,
-            mcts_strategy=args.mcts_strategy,
-            mcts_bootstrap_steps=args.mcts_bootstrap_steps,
-            mcts_bootstrap_patience=args.mcts_bootstrap_patience,
-            mcts_bootstrap_min_delta=args.mcts_bootstrap_min_delta,
-            mcts_bootstrap_max_steps=args.mcts_bootstrap_max_steps,
-            mcts_handoff_top_k=args.mcts_handoff_top_k,
-            mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
-            mcts_prior_mode=args.mcts_prior_mode,
-            seed=args.seed,
-            mutable_mask=esmfold2_mutable_mask,
-            artifact_dir=args.esmfold2_artifact_dir
-            or os.path.join(args.output_dir, "esmfold2_artifacts"),
-            esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
-            esmfold2_stagea_soft_steps=args.esmfold2_stagea_soft_steps,
-            esmfold2_stageb_soft_steps=args.esmfold2_stageb_soft_steps,
-            esmfold2_final_polish=args.esmfold2_final_polish,
+        from bindcraft.hallucination.esmfold2_pipeline import (
+            run_esmfold2_best_of_n,
+            run_esmfold2_chunked_best_of_n,
+            run_esmfold2_mcts_hallucination,
         )
+
+        esmfold2_artifact_dir = (
+            args.esmfold2_artifact_dir
+            or os.path.join(args.output_dir, "esmfold2_artifacts")
+        )
+        if args.mcts_strategy == "best_of_n":
+            best_seq, final_seq, losses_history = run_esmfold2_best_of_n(
+                backend=esmfold2_backend,
+                target_seq=args.target,
+                L_binder=args.binder_length,
+                best_of_n=args.esmfold2_best_of_n,
+                init_binder_seq=args.init_binder_seq,
+                seed=args.seed,
+                mutable_mask=esmfold2_mutable_mask,
+                hotspot_params=hotspot_params,
+                artifact_dir=esmfold2_artifact_dir,
+                save_verified_candidate_cif=(
+                    args.esmfold2_save_verified_candidate_cif
+                ),
+                esmfold2_initial_logits_checkpoint=(
+                    args.esmfold2_initial_logits_checkpoint
+                ),
+                esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
+                esmfold2_soft_steps=args.esmfold2_stagea_soft_steps,
+                track_confidence=args.esmfold2_track_proposal_confidence,
+                pass_loss_threshold=args.esmfold2_best_of_n_pass_loss_threshold,
+                verifier_seed=args.esmfold2_stagea_verifier_seed,
+                resume=args.esmfold2_best_of_n_resume,
+            )
+        elif args.mcts_strategy == "best_of_n_chunked":
+            best_seq, final_seq, losses_history = (
+                run_esmfold2_chunked_best_of_n(
+                    backend=esmfold2_backend,
+                    target_seq=args.target,
+                    L_binder=args.binder_length,
+                    best_of_n=args.esmfold2_best_of_n,
+                    total_outer_steps=args.n_steps,
+                    init_binder_seq=args.init_binder_seq,
+                    seed=args.seed,
+                    mutable_mask=esmfold2_mutable_mask,
+                    hotspot_params=hotspot_params,
+                    artifact_dir=esmfold2_artifact_dir,
+                    save_verified_candidate_cif=(
+                        args.esmfold2_save_verified_candidate_cif
+                    ),
+                    esmfold2_initial_logits_checkpoint=(
+                        args.esmfold2_initial_logits_checkpoint
+                    ),
+                    esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
+                    esmfold2_soft_steps=args.esmfold2_stagea_soft_steps,
+                    verifier_candidates_per_outer_step=(
+                        args.esmfold2_best_of_n_verify_candidates_per_outer_step
+                    ),
+                    continuation_policy=(
+                        args.esmfold2_best_of_n_continuation_policy
+                    ),
+                    continuation_soft_anchor_margin=(
+                        args.esmfold2_stagea_soft_anchor_margin
+                    ),
+                    candidate_k_top=args.k_top,
+                    candidate_temperature=args.t_sample,
+                    candidate_max_mutations_per_seq=(
+                        args.stagea_max_mutations_per_seq
+                    ),
+                    pass_loss_threshold=(
+                        args.esmfold2_best_of_n_pass_loss_threshold
+                    ),
+                    verifier_seed=args.esmfold2_stagea_verifier_seed,
+                    resume=args.esmfold2_best_of_n_resume,
+                )
+            )
+        else:
+            best_seq, final_seq, losses_history = run_esmfold2_mcts_hallucination(
+                backend=esmfold2_backend,
+                target_seq=args.target,
+                L_binder=args.binder_length,
+                N_steps=args.n_steps,
+                K_top=args.k_top,
+                B_candidates=args.b_candidates,
+                T_sample=args.t_sample,
+                max_mutations_per_seq=args.max_mutations_per_seq,
+                stagea_max_mutations_per_seq=args.stagea_max_mutations_per_seq,
+                stageb_max_mutations_per_seq=args.stageb_max_mutations_per_seq,
+                num_beams=args.mcts_num_beams,
+                init_binder_seq=args.init_binder_seq,
+                esmfold2_initial_logits_checkpoint=args.esmfold2_initial_logits_checkpoint,
+                mcts_C=args.mcts_c,
+                mcts_max_nodes=args.mcts_max_nodes,
+                mcts_strategy=args.mcts_strategy,
+                mcts_bootstrap_steps=args.mcts_bootstrap_steps,
+                mcts_bootstrap_patience=args.mcts_bootstrap_patience,
+                mcts_bootstrap_min_delta=args.mcts_bootstrap_min_delta,
+                mcts_bootstrap_max_steps=args.mcts_bootstrap_max_steps,
+                mcts_handoff_top_k=args.mcts_handoff_top_k,
+                mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
+                mcts_prior_mode=args.mcts_prior_mode,
+                seed=args.seed,
+                mutable_mask=esmfold2_mutable_mask,
+                hotspot_params=hotspot_params,
+                artifact_dir=esmfold2_artifact_dir,
+                save_verified_candidate_cif=(
+                    args.esmfold2_save_verified_candidate_cif
+                ),
+                esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
+                esmfold2_stagea_soft_steps=args.esmfold2_stagea_soft_steps,
+                esmfold2_stagea_tree_children=args.esmfold2_stagea_tree_children,
+                esmfold2_stagea_root_selection_mode=(
+                    args.esmfold2_stagea_root_selection_mode
+                ),
+                esmfold2_stagea_min_root_expansions=(
+                    args.esmfold2_stagea_min_root_expansions
+                ),
+                esmfold2_stagea_preserve_soft_state=args.esmfold2_stagea_preserve_soft_state,
+                esmfold2_stagea_cumulative_annealing=args.esmfold2_stagea_cumulative_annealing,
+                esmfold2_stagea_annealing_horizon=args.esmfold2_stagea_annealing_horizon,
+                esmfold2_stagea_soft_anchor_margin=args.esmfold2_stagea_soft_anchor_margin,
+                esmfold2_stagea_paired_verifier_seed=args.esmfold2_stagea_paired_verifier_seed,
+                esmfold2_stagea_verifier_seed=args.esmfold2_stagea_verifier_seed,
+                esmfold2_raw_lineage_annealing_horizon=args.esmfold2_raw_lineage_annealing_horizon,
+                esmfold2_stageb_soft_steps=args.esmfold2_stageb_soft_steps,
+                esmfold2_stageb_discrete_rerank=args.esmfold2_stageb_discrete_rerank,
+                esmfold2_stageb_rerank_pool_size=args.esmfold2_stageb_rerank_pool_size,
+                esmfold2_stageb_exploration_actions=args.esmfold2_stageb_exploration_actions,
+                esmfold2_stageb_verifier_candidates=args.esmfold2_stageb_verifier_candidates,
+                esmfold2_stageb_hotspot_coverage_weight=args.esmfold2_stageb_hotspot_coverage_weight,
+                esmfold2_stageb_hotspot_distance_weight=args.esmfold2_stageb_hotspot_distance_weight,
+                esmfold2_stageb_hotspot_miss_penalty=args.esmfold2_stageb_hotspot_miss_penalty,
+                esmfold2_stageb_min_pair_chain_iptm=args.esmfold2_stageb_min_pair_chain_iptm,
+                esmfold2_stageb_handoff_quality_tolerance=args.esmfold2_stageb_handoff_quality_tolerance,
+                esmfold2_stageb_paired_verifier_seed=args.esmfold2_stageb_paired_verifier_seed,
+                esmfold2_final_polish=args.esmfold2_final_polish,
+                esmfold2_stagea_handoff_checkpoint_interval=args.esmfold2_stagea_handoff_checkpoint_interval,
+                esmfold2_resume_handoff_checkpoint=args.esmfold2_resume_handoff_checkpoint,
+                esmfold2_resume_reverify_roots=args.esmfold2_resume_reverify_roots,
+            )
     elif args.mode == "first_order":
         from bindcraft.hallucination.pipeline import run_hallucination
 
@@ -819,17 +1783,116 @@ def main():
         f.write(f"Target: {args.target}\n")
         f.write(f"Binder Length: {args.binder_length}\n")
         f.write(f"Mode: {args.mode}\n")
+        f.write(
+            "Launch Profile: "
+            f"{args.launch_profile_name or 'NONE'}\n"
+        )
+        f.write(
+            "Launch Profile Path: "
+            f"{args.launch_profile_path or 'NONE'}\n"
+        )
         f.write(f"Model Backend: {model_backend}\n")
         f.write(f"Model Name: {args.model_name if model_backend == 'protenix' else args.esmfold2_verifier_model}\n")
         if model_backend == "esmfold2":
             f.write(f"ESMFold2 Experimental Model: {args.esmfold2_experimental_model}\n")
             f.write(f"ESMFold2 Soft Steps Legacy Override: {args.esmfold2_soft_steps}\n")
             f.write(f"ESMFold2 Stage A Soft Steps: {args.esmfold2_stagea_soft_steps}\n")
+            f.write(f"ESMFold2 Temperature Min: {args.esmfold2_temperature_min}\n")
+            f.write(f"ESMFold2 Temperature Max: {args.esmfold2_temperature_max}\n")
+            f.write(
+                "ESMFold2 Stage A Tree Children: "
+                f"{args.esmfold2_stagea_tree_children}\n"
+            )
+            f.write(
+                "ESMFold2 Stage A Preserve Soft State: "
+                f"{args.esmfold2_stagea_preserve_soft_state}\n"
+            )
+            f.write(
+                "ESMFold2 Stage A Cumulative Annealing: "
+                f"{args.esmfold2_stagea_cumulative_annealing}\n"
+            )
+            f.write(
+                "ESMFold2 Stage A Annealing Horizon: "
+                f"{args.esmfold2_stagea_annealing_horizon}\n"
+            )
+            f.write(
+                "ESMFold2 Stage A Soft Anchor Margin: "
+                f"{args.esmfold2_stagea_soft_anchor_margin}\n"
+            )
+            f.write(
+                "ESMFold2 Stage A Paired Verifier Seed: "
+                f"{args.esmfold2_stagea_paired_verifier_seed}\n"
+            )
+            f.write(
+                "ESMFold2 Stage A Verifier Seed: "
+                f"{args.esmfold2_stagea_verifier_seed or 'AUTO'}\n"
+            )
+            f.write(
+                "ESMFold2 Raw Lineage Annealing Horizon: "
+                f"{args.esmfold2_raw_lineage_annealing_horizon}\n"
+            )
             f.write(f"ESMFold2 Stage B Soft Steps: {args.esmfold2_stageb_soft_steps}\n")
+            f.write(f"ESMFold2 Best-of-N: {args.esmfold2_best_of_n}\n")
+            if args.mcts_strategy == "best_of_n_chunked":
+                f.write(
+                    "ESMFold2 Chunked Best-of-N Total Outer Steps: "
+                    f"{args.n_steps}\n"
+                )
+            f.write(
+                "ESMFold2 Best-of-N Pass Loss Threshold: "
+                f"{args.esmfold2_best_of_n_pass_loss_threshold}\n"
+            )
+            f.write(
+                "ESMFold2 Best-of-N Verified Candidates Per Outer Step: "
+                f"{args.esmfold2_best_of_n_verify_candidates_per_outer_step}\n"
+            )
+            f.write(
+                "ESMFold2 Best-of-N Continuation Policy: "
+                f"{args.esmfold2_best_of_n_continuation_policy}\n"
+            )
+            f.write(f"ESMFold2 Stage B Discrete Rerank: {args.esmfold2_stageb_discrete_rerank}\n")
+            f.write(f"ESMFold2 Stage B Rerank Pool Size: {args.esmfold2_stageb_rerank_pool_size}\n")
+            f.write(f"ESMFold2 Stage B Exploration Actions: {args.esmfold2_stageb_exploration_actions}\n")
+            f.write(f"ESMFold2 Stage B Verifier Candidates: {args.esmfold2_stageb_verifier_candidates}\n")
+            f.write(
+                "ESMFold2 Stage B Hotspot Coverage Weight: "
+                f"{args.esmfold2_stageb_hotspot_coverage_weight}\n"
+            )
+            f.write(
+                "ESMFold2 Stage B Hotspot Distance Weight: "
+                f"{args.esmfold2_stageb_hotspot_distance_weight}\n"
+            )
+            f.write(
+                "ESMFold2 Stage B Hotspot Miss Penalty: "
+                f"{args.esmfold2_stageb_hotspot_miss_penalty}\n"
+            )
+            f.write(
+                "ESMFold2 Stage B Min Pair-chain iPTM: "
+                f"{args.esmfold2_stageb_min_pair_chain_iptm}\n"
+            )
+            f.write(
+                "ESMFold2 Stage B Handoff Quality Tolerance: "
+                f"{args.esmfold2_stageb_handoff_quality_tolerance}\n"
+            )
+            f.write(
+                "ESMFold2 Stage B Paired Verifier Seed: "
+                f"{args.esmfold2_stageb_paired_verifier_seed}\n"
+            )
             f.write(f"ESMFold2 Lambda ESMC: {args.esmfold2_lambda_esmc}\n")
             f.write(f"ESMFold2 Task Type: {args.esmfold2_task_type}\n")
             f.write(f"ESMFold2 Logit Init Mode: {args.esmfold2_logit_init_mode}\n")
+            f.write(
+                "ESMFold2 Initial Logits Checkpoint: "
+                f"{args.esmfold2_initial_logits_checkpoint or 'NONE'}\n"
+            )
             f.write(f"ESMFold2 Mutable Mask: {args.esmfold2_mutable_mask or 'ALL'}\n")
+            f.write(
+                "ESMFold2 Target Chain Roles: "
+                f"{args.esmfold2_target_chain_roles or 'ALL_TARGET'}\n"
+            )
+            f.write(f"ESMFold2 Stage A Handoff Checkpoint Interval: {args.esmfold2_stagea_handoff_checkpoint_interval}\n")
+            f.write(f"ESMFold2 Resume Handoff Checkpoint: {args.esmfold2_resume_handoff_checkpoint or 'NONE'}\n")
+            f.write(f"ESMFold2 Resume Reverify Roots: {args.esmfold2_resume_reverify_roots}\n")
             f.write(f"ESMFold2 Proposal Load Internal ESMC: {args.esmfold2_proposal_load_internal_esmc}\n")
             f.write(f"ESMFold2 Proposal LM Dropout: {args.esmfold2_proposal_lm_dropout}\n")
             f.write(f"ESMFold2 Force Proposal LM Dropout: {args.esmfold2_force_proposal_lm_dropout}\n")
@@ -841,6 +1904,68 @@ def main():
             f.write(f"ESMFold2 Proposal Confidence Max Candidates: {args.esmfold2_proposal_confidence_max_candidates}\n")
             f.write(f"ESMFold2 Proposal Confidence Tail Steps: {args.esmfold2_proposal_confidence_tail_steps}\n")
             f.write(f"ESMFold2 Final Polish: {args.esmfold2_final_polish}\n")
+            f.write(
+                "ESMFold2 One-step Diffusion: "
+                f"{args.esmfold2_one_step_diffusion}\n"
+            )
+            f.write(
+                "ESMFold2 One-step Diffusion Tau: "
+                f"{args.esmfold2_one_step_diffusion_tau}\n"
+            )
+            f.write(
+                "ESMFold2 One-step Diffusion Weight: "
+                f"{args.esmfold2_one_step_diffusion_weight}\n"
+            )
+            f.write(
+                "ESMFold2 One-step Diffusion Rg Weight: "
+                f"{args.esmfold2_one_step_diffusion_rg_weight}\n"
+            )
+            f.write(
+                "ESMFold2 One-step Diffusion Interval: "
+                f"{args.esmfold2_one_step_diffusion_interval}\n"
+            )
+            f.write(
+                "ESMFold2 One-step Recycle Coordinates: "
+                f"{args.esmfold2_one_step_recycle_coordinates}\n"
+            )
+            f.write(
+                "ESMFold2 One-step Diffusion Hotspot: "
+                f"{args.esmfold2_one_step_diffusion_hotspot}\n"
+            )
+            f.write(
+                "ESMFold2 Distogram Hotspot: "
+                f"{args.esmfold2_distogram_hotspot}\n"
+            )
+            f.write(f"ESMFold2 Hotspot Weight: {args.esmfold2_hotspot_weight}\n")
+            f.write(
+                "ESMFold2 Hotspot Satisfied Proposal Weight: "
+                f"{args.esmfold2_hotspot_satisfied_proposal_weight}\n"
+            )
+            f.write(f"ESMFold2 Hotspot Cutoff: {args.esmfold2_hotspot_cutoff} A\n")
+            f.write(
+                "ESMFold2 Hotspot Interface Mode: "
+                f"{args.esmfold2_hotspot_interface_mode}\n"
+            )
+            f.write(
+                "ESMFold2 Hotspot Verify Weight: "
+                f"{args.esmfold2_hotspot_verify_weight}\n"
+            )
+            f.write(
+                "ESMFold2 Hotspot Verify Near Cutoff: "
+                f"{args.esmfold2_hotspot_verify_near_cutoff} A\n"
+            )
+            f.write(
+                "ESMFold2 Hotspot Verify Far Cutoff: "
+                f"{args.esmfold2_hotspot_verify_far_cutoff} A\n"
+            )
+            f.write(
+                "ESMFold2 Hotspot Verify Min Distance: "
+                f"{args.esmfold2_hotspot_verify_min_distance} A\n"
+            )
+            f.write(
+                "ESMFold2 Hotspot Verify Too Close Weight: "
+                f"{args.esmfold2_hotspot_verify_too_close_weight}\n"
+            )
         f.write(f"Optimization Steps: {args.n_steps}\n")
         f.write(f"Learning Rate: {args.learning_rate}\n")
         f.write(f"Tau Noise: {args.tau_noise}\n")
@@ -848,6 +1973,7 @@ def main():
         f.write(f"Save Checkpoint Dir: {args.save_checkpoint_dir or 'DISABLED'}\n")
         f.write(f"Checkpoint Save Policy: {args.checkpoint_save_policy}\n")
         f.write(f"MCTS Strategy: {args.mcts_strategy}\n")
+        f.write(f"MCTS Handoff Top K: {args.mcts_handoff_top_k}\n")
         f.write(f"MCTS Bootstrap Steps: {args.mcts_bootstrap_steps}\n")
         f.write(f"MCTS Bootstrap Max Steps: {args.mcts_bootstrap_max_steps}\n")
         f.write(f"MCTS Expand Actions Per Step: {args.mcts_expand_actions_per_step}\n")
@@ -863,9 +1989,25 @@ def main():
         f.write(f"Best Sequence: {best_seq}\n")
         f.write(f"Final Sequence: {final_seq}\n")
         f.write(f"\n")
-        f.write(f"Loss History:\n")
+        history_label = (
+            "Trajectory Best Losses"
+            if (
+                model_backend == "esmfold2"
+                and args.mcts_strategy in {"best_of_n", "best_of_n_chunked"}
+            )
+            else "Loss History"
+        )
+        item_label = (
+            "Trajectory"
+            if (
+                model_backend == "esmfold2"
+                and args.mcts_strategy in {"best_of_n", "best_of_n_chunked"}
+            )
+            else "Step"
+        )
+        f.write(f"{history_label}:\n")
         for i, loss in enumerate(losses_history):
-            f.write(f"Step {i}: {loss:.6f}\n")
+            f.write(f"{item_label} {i}: {loss:.6f}\n")
 
     logging.info(f"结果已保存到: {output_file}")
 
