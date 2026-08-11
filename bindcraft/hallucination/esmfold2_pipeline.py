@@ -40,6 +40,11 @@ from bindcraft.hallucination.mcts_legacy import (
     LegacyMCTSTree,
 )
 from bindcraft.hallucination.mcts_controller import MCTSTree
+from bindcraft.hallucination.tcr_prior import (
+    apply_tcr_verifier_score,
+    maybe_build_tcr_prior_scorer,
+    resolve_region_mask,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -3220,8 +3225,27 @@ def _verify_with_cache(
             dict(hotspot_params) if hotspot_params is not None else None
         )
     result = backend.verify(**verify_kwargs)
+    result = _apply_backend_tcr_prior(backend, result)
     verifier_cache[str(result.binder_seq)] = result
     return result
+
+
+def _apply_backend_tcr_prior(backend: Any, result: Any) -> Any:
+    """Fold the external TCR prior into a fresh verifier result.
+
+    Read off the backend (where `attach_tcr_prior` put it) so every verifier
+    call routes through one place. Only called on cache misses — a cached
+    result already carries its prior term and must not be scored twice.
+    """
+    scorer = getattr(backend, "tcr_prior_scorer", None)
+    if scorer is None or float(getattr(scorer, "verifier_weight", 0.0)) == 0.0:
+        return result
+    return apply_tcr_verifier_score(
+        result,
+        scorer,
+        region_mask=getattr(backend, "tcr_prior_region_mask", None),
+        metadata={"stage": "esmfold2_verifier", "seq": str(result.binder_seq)},
+    )
 
 
 def _finite_float(value: Any) -> Optional[float]:
@@ -3804,6 +3828,7 @@ def run_esmfold2_mcts_hallucination(
     esmfold2_stagea_handoff_checkpoint_interval: int = 10,
     esmfold2_resume_handoff_checkpoint: Optional[Union[str, os.PathLike[str]]] = None,
     esmfold2_resume_reverify_roots: bool = False,
+    tcr_prior_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str, List[float]]:
     """
     Run the first ESMFold2 closed-loop path.
@@ -3822,6 +3847,41 @@ def run_esmfold2_mcts_hallucination(
 
     if backend is None:
         raise ValueError("backend is required for ESMFold2 MCTS")
+
+    # ── External TCR sequence prior ───────────────────────────────────────
+    # Separate channel from ESMFold2's own ESM-C pseudo-perplexity gradient:
+    # this one is CDR-scoped and also feeds the verifier / tree value.
+    tcr_prior_scorer = maybe_build_tcr_prior_scorer(
+        tcr_prior_config,
+        device=getattr(backend, "device", None),
+    )
+    if tcr_prior_scorer is not None:
+        tcr_region_mask = resolve_region_mask(
+            (tcr_prior_config or {}).get("tcr_prior_region", "cdr"),
+            mutable_mask,
+            int(L_binder),
+        )
+        if not hasattr(backend, "attach_tcr_prior"):
+            raise TypeError(
+                "TCR prior requested but the ESMFold2 backend does not implement "
+                "attach_tcr_prior(); the soft prior cannot reach the proposal gradient"
+            )
+        backend.attach_tcr_prior(
+            tcr_prior_scorer,
+            tcr_region_mask,
+            lambda_tcr=float(tcr_prior_scorer.gradient_weight),
+        )
+        logger.info(
+            "External TCR sequence prior enabled: model=%s region=%s (%d/%d residues) "
+            "lambda_tcr=%.4g (normalized-gradient mixing weight) verifier_weight=%.4g",
+            getattr(tcr_prior_scorer, "model_name", "dummy"),
+            (tcr_prior_config or {}).get("tcr_prior_region", "cdr"),
+            sum(1 for value in tcr_region_mask if value),
+            int(L_binder),
+            float(tcr_prior_scorer.gradient_weight),
+            float(tcr_prior_scorer.verifier_weight),
+        )
+
     L_binder = int(L_binder)
     N_steps = max(int(N_steps), 0)
     K_top = max(int(K_top), 1)

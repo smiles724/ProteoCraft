@@ -37,6 +37,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-dir", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--n-steps", dest="n_steps", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--prepare-only", action="store_true")
     return parser.parse_args()
 
@@ -58,6 +60,15 @@ def load_config(args: argparse.Namespace) -> Dict[str, Any]:
         config["output_dir"] = args.output_dir
     if args.device is not None:
         config["device"] = args.device
+    if args.n_steps is not None:
+        # Smoke runs shrink the search without needing a separate config; the
+        # Stage-A bootstrap bounds have to shrink with it or they dominate.
+        config["n_steps"] = args.n_steps
+        for key in ("mcts_bootstrap_steps", "mcts_bootstrap_max_steps"):
+            if config.get(key) is not None:
+                config[key] = min(int(config[key]), args.n_steps)
+    if args.seed is not None:
+        config["seed"] = args.seed
     config["prepare_only"] = bool(args.prepare_only)
     config["case"] = args.case
     config["case_index"] = args.case_index
@@ -162,6 +173,16 @@ def build_hallucination_command(
             "esmfold2_stagea_paired_verifier_seed"
         ),
         "esmfold2_stageb_soft_steps": "esmfold2_stageb_soft_steps",
+        # External TCR sequence prior (off unless the config enables it).
+        "use_tcr_prior_gradient": "use_tcr_prior_gradient",
+        "tcr_prior_gradient_weight": "tcr_prior_gradient_weight",
+        "use_tcr_prior_verifier": "use_tcr_prior_verifier",
+        "tcr_prior_verifier_weight": "tcr_prior_verifier_weight",
+        "tcr_prior_region": "tcr_prior_region",
+        "tcr_prior_model_name": "tcr_prior_model_name",
+        "tcr_prior_checkpoint": "tcr_prior_checkpoint",
+        "tcr_prior_masked": "tcr_prior_masked",
+        "require_real_tcr_prior": "require_real_tcr_prior",
         "esmfold2_experimental_model": "esmfold2_experimental_model",
         "esmfold2_verifier_model": "esmfold2_verifier_model",
         "esmfold2_verifier_num_loops": "esmfold2_verifier_num_loops",

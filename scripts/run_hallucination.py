@@ -1685,6 +1685,7 @@ def main(argv=None):
                 esmfold2_stagea_handoff_checkpoint_interval=args.esmfold2_stagea_handoff_checkpoint_interval,
                 esmfold2_resume_handoff_checkpoint=args.esmfold2_resume_handoff_checkpoint,
                 esmfold2_resume_reverify_roots=args.esmfold2_resume_reverify_roots,
+                tcr_prior_config=tcr_prior_config,
             )
     elif args.mode == "first_order":
         from bindcraft.hallucination.pipeline import run_hallucination

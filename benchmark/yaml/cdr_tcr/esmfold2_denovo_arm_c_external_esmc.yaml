@@ -1,0 +1,88 @@
+# Arm C — ESMFold2 + external ESM-C prior ON.
+#
+# Differs from esmfold2_denovo_arm_a_prior_off.yaml ONLY in the
+# `use_tcr_prior_*` block at the bottom; every search hyperparameter, the
+# scaffold, and the seed are identical.
+#
+# IMPORTANT — what "prior OFF" means here: ESMFold2's proposal path always
+# carries its own ESM-C pseudo-perplexity gradient (`esmfold2_lambda_esmc`),
+# which stays on in all three arms. This flag only switches the EXTERNAL
+# prior (bindcraft.hallucination.tcr_prior) on and off. Arm A is therefore
+# "no external prior", not "no sequence prior".
+#
+# IMPORTANT — this is NOT the Protenix setting. ESMFold2 ignores
+# `template_path`: the A6 scaffold contributes only a fixed TCR framework
+# *sequence*, and the TCR-pMHC docking pose is NOT held fixed. Results are
+# not directly comparable to the Protenix template-conditioned runs.
+#
+# Smoke:
+#   python benchmark/script/run_esmfold2_cdr_redesign.py \
+#     --config benchmark/yaml/cdr_tcr/esmfold2_denovo_arm_c_external_esmc.yaml \
+#     --case ALGRRIPPV_beta --n-steps 3
+
+input_dir: benchmark/input/denovo_tcr_case
+output_dir: benchmark/outputs/esmfold2_denovo/arm_c_external_esmc
+device: cuda
+seed: 42
+
+n_steps: 70
+mcts_strategy: stage_a_only
+mcts_num_beams: 8
+mcts_bootstrap_steps: 50
+mcts_bootstrap_max_steps: 70
+mcts_expand_actions_per_step: 2
+k_top: 10
+b_candidates: 8
+t_sample: 1.0
+max_mutations_per_seq: 3
+stagea_max_mutations_per_seq: 3
+stageb_max_mutations_per_seq: 1
+
+esmfold2_stagea_soft_steps: 30
+esmfold2_stageb_soft_steps: 20
+esmfold2_experimental_model: biohub/ESMFold2-Experimental-Fast
+esmfold2_verifier_model: biohub/ESMFold2
+esmfold2_verifier_num_loops: 20
+esmfold2_verifier_num_sampling_steps: 200
+esmfold2_proposal_num_loops: 1
+esmfold2_proposal_num_sampling_steps: 1
+esmfold2_proposal_load_internal_esmc: true
+esmfold2_proposal_lm_dropout: 0.5
+esmfold2_force_proposal_lm_dropout: true
+esmfold2_one_step_diffusion: false
+esmfold2_one_step_diffusion_tau: 4.0
+esmfold2_one_step_diffusion_weight: 1.0
+esmfold2_one_step_diffusion_rg_weight: 0.3
+esmfold2_one_step_diffusion_interval: 0
+esmfold2_one_step_recycle_coordinates: false
+esmfold2_one_step_diffusion_hotspot: false
+esmfold2_distogram_hotspot: true
+esmfold2_verifier_loss_mode: pair_chain_iptm
+esmfold2_lambda_esmc: auto
+esmfold2_logit_init_mode: official_exact
+esmfold2_stagea_handoff_checkpoint_interval: 10
+
+# --- External TCR sequence prior: ESM-C -------------------------------------
+# This is NOT a second copy of ESMFold2's native ESM-C gradient. The native
+# term is a whole-sequence pseudo-perplexity gradient inside the proposal;
+# this one is CDR-scoped AND additionally feeds the verifier / tree value.
+# A gain of C over A should therefore be read as "explicit sequence-prior
+# injection through the verifier channel helps", NOT as "new ESM-C knowledge".
+# lambda_tcr = tcr_prior_gradient_weight is a normalized-gradient mixing
+# weight, not the Protenix scalar loss weight.
+use_tcr_prior_gradient: true
+tcr_prior_gradient_weight: 0.1
+use_tcr_prior_verifier: true
+tcr_prior_verifier_weight: 0.1
+tcr_prior_region: cdr
+tcr_prior_model_name: esmc:esmc_300m
+require_real_tcr_prior: true
+
+cases:
+  - id: ALGRRIPPV_beta
+    fasta_path: A6scaffold_ALGRRIPPV.fasta
+    template_path: A6scaffold_ALGRRIPPV.cif
+    binder_chain: E
+    target_chains: [C]
+    scaffold_chains: [A, D]
+    cdr_motif: CASRPGLAGGRPEQYF

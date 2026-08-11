@@ -860,6 +860,126 @@ class ESMFold2RuntimeBackend:
         self.task_type = task_type
         self.verifier_num_loops = int(config.verifier_num_loops)
         self.verifier_num_sampling_steps = int(config.verifier_num_sampling_steps)
+        # External TCR sequence prior; stays inert until attach_tcr_prior().
+        self.tcr_prior_scorer: Optional[Any] = None
+        self.tcr_prior_region_mask: Optional[List[bool]] = None
+        self.tcr_prior_lambda: float = 0.0
+
+    def attach_tcr_prior(
+        self,
+        scorer: Optional[Any],
+        region_mask: Optional[Sequence[bool]],
+        *,
+        lambda_tcr: float = 0.1,
+    ) -> None:
+        """Attach an external TCR sequence prior to the proposal gradient.
+
+        Held on the backend rather than threaded through every propose() call
+        because the scorer is built once per run and read deep inside the soft
+        update. ``lambda_tcr`` mixes the normalized prior gradient with the
+        structural one.
+        """
+        self.tcr_prior_scorer = scorer
+        self.tcr_prior_region_mask = (
+            None if region_mask is None else [bool(value) for value in region_mask]
+        )
+        self.tcr_prior_lambda = float(lambda_tcr)
+
+    def _tcr_prior_gradient(
+        self,
+        logits: torch.Tensor,
+        *,
+        temperature: float,
+        current_seq: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[torch.Tensor]:
+        """Gradient of the external TCR soft prior w.r.t. the binder logits.
+
+        Returns None when the prior is disabled or produced no distribution
+        (e.g. a structure-conditioned backend with no coordinates available),
+        in which case the caller falls back to the native gradient mix.
+        """
+        scorer = self.tcr_prior_scorer
+        if scorer is None or float(self.tcr_prior_lambda) == 0.0:
+            return None
+        if float(getattr(scorer, "gradient_weight", 0.0)) == 0.0:
+            return None
+
+        prior_metadata = dict(metadata or {})
+        prior_metadata.setdefault("current_seq", current_seq)
+        prior_loss = scorer.soft_prior_loss(
+            sequence_logits=logits[0] / float(temperature),
+            region_mask=self.tcr_prior_region_mask,
+            metadata=prior_metadata,
+        )
+        if not isinstance(prior_loss, torch.Tensor) or not prior_loss.requires_grad:
+            return None
+        grad = torch.autograd.grad(prior_loss, logits, allow_unused=True)[0]
+        return grad
+
+    @staticmethod
+    def _masked_cosine(
+        first: Optional[torch.Tensor],
+        second: Optional[torch.Tensor],
+        gradient_mask: torch.Tensor,
+    ) -> Optional[float]:
+        if first is None or second is None:
+            return None
+        left = (first * gradient_mask).flatten()
+        right = (second * gradient_mask).flatten()
+        denominator = float(left.norm()) * float(right.norm())
+        if denominator <= 0.0:
+            return None
+        return float(torch.dot(left, right)) / denominator
+
+    def _log_tcr_prior_gradient_diagnostics(
+        self,
+        *,
+        stage: str,
+        global_step: int,
+        soft_step: int,
+        structure_grad: torch.Tensor,
+        esmc_grad: Optional[torch.Tensor],
+        tcr_grad: Optional[torch.Tensor],
+        gradient_mask: torch.Tensor,
+    ) -> Dict[str, Any]:
+        """Record whether the external prior actually reaches the proposal.
+
+        A non-zero norm proves the prior contributed a gradient at all; the
+        cosines show whether it points somewhere the structural and native
+        ESM-C terms do not already point.
+        """
+        diagnostics: Dict[str, Any] = {
+            "stage": stage,
+            "global_step": int(global_step),
+            "soft_step": int(soft_step),
+            "lambda_tcr": float(self.tcr_prior_lambda),
+            "tcr_grad_norm": (
+                None if tcr_grad is None else float((tcr_grad * gradient_mask).norm())
+            ),
+            "structure_grad_norm": float((structure_grad * gradient_mask).norm()),
+            "esmc_grad_norm": (
+                None if esmc_grad is None else float((esmc_grad * gradient_mask).norm())
+            ),
+            "cos_tcr_structure": self._masked_cosine(
+                tcr_grad, structure_grad, gradient_mask
+            ),
+            "cos_tcr_esmc": self._masked_cosine(tcr_grad, esmc_grad, gradient_mask),
+        }
+        logger.info(
+            "[tcr_prior/grad] stage=%s step=%d soft=%d lambda=%.4g "
+            "|tcr|=%s |structure|=%.6g |esmc|=%s cos(tcr,structure)=%s cos(tcr,esmc)=%s",
+            stage,
+            diagnostics["global_step"],
+            diagnostics["soft_step"],
+            diagnostics["lambda_tcr"],
+            "none" if diagnostics["tcr_grad_norm"] is None else f"{diagnostics['tcr_grad_norm']:.6g}",
+            diagnostics["structure_grad_norm"],
+            "none" if diagnostics["esmc_grad_norm"] is None else f"{diagnostics['esmc_grad_norm']:.6g}",
+            "n/a" if diagnostics["cos_tcr_structure"] is None else f"{diagnostics['cos_tcr_structure']:.4f}",
+            "n/a" if diagnostics["cos_tcr_esmc"] is None else f"{diagnostics['cos_tcr_esmc']:.4f}",
+        )
+        return diagnostics
 
     def _fold_verifier_with_raw_output(
         self,
@@ -1829,11 +1949,35 @@ class ESMFold2RuntimeBackend:
                     )
                 esmc_grad = torch.autograd.grad(esmc_loss.mean(), logits)[0]
 
+            tcr_grad = self._tcr_prior_gradient(
+                logits,
+                temperature=temperature,
+                current_seq=current_seq,
+                metadata={
+                    "stage": "esmfold2_soft_update",
+                    "step": int(global_step),
+                    "soft_step": local_step,
+                    "action_group": action_group,
+                },
+            )
+            if self.tcr_prior_scorer is not None:
+                self._log_tcr_prior_gradient_diagnostics(
+                    stage="esmfold2_soft_update",
+                    global_step=int(global_step),
+                    soft_step=local_step,
+                    structure_grad=structure_grad,
+                    esmc_grad=esmc_grad,
+                    tcr_grad=tcr_grad,
+                    gradient_mask=gradient_mask,
+                )
+
             combined_grad = combine_normalized_gradients(
                 structure_grad,
                 esmc_grad,
                 gradient_mask=gradient_mask,
                 lambda_esmc=lambda_esmc,
+                tcr_grad=tcr_grad,
+                lambda_tcr=self.tcr_prior_lambda,
             )
             scheduled_one_step: Optional[Dict[str, Any]] = None
             if run_scheduled_one_step:
@@ -2138,11 +2282,34 @@ class ESMFold2RuntimeBackend:
                 ),
             )
             diffusion_grad = torch.autograd.grad(diffusion_total, logits)[0]
+            tcr_grad = self._tcr_prior_gradient(
+                logits,
+                temperature=final_temperature,
+                current_seq=current_seq,
+                metadata={
+                    "stage": "esmfold2_one_step",
+                    "step": int(global_step),
+                    "soft_step": local_step,
+                    "action_group": action_group,
+                },
+            )
+            if self.tcr_prior_scorer is not None:
+                self._log_tcr_prior_gradient_diagnostics(
+                    stage="esmfold2_one_step",
+                    global_step=int(global_step),
+                    soft_step=local_step,
+                    structure_grad=structure_grad,
+                    esmc_grad=esmc_grad,
+                    tcr_grad=tcr_grad,
+                    gradient_mask=gradient_mask,
+                )
             combined_grad = combine_normalized_gradients(
                 structure_grad,
                 esmc_grad,
                 gradient_mask=gradient_mask,
                 lambda_esmc=lambda_esmc,
+                tcr_grad=tcr_grad,
+                lambda_tcr=self.tcr_prior_lambda,
             )
             combined_grad = combined_grad + float(
                 self.config.one_step_diffusion_weight

@@ -797,13 +797,28 @@ def combine_normalized_gradients(
     *,
     gradient_mask: torch.Tensor,
     lambda_esmc: float,
+    tcr_grad: Optional[torch.Tensor] = None,
+    lambda_tcr: float = 0.0,
 ) -> torch.Tensor:
-    """Combine ESMFold2 structural gradient and optional ESMC sequence prior."""
+    """Combine ESMFold2 structural gradient and optional sequence priors.
+
+    ``esmc_grad`` is ESMFold2's own ESM-C pseudo-perplexity term. ``tcr_grad``
+    is the external TCR sequence prior (`bindcraft.hallucination.tcr_prior`),
+    kept as a separate channel so it can be switched on and off without
+    touching the native term. Both are mixed after per-tensor normalization,
+    so ``lambda_tcr`` is a normalized-gradient mixing weight — it is NOT
+    numerically comparable to the scalar loss weight used on the Protenix path.
+    """
 
     combined = normalized_gradient_tensor(structure_grad, gradient_mask)
     if esmc_grad is not None and float(lambda_esmc) != 0.0:
         combined = combined + float(lambda_esmc) * normalized_gradient_tensor(
             esmc_grad,
+            gradient_mask,
+        )
+    if tcr_grad is not None and float(lambda_tcr) != 0.0:
+        combined = combined + float(lambda_tcr) * normalized_gradient_tensor(
+            tcr_grad,
             gradient_mask,
         )
     return combined * gradient_mask
