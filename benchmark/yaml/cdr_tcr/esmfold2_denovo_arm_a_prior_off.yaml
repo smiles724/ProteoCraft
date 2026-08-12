@@ -25,9 +25,10 @@ output_dir: benchmark/outputs/esmfold2_denovo/arm_a_prior_off
 device: cuda
 seed: 42
 
-n_steps: 70
+n_steps: 150
 mcts_strategy: stage_a_only
 mcts_num_beams: 8
+# Inert under stage_a_only (stagea_steps = n_steps); kept for two_stage runs.
 mcts_bootstrap_steps: 50
 mcts_bootstrap_max_steps: 70
 mcts_expand_actions_per_step: 2
