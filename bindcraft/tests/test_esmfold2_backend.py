@@ -363,8 +363,8 @@ def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     assert default_config.hotspot_verify_min_distance == pytest.approx(2.5)
     assert default_config.hotspot_verify_too_close_weight == pytest.approx(0.0)
     assert default_config.one_step_diffusion_enabled is True
-    assert default_config.one_step_diffusion_mode == "reference_noising"
-    assert default_config.one_step_diffusion_tau == pytest.approx(2.0)
+    assert default_config.one_step_diffusion_mode == "truncated_trajectory"
+    assert default_config.one_step_diffusion_tau == pytest.approx(1.0)
     assert default_config.one_step_diffusion_truncated_num_sampling_steps == 50
     assert default_config.one_step_diffusion_weight == pytest.approx(0.25)
     assert default_config.one_step_diffusion_rg_weight == pytest.approx(0.1)
@@ -607,20 +607,26 @@ def test_positive_score_argmax_control_is_explicit_and_unrestricted():
     after = before.clone()
     after[:, aa_to_idx["Y"]] = 3.0
 
+    torch.manual_seed(0)
     batch = build_logit_delta_candidate_batch(
         before,
         after,
         current_seq="A" * 6,
-        B_candidates=4,
+        B_candidates=8,
         mutation_fraction=0.5,
         include_logit_candidates=True,
         candidate_strategy="positive_score",
     )
 
     assert batch.sequences[0] == "Y" * 6
+    assert len(batch.sequences) == 8
     assert batch.candidate_metadata[0]["source"] == "unrestricted_argmax"
     assert batch.candidate_metadata[0]["mutation_count"] == 6
-    assert batch.candidate_metadata[1]["mutation_count"] == 3
+    assert all(
+        item["source"] in {"positive_score_topk", "positive_score_weighted"}
+        and item["mutation_count"] == 3
+        for item in batch.candidate_metadata[1:]
+    )
 
 
 def test_positive_score_strategy_requires_mutation_fraction():

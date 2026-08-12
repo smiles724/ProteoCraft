@@ -1,12 +1,14 @@
 from pathlib import Path
 
 import pytest
+import yaml
 
 from bindcraft.hallucination.esmfold2_cdr import (
     framework_unchanged,
     prepare_esmfold2_cdr_case,
 )
 from benchmark.script.run_esmfold2_cdr_redesign import build_hallucination_command
+from scripts.run_hallucination import parse_args_with_profile, resolve_model_backend
 
 
 def _write_case_fasta(path: Path) -> None:
@@ -113,6 +115,12 @@ def test_cdr_launcher_forwards_one_step_diffusion_options(tmp_path):
             "esmfold2_one_step_diffusion_hotspot": False,
             "esmfold2_distogram_hotspot": True,
             "esmfold2_verifier_loss_mode": "aligned_common",
+            "mcts_handoff_top_k": 2,
+            "esmfold2_stageb_discrete_rerank": True,
+            "esmfold2_stageb_rerank_pool_size": 20,
+            "esmfold2_stageb_exploration_actions": 1,
+            "esmfold2_stageb_verifier_candidates": 8,
+            "esmfold2_stageb_paired_verifier_seed": True,
             "checkpoint_save_policy": "all",
         },
         case_dir=tmp_path / "output",
@@ -132,5 +140,67 @@ def test_cdr_launcher_forwards_one_step_diffusion_options(tmp_path):
     assert options["--esmfold2_one_step_diffusion_hotspot"] == "false"
     assert options["--esmfold2_distogram_hotspot"] == "true"
     assert options["--esmfold2_verifier_loss_mode"] == "aligned_common"
+    assert options["--mcts_handoff_top_k"] == "2"
+    assert options["--esmfold2_stageb_discrete_rerank"] == "true"
+    assert options["--esmfold2_stageb_rerank_pool_size"] == "20"
+    assert options["--esmfold2_stageb_exploration_actions"] == "1"
+    assert options["--esmfold2_stageb_verifier_candidates"] == "8"
+    assert options["--esmfold2_stageb_paired_verifier_seed"] == "true"
     assert options["--save_checkpoint_dir"] == str(tmp_path / "output" / "checkpoints")
     assert options["--checkpoint_save_policy"] == "all"
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    (
+        "esmfold2_cdr_redesign.yaml",
+        "esmfold2_cdr_redesign_d_4cases.yaml",
+    ),
+)
+def test_formal_cdr_configs_inherit_recommended_two_stage_profile(
+    tmp_path,
+    config_name,
+):
+    fasta_path = tmp_path / "case.fasta"
+    _write_case_fasta(fasta_path)
+    case = prepare_esmfold2_cdr_case(
+        {
+            "id": "case_alpha",
+            "fasta_path": fasta_path.name,
+            "binder_chain": "C",
+            "target_chains": ["A"],
+            "scaffold_chains": ["B"],
+            "cdr_motif": "ACDEFG",
+        },
+        input_dir=tmp_path,
+    )
+    config_path = (
+        Path(__file__).resolve().parents[2]
+        / "benchmark"
+        / "yaml"
+        / "cdr_tcr"
+        / config_name
+    )
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    command = build_hallucination_command(
+        case,
+        config,
+        case_dir=tmp_path / "output",
+    )
+
+    args, parser = parse_args_with_profile(command[2:])
+    assert resolve_model_backend(args, parser) == "esmfold2"
+    assert args.esmfold2_task_type == "cdr_redesign"
+    assert args.mcts_strategy == "two_stage"
+    assert args.n_steps == 110
+    assert args.mcts_bootstrap_steps == 70
+    assert args.mcts_bootstrap_max_steps == 70
+    assert args.mcts_prior_mode == "no_group_matched_compute"
+    assert args.esmfold2_stagea_candidate_strategy == "positive_score"
+    assert args.esmfold2_stagea_mutation_fraction == pytest.approx(0.5)
+    assert args.esmfold2_stagea_include_argmax_candidate is True
+    assert args.esmfold2_one_step_diffusion_mode == "truncated_trajectory"
+    assert args.esmfold2_one_step_diffusion_tau == pytest.approx(1.0)
+    assert args.esmfold2_one_step_recycle_coordinates is False
+    assert args.esmfold2_verifier_num_loops == 20
+    assert args.esmfold2_verifier_num_sampling_steps == 200

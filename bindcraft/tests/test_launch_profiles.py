@@ -61,8 +61,12 @@ def test_esmfold2_d_profile_matches_formal_method_defaults():
     assert args.esmfold2_experimental_model == (
         "biohub/ESMFold2-Experimental-Fast"
     )
-    assert args.mcts_strategy == "stage_a_only"
-    assert args.n_steps == 70
+    assert args.mcts_strategy == "two_stage"
+    assert args.n_steps == 110
+    assert args.mcts_bootstrap_steps == 70
+    assert args.mcts_bootstrap_max_steps == 70
+    assert args.mcts_handoff_top_k == 2
+    assert args.mcts_prior_mode == "no_group_matched_compute"
     assert args.mcts_num_beams == 8
     assert args.b_candidates == 8
     assert args.esmfold2_stagea_soft_steps == 30
@@ -74,9 +78,16 @@ def test_esmfold2_d_profile_matches_formal_method_defaults():
     assert args.esmfold2_stagea_mutation_fraction == pytest.approx(0.5)
     assert args.esmfold2_stagea_candidate_strategy == "positive_score"
     assert args.esmfold2_stagea_include_argmax_candidate is True
+    assert args.stagea_max_mutations_per_seq is None
+    assert args.stageb_max_mutations_per_seq == 1
+    assert args.esmfold2_stageb_discrete_rerank is True
+    assert args.esmfold2_stageb_rerank_pool_size == 20
+    assert args.esmfold2_stageb_exploration_actions == 1
+    assert args.esmfold2_stageb_verifier_candidates == 8
     assert args.esmfold2_one_step_diffusion is True
+    assert args.esmfold2_one_step_diffusion_mode == "truncated_trajectory"
     assert args.esmfold2_one_step_diffusion_interval == 5
-    assert args.esmfold2_one_step_diffusion_tau == pytest.approx(2.0)
+    assert args.esmfold2_one_step_diffusion_tau == pytest.approx(1.0)
     assert args.esmfold2_one_step_diffusion_weight == pytest.approx(0.25)
     assert args.esmfold2_one_step_diffusion_rg_weight == pytest.approx(0.1)
     assert args.esmfold2_one_step_recycle_coordinates is False
@@ -124,6 +135,43 @@ def test_tcr_explicit_verifier_precision_overrides_task_defaults():
 
     assert args.esmfold2_verifier_num_loops == 20
     assert args.esmfold2_verifier_num_sampling_steps == 200
+
+
+@pytest.mark.parametrize(
+    ("task_type", "verifier_precision"),
+    (
+        ("denovo", (20, 200)),
+        ("tcr", (4, 50)),
+        ("cdr_redesign", (20, 200)),
+    ),
+)
+def test_esmfold2_profile_covers_all_formal_task_modes(
+    task_type,
+    verifier_precision,
+):
+    args = _parse_profile(
+        "esmfold2_d",
+        "--esmfold2_task_type",
+        task_type,
+    )
+
+    assert args.esmfold2_task_type == task_type
+    assert args.mcts_strategy == "two_stage"
+    assert args.n_steps == 110
+    assert args.mcts_bootstrap_steps == 70
+    assert args.mcts_bootstrap_max_steps == 70
+    assert args.mcts_prior_mode == "no_group_matched_compute"
+    assert args.b_candidates == 8
+    assert args.esmfold2_stagea_candidate_strategy == "positive_score"
+    assert args.esmfold2_stagea_mutation_fraction == pytest.approx(0.5)
+    assert args.esmfold2_stagea_include_argmax_candidate is True
+    assert args.esmfold2_one_step_diffusion_mode == "truncated_trajectory"
+    assert args.esmfold2_one_step_diffusion_tau == pytest.approx(1.0)
+    assert args.esmfold2_one_step_recycle_coordinates is False
+    assert (
+        args.esmfold2_verifier_num_loops,
+        args.esmfold2_verifier_num_sampling_steps,
+    ) == verifier_precision
 
 
 def test_no_profile_preserves_existing_cli_defaults():

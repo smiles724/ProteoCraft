@@ -18,6 +18,10 @@ def test_default_model_backend_preserves_protenix_path():
     assert args.model_backend == "protenix"
     assert resolve_model_backend(args, parser) == "protenix"
     assert args.mcts_strategy == "two_stage"
+    assert args.mcts_prior_mode == "full"
+    assert args.n_steps == 200
+    assert args.mcts_bootstrap_steps == 50
+    assert args.mcts_bootstrap_max_steps == 80
     assert args.mcts_expand_actions_per_step == 2
 
 
@@ -29,7 +33,11 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_experimental_model == (
         "biohub/ESMFold2-Experimental-Fast"
     )
-    assert args.mcts_strategy == "stage_a_only"
+    assert args.mcts_strategy == "two_stage"
+    assert args.mcts_prior_mode == "no_group_matched_compute"
+    assert args.n_steps == 110
+    assert args.mcts_bootstrap_steps == 70
+    assert args.mcts_bootstrap_max_steps == 70
     assert args.esmfold2_soft_steps is None
     assert args.esmfold2_stagea_soft_steps == 30
     assert args.esmfold2_stagea_tree_children == 2
@@ -70,8 +78,8 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_force_proposal_lm_dropout is True
     assert args.esmfold2_one_step_diffusion_hotspot is False
     assert args.esmfold2_one_step_diffusion is True
-    assert args.esmfold2_one_step_diffusion_mode == "reference_noising"
-    assert args.esmfold2_one_step_diffusion_tau == pytest.approx(2.0)
+    assert args.esmfold2_one_step_diffusion_mode == "truncated_trajectory"
+    assert args.esmfold2_one_step_diffusion_tau == pytest.approx(1.0)
     assert args.esmfold2_one_step_truncated_num_sampling_steps == 50
     assert args.esmfold2_one_step_diffusion_weight == pytest.approx(0.25)
     assert args.esmfold2_one_step_diffusion_rg_weight == pytest.approx(0.1)
@@ -671,11 +679,11 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     assert "ESMFold2 Hotspot Verify Far Cutoff: 20.0 A" in result_text
     assert "ESMFold2 hotspot verifier configured" in log_text
     assert "ESMFold2 backend received target_template_path but does not use templates yet" in log_text
-    assert captured["mcts_strategy"] == "stage_a_only"
-    assert captured["mcts_bootstrap_steps"] == 50
+    assert captured["mcts_strategy"] == "two_stage"
+    assert captured["mcts_bootstrap_steps"] == 70
     assert captured["mcts_expand_actions_per_step"] == 2
     assert captured["mcts_handoff_top_k"] == 2
-    assert captured["mcts_prior_mode"] == "full"
+    assert captured["mcts_prior_mode"] == "no_group_matched_compute"
     assert captured["stagea_max_mutations_per_seq"] == 7
     assert captured["stageb_max_mutations_per_seq"] == 1
     assert captured["mutable_mask"] == [False, True, True]

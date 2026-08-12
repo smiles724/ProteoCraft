@@ -848,6 +848,7 @@ def test_runtime_schedules_and_recycles_interval_one_step_coordinates(monkeypatc
             num_loops=1,
             num_sampling_steps=1,
             one_step_diffusion_enabled=True,
+            one_step_diffusion_mode="reference_noising",
             one_step_diffusion_interval=2,
             one_step_diffusion_recycle_coordinates=True,
         ),

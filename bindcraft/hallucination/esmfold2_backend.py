@@ -74,8 +74,8 @@ class ESMFold2ProposalConfig:
     proposal_lm_dropout: Optional[float] = 0.5
     force_proposal_lm_dropout: bool = True
     one_step_diffusion_enabled: bool = True
-    one_step_diffusion_mode: str = "reference_noising"
-    one_step_diffusion_tau: float = 2.0
+    one_step_diffusion_mode: str = "truncated_trajectory"
+    one_step_diffusion_tau: float = 1.0
     one_step_diffusion_truncated_num_sampling_steps: int = 50
     one_step_diffusion_weight: float = 0.25
     one_step_diffusion_rg_weight: float = 0.1

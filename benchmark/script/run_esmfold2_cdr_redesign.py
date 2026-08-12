@@ -152,7 +152,10 @@ def build_hallucination_command(
         "mcts_num_beams": "mcts_num_beams",
         "mcts_strategy": "mcts_strategy",
         "mcts_bootstrap_steps": "mcts_bootstrap_steps",
+        "mcts_bootstrap_patience": "mcts_bootstrap_patience",
+        "mcts_bootstrap_min_delta": "mcts_bootstrap_min_delta",
         "mcts_bootstrap_max_steps": "mcts_bootstrap_max_steps",
+        "mcts_handoff_top_k": "mcts_handoff_top_k",
         "mcts_expand_actions_per_step": "mcts_expand_actions_per_step",
         "mcts_prior_mode": "mcts_prior_mode",
         "esmfold2_stagea_soft_steps": "esmfold2_stagea_soft_steps",
@@ -171,6 +174,22 @@ def build_hallucination_command(
             "esmfold2_stagea_paired_verifier_seed"
         ),
         "esmfold2_stageb_soft_steps": "esmfold2_stageb_soft_steps",
+        "esmfold2_stageb_discrete_rerank": (
+            "esmfold2_stageb_discrete_rerank"
+        ),
+        "esmfold2_stageb_rerank_pool_size": (
+            "esmfold2_stageb_rerank_pool_size"
+        ),
+        "esmfold2_stageb_exploration_actions": (
+            "esmfold2_stageb_exploration_actions"
+        ),
+        "esmfold2_stageb_verifier_candidates": (
+            "esmfold2_stageb_verifier_candidates"
+        ),
+        "esmfold2_stageb_paired_verifier_seed": (
+            "esmfold2_stageb_paired_verifier_seed"
+        ),
+        "esmfold2_stageb_verifier_seed": "esmfold2_stageb_verifier_seed",
         "esmfold2_experimental_model": "esmfold2_experimental_model",
         "esmfold2_verifier_model": "esmfold2_verifier_model",
         "esmfold2_verifier_num_loops": "esmfold2_verifier_num_loops",

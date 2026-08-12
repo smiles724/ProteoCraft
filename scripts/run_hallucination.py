@@ -501,8 +501,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # === Binder 与优化参数 ===
     parser.add_argument("--binder_length", type=int, default=40,
                        help="Binder 长度（默认：40）")
-    parser.add_argument("--n_steps", type=int, default=200,
-                       help="优化步数（默认：200）")
+    parser.add_argument("--n_steps", type=int, default=None,
+                       help=("优化步数；默认按 backend 解析："
+                             "Protenix=200，ESMFold2=110"))
     parser.add_argument("--learning_rate", type=float, default=0.05,
                        help="Adam 学习率（默认：0.05）")
     parser.add_argument("--tau_noise", type=float, default=4.0,
@@ -811,7 +812,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--esmfold2_one_step_diffusion_mode",
         choices=("reference_noising", "truncated_trajectory"),
-        default="reference_noising",
+        default="truncated_trajectory",
         help=(
             "One-step 坐标来源：reference_noising 使用 verifier 结构加噪；"
             "truncated_trajectory 从标准高噪声初态无梯度采样到 tau"
@@ -820,8 +821,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--esmfold2_one_step_diffusion_tau",
         type=float,
-        default=2.0,
-        help="ESMFold2 one-step diffusion 固定噪声尺度 tau（默认：2.0）",
+        default=1.0,
+        help="ESMFold2 one-step diffusion 固定噪声尺度 tau（默认：1.0）",
     )
     parser.add_argument(
         "--esmfold2_one_step_truncated_num_sampling_steps",
@@ -1037,7 +1038,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--stageb_max_mutations_per_seq", type=int, default=None,
-                       help="ESMFold2/两阶段搜索 StageB 每条候选最大突变数；默认沿用 --max_mutations_per_seq")
+                       help="ESMFold2 StageB 每条候选最大突变数（默认：1）")
     parser.add_argument("--use_annealing", type=lambda x: x.lower() == "true", default=True,
                        help="是否启用模拟退火（默认：true）")
     parser.add_argument("--t_init", type=float, default=1.0,
@@ -1061,21 +1062,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
                            "best_of_n_chunked 将 --n_steps 总 outer-step 预算"
                            "均分给独立分段轨迹，不做逐步 verifier 选择；"
                            "其余为 StageA/两阶段 MCTS 模式；默认按 backend 解析："
-                           "Protenix=two_stage，ESMFold2=stage_a_only"
+                           "Protenix=two_stage，ESMFold2=two_stage"
                        ))
-    parser.add_argument("--mcts_bootstrap_steps", type=int, default=50,
-                       help="two_stage: StageA 原版 MCTS 至少运行步数（默认：50）")
+    parser.add_argument("--mcts_bootstrap_steps", type=int, default=None,
+                       help=("two_stage: StageA 至少运行步数；默认按 backend "
+                             "解析：Protenix=50，ESMFold2=70"))
     parser.add_argument("--mcts_bootstrap_patience", type=int, default=10,
                        help="two_stage: StageA 停滞 patience（默认：10）")
     parser.add_argument("--mcts_bootstrap_min_delta", type=float, default=0.02,
                        help="two_stage: 判断 StageA 有效改善的 loss 阈值（默认：0.02）")
-    parser.add_argument("--mcts_bootstrap_max_steps", type=int, default=80,
-                       help="two_stage: StageA 最大运行步数（默认：80）")
+    parser.add_argument("--mcts_bootstrap_max_steps", type=int, default=None,
+                       help=("two_stage: StageA 最大运行步数；默认按 backend "
+                             "解析：Protenix=80，ESMFold2=70"))
     parser.add_argument("--mcts_handoff_top_k", type=int, default=None,
-                       help="two_stage: 交给 StageB 的 top 序列数（Protenix 默认 mcts_num_beams；ESMFold2 默认 4）")
+                       help="two_stage: 交给 StageB 的 top 序列数（Protenix 默认 mcts_num_beams；ESMFold2 默认 2）")
     parser.add_argument("--mcts_expand_actions_per_step", type=int, default=None,
-                       help="MCTS StageB 每步最多扩展并验证的 action 数（Protenix 默认 2；ESMFold2 默认 4）")
-    parser.add_argument("--mcts_prior_mode", type=str, default="full",
+                       help="MCTS StageB 每步最多扩展并验证的 action 数（默认：2）")
+    parser.add_argument("--mcts_prior_mode", type=str, default=None,
                        choices=[
                            "full",
                            "uniform",
@@ -1084,7 +1087,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                            "no_group_matched_compute",
                            "no_sequence",
                        ],
-                       help=("MCTS StageB prior 消融模式（默认：full；"
+                       help=("MCTS StageB prior 模式；默认按 backend 解析："
+                             "Protenix=full，ESMFold2=no_group_matched_compute；"
                              "no_group_matched_compute 用三条 unified-loss proposal "
                              "对齐 Full StageB 的 proposal 计算量）"))
     parser.add_argument("--mcts_proposal_method", type=str, default="one_step_fixed",
@@ -1149,8 +1153,16 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             parser.error(message)
         raise ValueError(message)
     if getattr(args, "mcts_strategy", None) is None:
-        args.mcts_strategy = (
-            "stage_a_only" if backend == "esmfold2" else "two_stage"
+        args.mcts_strategy = "two_stage"
+    if getattr(args, "n_steps", None) is None:
+        args.n_steps = 110 if backend == "esmfold2" else 200
+    if getattr(args, "mcts_bootstrap_steps", None) is None:
+        args.mcts_bootstrap_steps = 70 if backend == "esmfold2" else 50
+    if getattr(args, "mcts_bootstrap_max_steps", None) is None:
+        args.mcts_bootstrap_max_steps = 70 if backend == "esmfold2" else 80
+    if getattr(args, "mcts_prior_mode", None) is None:
+        args.mcts_prior_mode = (
+            "no_group_matched_compute" if backend == "esmfold2" else "full"
         )
     if backend == "esmfold2" and getattr(args, "mode", None) != "mcts":
         message = "ESMFold2 backend first version only supports --mode mcts"
