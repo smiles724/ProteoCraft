@@ -24,6 +24,10 @@ On top of the 1st-order gradient, BindCraft v2 adds a **0th-order verification l
 
 ## Quick Start
 
+### ESMFold2 Three-Mode Workflow
+
+The current recommended ESMFold2 workflow supports de novo binder design, TCR binder design, and TCR CDR redesign through the shared `esmfold2_d` launch profile. See the Chinese **[ESMFold2 quick-start guide](docs/ESMFold2_QUICK_START.md)** for the default configuration and runnable examples for all three task modes.
+
 ### Installation
 
 ```bash
