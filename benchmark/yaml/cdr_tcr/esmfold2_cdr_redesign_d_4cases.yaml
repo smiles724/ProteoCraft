@@ -15,7 +15,7 @@
 # provenance and downstream evaluation, but are not consumed by the model.
 
 launch_profile: esmfold2_d
-input_dir: benchmark/input/cdr_tcr_case
+input_dir: benchmark/datasets/proteocraft_59_v1/cdr
 output_dir: benchmark/outputs/esmfold2_cdr_redesign_d_seed43
 device: cuda
 seed: 43
@@ -27,32 +27,32 @@ esmfold2_verifier_num_sampling_steps: 50
 
 cases:
   - id: 9NMW_alpha
-    fasta_path: rcsb_pdb_9NMW_abtrunc.fasta
-    template_path: 9NMW.cif
+    fasta_path: fastas/rcsb_pdb_9NMW_abtrunc.fasta
+    template_path: templates/9NMW.cif
     binder_chain: D
     target_chains: [C]
     scaffold_chains: [A, E]
     cdr_motif: CAVNNARLMFGDGTQL
 
   - id: 9NMW_beta
-    fasta_path: rcsb_pdb_9NMW_abtrunc.fasta
-    template_path: 9NMW.cif
+    fasta_path: fastas/rcsb_pdb_9NMW_abtrunc.fasta
+    template_path: templates/9NMW.cif
     binder_chain: E
     target_chains: [C]
     scaffold_chains: [A, D]
     cdr_motif: CASSVAGSPEAFF
 
   - id: 1QRN_alpha
-    fasta_path: rcsb_pdb_1QRN_abtrunc.fasta
-    template_path: 1QRN_fixed_template.cif
+    fasta_path: fastas/rcsb_pdb_1QRN_abtrunc.fasta
+    template_path: templates/1QRN_fixed_template.cif
     binder_chain: D
     target_chains: [C]
     scaffold_chains: [A, E]
     cdr_motif: CAVTTDSWGKLQF
 
   - id: 1QRN_beta
-    fasta_path: rcsb_pdb_1QRN_abtrunc.fasta
-    template_path: 1QRN_fixed_template.cif
+    fasta_path: fastas/rcsb_pdb_1QRN_abtrunc.fasta
+    template_path: templates/1QRN_fixed_template.cif
     binder_chain: E
     target_chains: [C]
     scaffold_chains: [A, D]

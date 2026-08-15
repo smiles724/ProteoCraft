@@ -110,7 +110,8 @@ python benchmark/script/run_esmfold2_cdr_redesign.py \
   --device cuda:0
 ```
 
-该 YAML 是任务格式示例。使用前需准备其中引用的 FASTA/CIF 文件，或将 `input_dir` 和 case 路径改为实际位置。当前 ESMFold2 主流程是 sequence-only；template path 只记录数据来源并用于后续评价，不作为模型输入。
+该 YAML 已直接引用仓库内
+`benchmark/datasets/proteocraft_59_v1/cdr/` 的 4 个 benchmark case，无需另行准备输入。当前 ESMFold2 主流程是 sequence-only；template path 只记录数据来源并用于后续评价，不作为模型输入。
 
 ## 5. 输入和输出
 
@@ -133,3 +134,41 @@ python benchmark/script/run_esmfold2_cdr_redesign.py \
 ```bash
 python scripts/run_hallucination.py --help
 ```
+
+## 6. 完整 59-case Benchmark
+
+仓库内置的可移植 benchmark 包含 14 个 de novo、41 个 TCR binder design
+和 4 个 TCR CDR redesign case：
+
+```text
+benchmark/datasets/proteocraft_59_v1/
+```
+
+先在不加载模型、不占用 GPU 的情况下验证全部输入并查看命令：
+
+```bash
+python benchmark/script/run_esmfold2_59.py --prepare-only
+```
+
+运行单个 case：
+
+```bash
+python benchmark/script/run_esmfold2_59.py \
+  --case denovo_BetV1 \
+  --device cuda:0
+```
+
+运行一种任务或划分多 GPU shard：
+
+```bash
+python benchmark/script/run_esmfold2_59.py \
+  --task-type tcr \
+  --num-shards 8 \
+  --shard-index 0 \
+  --device cuda:0
+```
+
+启动器统一加载 `esmfold2_d`，只从 manifest 注入 target、hotspot、chain
+role、binder length 和 CDR mutable mask 等任务输入。详细字段、八卡启动示例
+和输出目录见
+[`benchmark/datasets/proteocraft_59_v1/README.md`](../benchmark/datasets/proteocraft_59_v1/README.md)。
