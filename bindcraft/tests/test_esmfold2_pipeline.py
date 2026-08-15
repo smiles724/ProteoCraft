@@ -20,6 +20,7 @@ from bindcraft.hallucination.esmfold2_pipeline import (
     run_esmfold2_mcts_hallucination,
 )
 from bindcraft.hallucination.esmfold2_pipeline import (
+    _ESMArtifactRecorder,
     _ESMFold2StageBMCTSTree,
     _allocate_chunked_best_of_n_steps,
     _allocate_group_budgets,
@@ -37,7 +38,66 @@ from bindcraft.hallucination.esmfold2_pipeline import (
     _stagea_child_logits,
     _stageb_guarded_rank,
     _stageb_preview_objective,
+    _write_proposal_visualization_trace,
 )
+
+
+def test_proposal_visualization_trace_is_opt_in(tmp_path):
+    logits_before = torch.zeros(3, len(ESM_AA_ORDER))
+    logits_after = logits_before.clone()
+    logits_after[2, AA_TO_ESM_IDX["Y"]] = 1.25
+    batch = ESMFold2ProposalBatch(
+        sequences=["AAY"],
+        logits_before=logits_before,
+        logits_after=logits_after,
+        candidate_metadata=[
+            {
+                "sequence": "AAY",
+                "source": "positive_score_top",
+                "mutation_changes": ["A3Y"],
+                "mutation_scores": [1.25],
+            }
+        ],
+    )
+
+    disabled = _ESMArtifactRecorder(tmp_path / "disabled")
+    _write_proposal_visualization_trace(
+        disabled,
+        stage="stage_a",
+        step=0,
+        selected_sequence="AAA",
+        batch=batch,
+        mutable_mask=[True, True, True],
+    )
+    assert not (tmp_path / "disabled" / "visualization_trace").exists()
+
+    enabled = _ESMArtifactRecorder(
+        tmp_path / "enabled",
+        save_visualization_trace=True,
+    )
+    _write_proposal_visualization_trace(
+        enabled,
+        stage="stage_a",
+        step=0,
+        selected_sequence="AAA",
+        batch=batch,
+        mutable_mask=[True, True, True],
+    )
+
+    index_path = (
+        tmp_path / "enabled" / "visualization_trace" / "proposal_trace.jsonl"
+    )
+    records = [json.loads(line) for line in index_path.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["aa_order"] == ESM_AA_ORDER
+    assert records[0]["mutation_scores_shape"] == [3, len(ESM_AA_ORDER)]
+    payload = torch.load(
+        tmp_path / "enabled" / records[0]["trace_file"],
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert payload["candidate_metadata"][0]["mutation_changes"] == ["A3Y"]
+    assert payload["mutation_scores"][2, AA_TO_ESM_IDX["Y"]] == pytest.approx(1.25)
 
 
 def test_minimal_proposal_alignment_preserves_existing_soft_logits():

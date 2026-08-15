@@ -756,6 +756,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "默认 false，不生成 PDB"
         ),
     )
+    parser.add_argument(
+        "--esmfold2_save_visualization_trace",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help=(
+            "是否保存 ESMFold2 proposal 前后 logits、完整 mutation-score "
+            "矩阵和候选元数据；仅用于可视化，默认 false"
+        ),
+    )
     parser.add_argument("--esmfold2_stagea_handoff_checkpoint_interval", type=int, default=10,
                        help="Stage A handoff checkpoint 保存间隔；默认每 10 step，0 表示仅保存最终 handoff")
     parser.add_argument("--esmfold2_resume_handoff_checkpoint", type=str, default=None,
@@ -1758,6 +1767,9 @@ def main(argv=None):
                 artifact_dir=esmfold2_artifact_dir,
                 save_verified_candidate_cif=(
                     args.esmfold2_save_verified_candidate_cif
+                ),
+                save_visualization_trace=(
+                    args.esmfold2_save_visualization_trace
                 ),
                 esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
                 esmfold2_stagea_soft_steps=args.esmfold2_stagea_soft_steps,

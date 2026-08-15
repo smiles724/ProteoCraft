@@ -104,6 +104,9 @@ class _NoopArtifactRecorder:
     def write_logits(self, **event: Any) -> None:
         return None
 
+    def write_proposal_trace(self, **event: Any) -> None:
+        return None
+
     def write_summary(self, **summary: Any) -> None:
         return None
 
@@ -127,10 +130,12 @@ class _ESMArtifactRecorder(_NoopArtifactRecorder):
         *,
         append: bool = False,
         save_verified_candidate_cif: bool = False,
+        save_visualization_trace: bool = False,
     ) -> None:
         self.artifact_dir = Path(artifact_dir)
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.save_verified_candidate_cif = bool(save_verified_candidate_cif)
+        self.save_visualization_trace = bool(save_visualization_trace)
         self.trajectory_path = self.artifact_dir / "trajectory.jsonl"
         self.candidates_path = self.artifact_dir / "candidates.jsonl"
         self.nodes_path = self.artifact_dir / "mcts_nodes.jsonl"
@@ -139,6 +144,10 @@ class _ESMArtifactRecorder(_NoopArtifactRecorder):
         self.soft_steps_path = self.artifact_dir / "soft_steps.jsonl"
         self.handoff_path = self.artifact_dir / "mcts_handoff.jsonl"
         self.summary_path = self.artifact_dir / "run_summary.json"
+        self.visualization_trace_dir = self.artifact_dir / "visualization_trace"
+        self.visualization_trace_index_path = (
+            self.visualization_trace_dir / "proposal_trace.jsonl"
+        )
         jsonl_paths = (
             self.trajectory_path,
             self.candidates_path,
@@ -153,6 +162,20 @@ class _ESMArtifactRecorder(_NoopArtifactRecorder):
                 path.touch(exist_ok=True)
             else:
                 path.write_text("", encoding="utf-8")
+        self._visualization_trace_counter = 0
+        if self.save_visualization_trace:
+            self.visualization_trace_dir.mkdir(parents=True, exist_ok=True)
+            if append:
+                self.visualization_trace_index_path.touch(exist_ok=True)
+                self._visualization_trace_counter = sum(
+                    1
+                    for line in self.visualization_trace_index_path.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                    if line.strip()
+                )
+            else:
+                self.visualization_trace_index_path.write_text("", encoding="utf-8")
 
     def write_step(self, **event: Any) -> None:
         self._append_jsonl(self.trajectory_path, event)
@@ -272,6 +295,48 @@ class _ESMArtifactRecorder(_NoopArtifactRecorder):
         }
         torch.save(payload, trajectory_dir / f"{label}.pt")
 
+    def write_proposal_trace(self, **event: Any) -> None:
+        if not self.save_visualization_trace:
+            return
+        logits_before = event.pop("logits_before", None)
+        logits_after = event.pop("logits_after", None)
+        mutation_scores = event.pop("mutation_scores", None)
+        if logits_before is None or logits_after is None or mutation_scores is None:
+            return
+
+        trace_index = self._visualization_trace_counter
+        self._visualization_trace_counter += 1
+        stage = _safe_path_token(str(event.get("stage", "unknown")))
+        step = event.get("step")
+        step_token = "none" if step is None else f"{int(step):04d}"
+        action_group = _safe_path_token(str(event.get("action_group") or "unrouted"))
+        trace_name = (
+            f"{trace_index:05d}_{stage}_step_{step_token}_{action_group}.pt"
+        )
+        trace_path = self.visualization_trace_dir / trace_name
+        tensor_payload = {
+            **dict(event),
+            "trace_index": trace_index,
+            "aa_order": ESM_AA_ORDER,
+            "logits_before": torch.as_tensor(logits_before).detach().cpu().clone(),
+            "logits_after": torch.as_tensor(logits_after).detach().cpu().clone(),
+            "mutation_scores": torch.as_tensor(mutation_scores).detach().cpu().clone(),
+        }
+        temporary_path = trace_path.with_suffix(trace_path.suffix + ".tmp")
+        torch.save(tensor_payload, temporary_path)
+        temporary_path.replace(trace_path)
+        self._append_jsonl(
+            self.visualization_trace_index_path,
+            {
+                **dict(event),
+                "trace_index": trace_index,
+                "aa_order": ESM_AA_ORDER,
+                "trace_file": str(trace_path.relative_to(self.artifact_dir)),
+                "logits_shape": list(torch.as_tensor(logits_before).shape),
+                "mutation_scores_shape": list(torch.as_tensor(mutation_scores).shape),
+            },
+        )
+
     def write_summary(self, **summary: Any) -> None:
         self._write_json_atomic(self.summary_path, summary)
 
@@ -353,6 +418,7 @@ def _make_artifact_recorder(
     *,
     append: bool = False,
     save_verified_candidate_cif: bool = False,
+    save_visualization_trace: bool = False,
 ) -> _NoopArtifactRecorder:
     if artifact_dir is None:
         return _NoopArtifactRecorder()
@@ -360,6 +426,7 @@ def _make_artifact_recorder(
         artifact_dir,
         append=append,
         save_verified_candidate_cif=save_verified_candidate_cif,
+        save_visualization_trace=save_visualization_trace,
     )
 
 
@@ -486,6 +553,50 @@ def _write_soft_step_artifacts(
             action_group=action_group,
             **metric,
         )
+
+
+def _write_proposal_visualization_trace(
+    recorder: _NoopArtifactRecorder,
+    *,
+    stage: str,
+    step: Optional[int],
+    selected_sequence: str,
+    batch: ESMFold2ProposalBatch,
+    mutable_mask: Optional[Sequence[bool]],
+    action_group: Optional[str] = None,
+    trace_label: Optional[str] = None,
+) -> None:
+    if not bool(getattr(recorder, "save_visualization_trace", False)):
+        return
+    logits_before = getattr(batch, "logits_before", None)
+    logits_after = getattr(batch, "logits_after", None)
+    if logits_before is None or logits_after is None:
+        return
+    mutation_scores = logit_delta_mutation_scores(
+        logits_before,
+        logits_after,
+        current_seq=str(selected_sequence),
+        mutable_mask=mutable_mask,
+    )
+    recorder.write_proposal_trace(
+        stage=stage,
+        step=step,
+        selected_sequence=str(selected_sequence),
+        selected_sequence_hash=_sequence_hash(selected_sequence),
+        action_group=action_group,
+        trace_label=trace_label,
+        mutable_mask=(
+            [bool(value) for value in mutable_mask]
+            if mutable_mask is not None
+            else [True] * len(selected_sequence)
+        ),
+        candidate_sequences=[str(sequence) for sequence in batch.sequences],
+        candidate_metadata=[dict(item) for item in batch.candidate_metadata],
+        proposal_diagnostics=dict(batch.proposal_diagnostics),
+        logits_before=logits_before,
+        logits_after=logits_after,
+        mutation_scores=mutation_scores,
+    )
 
 
 def _mean_legacy_loss(node: Any) -> Optional[float]:
@@ -3906,6 +4017,7 @@ def run_esmfold2_mcts_hallucination(
     hotspot_params: Optional[Dict[str, Any]] = None,
     artifact_dir: Optional[Union[str, os.PathLike[str]]] = None,
     save_verified_candidate_cif: bool = False,
+    save_visualization_trace: bool = False,
     esmfold2_logit_init_mode: str = "legacy_anchor",
     esmfold2_stagea_soft_steps: Optional[int] = None,
     esmfold2_stagea_tree_children: int = 2,
@@ -4228,6 +4340,7 @@ def run_esmfold2_mcts_hallucination(
     artifact_recorder = _make_artifact_recorder(
         artifact_dir,
         save_verified_candidate_cif=save_verified_candidate_cif,
+        save_visualization_trace=save_visualization_trace,
     )
 
     tree = LegacyMCTSTree(
@@ -5088,6 +5201,14 @@ def run_esmfold2_mcts_hallucination(
             selected_sequence=current_seq,
             batch=proposal_batch,
         )
+        _write_proposal_visualization_trace(
+            artifact_recorder,
+            stage="stage_a",
+            step=step,
+            selected_sequence=current_seq,
+            batch=proposal_batch,
+            mutable_mask=mutable_mask,
+        )
         if proposal_batch.logits_after is not None:
             argmax_sequence = sequence_from_logits_argmax(
                 proposal_batch.logits_after,
@@ -5597,6 +5718,16 @@ def run_esmfold2_mcts_hallucination(
                 selected_sequence=current_seq,
                 batch=proposal_batch,
                 action_group=group_name,
+            )
+            _write_proposal_visualization_trace(
+                artifact_recorder,
+                stage="stage_b",
+                step=step,
+                selected_sequence=current_seq,
+                batch=proposal_batch,
+                mutable_mask=mutable_mask,
+                action_group=group_name,
+                trace_label=proposal_seed_label,
             )
             candidates = _proposal_sequences_from_batch(proposal_batch, include_confidence=False)
             candidates = [
