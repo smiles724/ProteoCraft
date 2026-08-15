@@ -11,7 +11,7 @@ defaults:
   binder_length: 120
   n_steps: 110
   learning_rate: 0.05
-  seed: 42
+  seed: 43
   k_top: 10
   b_candidates: 8
   stageb_max_mutations_per_seq: 1
@@ -23,7 +23,7 @@ defaults:
   mcts_bootstrap_max_steps: 70
   mcts_handoff_top_k: 2
   mcts_expand_actions_per_step: 2
-  mcts_prior_mode: no_group_matched_compute
+  mcts_prior_mode: no_group
   esmfold2_stagea_soft_steps: 30
   esmfold2_stageb_soft_steps: 20
   esmfold2_stagea_tree_children: 2
@@ -43,6 +43,8 @@ defaults:
   esmfold2_logit_init_mode: official_exact
   esmfold2_proposal_num_loops: 1
   esmfold2_proposal_num_sampling_steps: 1
+  esmfold2_verifier_num_loops: 4
+  esmfold2_verifier_num_sampling_steps: 50
   esmfold2_proposal_load_internal_esmc: true
   esmfold2_proposal_lm_dropout: 0.5
   esmfold2_force_proposal_lm_dropout: true

@@ -195,12 +195,13 @@ def test_formal_cdr_configs_inherit_recommended_two_stage_profile(
     assert args.n_steps == 110
     assert args.mcts_bootstrap_steps == 70
     assert args.mcts_bootstrap_max_steps == 70
-    assert args.mcts_prior_mode == "no_group_matched_compute"
+    assert args.mcts_prior_mode == "no_group"
+    assert args.seed == 43
     assert args.esmfold2_stagea_candidate_strategy == "positive_score"
     assert args.esmfold2_stagea_mutation_fraction == pytest.approx(0.5)
     assert args.esmfold2_stagea_include_argmax_candidate is True
     assert args.esmfold2_one_step_diffusion_mode == "truncated_trajectory"
     assert args.esmfold2_one_step_diffusion_tau == pytest.approx(1.0)
     assert args.esmfold2_one_step_recycle_coordinates is False
-    assert args.esmfold2_verifier_num_loops == 20
-    assert args.esmfold2_verifier_num_sampling_steps == 200
+    assert args.esmfold2_verifier_num_loops == 4
+    assert args.esmfold2_verifier_num_sampling_steps == 50

@@ -16,14 +16,14 @@
 
 launch_profile: esmfold2_d
 input_dir: benchmark/input/cdr_tcr_case
-output_dir: benchmark/outputs/esmfold2_cdr_redesign_d_seed42
+output_dir: benchmark/outputs/esmfold2_cdr_redesign_d_seed43
 device: cuda
-seed: 42
+seed: 43
 
 # The formal profile supplies the common two-stage algorithm. Only the CDR
 # motif is mutable; framework residues remain fixed.
-esmfold2_verifier_num_loops: 20
-esmfold2_verifier_num_sampling_steps: 200
+esmfold2_verifier_num_loops: 4
+esmfold2_verifier_num_sampling_steps: 50
 
 cases:
   - id: 9NMW_alpha

@@ -35,6 +35,7 @@ def test_protenix_profiles_share_algorithm_defaults_and_switch_model():
     v2 = _parse_profile("protenix_v2")
 
     assert v1.model_backend == v2.model_backend == "protenix"
+    assert v1.seed == v2.seed == 42
     assert v1.model_name == "protenix_base_default_v1.0.0"
     assert v2.model_name == "protenix-v2"
     for field in (
@@ -66,7 +67,8 @@ def test_esmfold2_d_profile_matches_formal_method_defaults():
     assert args.mcts_bootstrap_steps == 70
     assert args.mcts_bootstrap_max_steps == 70
     assert args.mcts_handoff_top_k == 2
-    assert args.mcts_prior_mode == "no_group_matched_compute"
+    assert args.mcts_prior_mode == "no_group"
+    assert args.seed == 43
     assert args.mcts_num_beams == 8
     assert args.b_candidates == 8
     assert args.esmfold2_stagea_soft_steps == 30
@@ -91,8 +93,8 @@ def test_esmfold2_d_profile_matches_formal_method_defaults():
     assert args.esmfold2_one_step_diffusion_weight == pytest.approx(0.25)
     assert args.esmfold2_one_step_diffusion_rg_weight == pytest.approx(0.1)
     assert args.esmfold2_one_step_recycle_coordinates is False
-    assert args.esmfold2_verifier_num_loops == 20
-    assert args.esmfold2_verifier_num_sampling_steps == 200
+    assert args.esmfold2_verifier_num_loops == 4
+    assert args.esmfold2_verifier_num_sampling_steps == 50
     assert args.esmfold2_verifier_loss_mode == "aligned_common"
     assert args.esmfold2_hotspot_verify_weight == pytest.approx(0.0)
     assert args.esmfold2_hotspot_verify_too_close_weight == pytest.approx(0.0)
@@ -111,7 +113,7 @@ def test_explicit_cli_value_overrides_launch_profile():
     assert args.esmfold2_one_step_diffusion_weight == pytest.approx(0.5)
 
 
-def test_tcr_uses_low_precision_verifier_defaults():
+def test_esmfold2_uses_low_precision_verifier_defaults():
     args = _parse_profile(
         "esmfold2_d",
         "--esmfold2_task_type",
@@ -140,9 +142,9 @@ def test_tcr_explicit_verifier_precision_overrides_task_defaults():
 @pytest.mark.parametrize(
     ("task_type", "verifier_precision"),
     (
-        ("denovo", (20, 200)),
+        ("denovo", (4, 50)),
         ("tcr", (4, 50)),
-        ("cdr_redesign", (20, 200)),
+        ("cdr_redesign", (4, 50)),
     ),
 )
 def test_esmfold2_profile_covers_all_formal_task_modes(
@@ -160,7 +162,8 @@ def test_esmfold2_profile_covers_all_formal_task_modes(
     assert args.n_steps == 110
     assert args.mcts_bootstrap_steps == 70
     assert args.mcts_bootstrap_max_steps == 70
-    assert args.mcts_prior_mode == "no_group_matched_compute"
+    assert args.mcts_prior_mode == "no_group"
+    assert args.seed == 43
     assert args.b_candidates == 8
     assert args.esmfold2_stagea_candidate_strategy == "positive_score"
     assert args.esmfold2_stagea_mutation_fraction == pytest.approx(0.5)

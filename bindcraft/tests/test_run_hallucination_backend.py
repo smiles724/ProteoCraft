@@ -17,6 +17,7 @@ def test_default_model_backend_preserves_protenix_path():
 
     assert args.model_backend == "protenix"
     assert resolve_model_backend(args, parser) == "protenix"
+    assert args.seed == 42
     assert args.mcts_strategy == "two_stage"
     assert args.mcts_prior_mode == "full"
     assert args.n_steps == 200
@@ -34,7 +35,8 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
         "biohub/ESMFold2-Experimental-Fast"
     )
     assert args.mcts_strategy == "two_stage"
-    assert args.mcts_prior_mode == "no_group_matched_compute"
+    assert args.mcts_prior_mode == "no_group"
+    assert args.seed == 43
     assert args.n_steps == 110
     assert args.mcts_bootstrap_steps == 70
     assert args.mcts_bootstrap_max_steps == 70
@@ -686,7 +688,7 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     assert captured["mcts_bootstrap_steps"] == 70
     assert captured["mcts_expand_actions_per_step"] == 2
     assert captured["mcts_handoff_top_k"] == 2
-    assert captured["mcts_prior_mode"] == "no_group_matched_compute"
+    assert captured["mcts_prior_mode"] == "no_group"
     assert captured["stagea_max_mutations_per_seq"] == 7
     assert captured["stageb_max_mutations_per_seq"] == 1
     assert captured["mutable_mask"] == [False, True, True]

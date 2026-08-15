@@ -52,22 +52,13 @@ from bindcraft.hallucination.profile_loader import (
 from bindcraft.utils import LOSS_WEIGHT_PRESETS
 
 
-ESMFOLD2_VERIFIER_DEFAULTS_BY_TASK = {
-    "tcr": (4, 50),
-}
-ESMFOLD2_VERIFIER_DEFAULT = (20, 200)
+ESMFOLD2_VERIFIER_DEFAULT = (4, 50)
 
 
 def resolve_esmfold2_verifier_precision_defaults(args):
-    """Apply task-aware verifier defaults while preserving explicit values."""
+    """Apply search-time verifier defaults while preserving explicit values."""
 
-    task_type = str(args.esmfold2_task_type).strip().lower()
-    default_loops, default_sampling_steps = (
-        ESMFOLD2_VERIFIER_DEFAULTS_BY_TASK.get(
-            task_type,
-            ESMFOLD2_VERIFIER_DEFAULT,
-        )
-    )
+    default_loops, default_sampling_steps = ESMFOLD2_VERIFIER_DEFAULT
     if args.esmfold2_verifier_num_loops is None:
         args.esmfold2_verifier_num_loops = default_loops
     if args.esmfold2_verifier_num_sampling_steps is None:
@@ -781,7 +772,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "ESMFold2 verifier full fold loop 数；"
-            "默认 TCR=4，其他任务=20，可显式覆盖"
+            "所有任务搜索期默认 4，可显式覆盖"
         ),
     )
     parser.add_argument(
@@ -790,7 +781,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "ESMFold2 verifier diffusion sampling steps；"
-            "默认 TCR=50，其他任务=200，可显式覆盖"
+            "所有任务搜索期默认 50，可显式覆盖"
         ),
     )
     parser.add_argument("--esmfold2_proposal_num_loops", type=int, default=1,
@@ -1002,8 +993,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="可选的初始 Binder 单字母序列；长度必须与 --binder_length 一致")
     parser.add_argument("--target_hotspots", type=str, default=None,
                        help="Target hotspot residues，使用 1-based 序号；支持逗号/空格/范围，如 10,11,45-47")
-    parser.add_argument("--seed", type=int, default=42,
-                       help="随机种子；用于固定 Phase0、mutation sampling 和 verifier diffusion（默认：42）")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "随机种子；用于固定 Phase0、mutation sampling 和 verifier "
+            "diffusion。默认按 backend 解析：Protenix=42，ESMFold2=43"
+        ),
+    )
     parser.add_argument("--target_template_path", type=str, default=None,
                        help="可选 target template 结构文件（.cif/.mmcif/.pdb），只作用于 target 链")
 
@@ -1097,7 +1095,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                            "no_sequence",
                        ],
                        help=("MCTS StageB prior 模式；默认按 backend 解析："
-                             "Protenix=full，ESMFold2=no_group_matched_compute；"
+                             "Protenix=full，ESMFold2=no_group；"
                              "no_group_matched_compute 用三条 unified-loss proposal "
                              "对齐 Full StageB 的 proposal 计算量）"))
     parser.add_argument("--mcts_proposal_method", type=str, default="one_step_fixed",
@@ -1163,6 +1161,8 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
         raise ValueError(message)
     if getattr(args, "mcts_strategy", None) is None:
         args.mcts_strategy = "two_stage"
+    if getattr(args, "seed", None) is None:
+        args.seed = 43 if backend == "esmfold2" else 42
     if getattr(args, "n_steps", None) is None:
         args.n_steps = 110 if backend == "esmfold2" else 200
     if getattr(args, "mcts_bootstrap_steps", None) is None:
@@ -1171,7 +1171,7 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
         args.mcts_bootstrap_max_steps = 70 if backend == "esmfold2" else 80
     if getattr(args, "mcts_prior_mode", None) is None:
         args.mcts_prior_mode = (
-            "no_group_matched_compute" if backend == "esmfold2" else "full"
+            "no_group" if backend == "esmfold2" else "full"
         )
     if backend == "esmfold2" and getattr(args, "mode", None) != "mcts":
         message = "ESMFold2 backend first version only supports --mode mcts"
