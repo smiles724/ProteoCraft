@@ -55,10 +55,11 @@ if [ "${N_ROWS}" -eq 0 ]; then
 fi
 
 # 2) Run pipeline
-echo "[2] run ESMFold pipeline"
+echo "[2] run legacy ESMFold 2026-05 pipeline"
 python -m eval_pipeline.cli \
     --manifest "${OUT}/manifest.csv" \
     --out-dir "${OUT}" \
+    --evaluator esmfold_202605 \
     --device cuda:0
 
 # 3) Per-case error summary

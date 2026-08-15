@@ -20,6 +20,8 @@ def _passing_metrics():
 
 def test_thresholds_dict_has_both_evaluators():
     assert "esmfold" in THRESHOLDS_BY_EVALUATOR
+    assert "esmfold_202605" in THRESHOLDS_BY_EVALUATOR
+    assert "esmfold2" in THRESHOLDS_BY_EVALUATOR
     assert "af3" in THRESHOLDS_BY_EVALUATOR
     keys = {
         "binder_plddt_strict",
@@ -29,12 +31,13 @@ def test_thresholds_dict_has_both_evaluators():
         "scrmsd_max",
         "clash_max",
     }
-    for ev in ("esmfold", "af3"):
+    for ev in ("esmfold", "esmfold_202605", "esmfold2", "af3"):
         assert keys <= set(THRESHOLDS_BY_EVALUATOR[ev].keys()), f"{ev} missing keys"
 
 
 def test_thresholds_backward_compat_alias():
-    assert THRESHOLDS == THRESHOLDS_BY_EVALUATOR["esmfold"]
+    assert THRESHOLDS == THRESHOLDS_BY_EVALUATOR["esmfold_202605"]
+    assert THRESHOLDS_BY_EVALUATOR["esmfold"] == THRESHOLDS
 
 
 def test_compute_tier_flags_esmfold_default_no_regression():

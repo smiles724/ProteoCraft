@@ -3,14 +3,28 @@ from __future__ import annotations
 
 import math
 
+_LEGACY_ESMFOLD_THRESHOLDS = {
+    "binder_plddt_strict": 90.0,    # Tier 1 strict (Proteina 严)
+    "binder_plddt_loose": 80.0,     # Tier 1 aux (BCv1 默认)
+    "complex_plddt": 90.0,          # Tier 2
+    "ipae_max": 7.0,                # Å, raw HF ESMFold
+    "scrmsd_max": 1.5,              # Å, target-aligned
+    "clash_max": 0,                 # for strict_physical
+}
+
 THRESHOLDS_BY_EVALUATOR = {
-    "esmfold": {
-        "binder_plddt_strict": 90.0,    # Tier 1 strict (Proteina 严)
-        "binder_plddt_loose": 80.0,     # Tier 1 aux (BCv1 默认)
-        "complex_plddt": 90.0,          # Tier 2
-        "ipae_max": 7.0,                # Å, raw HF ESMFold
-        "scrmsd_max": 1.5,              # Å, target-aligned
-        "clash_max": 0,                 # for strict_physical
+    "esmfold_202605": dict(_LEGACY_ESMFOLD_THRESHOLDS),
+    # Deprecated compatibility alias. New records use esmfold_202605.
+    "esmfold": dict(_LEGACY_ESMFOLD_THRESHOLDS),
+    "esmfold2": {
+        # Tier-1 is retained as a confidence diagnostic. The primary ESMFold2
+        # ranking metric is pair-chain iPTM, not these legacy pass thresholds.
+        "binder_plddt_strict": 90.0,
+        "binder_plddt_loose": 80.0,
+        "complex_plddt": 90.0,
+        "ipae_max": 7.0,
+        "scrmsd_max": 1.5,
+        "clash_max": 0,
     },
     "af3": {
         # Placeholder: occurrence-locked equal to ESMFold until Phase 1 calibration.
@@ -23,7 +37,7 @@ THRESHOLDS_BY_EVALUATOR = {
     },
 }
 
-THRESHOLDS = THRESHOLDS_BY_EVALUATOR["esmfold"]
+THRESHOLDS = THRESHOLDS_BY_EVALUATOR["esmfold_202605"]
 
 
 def _is_num(x):
@@ -42,7 +56,7 @@ def _le(x, thr):
     return _is_num(x) and float(x) <= thr
 
 
-def compute_tier_flags(metrics: dict, evaluator: str = "esmfold") -> dict:
+def compute_tier_flags(metrics: dict, evaluator: str = "esmfold_202605") -> dict:
     thr = THRESHOLDS_BY_EVALUATOR[evaluator]
     bpl = metrics.get("binder_pLDDT")
     cpl = metrics.get("complex_pLDDT")

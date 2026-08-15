@@ -13,7 +13,7 @@ import pandas as pd
 # Allow `python -m eval_pipeline.cli` from project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from eval_pipeline import af3_runner  # noqa: E402
+from eval_pipeline import af3_runner, esmfold2_runner  # noqa: E402
 from eval_pipeline import metrics as M  # noqa: E402
 from eval_pipeline.esmfold_runner import (  # noqa: E402
     build_esmfold_input,
@@ -24,6 +24,11 @@ from eval_pipeline.esmfold_runner import (  # noqa: E402
 from eval_pipeline.manifest import load_manifest  # noqa: E402
 from eval_pipeline.tier_gating import compute_tier_flags  # noqa: E402
 from vendor.proteina_complexa.pdb_chain_utils import get_chain_ca_coords  # noqa: E402
+
+
+DEFAULT_EVALUATOR = "esmfold2"
+LEGACY_ESMFOLD_EVALUATOR = "esmfold_202605"
+LEGACY_ESMFOLD_ALIAS = "esmfold"
 
 CSV_COLS_BASE = [
     # metadata
@@ -59,6 +64,23 @@ CSV_COLS_NEW = [
     "af3_ptm_native",
     "af3_has_clash",
     "af3_fraction_disordered",
+    # Current ProteoCraft ESMFold2 full-verifier metrics.
+    "pair_chain_iptm",
+    "iptm",
+    "esmfold2_total_loss",
+    "esmfold2_plddt",
+    "esmfold2_binder_plddt",
+    "esmfold2_binder_rg_excess",
+    "esmfold2_mmcif_path",
+    "esmfold2_model",
+    "esmfold2_num_loops",
+    "esmfold2_num_sampling_steps",
+    "esmfold2_seed",
+    "esmfold2_loss_mode",
+    "target_chain_roles",
+    "hotspot_mean_min_heavy_atom_distance",
+    "hotspot_heavy_atom_coverage",
+    "hotspot_heavy_atom_coverage_5a",
 ]
 
 CSV_COLS = CSV_COLS_BASE + CSV_COLS_NEW
@@ -104,7 +126,20 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--evaluator", choices=["esmfold", "af3"], default="esmfold")
+    ap.add_argument(
+        "--evaluator",
+        choices=[
+            DEFAULT_EVALUATOR,
+            LEGACY_ESMFOLD_EVALUATOR,
+            LEGACY_ESMFOLD_ALIAS,
+            "af3",
+        ],
+        default=DEFAULT_EVALUATOR,
+        help=(
+            "evaluation backend (default: esmfold2). 'esmfold' remains a "
+            "compatibility alias for esmfold_202605"
+        ),
+    )
     ap.add_argument("--paper-case", default=None)
     ap.add_argument("--sub-run", default=None)
     ap.add_argument("--af3-python", default=os.environ.get("AF3_PYTHON"))
@@ -115,6 +150,30 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--af3-staging-root", default=None)
     ap.add_argument("--af3-output-root", default=None)
     ap.add_argument("--af3-timeout-per-sub-run", type=int, default=43200)
+    ap.add_argument(
+        "--esmfold2-model",
+        default=esmfold2_runner.DEFAULT_MODEL_NAME,
+    )
+    ap.add_argument(
+        "--esmfold2-num-loops",
+        type=int,
+        default=esmfold2_runner.DEFAULT_NUM_LOOPS,
+    )
+    ap.add_argument(
+        "--esmfold2-num-sampling-steps",
+        type=int,
+        default=esmfold2_runner.DEFAULT_NUM_SAMPLING_STEPS,
+    )
+    ap.add_argument(
+        "--esmfold2-seed",
+        type=int,
+        default=esmfold2_runner.DEFAULT_SEED,
+    )
+    ap.add_argument(
+        "--esmfold2-loss-mode",
+        choices=["pair_chain_iptm", "aligned_common"],
+        default=esmfold2_runner.DEFAULT_LOSS_MODE,
+    )
     ap.add_argument("--skip-existing", action=argparse.BooleanOptionalAction, default=True)
     return ap
 
@@ -171,7 +230,10 @@ def _compute_eval_n_successes(out: dict) -> int:
     error_msg = out.get("error_msg", "")
     if pd.notna(error_msg) and str(error_msg) != "":
         return 0
-    key_cols = ["binder_pLDDT", "ipAE", "binder_scRMSD"]
+    if out.get("evaluator") == DEFAULT_EVALUATOR:
+        key_cols = ["pair_chain_iptm", "esmfold2_total_loss"]
+    else:
+        key_cols = ["binder_pLDDT", "ipAE", "binder_scRMSD"]
     return int(all(pd.notna(out.get(c)) for c in key_cols))
 
 
@@ -183,7 +245,7 @@ def evaluate_one(
     device: str = "cuda:0",
     *,
     af3_result: af3_runner.AF3Result | None = None,
-    evaluator: str = "esmfold",
+    evaluator: str = LEGACY_ESMFOLD_EVALUATOR,
 ) -> dict:
     out: dict = _empty_row()
     out["evaluator"] = evaluator
@@ -290,6 +352,108 @@ def evaluate_one(
 
     except Exception as e:
         out["error_msg"] = f"{type(e).__name__}: {e}"
+        traceback.print_exc()
+    out["eval_n_successes"] = _compute_eval_n_successes(out)
+    return out
+
+
+def _score_as_percent(value) -> float:
+    """Normalize confidence scores to the legacy report's 0-100 pLDDT scale."""
+
+    score = float(value)
+    return score * 100.0 if score <= 1.0 else score
+
+
+def evaluate_one_esmfold2(
+    row: pd.Series,
+    out_root: Path,
+    backend,
+    *,
+    seed: int,
+) -> dict:
+    """Evaluate one manifest row with the current ProteoCraft full verifier."""
+
+    out: dict = _empty_row()
+    out["evaluator"] = DEFAULT_EVALUATOR
+    out["eval_n_calls"] = 1
+    out.update({
+        "method": row["method"],
+        "case": row["case"],
+        "paper_case": _row_get(row, "paper_case", row["case"]),
+        "design_id": row["design_id"],
+        "target_chain": row["target_chain"],
+        "binder_length": len(row["binder_seq"]),
+        "designed_complex_pdb_path": row["designed_complex_pdb_path"],
+        "n_generated_trajectories": row.get("n_generated_trajectories", -1),
+        "n_mpnn_attempted": row.get("n_mpnn_attempted", -1),
+        "n_accepted_by_method": row.get("n_accepted_by_method", -1),
+        "candidate_rank": row.get("candidate_rank", -1),
+        "source_filter_status": row.get("source_filter_status", "unknown"),
+        "verifier_calls": row.get("verifier_calls", -1),
+        "design_gpu_seconds": row.get("design_gpu_seconds", float("nan")),
+        "esmfold2_model": backend.config.verifier_model_name,
+        "esmfold2_num_loops": backend.config.verifier_num_loops,
+        "esmfold2_num_sampling_steps": backend.config.verifier_num_sampling_steps,
+        "esmfold2_seed": int(seed),
+        "esmfold2_loss_mode": backend.config.verifier_loss_mode,
+    })
+    design_dir = _design_dir_for_row(out_root, row)
+    try:
+        target_sequences = esmfold2_runner.parse_target_sequences(row["target_seq"])
+        target_chain_roles = esmfold2_runner.parse_target_chain_roles(
+            _row_get(row, "target_chain_roles", None),
+            len(target_sequences),
+        )
+        evaluation = esmfold2_runner.evaluate(
+            backend,
+            binder_seq=row["binder_seq"],
+            target_seq=target_sequences,
+            design_dir=design_dir,
+            seed=int(seed),
+            target_chain_roles=target_chain_roles,
+            hotspot_indices=_row_get(row, "target_hotspot_concat_indices", None),
+        )
+        result = evaluation.verifier_result
+        summary = result.summary_confidence
+        out.update({
+            "esmfold2_total_loss": float(result.total_loss),
+            "pair_chain_iptm": summary.get("pair_chain_iptm", float("nan")),
+            "iptm": summary.get("iptm", float("nan")),
+            "ptm": summary.get("ptm", float("nan")),
+            "esmfold2_plddt": summary.get("plddt", float("nan")),
+            "esmfold2_binder_plddt": summary.get("binder_plddt", float("nan")),
+            "esmfold2_binder_rg_excess": summary.get(
+                "binder_rg_excess", float("nan")
+            ),
+            "esmfold2_mmcif_path": evaluation.mmcif_path,
+            "target_chain_roles": "+".join(target_chain_roles),
+            "hotspot_mean_min_heavy_atom_distance": summary.get(
+                "hotspot_mean_min_heavy_atom_distance", float("nan")
+            ),
+            "hotspot_heavy_atom_coverage": summary.get(
+                "hotspot_heavy_atom_coverage", float("nan")
+            ),
+            "hotspot_heavy_atom_coverage_5a": summary.get(
+                "hotspot_heavy_atom_coverage_5a", float("nan")
+            ),
+            "eval_runtime_s": evaluation.runtime_s,
+            "esmfold_runtime_s": evaluation.runtime_s,
+        })
+        if pd.notna(out["esmfold2_plddt"]):
+            out["complex_pLDDT"] = _score_as_percent(out["esmfold2_plddt"])
+        if pd.notna(out["esmfold2_binder_plddt"]):
+            out["binder_pLDDT"] = _score_as_percent(
+                out["esmfold2_binder_plddt"]
+            )
+        radius = summary.get("binder_radius_gyration")
+        if radius is not None:
+            out["radius_of_gyration_binder"] = float(radius)
+        # Tier-1 remains a confidence diagnostic. Tier-2 stays false because the
+        # legacy ipAE/scRMSD contract is not emitted by the ESMFold2 verifier.
+        flags = compute_tier_flags(out, evaluator=DEFAULT_EVALUATOR)
+        out.update(flags)
+    except Exception as exc:
+        out["error_msg"] = f"{type(exc).__name__}: {exc}"
         traceback.print_exc()
     out["eval_n_successes"] = _compute_eval_n_successes(out)
     return out
@@ -416,6 +580,7 @@ def _build_failed_row(staged: dict, paper_case: str, sub_run: str, error: str) -
 
 
 def _run_esmfold_loop(df: pd.DataFrame, args, out_root: Path) -> None:
+    """Run the May 2026 HuggingFace ESMFold evaluator."""
     output_csv = (
         _resolve_output_csv(args, sub_run=args.sub_run)
         if args.paper_case
@@ -455,7 +620,77 @@ def _run_esmfold_loop(df: pd.DataFrame, args, out_root: Path) -> None:
             flush=True,
         )
         rows_out.append(
-            evaluate_one(row_dict, out_root, tok, mdl, args.device, evaluator="esmfold")
+            evaluate_one(
+                row_dict,
+                out_root,
+                tok,
+                mdl,
+                args.device,
+                evaluator=LEGACY_ESMFOLD_EVALUATOR,
+            )
+        )
+        _align_eval_csv_rows(rows_out).to_csv(output_csv, index=False)
+    print(f"wrote {output_csv}")
+
+
+def _run_esmfold2_loop(df: pd.DataFrame, args, out_root: Path) -> None:
+    output_csv = (
+        _resolve_output_csv(args, sub_run=args.sub_run)
+        if args.paper_case
+        else Path(args.out_dir) / "eval_long.csv"
+    )
+    if args.skip_existing:
+        before = len(df)
+        df = df[
+            df.apply(
+                lambda row: not (
+                    _design_dir_for_row(out_root, row) / "esmfold2.cif"
+                ).exists(),
+                axis=1,
+            )
+        ]
+        if len(df) < before:
+            print(f"skip_existing: {before - len(df)} designs already have esmfold2.cif")
+        if len(df) == 0:
+            if output_csv.exists():
+                print(f"all designs already evaluated; preserving existing {output_csv}")
+                return
+            raise SystemExit(
+                "all designs already have esmfold2.cif but no eval csv at "
+                f"{output_csv}; use --no-skip-existing to rebuild"
+            )
+
+    print(
+        "Loading ESMFold2 verifier on "
+        f"{args.device} ({args.esmfold2_num_loops}x"
+        f"{args.esmfold2_num_sampling_steps}, seed={args.esmfold2_seed})..."
+    )
+    backend = esmfold2_runner.build_backend(
+        device=args.device,
+        model_name=args.esmfold2_model,
+        num_loops=args.esmfold2_num_loops,
+        num_sampling_steps=args.esmfold2_num_sampling_steps,
+        loss_mode=args.esmfold2_loss_mode,
+    )
+    rows_out: list[dict] = (
+        _read_existing_eval_rows(output_csv)
+        if args.skip_existing and output_csv.exists()
+        else []
+    )
+    for index, row in df.iterrows():
+        row_dict = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+        print(
+            f"[{index + 1}/{len(df)}] "
+            f"{row_dict['method']}/{row_dict['case']}/{row_dict['design_id']}",
+            flush=True,
+        )
+        rows_out.append(
+            evaluate_one_esmfold2(
+                row_dict,
+                out_root,
+                backend,
+                seed=args.esmfold2_seed,
+            )
         )
         _align_eval_csv_rows(rows_out).to_csv(output_csv, index=False)
     print(f"wrote {output_csv}")
@@ -592,6 +827,11 @@ def _run_af3_for_one_sub_run(df: pd.DataFrame, args, out_root: Path) -> None:
 
 def main():
     args = _build_argparser().parse_args()
+    if args.evaluator == LEGACY_ESMFOLD_ALIAS:
+        print(
+            "WARNING: --evaluator esmfold is deprecated; "
+            f"use --evaluator {LEGACY_ESMFOLD_EVALUATOR}"
+        )
     out_root = Path(args.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -617,7 +857,9 @@ def main():
         print(f"manifest empty after filter; wrote header-only {output_csv}")
         return
 
-    if args.evaluator == "esmfold":
+    if args.evaluator == DEFAULT_EVALUATOR:
+        _run_esmfold2_loop(df, args, out_root)
+    elif args.evaluator in {LEGACY_ESMFOLD_EVALUATOR, LEGACY_ESMFOLD_ALIAS}:
         _run_esmfold_loop(df, args, out_root)
     else:
         _run_af3_for_one_sub_run(df, args, out_root)

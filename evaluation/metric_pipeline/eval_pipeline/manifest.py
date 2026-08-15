@@ -27,7 +27,12 @@ DENOMINATOR_COLS = [
     "verifier_calls",
     "design_gpu_seconds",
 ]
-OPTIONAL_COLS = ["binder_length", "notes"]
+OPTIONAL_COLS = [
+    "binder_length",
+    "target_chain_roles",
+    "target_hotspot_concat_indices",
+    "notes",
+]
 
 
 @dataclass
@@ -49,6 +54,8 @@ class ManifestRow:
     source_filter_status: str = "unknown"
     verifier_calls: int = -1
     design_gpu_seconds: float = float("nan")
+    target_chain_roles: str = ""
+    target_hotspot_concat_indices: str = ""
     notes: str = ""
 
     @property
