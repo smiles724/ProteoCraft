@@ -104,13 +104,75 @@ def test_framework_excludes_cdr1_and_cdr2():
     assert overlap_3 == 0.0
 
 
-def test_framework_plus_cdrs_covers_binder_exactly():
+def test_framework_plus_cdrs_covers_the_variable_domain():
+    """framework = FR1 u FR2 u FR3 u FR4, i.e. V domain minus all CDRs."""
+
     masks, annotation = _masks()
-    recombined = masks["framework"] + masks["cdr_all"]
-    assert torch.equal(recombined, masks["binder"])
     n_cdr = sum(end - start for start, end in annotation.spans())
     assert masks["cdr_all"].sum().item() == float(n_cdr)
     assert masks["binder"].sum().item() == float(len(A6_BETA_SEQ))
+    # V domain = framework + CDRs, and stops before the constant domain.
+    expected_v = float(annotation.v_domain_end - n_cdr)
+    assert masks["framework"].sum().item() == pytest.approx(expected_v)
+
+
+def test_constant_domain_is_not_framework():
+    """The constant domain sits far from pMHC and must not dilute the average."""
+
+    masks, annotation = _masks()
+    binder_start = sum(BETA_TARGET_LENGTHS)
+    constant = masks["framework"][binder_start + annotation.v_domain_end:]
+    assert constant.sum().item() == 0.0
+    assert annotation.v_domain_end == 113
+    assert A6_BETA_SEQ[annotation.v_domain_end:][:5] == "EDLKN"
+
+
+def test_alpha_v_domain_boundary():
+    annotation = resolve_annotation(A6_ALPHA_SEQ)
+    assert annotation.v_domain_end == 110
+    assert A6_ALPHA_SEQ[99:110] == "FGAGTQVVVTP"   # FR4
+    assert A6_ALPHA_SEQ[110:115] == "DIQNP"        # constant domain
+
+
+def test_partner_tcr_chain_framework_is_included():
+    """Spec 8 counts FR1-FR4 of alpha *and* beta."""
+
+    config = _config(
+        partner_tcr_chain_index=2,
+        partner_cdr1_span=A6_ALPHA.cdr1,
+        partner_cdr2_span=A6_ALPHA.cdr2,
+        partner_cdr3_span=A6_ALPHA.cdr3,
+        partner_v_domain_end=A6_ALPHA.v_domain_end,
+    )
+    masks, _ = _masks(config=config)
+    partner_start = BETA_TARGET_LENGTHS[0] + BETA_TARGET_LENGTHS[1]
+    partner_fr = masks["framework"][partner_start:partner_start + 200]
+    n_partner_cdr = sum(e - s for s, e in A6_ALPHA.spans())
+    assert partner_fr.sum().item() == pytest.approx(
+        float(A6_ALPHA.v_domain_end - n_partner_cdr)
+    )
+    # the partner's own CDRs are excluded too
+    for span in A6_ALPHA.spans():
+        assert partner_fr[span[0]:span[1]].sum().item() == 0.0
+
+
+def test_partner_chain_cannot_be_the_peptide_or_mhc():
+    annotation = resolve_annotation(A6_BETA_SEQ)
+    for bad in (0, 1):
+        with pytest.raises(ValueError, match="must not overlap"):
+            build_tcr_contact_masks(
+                binder_length=len(A6_BETA_SEQ),
+                target_chain_lengths=BETA_TARGET_LENGTHS,
+                annotation=annotation,
+                config=_config(partner_tcr_chain_index=bad),
+                device=torch.device("cpu"),
+            )
+
+
+def test_framework_never_touches_peptide_or_mhc_positions():
+    masks, _ = _masks(config=_config(partner_tcr_chain_index=2))
+    assert (masks["framework"] * masks["peptide"]).sum().item() == 0.0
+    assert (masks["framework"] * masks["mhc"]).sum().item() == 0.0
 
 
 def test_peptide_and_mhc_masks_are_the_right_chains():

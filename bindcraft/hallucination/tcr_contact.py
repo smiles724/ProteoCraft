@@ -52,6 +52,9 @@ class TCRChainAnnotation:
     cdr1_motif: str
     cdr2_motif: str
     cdr3_motif: str
+    # End of the variable domain (exclusive): FR4 ends here, the constant
+    # domain begins.  Framework contact is scored over the V domain only.
+    v_domain_end: int = 0
 
     def spans(self) -> tuple[tuple[int, int], ...]:
         return (self.cdr1, self.cdr2, self.cdr3)
@@ -84,6 +87,8 @@ A6_ALPHA = TCRChainAnnotation(
     cdr1_motif="DRGSQS",
     cdr2_motif="IYSNGD",
     cdr3_motif="AVTTDSWGKLQ",
+    # FR4 = FGAGTQVVVTP [99,110); constant domain starts at DIQNPDPAVY.
+    v_domain_end=110,
 )
 
 A6_BETA = TCRChainAnnotation(
@@ -96,6 +101,8 @@ A6_BETA = TCRChainAnnotation(
     cdr1_motif="MNHEY",
     cdr2_motif="SVGAGI",
     cdr3_motif="ASRPGLAGGRPEQY",
+    # FR4 = FGPGTRLTVT [103,113); constant domain starts at EDLKNVFPPE.
+    v_domain_end=113,
 )
 
 KNOWN_SCAFFOLDS: tuple[TCRChainAnnotation, ...] = (A6_ALPHA, A6_BETA)
@@ -126,6 +133,7 @@ def resolve_annotation(
     cdr3_span: Optional[tuple[int, int]] = None,
     cdr1_span: Optional[tuple[int, int]] = None,
     cdr2_span: Optional[tuple[int, int]] = None,
+    v_domain_end: Optional[int] = None,
     strict: bool = True,
 ) -> TCRChainAnnotation:
     """Resolve CDR spans for ``sequence``.
@@ -167,6 +175,7 @@ def resolve_annotation(
         cdr1_motif=sequence[cdr1_span[0] : cdr1_span[1]],
         cdr2_motif=sequence[cdr2_span[0] : cdr2_span[1]],
         cdr3_motif=sequence[cdr3_span[0] : cdr3_span[1]],
+        v_domain_end=int(v_domain_end or len(sequence)),
     )
 
 
@@ -186,7 +195,14 @@ class TCRContactConfig:
     # Weight of the framework hinge penalty inside L_contact.
     lambda_fw: float = 1.0
     # Framework penalty activates once framework contact nll drops below this.
-    fw_hinge: float = 6.0
+    # Calibrated as a guardrail, not a driver: on the A6 scaffold the natural
+    # framework-pMHC nll sits at ~8.0-8.8 in the proposal path and ~13.5-14.8
+    # in the verifier path (the full model and the fast experimental model put
+    # the distogram on different scales), so each threshold sits just below its
+    # own natural range and fires only on a genuine excursion toward the pMHC.
+    fw_hinge: float = 7.0
+    # Verifier-path threshold; falls back to fw_hinge when None.
+    fw_hinge_verifier: Optional[float] = None
     # Which non-binder chain is the 9-mer peptide, and which are MHC.
     peptide_chain_index: int = 0
     mhc_chain_indices: tuple[int, ...] = (1,)
@@ -205,7 +221,15 @@ class TCRContactConfig:
     cdr1_span: Optional[tuple[int, int]] = None
     cdr2_span: Optional[tuple[int, int]] = None
     cdr3_span: Optional[tuple[int, int]] = None
+    v_domain_end: Optional[int] = None
     strict_annotation: bool = True
+    # The partner TCR chain (the alpha when redesigning beta, and vice versa).
+    # Its FR1-FR4 also count as framework for the pMHC penalty.
+    partner_tcr_chain_index: Optional[int] = None
+    partner_cdr1_span: Optional[tuple[int, int]] = None
+    partner_cdr2_span: Optional[tuple[int, int]] = None
+    partner_cdr3_span: Optional[tuple[int, int]] = None
+    partner_v_domain_end: Optional[int] = None
 
     @classmethod
     def from_mapping(cls, raw: Optional[Mapping]) -> "TCRContactConfig":
@@ -216,7 +240,10 @@ class TCRContactConfig:
         for key in ("mhc_chain_indices",):
             if key in kwargs and kwargs[key] is not None:
                 kwargs[key] = tuple(int(v) for v in kwargs[key])
-        for key in ("cdr1_span", "cdr2_span", "cdr3_span"):
+        for key in (
+            "cdr1_span", "cdr2_span", "cdr3_span",
+            "partner_cdr1_span", "partner_cdr2_span", "partner_cdr3_span",
+        ):
             if kwargs.get(key) is not None:
                 kwargs[key] = tuple(int(v) for v in kwargs[key])
         return cls(**kwargs)
@@ -310,9 +337,44 @@ def build_tcr_contact_masks(
     cdr3_mask = _span_mask(annotation.cdr3)
     cdr_all_mask = torch.clamp(cdr1_mask + cdr2_mask + cdr3_mask, max=1.0)
 
-    # Framework = binder minus ALL CDRs.  CDR1/CDR2 are excluded on purpose:
-    # they contribute to MHC recognition in natural TCRs.
-    framework_mask = torch.clamp(binder_mask - cdr_all_mask, min=0.0)
+    # Framework = FR1 u FR2 u FR3 u FR4 of the *variable* domain only.
+    # Two exclusions matter:
+    #   - the constant domain is dropped; it sits far from the pMHC and would
+    #     dilute the per-residue average until the penalty never fires;
+    #   - CDR1/CDR2 are dropped; they contribute to MHC recognition in natural
+    #     TCRs and must not be penalised.
+    binder_v_mask = _zeros()
+    v_end = int(annotation.v_domain_end or binder_length)
+    binder_v_mask[binder_offset : binder_offset + min(v_end, int(binder_length))] = 1.0
+    framework_mask = torch.clamp(binder_v_mask - cdr_all_mask, min=0.0)
+
+    # The partner TCR chain is fixed, but its framework can still mediate an
+    # abnormal pMHC contact, so FR1-FR4 of both chains count (spec 8: alpha + beta).
+    partner_index = config.partner_tcr_chain_index
+    if partner_index is not None:
+        partner_index = int(partner_index)
+        if not (0 <= partner_index < n_chains):
+            raise ValueError(
+                f"partner_tcr_chain_index {partner_index} out of range for "
+                f"{n_chains} non-binder chains"
+            )
+        if partner_index == peptide_index or partner_index in mhc_indices:
+            raise ValueError(
+                "partner_tcr_chain_index must not overlap the peptide or MHC chains"
+            )
+        p_start = starts[partner_index]
+        p_len = chain_lengths[partner_index]
+        p_v_end = int(config.partner_v_domain_end or p_len)
+        partner_fr = _zeros()
+        partner_fr[p_start : p_start + min(p_v_end, p_len)] = 1.0
+        for span in (
+            config.partner_cdr1_span,
+            config.partner_cdr2_span,
+            config.partner_cdr3_span,
+        ):
+            if span:
+                partner_fr[p_start + int(span[0]) : p_start + int(span[1])] = 0.0
+        framework_mask = torch.clamp(framework_mask + partner_fr, max=1.0)
 
     if float(cdr3_mask.sum().item()) <= 0.0:
         raise ValueError("CDR3 mask is empty")
@@ -365,6 +427,7 @@ def tcr_contact_losses(
     masks: Mapping[str, torch.Tensor],
     *,
     config: TCRContactConfig,
+    verifier_path: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Compute the TCR contact objective and its diagnostics.
 
@@ -404,9 +467,12 @@ def tcr_contact_losses(
     # Bounded framework penalty: zero while the framework stays farther than
     # fw_hinge, rising to at most fw_hinge as it closes in.  Keeps the term in
     # [0, fw_hinge] instead of the unbounded -Contact form.
+    hinge = float(config.fw_hinge)
+    if verifier_path and config.fw_hinge_verifier is not None:
+        hinge = float(config.fw_hinge_verifier)
     framework_penalty = torch.relu(
         torch.as_tensor(
-            float(config.fw_hinge),
+            hinge,
             device=framework_pmhc_nll.device,
             dtype=framework_pmhc_nll.dtype,
         )
@@ -437,6 +503,11 @@ def tcr_contact_losses(
         "cdr3_peptide_contact_nll": cdr3_peptide_nll,
         "framework_pmhc_contact_nll": framework_pmhc_nll,
         "framework_penalty": framework_penalty,
+        "framework_hinge_used": torch.as_tensor(
+            hinge,
+            device=framework_pmhc_nll.device,
+            dtype=framework_pmhc_nll.dtype,
+        ).expand_as(framework_penalty),
         "cdr3_peptide_contact_mass": cdr3_peptide_mass,
         "tcr_pmhc_contact_mass": tcr_pmhc_mass,
         "r_pep": r_pep,
@@ -473,6 +544,7 @@ def annotation_from_config(
         cdr1_motif=placeholder[config.cdr1_span[0] : config.cdr1_span[1]],
         cdr2_motif=placeholder[config.cdr2_span[0] : config.cdr2_span[1]],
         cdr3_motif=placeholder[config.cdr3_span[0] : config.cdr3_span[1]],
+        v_domain_end=int(config.v_domain_end or binder_length),
     )
 
 
@@ -480,6 +552,7 @@ def resolve_contact_config_spans(
     raw: Optional[Mapping],
     *,
     scaffold_sequence: str,
+    partner_sequence: Optional[str] = None,
 ) -> Dict:
     """Fill CDR spans into a raw contact-config mapping from the scaffold.
 
@@ -500,10 +573,27 @@ def resolve_contact_config_spans(
         cdr2_span=(
             tuple(payload["cdr2_span"]) if payload.get("cdr2_span") else None
         ),
+        v_domain_end=payload.get("v_domain_end"),
         strict=bool(payload.get("strict_annotation", True)),
     )
     payload["cdr1_span"] = list(annotation.cdr1)
     payload["cdr2_span"] = list(annotation.cdr2)
     payload["cdr3_span"] = list(annotation.cdr3)
+    payload["v_domain_end"] = int(annotation.v_domain_end)
     payload["annotation_name"] = annotation.name
+
+    if partner_sequence is not None:
+        partner = lookup_annotation(partner_sequence)
+        if partner is None:
+            if bool(payload.get("strict_annotation", True)):
+                raise ValueError(
+                    "partner TCR chain is not a registered scaffold; register it "
+                    "in tcr_contact.KNOWN_SCAFFOLDS so its FR1-FR4 can be masked"
+                )
+        else:
+            payload["partner_cdr1_span"] = list(partner.cdr1)
+            payload["partner_cdr2_span"] = list(partner.cdr2)
+            payload["partner_cdr3_span"] = list(partner.cdr3)
+            payload["partner_v_domain_end"] = int(partner.v_domain_end)
+            payload["partner_annotation_name"] = partner.name
     return payload

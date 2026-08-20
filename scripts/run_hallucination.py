@@ -420,6 +420,7 @@ def build_tcr_contact_config(args) -> dict:
         "lambda_contact": args.tcr_contact_lambda,
         "lambda_fw": args.tcr_contact_lambda_fw,
         "fw_hinge": args.tcr_contact_fw_hinge,
+        "fw_hinge_verifier": args.tcr_contact_fw_hinge_verifier,
         "verifier_weight": args.tcr_contact_verifier_weight,
         "use_gradient": args.tcr_contact_use_gradient,
         "use_verifier": args.tcr_contact_use_verifier,
@@ -428,6 +429,9 @@ def build_tcr_contact_config(args) -> dict:
         "cdr3_cutoff": args.tcr_contact_cdr3_cutoff,
         "fw_cutoff": args.tcr_contact_fw_cutoff,
     }
+    partner_index = int(getattr(args, "tcr_contact_partner_tcr_chain_index", 2))
+    if partner_index >= 0:
+        payload["partner_tcr_chain_index"] = partner_index
     if not enabled:
         return payload
 
@@ -439,7 +443,16 @@ def build_tcr_contact_config(args) -> dict:
         )
     from bindcraft.hallucination.tcr_contact import resolve_contact_config_spans
 
-    return resolve_contact_config_spans(payload, scaffold_sequence=scaffold)
+    partner_sequence = None
+    if partner_index >= 0:
+        chains = [c for c in str(getattr(args, "target", "") or "").split("|") if c]
+        if partner_index < len(chains):
+            partner_sequence = chains[partner_index]
+    return resolve_contact_config_spans(
+        payload,
+        scaffold_sequence=scaffold,
+        partner_sequence=partner_sequence,
+    )
 
 
 def load_esmfold2_backend(
@@ -1200,8 +1213,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="提议路径接触梯度的归一化方向混合系数，与 lambda_esmc 同一约定（默认：0.1）")
     parser.add_argument("--tcr_contact_lambda_fw", type=float, default=1.0,
                        help="L_contact 内框架-pMHC 铰链惩罚的权重（默认：1.0）")
-    parser.add_argument("--tcr_contact_fw_hinge", type=float, default=6.0,
-                       help="框架惩罚铰链阈值：框架接触 nll 低于此值才开始惩罚（默认：6.0）")
+    parser.add_argument("--tcr_contact_fw_hinge", type=float, default=7.0,
+                       help="proposal 路径框架惩罚铰链阈值：框架接触 nll 低于此值才惩罚。"
+                            "A6 scaffold 自然值约 8.0-8.8，因此 7.0 只在真正异常靠近时触发（默认：7.0）")
+    parser.add_argument("--tcr_contact_fw_hinge_verifier", type=float, default=12.5,
+                       help="verifier 路径的铰链阈值；full ESMFold2 与 fast experimental model 的 "
+                            "distogram 尺度不同，自然值约 13.5-14.8（默认：12.5）")
     parser.add_argument("--tcr_contact_verifier_weight", type=float, default=1.0,
                        help="verifier/MCTS 路径的硬接触损失权重（默认：1.0）")
     parser.add_argument("--tcr_contact_use_gradient", type=lambda x: x.lower() == "true", default=True,
@@ -1216,6 +1233,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="CDR3-肽接触距离阈值，单位 Å（默认：8.0）")
     parser.add_argument("--tcr_contact_fw_cutoff", type=float, default=8.0,
                        help="框架-pMHC 接触距离阈值，单位 Å（默认：8.0）")
+    parser.add_argument("--tcr_contact_partner_tcr_chain_index", type=int, default=2,
+                       help="配对 TCR 链（设计 beta 时的 alpha，反之亦然）的链索引；其 FR1-FR4 同样计入 "
+                            "framework 惩罚。设为 -1 表示只用 binder 自身的 framework（默认：2）")
 
     # === 损失函数权重（key 必须与 DEFAULT_LOSS_WEIGHTS 一致） ===
     parser.add_argument("--loss_preset", type=str, default="tuned",

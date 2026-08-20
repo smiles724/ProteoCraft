@@ -957,6 +957,7 @@ class ESMFold2RuntimeBackend:
         *,
         binder_length: int,
         target_chain_lengths: Sequence[int],
+        verifier_path: bool = False,
     ) -> Optional[Dict[str, torch.Tensor]]:
         """TCR contact objective for one folded complex, or None if disabled."""
 
@@ -974,6 +975,7 @@ class ESMFold2RuntimeBackend:
             distogram_logits,
             masks,
             config=self._tcr_contact_config,
+            verifier_path=verifier_path,
         )
 
     def compute_tcr_prior_soft_loss(
@@ -1295,6 +1297,7 @@ class ESMFold2RuntimeBackend:
                         target_chain_lengths=[
                             len(sequence) for sequence in targets
                         ],
+                        verifier_path=True,
                     )
                 if _terms is not None:
                     tcr_contact_terms = {
