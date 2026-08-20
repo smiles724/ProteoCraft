@@ -24,6 +24,8 @@ BindCraft v2 解决了 AlphaFold 3 / Protenix 与朴素梯度序列优化之间�
 
 ## 快速开始
 
+当前推荐的 ESMFold2 流程使用统一的 `esmfold2_d` profile，支持 de novo binder、TCR binder、TCR CDR redesign 和 IMGT all-CDR VHH redesign。四种模式的默认配置与可运行命令见 **[ESMFold2 运行指南](docs/ESMFold2_QUICK_START.md)**。
+
 ### 安装
 
 ```bash

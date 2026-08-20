@@ -325,6 +325,9 @@ def test_combine_normalized_gradients_respects_mask_and_task_lambda():
     assert resolve_lambda_esmc("auto", task_type="cdr") < resolve_lambda_esmc(
         "auto", task_type="denovo"
     )
+    assert resolve_lambda_esmc("auto", task_type="vhh_redesign") == pytest.approx(
+        0.05
+    )
 
 
 def test_normalized_gradient_tensor_matches_official_eff_length_scaling():

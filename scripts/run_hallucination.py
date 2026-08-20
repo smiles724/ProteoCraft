@@ -711,7 +711,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--esmfold2_lambda_esmc", type=str, default="auto",
                        help="ESMC sequence prior 权重；auto 按任务类型选择，或传入数值字符串")
     parser.add_argument("--esmfold2_task_type", type=str, default="denovo",
-                       choices=["denovo", "de_novo", "minibinder", "binder", "tcr", "cdr", "cdr_redesign", "antibody", "antibody_like"],
+                       choices=["denovo", "de_novo", "minibinder", "binder", "tcr", "cdr", "cdr_redesign", "vhh_redesign", "antibody", "antibody_like"],
                        help="ESMFold2/ESMC 任务类型；用于解析 lambda_ESMC=auto（默认：denovo）")
     parser.add_argument("--esmfold2_logit_init_mode", type=str, default="official_exact",
                        choices=["official_free", "official_exact", "legacy_anchor"],

@@ -47,6 +47,7 @@ AUTO_ESMC_LAMBDA_BY_TASK = {
     "tcr": 0.05,
     "cdr": 0.05,
     "cdr_redesign": 0.05,
+    "vhh_redesign": 0.05,
     "antibody": 0.05,
     "antibody_like": 0.05,
 }

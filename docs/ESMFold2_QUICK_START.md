@@ -1,12 +1,12 @@
 # ProteoCraft ESMFold2 运行指南
 
-本文档说明当前推荐的 ESMFold2 默认配置，以及 De novo binder design、TCR binder design 和 TCR CDR redesign 三种任务的启动方式。以下命令均需在仓库根目录执行。
+本文档说明当前推荐的 ESMFold2 默认配置，以及 De novo binder design、TCR binder design、TCR CDR redesign 和 VHH all-CDR redesign 四种任务的启动方式。以下命令均需在仓库根目录执行。
 
 运行前需要激活能够加载 `biohub/ESMFold2`、`biohub/ESMFold2-Experimental-Fast` 和 ESMC 的项目环境，并确保 CUDA GPU 与对应模型文件可用。
 
 ## 1. 默认配置
 
-三种任务共用启动 profile：
+四种任务共用启动 profile：
 
 ```text
 configs/proteocraft_profiles/esmfold2_d.yaml
@@ -113,7 +113,42 @@ python benchmark/script/run_esmfold2_cdr_redesign.py \
 该 YAML 已直接引用仓库内
 `benchmark/datasets/proteocraft_59_v1/cdr/` 的 4 个 benchmark case，无需另行准备输入。当前 ESMFold2 主流程是 sequence-only；template path 只记录数据来源并用于后续评价，不作为模型输入。
 
-## 5. 输入和输出
+## 5. VHH All-CDR Redesign
+
+该模式保留已有 VHH 的 framework sequence，只允许 IMGT 定义的 CDR1、CDR2 和 CDR3 位点发生替换。IMGT 是抗体/VHH 可变区的标准编号体系；适配器使用其编号结果定位三段 CDR，再将对应的 VHH sequence indices 转成 mutable mask。IMGT 编号不参与模型损失计算。
+
+使用 7EOW Chain B scaffold 模板启动：
+
+```bash
+cp benchmark/yaml/vhh/esmfold2_vhh_redesign_7eow_template.yaml \
+  /path/to/vhh_case.yaml
+# 编辑 vhh_case.yaml，填入 target sequence 和可选 hotspot。
+
+python benchmark/script/run_esmfold2_vhh_redesign.py \
+  --config /path/to/vhh_case.yaml \
+  --device cuda:0
+```
+
+该 runner 只提供一个正式 VHH 模式：`vhh_redesign` + IMGT all-CDR mask。它会校验 CDR1/2/3 均存在、三段位置不重叠、位置位于 VHH sequence 范围内，并在运行结束后检查所有 framework residues 是否保持不变。当前默认仍使用 50% mutation fraction，不为 VHH 修改 Stage A/B 或候选生成逻辑。
+
+当前实现是 sequence-only：7EOW 等参考结构只记录 scaffold 与编号来源，不输入 ESMFold2；模型会重新预测完整 target--VHH complex。因此固定的是 framework amino-acid sequence，而不是 framework coordinates。`official_exact` 初始化会在 CDR mutable positions 上生成多组随机初始 logits；若要量化设计相对 native VHH 的增益，应另外使用相同 verifier 对原始 VHH sequence 打分。
+
+也可以绕过 YAML 直接调用 `scripts/run_hallucination.py`，但此时需自行提供与 VHH 等长且覆盖全部三段 CDR 的 `--esmfold2_mutable_mask`：
+
+```bash
+python scripts/run_hallucination.py \
+  --profile esmfold2_d \
+  --esmfold2_task_type vhh_redesign \
+  --target "$TARGET_SEQ" \
+  --esmfold2_target_chain_roles target \
+  --binder_length "${#VHH_SEQ}" \
+  --init_binder_seq "$VHH_SEQ" \
+  --esmfold2_mutable_mask "$IMGT_ALL_CDR_MASK" \
+  --output_dir outputs/esmfold2_vhh_redesign \
+  --device cuda:0
+```
+
+## 6. 输入和输出
 
 - `--target` 只接受单字母氨基酸序列；多条 chain 使用 `|` 分隔。
 - `--esmfold2_target_chain_roles` 的数量必须与 `--target` 中的 chain 数一致，可取 `target` 或 `scaffold`。
@@ -135,7 +170,7 @@ python benchmark/script/run_esmfold2_cdr_redesign.py \
 python scripts/run_hallucination.py --help
 ```
 
-## 6. 完整 59-case Benchmark
+## 7. 完整 59-case Benchmark
 
 仓库内置的可移植 benchmark 包含 14 个 de novo、41 个 TCR binder design
 和 4 个 TCR CDR redesign case：

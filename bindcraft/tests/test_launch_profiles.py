@@ -145,6 +145,7 @@ def test_tcr_explicit_verifier_precision_overrides_task_defaults():
         ("denovo", (4, 50)),
         ("tcr", (4, 50)),
         ("cdr_redesign", (4, 50)),
+        ("vhh_redesign", (4, 50)),
     ),
 )
 def test_esmfold2_profile_covers_all_formal_task_modes(

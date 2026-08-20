@@ -24,9 +24,9 @@ On top of the 1st-order gradient, BindCraft v2 adds a **0th-order verification l
 
 ## Quick Start
 
-### ESMFold2 Three-Mode Workflow
+### ESMFold2 Four-Mode Workflow
 
-The current recommended ESMFold2 workflow supports de novo binder design, TCR binder design, and TCR CDR redesign through the shared `esmfold2_d` launch profile. See the Chinese **[ESMFold2 quick-start guide](docs/ESMFold2_QUICK_START.md)** for the default configuration and runnable examples for all three task modes. The portable **[59-case benchmark](benchmark/datasets/proteocraft_59_v1/README.md)** contains all 14 de novo, 41 TCR binder-design, and 4 CDR-redesign run definitions.
+The current recommended ESMFold2 workflow supports de novo binder design, TCR binder design, TCR CDR redesign, and IMGT all-CDR VHH redesign through the shared `esmfold2_d` launch profile. See the Chinese **[ESMFold2 quick-start guide](docs/ESMFold2_QUICK_START.md)** for the default configuration and runnable examples for all four task modes. The portable **[59-case benchmark](benchmark/datasets/proteocraft_59_v1/README.md)** remains the fixed 14 de novo + 41 TCR binder-design + 4 CDR-redesign benchmark; VHH cases are launched separately.
 
 ### Installation
 
