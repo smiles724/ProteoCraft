@@ -22,6 +22,11 @@ NUMERIC_COLS = [
     "eval_n_calls", "eval_n_successes", "eval_runtime_s",
     "af3_ranking_score", "af3_iptm", "af3_ptm_native",
     "af3_has_clash", "af3_fraction_disordered",
+    "pair_chain_iptm", "iptm", "esmfold2_total_loss",
+    "esmfold2_plddt", "esmfold2_binder_plddt", "esmfold2_binder_rg_excess",
+    "esmfold2_num_loops", "esmfold2_num_sampling_steps", "esmfold2_seed",
+    "hotspot_mean_min_heavy_atom_distance", "hotspot_heavy_atom_coverage",
+    "hotspot_heavy_atom_coverage_5a",
 ]
 BOOL_COLS = [
     "tier1_pass", "tier2_pass",
@@ -75,6 +80,26 @@ def aggregate_per_case(df: pd.DataFrame) -> pd.DataFrame:
             "tier2_pass_rate_over_generated": (n_t2 / n_gen) if n_gen > 0 else float("nan"),
             "best_binder_pLDDT": float(g["binder_pLDDT"].max()) if g["binder_pLDDT"].notna().any() else float("nan"),
             "best_complex_pLDDT": float(g["complex_pLDDT"].max()) if g["complex_pLDDT"].notna().any() else float("nan"),
+            "best_pair_chain_iptm": (
+                float(g["pair_chain_iptm"].max())
+                if "pair_chain_iptm" in g and g["pair_chain_iptm"].notna().any()
+                else float("nan")
+            ),
+            "best_iptm": (
+                float(g["iptm"].max())
+                if "iptm" in g and g["iptm"].notna().any()
+                else float("nan")
+            ),
+            "best_ptm": (
+                float(g["ptm"].max())
+                if "ptm" in g and g["ptm"].notna().any()
+                else float("nan")
+            ),
+            "best_esmfold2_loss": (
+                float(g["esmfold2_total_loss"].min())
+                if "esmfold2_total_loss" in g and g["esmfold2_total_loss"].notna().any()
+                else float("nan")
+            ),
             "best_ipAE_min": float(g["ipAE"].min()) if g["ipAE"].notna().any() else float("nan"),
             "best_binder_scRMSD": float(g["binder_scRMSD"].min()) if g["binder_scRMSD"].notna().any() else float("nan"),
             "mean_esmfold_runtime_s": float(g["esmfold_runtime_s"].mean()) if g["esmfold_runtime_s"].notna().any() else float("nan"),
@@ -106,11 +131,16 @@ def compute_bio_summary(df: pd.DataFrame) -> dict:
 
 
 def get_top_designs(df: pd.DataFrame, k: int = 5) -> pd.DataFrame:
-    """Top-K designs ranked by binder_pLDDT (the most informative single metric)."""
-    cols = ["case", "design_id", "binder_pLDDT", "complex_pLDDT",
-            "ipAE", "binder_scRMSD", "n_contacts_5A", "inter_chain_clash_count"]
+    """Top-K designs using the evaluator's primary available confidence metric."""
+    cols = ["case", "design_id", "pair_chain_iptm", "iptm", "ptm",
+            "binder_pLDDT", "complex_pLDDT", "ipAE", "binder_scRMSD",
+            "n_contacts_5A", "inter_chain_clash_count"]
     cols = [c for c in cols if c in df.columns]
-    sub = df.dropna(subset=["binder_pLDDT"]).nlargest(k, "binder_pLDDT")[cols]
+    if "pair_chain_iptm" in df.columns and df["pair_chain_iptm"].notna().any():
+        rank_col = "pair_chain_iptm"
+    else:
+        rank_col = "binder_pLDDT"
+    sub = df.dropna(subset=[rank_col]).nlargest(k, rank_col)[cols]
     return sub.reset_index(drop=True)
 
 
@@ -118,7 +148,7 @@ def normalize_eval_schema(df: pd.DataFrame, source_path: Path | None = None) -> 
     """Normalize legacy and per-sub-run eval CSV schema for paper_case aggregation."""
     df = df.copy()
     if "evaluator" not in df.columns:
-        df["evaluator"] = "esmfold"
+        df["evaluator"] = "esmfold_202605"
     if "case" not in df.columns:
         df["case"] = "unknown"
     if "paper_case" not in df.columns:
@@ -492,10 +522,10 @@ def main():
     ap.add_argument(
         "--evaluators",
         nargs="+",
-        default=["esmfold", "af3"],
+        default=["esmfold2", "af3"],
         help=(
             "evaluators expected during roster fill (default assumes BCv2 "
-            "esmfold+af3 protocol; pass explicit list for other evaluators)"
+            "esmfold2+af3 protocol; pass explicit list for other evaluators)"
         ),
     )
     ap.add_argument("--run-id", default="report")

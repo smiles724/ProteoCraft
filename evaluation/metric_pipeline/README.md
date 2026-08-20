@@ -1,9 +1,10 @@
-# BCv2 AF3/ESMFold Evaluator
+# BCv2 ESMFold2/AF3 Evaluator
 
 BCv2  evaluation 代码目标：
 
 - 将 method 产出的 binder design 统一整理成 manifest。
-- 用 ESMFold 和 AlphaFold 3 两条 evaluator lane 评估 designs。
+- 用当前 ProteoCraft ESMFold2 full verifier 和 AlphaFold 3 评估 designs。
+- 保留 2026 年 5 月加入的 HuggingFace ESMFold evaluator 以复现旧结果。
 - 汇总每个 paper case 的成功率、调用次数、运行时间和报告图表。
 - 生成后续主实验表格需要的 `table2.csv` 和 `table2.md`。
 
@@ -13,7 +14,7 @@ BCv2  evaluation 代码目标：
 flowchart TD
     A[method outputs / raw sub-run manifests] --> B[selected paper-case manifests]
     B --> C[target MSA cache for AF3]
-    B --> D[ESMFold evaluator lane]
+    B --> D[ESMFold2 evaluator lane]
     C --> E[AF3 evaluator lane]
     D --> F[per-sub-run eval CSVs]
     E --> F
@@ -27,7 +28,7 @@ flowchart TD
 1. 从 method 输出构建 raw manifest。
 2. 将 sub-run 合并/筛选成每个 paper case 一份 selected manifest。
 3. 准备 AF3 target-only MSA cache。
-4. 对每个 selected sub-run 跑 ESMFold evaluator。
+4. 对每个 selected sub-run 跑 ESMFold2 evaluator。
 5. 对每个 selected sub-run 跑 AF3 evaluator。
 6. 运行 report 命令，生成 aggregate CSV、markdown report、Table 2 和图表。
 
@@ -42,9 +43,10 @@ flowchart TD
 │   ├── bcv2_case_roster.json     # 预期 paper-case 列表，用于补 no-design stubs
 │   └── target_templates.py       # 统一 target template 元数据
 ├── eval_pipeline/
-│   ├── cli.py                    # evaluator 主入口，支持 esmfold / af3
+│   ├── cli.py                    # evaluator 主入口，默认 esmfold2
 │   ├── af3_runner.py             # AF3 input JSON、subprocess 调用、输出解析
-│   ├── esmfold_runner.py         # ESMFold inference wrapper
+│   ├── esmfold2_runner.py        # 当前 ProteoCraft full-verifier adapter
+│   ├── esmfold_runner.py         # 2026-05 legacy ESMFold wrapper
 │   ├── manifest.py               # manifest schema 加载和校验
 │   ├── metrics.py                # 结构指标和 confidence metrics
 │   ├── report.py                 # 聚合、报告、Table 2、图表
@@ -74,7 +76,9 @@ bash env_setup.sh
 conda activate esmfold-eval
 ```
 
-Python 依赖见 `requirements.txt`。其中比较关键的是：
+Python 依赖见 `requirements.txt`。运行默认 `esmfold2` lane 时，应使用能够
+加载 `biohub/ESMFold2` 的 ProteoCraft 主环境；独立的 `esmfold-eval` 环境仅
+用于复现 `esmfold_202605`。其中比较关键的是：
 
 - `biopython`
 - `numpy`
@@ -123,6 +127,8 @@ python -m adapters.bcv1_adapter \
 | `paper_case`                | paper-level case，例如 `DerF21`                                |
 | `design_id`                 | design 唯一 ID，应该和 PDB 文件 stem 一致                        |
 | `target_seq`                | target 序列；多链 target 用 `:` 分隔                           |
+| `target_chain_roles`        | 可选；按链填写 `target`/`scaffold`，CDR 任务用于排除 scaffold |
+| `target_hotspot_concat_indices` | 可选；拼接 target 序列上的零基 hotspot indices             |
 | `binder_seq`                | binder 序列                                                      |
 | `designed_complex_pdb_path` | complex PDB 路径，需包含 target 和 binder chains                 |
 | `target_chain_in_complex`   | reference complex 里的 target chain IDs，多链写成 `D+E`        |
@@ -203,9 +209,10 @@ work/per_paper_case_msa/<paper_case>/target_chain_<id>.a3m
 
 完整 cache 在 rerun 时会自动跳过。这里 target-chain 顺序有语义，脚本会按顺序检查一致性。
 
-### Step 4: 运行 ESMFold lane
+### Step 4: 运行默认 ESMFold2 lane
 
-如果 report 中请求 `esmfold af3` 两个 evaluators，那么最终报告预期两条 lane 都存在：
+默认评价器直接复用 ProteoCraft 搜索所使用的 full verifier，默认配置为
+`biohub/ESMFold2`、`20 × 200`、seed 43 和 `aligned_common` loss：
 
 ```bash
 for paper_case in PD1 PDL1 IFNAR2 BetV1 DerF7 DerF21 HER2 SpCas9 \
@@ -215,7 +222,7 @@ for paper_case in PD1 PDL1 IFNAR2 BetV1 DerF7 DerF21 HER2 SpCas9 \
     python -m eval_pipeline.cli \
       --manifest "$selected" \
       --out-dir work/ \
-      --evaluator esmfold \
+      --evaluator esmfold2 \
       --paper-case "$paper_case" \
       --sub-run "$sub_run"
   done
@@ -225,8 +232,11 @@ done
 输出：
 
 ```text
-work/eval/<paper_case>__<sub_run>__esmfold.csv
+work/eval/<paper_case>__<sub_run>__esmfold2.csv
 ```
+
+复现旧评估时显式使用 `--evaluator esmfold_202605`。`--evaluator esmfold`
+仍作为兼容别名保留，但会输出弃用提示。
 
 ### Step 5: 运行 AF3 lane
 
@@ -283,7 +293,7 @@ awk -F, 'NR>1 {print $2}' work/manifests/DerF21.selected.manifest.csv | sort -u
 python -m eval_pipeline.report \
   --auto-discover \
   --case-roster configs/bcv2_case_roster.json \
-  --evaluators esmfold af3 \
+  --evaluators esmfold2 af3 \
   --out-dir work/ \
   --run-id bcv2_table2
 ```
@@ -294,23 +304,24 @@ python -m eval_pipeline.report \
 
 | Path                                               | 用途                                                          |
 | -------------------------------------------------- | ------------------------------------------------------------- |
-| `work/eval/<paper_case>__<sub_run>__esmfold.csv` | 单个 sub-run 的 per-design ESMFold metrics                    |
+| `work/eval/<paper_case>__<sub_run>__esmfold2.csv` | 当前 ESMFold2 full-verifier metrics                         |
+| `work/eval/<paper_case>__<sub_run>__esmfold_202605.csv` | 旧 ESMFold evaluator metrics                        |
 | `work/eval/<paper_case>__<sub_run>__af3.csv`     | 单个 sub-run 的 per-design AF3 metrics                        |
 | `work/eval_per_paper_case_aggregate.csv`         | 按 evaluator、method、paper case 聚合的主结果表               |
 | `work/table2.csv`                                | wide format Table 2 CSV，列名形如 `method_evaluator_metric` |
 | `work/table2.md`                                 | Markdown 版 Table 2                                           |
-| `work/report_esmfold.md`                         | ESMFold lane 报告                                             |
+| `work/report_esmfold2.md`                        | 当前 ESMFold2 lane 报告                                      |
 | `work/report_af3.md`                             | AF3 lane 报告；如果有 AF3 native metrics，会单独汇总          |
-| `work/bar_chart_esmfold.png`                     | ESMFold 各 paper case pass-rate 图                            |
+| `work/bar_chart_esmfold2.png`                    | ESMFold2 各 paper case pass-rate 图                           |
 | `work/bar_chart_af3.png`                         | AF3 各 paper case pass-rate 图                                |
 
-使用 `configs/bcv2_case_roster.json` 和 `--evaluators esmfold af3` 时，aggregate 预期有 26 行：13 个 paper cases 乘以 2 个 evaluators。没有 accepted designs 的 case 会以 `_NO_DESIGNS` stub 表示，calls 和 successes 为 0；图里会标成 `no designs`，不会当成真实 0% pass rate。
+使用 `configs/bcv2_case_roster.json` 和 `--evaluators esmfold2 af3` 时，aggregate 预期有 26 行：13 个 paper cases 乘以 2 个 evaluators。没有 accepted designs 的 case 会以 `_NO_DESIGNS` stub 表示，calls 和 successes 为 0；图里会标成 `no designs`，不会当成真实 0% pass rate。
 
 `eval_per_paper_case_aggregate.csv` 中几个关键列：
 
 | Column                   | 含义                                                             |
 | ------------------------ | ---------------------------------------------------------------- |
-| `evaluator`            | `esmfold` 或 `af3`                                           |
+| `evaluator`            | `esmfold2`、`esmfold_202605` 或 `af3`                       |
 | `method`               | method 名称                                                      |
 | `paper_case`           | paper-level case                                                 |
 | `n_designs_evaluated`  | 实际被 evaluator 评估的 designs 数                               |

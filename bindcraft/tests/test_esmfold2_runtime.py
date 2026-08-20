@@ -13,20 +13,88 @@ from bindcraft.hallucination.esmfold2_backend import (
 )
 from bindcraft.hallucination.esmfold2_runtime import (
     ESMFold2RuntimeBackend,
+    _hotspot_structure_metrics,
+    _mean_target_to_binder_pair_iptm,
+    _scheduled_one_step_soft_steps,
+    _structure_losses,
     _stageb_structure_loss,
+    _validate_decoded_coordinate_layout,
 )
 import bindcraft.hallucination.esmfold2_runtime as esmfold2_runtime_module
 
 
+def test_scheduled_one_step_soft_steps_include_interval_and_final_step():
+    assert _scheduled_one_step_soft_steps(soft_steps=30, interval=0) == ()
+    assert _scheduled_one_step_soft_steps(
+        soft_steps=30,
+        interval=5,
+    ) == (5, 10, 15, 20, 25, 30)
+    assert _scheduled_one_step_soft_steps(
+        soft_steps=30,
+        interval=7,
+    ) == (7, 14, 21, 28, 30)
+
+
 class FakeComplex:
+    def __init__(self):
+        self.atom37_positions = torch.zeros(7, 37, 3)
+        self.atom37_mask = torch.zeros(7, 37, dtype=torch.bool)
+        for residue_index, x_coord in enumerate([0.0, 1.0, 2.0, 3.0, 0.0, 4.0, 8.0]):
+            self.atom37_positions[residue_index, 1] = torch.tensor([x_coord, 0.0, 0.0])
+            self.atom37_mask[residue_index, 1] = True
+
     def to_mmcif_string(self):
         return "data_fake\n"
+
+
+class FakeModernComplex(FakeComplex):
+    def to_mmcif(self):
+        return "data_modern\n"
+
+
+class FakeGeometryComplex(FakeComplex):
+    def __init__(self):
+        self.chain_boundaries = [(0, 4), (5, 8)]
+        self.atom37_positions = torch.zeros(8, 37, 3)
+        self.atom37_mask = torch.zeros(8, 37, dtype=torch.bool)
+        target_coordinates = [0.0, 10.0, 24.0, 30.0]
+        for residue_index, x_coord in enumerate(target_coordinates):
+            self.atom37_positions[residue_index, 0] = torch.tensor(
+                [x_coord, 0.0, 0.0]
+            )
+            self.atom37_mask[residue_index, 0] = True
+        for residue_index in range(5, 8):
+            self.atom37_positions[residue_index, 0] = torch.tensor(
+                [4.0, 0.0, 0.0]
+            )
+            self.atom37_mask[residue_index, 0] = True
+
+
+class FakeMolecularComplex(FakeComplex):
+    def __init__(self):
+        self.sequence = ["ALA"] * 7
+        self.chain_id = torch.tensor([0, 0, 0, 0, 1, 1, 1])
+        self.atom_positions = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0],
+                [24.0, 0.0, 0.0],
+                [30.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+            ]
+        )
+        self.atom_elements = ["C"] * 7
+        self.token_to_atoms = torch.tensor(
+            [[index, index + 1] for index in range(7)]
+        )
 
 
 class FakeFoldResult:
     def __init__(self):
         self.complex = FakeComplex()
-        self.plddt = torch.tensor([0.8, 0.9])
+        self.plddt = torch.tensor([0.8875, 0.8875, 0.8875, 0.8875, 0.7, 0.8, 0.9])
         self.ptm = 0.72
         self.iptm = 0.61
         self.pair_chains_iptm = torch.tensor(
@@ -35,6 +103,24 @@ class FakeFoldResult:
                 [0.41, 1.0],
             ]
         )
+
+
+class FakeModernFoldResult(FakeFoldResult):
+    def __init__(self):
+        super().__init__()
+        self.complex = FakeModernComplex()
+
+
+class FakeGeometryFoldResult(FakeFoldResult):
+    def __init__(self):
+        super().__init__()
+        self.complex = FakeGeometryComplex()
+
+
+class FakeMolecularFoldResult(FakeFoldResult):
+    def __init__(self):
+        super().__init__()
+        self.complex = FakeMolecularComplex()
 
 
 class FakeFoldResultBatchedPairIptm(FakeFoldResult):
@@ -50,6 +136,97 @@ class FakeFoldResultBatchedPairIptm(FakeFoldResult):
         )
 
 
+def test_validate_decoded_coordinate_layout_uses_valid_atoms_not_padding():
+    coordinate = torch.zeros(1, 3, 3)
+    atom_mask = torch.tensor([[True, True, False, True, False]])
+
+    assert (
+        _validate_decoded_coordinate_layout(coordinate, atom_mask)
+        is coordinate
+    )
+
+
+def test_validate_decoded_coordinate_layout_rejects_padded_coordinates():
+    coordinate = torch.zeros(1, 5, 3)
+    atom_mask = torch.tensor([[True, True, False, True, False]])
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"decoded=5, expected_valid=3",
+    ):
+        _validate_decoded_coordinate_layout(coordinate, atom_mask)
+
+
+def test_role_aware_pair_chain_iptm_excludes_scaffold_chain():
+    pair_chains_iptm = torch.tensor(
+        [
+            [1.0, 0.2, 0.8],
+            [0.2, 1.0, 0.1],
+            [0.8, 0.1, 1.0],
+        ]
+    )
+
+    target_score = _mean_target_to_binder_pair_iptm(
+        pair_chains_iptm,
+        n_target_chains=2,
+        target_chain_roles=("target", "scaffold"),
+    )
+    scaffold_score = _mean_target_to_binder_pair_iptm(
+        pair_chains_iptm,
+        n_target_chains=2,
+        target_chain_roles=("target", "scaffold"),
+        selected_role="scaffold",
+    )
+
+    assert target_score == pytest.approx(0.8)
+    assert scaffold_score == pytest.approx(0.1)
+
+
+def test_cdr_structure_loss_uses_true_target_and_mutable_cdr_only(monkeypatch):
+    captured_masks = []
+
+    def fake_contact_loss(
+        distogram_logits,
+        bin_distance,
+        *,
+        chain_mask,
+        binder_mask,
+        **kwargs,
+    ):
+        captured_masks.append(
+            (
+                chain_mask.detach().cpu().tolist(),
+                binder_mask.detach().cpu().tolist(),
+            )
+        )
+        return torch.tensor([0.1], dtype=distogram_logits.dtype)
+
+    monkeypatch.setattr(
+        esmfold2_runtime_module,
+        "_contact_loss",
+        fake_contact_loss,
+    )
+    _structure_losses(
+        torch.zeros(1, 7, 7, 128),
+        binder_length=3,
+        target_chain_lengths=(2, 2),
+        target_chain_roles=("target", "scaffold"),
+        binder_mutable_mask=(False, True, False),
+    )
+
+    inter_chain_mask, inter_binder_mask = captured_masks[1]
+    assert inter_chain_mask == [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    assert inter_binder_mask == [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+
+
+def test_structure_losses_support_full_verifier_64_bin_distogram():
+    losses = _structure_losses(
+        torch.zeros(1, 7, 7, 64),
+        binder_length=3,
+    )
+    assert torch.isfinite(losses["total_loss"]).all()
+
+
 class FakeInputBuilder:
     def __init__(self):
         self.calls = []
@@ -59,10 +236,28 @@ class FakeInputBuilder:
         return FakeFoldResult()
 
 
+class FakeModernInputBuilder(FakeInputBuilder):
+    def fold(self, model, input_spec, **kwargs):
+        self.calls.append((model, input_spec, kwargs))
+        return FakeModernFoldResult()
+
+
 class FakeBatchedPairInputBuilder(FakeInputBuilder):
     def fold(self, model, input_spec, **kwargs):
         self.calls.append((model, input_spec, kwargs))
         return FakeFoldResultBatchedPairIptm()
+
+
+class FakeGeometryInputBuilder(FakeInputBuilder):
+    def fold(self, model, input_spec, **kwargs):
+        self.calls.append((model, input_spec, kwargs))
+        return FakeGeometryFoldResult()
+
+
+class FakeMolecularInputBuilder(FakeInputBuilder):
+    def fold(self, model, input_spec, **kwargs):
+        self.calls.append((model, input_spec, kwargs))
+        return FakeMolecularFoldResult()
 
 
 class FakeProteinInput:
@@ -95,6 +290,9 @@ def test_runtime_verifier_extracts_pair_chain_metrics_and_mmcif():
     assert result.summary_confidence["iptm"] == pytest.approx(0.61)
     assert result.summary_confidence["ptm"] == pytest.approx(0.72)
     assert result.summary_confidence["plddt"] == pytest.approx(0.85)
+    assert result.summary_confidence["binder_plddt"] == pytest.approx(0.8)
+    assert result.loss_dict["binder_confidence_loss"] == pytest.approx(0.2)
+    assert result.loss_dict["binder_rg_excess_loss"] == pytest.approx(0.0)
     assert result.summary_confidence["mmcif"] == "data_fake\n"
 
     _, input_spec, kwargs = builder.calls[0]
@@ -103,6 +301,21 @@ def test_runtime_verifier_extracts_pair_chain_metrics_and_mmcif():
     assert kwargs["seed"] == 7
     assert kwargs["num_loops"] == backend.verifier_num_loops
     assert kwargs["num_sampling_steps"] == backend.verifier_num_sampling_steps
+
+
+def test_runtime_verifier_uses_modern_to_mmcif_api():
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(),
+        device="cpu",
+        verifier_model=object(),
+        input_builder=FakeModernInputBuilder(),
+        protein_input_cls=FakeProteinInput,
+        structure_prediction_input_cls=FakeStructurePredictionInput,
+    )
+
+    result = backend.verify(binder_seq="YYY", target_seq="AAAA", seed=7)
+
+    assert result.summary_confidence["mmcif"] == "data_modern\n"
 
 
 def test_runtime_verifier_extracts_batched_pair_chain_metrics():
@@ -120,6 +333,145 @@ def test_runtime_verifier_extracts_batched_pair_chain_metrics():
     assert result.total_loss == pytest.approx(0.26)
     assert result.summary_confidence["pair_chain_iptm"] == pytest.approx(0.74)
     assert result.summary_confidence["esm_verify_source"] == "pair_chain_iptm"
+
+
+def test_runtime_hotspot_verifier_combines_full_structure_distance_with_global_loss():
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(
+            hotspot_verify_weight=0.2,
+            hotspot_verify_near_cutoff=5.0,
+            hotspot_verify_far_cutoff=20.0,
+        ),
+        device="cpu",
+        verifier_model=object(),
+        input_builder=FakeGeometryInputBuilder(),
+        protein_input_cls=FakeProteinInput,
+        structure_prediction_input_cls=FakeStructurePredictionInput,
+    )
+
+    result = backend.verify(
+        binder_seq="YYY",
+        target_seq="AAAA",
+        seed=7,
+        hotspot_params={"target_hotspot_concat_indices": [0, 2]},
+    )
+
+    assert result.loss_dict["esm_verify_global_loss"] == pytest.approx(0.17)
+    assert result.loss_dict["hotspot_verify_distance_loss"] == pytest.approx(0.5)
+    assert result.total_loss == pytest.approx(0.27)
+    assert result.summary_confidence["hotspot_mean_min_heavy_atom_distance"] == pytest.approx(12.0)
+    assert result.summary_confidence["hotspot_heavy_atom_coverage"] == pytest.approx(0.5)
+    assert result.summary_confidence["hotspot_heavy_atom_covered_count"] == 1
+    assert result.summary_confidence["hotspot_heavy_atom_coverage_5a"] == pytest.approx(0.5)
+    assert result.summary_confidence["hotspot_heavy_atom_covered_count_5a"] == 1
+
+
+def test_runtime_tracks_hotspot_geometry_without_adding_hotspot_reward():
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(
+            hotspot_verify_weight=0.0,
+            hotspot_verify_too_close_weight=0.0,
+            hotspot_verify_near_cutoff=5.0,
+            hotspot_verify_far_cutoff=20.0,
+        ),
+        device="cpu",
+        verifier_model=object(),
+        input_builder=FakeGeometryInputBuilder(),
+        protein_input_cls=FakeProteinInput,
+        structure_prediction_input_cls=FakeStructurePredictionInput,
+    )
+
+    result = backend.verify(
+        binder_seq="YYY",
+        target_seq="AAAA",
+        seed=7,
+        hotspot_params={"target_hotspot_concat_indices": [0, 2]},
+    )
+
+    assert result.total_loss == pytest.approx(0.17)
+    assert result.loss_dict["esm_verify_loss"] == pytest.approx(0.17)
+    assert result.loss_dict["hotspot_verify_distance_loss"] == pytest.approx(0.5)
+    assert result.summary_confidence["hotspot_heavy_atom_coverage"] == pytest.approx(0.5)
+    assert result.summary_confidence["hotspot_heavy_atom_covered_count"] == 1
+
+
+def test_runtime_hotspot_verifier_supports_current_molecular_complex_output():
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(
+            hotspot_verify_weight=0.2,
+            hotspot_verify_near_cutoff=5.0,
+        ),
+        device="cpu",
+        verifier_model=object(),
+        input_builder=FakeMolecularInputBuilder(),
+        protein_input_cls=FakeProteinInput,
+        structure_prediction_input_cls=FakeStructurePredictionInput,
+    )
+
+    result = backend.verify(
+        binder_seq="YYY",
+        target_seq="AAAA",
+        seed=7,
+        hotspot_params={"target_hotspot_concat_indices": [0, 2]},
+    )
+
+    assert result.total_loss == pytest.approx(0.27)
+    assert result.summary_confidence["hotspot_mean_min_heavy_atom_distance"] == pytest.approx(12.0)
+    assert result.summary_confidence["hotspot_heavy_atom_coverage"] == pytest.approx(0.5)
+
+
+def test_runtime_hotspot_verifier_requires_hotspot_indices_when_enabled():
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(hotspot_verify_weight=0.2),
+        device="cpu",
+        verifier_model=object(),
+        input_builder=FakeGeometryInputBuilder(),
+        protein_input_cls=FakeProteinInput,
+        structure_prediction_input_cls=FakeStructurePredictionInput,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="hotspot-aware verifier requires target_hotspot_concat_indices",
+    ):
+        backend.verify(binder_seq="YYY", target_seq="AAAA", seed=7)
+
+
+def test_hotspot_structure_metrics_map_concatenated_indices_across_target_chains():
+    complex_obj = FakeGeometryComplex()
+    complex_obj.chain_boundaries = [(0, 2), (2, 4), (5, 8)]
+
+    metrics = _hotspot_structure_metrics(
+        complex_obj,
+        target_sequences=["AA", "AA"],
+        hotspot_params={"target_hotspot_concat_indices": [2]},
+        near_cutoff=5.0,
+        far_cutoff=20.0,
+    )
+
+    assert metrics["hotspot_min_heavy_atom_distances"] == pytest.approx([20.0])
+    assert metrics["hotspot_verify_distance_loss"] == pytest.approx(1.0)
+
+
+def test_hotspot_structure_metrics_penalize_unsafe_heavy_atom_distance():
+    complex_obj = FakeGeometryComplex()
+    complex_obj.chain_boundaries = [(0, 4), (5, 8)]
+    complex_obj.atom37_positions[5:8, 0] = torch.tensor([1.8, 0.0, 0.0])
+
+    metrics = _hotspot_structure_metrics(
+        complex_obj,
+        target_sequences=["AAAA"],
+        hotspot_params={"target_hotspot_concat_indices": [0]},
+        near_cutoff=8.0,
+        far_cutoff=20.0,
+        min_safe_distance=2.5,
+    )
+
+    assert metrics["hotspot_verify_distance_loss"] == pytest.approx(0.0)
+    assert metrics["hotspot_too_close_loss"] == pytest.approx(
+        (2.5 - 1.8) / 2.5
+    )
+    assert metrics["hotspot_verify_min_distance"] == pytest.approx(2.5)
 
 
 def test_runtime_preserves_matching_free_proposal_logits_without_hard_anchor():
@@ -154,6 +506,26 @@ def test_runtime_preserves_matching_free_proposal_logits_without_hard_anchor():
             proposal_logits[pos, aa_idx].item()
         )
         assert initialized[0, pos, aa_idx].item() < 0.5
+
+
+def test_runtime_can_preserve_soft_logits_when_sequence_is_a_local_branch():
+    proposal_logits = torch.full((3, len(AA_TO_ESM_IDX)), -1.0)
+    proposal_logits[:, AA_TO_ESM_IDX["C"]] = float("-inf")
+    proposal_logits[:, AA_TO_ESM_IDX["A"]] = 0.5
+    proposal_logits[1, AA_TO_ESM_IDX["Y"]] = 0.4
+
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(),
+        device="cpu",
+    )
+    initialized = backend._init_current_sequence_logits(
+        "AYA",
+        mutable_mask=[True, True, True],
+        proposal_logits=proposal_logits,
+        preserve_proposal_logits=True,
+    )
+
+    assert torch.equal(initialized[0].detach().cpu(), proposal_logits)
 
 
 def test_runtime_configures_official_proposal_lm_dropout(monkeypatch):
@@ -283,6 +655,94 @@ def test_runtime_propose_uses_injected_soft_update_and_logit_delta_candidates():
     assert seen["proposal_logits"] is None
 
 
+def test_runtime_propose_candidate_sampling_is_reproducible_for_fixed_seed():
+    def fake_soft_update(**kwargs):
+        current_seq = kwargs["current_seq"]
+        before = torch.zeros(len(current_seq), 20)
+        after = before.clone()
+        for position in range(len(current_seq)):
+            after[position, (position + 1) % 20] = 3.0 - 0.1 * position
+            after[position, (position + 2) % 20] = 2.0 - 0.1 * position
+        return before, after
+
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(),
+        device="cpu",
+        verifier_model=object(),
+        input_builder=FakeInputBuilder(),
+        protein_input_cls=FakeProteinInput,
+        structure_prediction_input_cls=FakeStructurePredictionInput,
+        soft_update_fn=fake_soft_update,
+    )
+    kwargs = {
+        "current_seq": "AAAAAA",
+        "target_seq": "TTTT",
+        "global_step": 3,
+        "K_top": 8,
+        "B_candidates": 6,
+        "T_sample": 1.0,
+        "max_mutations_per_seq": 3,
+        "seed": 17,
+        "action_group": "interface_formation",
+    }
+
+    torch.manual_seed(1)
+    first = list(backend.propose(**kwargs).sequences)
+    torch.manual_seed(999)
+    second = list(backend.propose(**kwargs).sequences)
+
+    assert first == second
+
+
+def test_positive_score_runtime_excludes_unbounded_confidence_candidates(
+    monkeypatch,
+):
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(),
+        device="cpu",
+        verifier_model=object(),
+        input_builder=FakeInputBuilder(),
+        protein_input_cls=FakeProteinInput,
+        structure_prediction_input_cls=FakeStructurePredictionInput,
+    )
+    before = torch.zeros(4, 20)
+    after = before.clone()
+    after[0, AA_TO_ESM_IDX["Y"]] = 4.0
+    after[1, AA_TO_ESM_IDX["F"]] = 3.0
+    monkeypatch.setattr(
+        backend,
+        "_run_soft_update_with_tracking",
+        lambda **kwargs: (
+            before,
+            after,
+            [{"sequence": "YYYY", "confidence_score": 1.0}],
+            [],
+        ),
+    )
+
+    batch = backend.propose(
+        current_seq="AAAA",
+        target_seq="TTTT",
+        global_step=0,
+        K_top=10,
+        B_candidates=8,
+        T_sample=1.0,
+        max_mutations_per_seq=3,
+        mutation_fraction=0.25,
+        candidate_strategy="positive_score",
+        include_argmax_candidate=False,
+        seed=17,
+    )
+
+    assert "YYYY" not in batch.sequences
+    assert all(
+        sum(a != b for a, b in zip("AAAA", sequence)) == 1
+        for sequence in batch.sequences
+    )
+    assert batch.proposal_diagnostics["confidence_candidate_count"] == 1
+    assert batch.proposal_diagnostics["returned_confidence_candidate_count"] == 0
+
+
 def test_runtime_propose_can_continue_from_saved_proposal_logits():
     aa_to_idx = {aa: idx for idx, aa in enumerate("ARNDCQEGHILKMFPSTWYV")}
     saved_logits = torch.zeros(3, 20)
@@ -340,6 +800,8 @@ def test_runtime_continuous_design_records_soft_step_metrics(monkeypatch):
             lambda_esmc=0.0,
             num_loops=1,
             num_sampling_steps=1,
+            one_step_diffusion_enabled=False,
+            one_step_diffusion_interval=0,
         ),
         device="cpu",
         experimental_model=object(),
@@ -374,6 +836,311 @@ def test_runtime_continuous_design_records_soft_step_metrics(monkeypatch):
     assert "structure_total_loss" in batch.soft_step_metrics[0]
     assert "backprop_loss" in batch.soft_step_metrics[0]
     assert "temperature" in batch.soft_step_metrics[0]
+    assert "argmax_sequence" in batch.soft_step_metrics[0]
+    assert "logits_snapshot" in batch.soft_step_metrics[0]
+
+
+def test_runtime_schedules_and_recycles_interval_one_step_coordinates(monkeypatch):
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(
+            soft_steps=6,
+            lambda_esmc=0.0,
+            num_loops=1,
+            num_sampling_steps=1,
+            one_step_diffusion_enabled=True,
+            one_step_diffusion_mode="reference_noising",
+            one_step_diffusion_interval=2,
+            one_step_diffusion_recycle_coordinates=True,
+        ),
+        device="cpu",
+        experimental_model=object(),
+    )
+    monkeypatch.setattr(backend, "_ensure_proposal_models_loaded", lambda: None)
+
+    def fake_fold_distogram(**kwargs):
+        design = kwargs["design"]
+        full_len = len(kwargs["target_seq"]) + design.shape[1]
+        bins = torch.arange(128, dtype=design.dtype, device=design.device)
+        signal = design[..., 0].sum()
+        return {
+            "distogram_logits": signal
+            * bins.reshape(1, 1, 1, -1).expand(
+                1,
+                full_len,
+                full_len,
+                128,
+            )
+        }
+
+    references = []
+    reference_feature_markers = []
+
+    def fake_one_step_diffusion_gradient(**kwargs):
+        references.append(kwargs["reference_coordinates"].detach().clone())
+        reference_feature_markers.append(
+            float(kwargs["reference_features"]["marker"].item())
+        )
+        call_index = len(references)
+        return {
+            "gradient": torch.ones_like(kwargs["logits"]),
+            "total": torch.tensor(float(call_index)),
+            "losses": {"rg": torch.tensor(0.5)},
+            "coordinates": torch.full(
+                (1, 1, 3),
+                float(call_index),
+            ),
+            "features": {"marker": torch.tensor(float(call_index))},
+            "reference_rmsd": torch.tensor(0.25),
+        }
+
+    monkeypatch.setattr(backend, "_fold_distogram", fake_fold_distogram)
+    monkeypatch.setattr(
+        backend,
+        "_one_step_diffusion_gradient",
+        fake_one_step_diffusion_gradient,
+    )
+
+    batch = backend.continuous_design(
+        current_seq="AAA",
+        target_seq="TTTT",
+        global_step=0,
+        seed=5,
+        mutable_mask=[True, True, True],
+        proposal_logits=torch.zeros(3, 20),
+        reference_coordinates=torch.zeros(1, 1, 3),
+        reference_features={"marker": torch.tensor(99.0)},
+    )
+
+    assert len(batch.soft_step_metrics) == 6
+    assert len(references) == 3
+    assert torch.equal(references[0], torch.zeros(1, 1, 3))
+    assert torch.equal(references[1], torch.ones(1, 1, 3))
+    assert torch.equal(references[2], torch.full((1, 1, 3), 2.0))
+    assert reference_feature_markers == [99.0, 1.0, 2.0]
+    injection_metrics = [
+        metrics
+        for metrics in batch.soft_step_metrics
+        if metrics.get("one_step_diffusion")
+    ]
+    assert [metrics["local_step"] for metrics in injection_metrics] == [1, 3, 5]
+    assert [
+        metrics["one_step_diffusion_used_recycled_coordinates"]
+        for metrics in injection_metrics
+    ] == [False, True, True]
+
+
+def test_hotspot_structure_loss_is_additive_and_weight_zero_preserves_base_loss():
+    torch.manual_seed(3)
+    distogram = torch.randn(1, 7, 7, 128, requires_grad=True)
+    hotspot_params = {"target_hotspot_concat_indices": [1, 3, 1]}
+
+    baseline = _structure_losses(distogram, binder_length=3)
+    diagnostic = _structure_losses(
+        distogram,
+        binder_length=3,
+        hotspot_params=hotspot_params,
+        hotspot_weight=0.0,
+    )
+    weighted = _structure_losses(
+        distogram,
+        binder_length=3,
+        hotspot_params=hotspot_params,
+        hotspot_weight=0.4,
+    )
+
+    assert torch.allclose(diagnostic["total_loss"], baseline["total_loss"])
+    assert torch.allclose(diagnostic["base_structure_loss"], baseline["total_loss"])
+    assert torch.allclose(
+        weighted["total_loss"],
+        baseline["total_loss"] + 0.4 * weighted["hotspot_contact_loss"],
+    )
+    weighted["total_loss"].mean().backward()
+    assert distogram.grad is not None
+    assert torch.isfinite(distogram.grad).all()
+
+
+def test_hotspot_structure_loss_uses_independent_strict_cutoff():
+    distogram = torch.zeros(1, 7, 7, 128)
+    bin_distances = esmfold2_runtime_module._midpoint_bins(distogram.device)
+    twenty_angstrom_bin = int(torch.argmin(torch.abs(bin_distances - 20.0)).item())
+    distogram[0, 1, 4, twenty_angstrom_bin] = 12.0
+
+    broad = _structure_losses(
+        distogram,
+        binder_length=3,
+        hotspot_params={"target_hotspot_concat_indices": [1]},
+        hotspot_weight=0.4,
+        hotspot_cutoff=22.0,
+    )
+    strict = _structure_losses(
+        distogram,
+        binder_length=3,
+        hotspot_params={"target_hotspot_concat_indices": [1]},
+        hotspot_weight=0.4,
+        hotspot_cutoff=8.0,
+    )
+
+    assert strict["hotspot_contact_loss"] > broad["hotspot_contact_loss"]
+    assert torch.allclose(strict["base_structure_loss"], broad["base_structure_loss"])
+
+
+def test_localized_hotspot_mode_replaces_global_inter_objective_by_interpolation():
+    distogram = torch.randn(1, 7, 7, 128)
+    losses = _structure_losses(
+        distogram,
+        binder_length=3,
+        hotspot_params={"target_hotspot_concat_indices": [1]},
+        hotspot_weight=1.0,
+        hotspot_cutoff=8.0,
+        hotspot_interface_mode="localized",
+    )
+
+    expected = (
+        0.5 * losses["intra_contact_loss"]
+        + 0.5 * losses["hotspot_contact_loss"]
+        + 0.2 * losses["glob_loss"]
+    )
+    assert torch.allclose(losses["effective_inter_contact_loss"], losses["hotspot_contact_loss"])
+    assert torch.allclose(losses["total_loss"], expected)
+    assert torch.allclose(
+        losses["hotspot_objective_adjustment"],
+        losses["total_loss"] - losses["base_structure_loss"],
+    )
+
+
+def test_localized_hotspot_mode_rejects_weight_above_one():
+    with pytest.raises(ValueError, match="hotspot_weight in"):
+        _structure_losses(
+            torch.randn(1, 7, 7, 128),
+            binder_length=3,
+            hotspot_params={"target_hotspot_concat_indices": [1]},
+            hotspot_weight=1.1,
+            hotspot_interface_mode="localized",
+        )
+
+
+@pytest.mark.parametrize("indices", [[4], [-1], [1.5], [True]])
+def test_hotspot_structure_loss_rejects_invalid_target_indices(indices):
+    distogram = torch.zeros(1, 7, 7, 128)
+
+    with pytest.raises(ValueError):
+        _structure_losses(
+            distogram,
+            binder_length=3,
+            hotspot_params={"target_hotspot_concat_indices": indices},
+            hotspot_weight=0.2,
+        )
+
+
+def test_hotspot_structure_loss_rejects_positive_weight_without_hotspots():
+    with pytest.raises(
+        ValueError,
+        match="positive hotspot_weight requires target_hotspot_concat_indices",
+    ):
+        _structure_losses(
+            torch.zeros(1, 7, 7, 128),
+            binder_length=3,
+            hotspot_weight=0.2,
+        )
+
+
+def test_runtime_continuous_design_logs_multichain_hotspot_metrics(monkeypatch):
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(
+            soft_steps=1,
+            lambda_esmc=0.0,
+            num_loops=1,
+            num_sampling_steps=1,
+            hotspot_weight=0.3,
+            hotspot_cutoff=8.0,
+            one_step_diffusion_enabled=False,
+            one_step_diffusion_interval=0,
+        ),
+        device="cpu",
+        experimental_model=object(),
+    )
+    monkeypatch.setattr(backend, "_ensure_proposal_models_loaded", lambda: None)
+
+    def fake_fold_distogram(**kwargs):
+        targets = esmfold2_runtime_module._target_sequences(kwargs["target_seq"])
+        design = kwargs["design"]
+        full_len = sum(len(seq) for seq in targets) + design.shape[1]
+        bins = torch.arange(128, dtype=design.dtype, device=design.device)
+        signal = design[..., 0].sum()
+        return {
+            "distogram_logits": signal
+            * bins.reshape(1, 1, 1, -1).expand(1, full_len, full_len, 128)
+        }
+
+    monkeypatch.setattr(backend, "_fold_distogram", fake_fold_distogram)
+
+    batch = backend.continuous_design(
+        current_seq="AAA",
+        target_seq=["TT", "GGG"],
+        global_step=0,
+        seed=5,
+        mutable_mask=[True, True, True],
+        proposal_logits=torch.zeros(3, 20),
+        hotspot_params={"target_hotspot_concat_indices": [3, 4]},
+    )
+
+    metrics = batch.soft_step_metrics[0]
+    assert metrics["hotspot_weight"] == pytest.approx(0.3)
+    assert metrics["hotspot_cutoff"] == pytest.approx(8.0)
+    assert metrics["hotspot_contact_loss"] is not None
+    assert metrics["hotspot_weighted_contribution"] == pytest.approx(
+        0.3 * metrics["hotspot_contact_loss"]
+    )
+
+
+def test_runtime_can_disable_only_distogram_hotspot(monkeypatch):
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(
+            soft_steps=1,
+            lambda_esmc=0.0,
+            num_loops=1,
+            num_sampling_steps=1,
+            hotspot_weight=0.5,
+            hotspot_cutoff=8.0,
+            one_step_diffusion_enabled=False,
+            one_step_diffusion_interval=0,
+            hotspot_interface_mode="localized",
+            distogram_hotspot_enabled=False,
+        ),
+        device="cpu",
+        experimental_model=object(),
+    )
+    monkeypatch.setattr(backend, "_ensure_proposal_models_loaded", lambda: None)
+
+    def fake_fold_distogram(**kwargs):
+        targets = esmfold2_runtime_module._target_sequences(kwargs["target_seq"])
+        design = kwargs["design"]
+        full_len = sum(len(seq) for seq in targets) + design.shape[1]
+        bins = torch.arange(128, dtype=design.dtype, device=design.device)
+        signal = design[..., 0].sum()
+        return {
+            "distogram_logits": signal
+            * bins.reshape(1, 1, 1, -1).expand(1, full_len, full_len, 128)
+        }
+
+    monkeypatch.setattr(backend, "_fold_distogram", fake_fold_distogram)
+
+    batch = backend.continuous_design(
+        current_seq="AAA",
+        target_seq=["TT", "GGG"],
+        global_step=0,
+        seed=5,
+        mutable_mask=[True, True, True],
+        proposal_logits=torch.zeros(3, 20),
+        hotspot_params={"target_hotspot_concat_indices": [3, 4]},
+    )
+
+    metrics = batch.soft_step_metrics[0]
+    assert metrics["hotspot_weight"] == pytest.approx(0.0)
+    assert metrics["distogram_hotspot_enabled"] is False
+    assert metrics["distogram_hotspot_weight"] == pytest.approx(0.0)
+    assert metrics["hotspot_contact_loss"] is not None
+    assert metrics["hotspot_objective_adjustment"] == pytest.approx(0.0)
 
 
 def test_runtime_continuous_design_accepts_multiple_target_chains(monkeypatch):
@@ -384,6 +1151,8 @@ def test_runtime_continuous_design_accepts_multiple_target_chains(monkeypatch):
             lambda_esmc=0.0,
             num_loops=1,
             num_sampling_steps=1,
+            one_step_diffusion_enabled=False,
+            one_step_diffusion_interval=0,
         ),
         device="cpu",
         experimental_model=object(),
@@ -563,7 +1332,7 @@ def test_fold_distogram_accepts_multiple_target_chains(monkeypatch):
     assert result["distogram_logits"].shape == (1, 8, 8, 128)
 
 
-def test_stageb_structure_loss_keeps_base_total_when_group_is_selected():
+def test_stageb_structure_loss_backpropagates_only_selected_group():
     losses = {
         "total_loss": torch.tensor(10.0),
         "inter_contact_loss": torch.tensor(3.0),
@@ -575,8 +1344,50 @@ def test_stageb_structure_loss_keeps_base_total_when_group_is_selected():
         group_weight=1.0,
     )
 
-    assert proposal_loss.item() == pytest.approx(13.0)
-    assert source == "total_loss+inter_contact_loss"
+    assert proposal_loss.item() == pytest.approx(3.0)
+    assert source == "inter_contact_loss"
+
+
+def test_stageb_structure_loss_keeps_hotspot_constraint_for_every_group():
+    losses = {
+        "total_loss": torch.tensor(10.0),
+        "intra_contact_loss": torch.tensor(2.0),
+        "glob_loss": torch.tensor(1.0),
+        "hotspot_weighted_contribution": torch.tensor(0.4),
+    }
+
+    core_loss, core_source = _stageb_structure_loss(losses, "core_stabilization")
+    compact_loss, compact_source = _stageb_structure_loss(losses, "compactness_repair")
+
+    assert core_loss.item() == pytest.approx(2.4)
+    assert core_source == "intra_contact_loss+hotspot_weighted_contribution"
+    assert compact_loss.item() == pytest.approx(1.4)
+    assert compact_source == "glob_loss+hotspot_weighted_contribution"
+
+
+def test_stageb_interface_hotspot_is_counted_once_for_both_modes():
+    losses = {
+        "total_loss": torch.tensor(10.0),
+        "inter_contact_loss": torch.tensor(3.0),
+        "effective_inter_contact_loss": torch.tensor(2.2),
+        "hotspot_weighted_contribution": torch.tensor(0.4),
+    }
+
+    localized, localized_source = _stageb_structure_loss(
+        losses,
+        "interface_formation",
+        hotspot_interface_mode="localized",
+    )
+    additive, additive_source = _stageb_structure_loss(
+        losses,
+        "interface_formation",
+        hotspot_interface_mode="additive",
+    )
+
+    assert localized.item() == pytest.approx(2.2)
+    assert localized_source == "effective_inter_contact_loss"
+    assert additive.item() == pytest.approx(3.4)
+    assert additive_source == "inter_contact_loss+hotspot_weighted_contribution"
 
 
 def test_proposal_confidence_tail_steps_override_temperature_gate():

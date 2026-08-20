@@ -2,6 +2,7 @@
 *__pycache__/
 *.py[cod]
 *$py.class
+.DS_Store
 
 # C extensions
 *.so
@@ -147,6 +148,7 @@ A6_TCR/results/
 A6_TCR/protenix_runtime/
 
 # HPC/local runtime artifacts and large model/input files
+.codex_backups/
 checkpoint/
 common/
 experiments/
