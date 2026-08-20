@@ -1073,6 +1073,24 @@ class ESMFold2RuntimeBackend:
             }
         )
         self._last_tcr_diagnostics = diagnostics
+        if contact_grad is not None or tcr_grad is not None:
+            logger.info(
+                "TCR proposal grads | |contact|=%.4e |tcr|=%.4e |structure|=%.4e "
+                "| cos(contact,struct)=%+.4f cos(contact,esmc)=%+.4f "
+                "cos(contact,tcr)=%+.4f cos(tcr,struct)=%+.4f "
+                "cos(tcr,esmc)=%+.4f | cdr3_pep=%.4f fw_pmhc=%.4f r_pep=%.4f",
+                diagnostics.get("contact_grad_norm", 0.0),
+                diagnostics.get("tcr_grad_norm", 0.0),
+                diagnostics.get("structure_grad_norm", 0.0),
+                diagnostics.get("cos_contact_structure", 0.0),
+                diagnostics.get("cos_contact_native_esmc", 0.0),
+                diagnostics.get("cos_contact_tcr_prior", 0.0),
+                diagnostics.get("cos_tcr_structure", 0.0),
+                diagnostics.get("cos_tcr_native_esmc", 0.0),
+                diagnostics.get("cdr3_peptide_contact_nll", float("nan")),
+                diagnostics.get("framework_pmhc_contact_nll", float("nan")),
+                diagnostics.get("r_pep", float("nan")),
+            )
         return contact_grad, tcr_grad, diagnostics
 
     def _mix_tcr_gradients(
