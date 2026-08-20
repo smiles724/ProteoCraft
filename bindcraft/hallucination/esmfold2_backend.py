@@ -103,6 +103,11 @@ class ESMFold2ProposalConfig:
     proposal_confidence_tail_steps: int = 0
     target_chain_roles: Optional[Tuple[str, ...]] = None
     binder_mutable_mask: Optional[Tuple[bool, ...]] = None
+    # === TCR-specific extensions (default OFF; identical behaviour when off) ===
+    # Raw mappings rather than dataclasses so the frozen config stays hashable
+    # to construct and trivially serialisable into run artifacts.
+    tcr_prior_config: Optional[Mapping[str, Any]] = None
+    tcr_contact_config: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
         if int(self.verifier_num_loops) <= 0:

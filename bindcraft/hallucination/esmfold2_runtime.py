@@ -861,6 +861,247 @@ class ESMFold2RuntimeBackend:
         self.task_type = task_type
         self.verifier_num_loops = int(config.verifier_num_loops)
         self.verifier_num_sampling_steps = int(config.verifier_num_sampling_steps)
+        # === TCR-specific extensions (default OFF; no-op when disabled) ===
+        from bindcraft.hallucination.tcr_contact import TCRContactConfig
+
+        self._tcr_contact_config = TCRContactConfig.from_mapping(
+            getattr(config, "tcr_contact_config", None)
+        )
+        self._tcr_contact_mask_cache: Dict[Any, Dict[str, torch.Tensor]] = {}
+        self._tcr_prior_raw_config = dict(
+            getattr(config, "tcr_prior_config", None) or {}
+        )
+        self._tcr_prior_scorer_cached: Any = None
+        self._tcr_prior_scorer_built = False
+
+    # ------------------------------------------------------------------
+    # TCR-specific extensions
+    # ------------------------------------------------------------------
+
+    @property
+    def tcr_contact_enabled(self) -> bool:
+        return bool(self._tcr_contact_config.enabled)
+
+    @property
+    def tcr_prior_scorer(self) -> Any:
+        """Lazily build the shared TCRSequencePriorScorer (or None)."""
+
+        if not self._tcr_prior_scorer_built:
+            from bindcraft.hallucination.tcr_prior import (
+                maybe_build_tcr_prior_scorer,
+            )
+
+            self._tcr_prior_scorer_cached = maybe_build_tcr_prior_scorer(
+                self._tcr_prior_raw_config,
+                device=self.device,
+            )
+            self._tcr_prior_scorer_built = True
+        return self._tcr_prior_scorer_cached
+
+    def _tcr_prior_region_mask(
+        self,
+        binder_length: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Region the sequence prior scores: CDR3 (mutable) by default."""
+
+        region = str(
+            self._tcr_prior_raw_config.get("tcr_prior_region", "cdr")
+        ).strip().lower()
+        if region in {"all", "none"}:
+            return torch.ones(int(binder_length), dtype=torch.bool, device=device)
+        mutable = self.config.binder_mutable_mask
+        if mutable is None:
+            return torch.ones(int(binder_length), dtype=torch.bool, device=device)
+        return torch.as_tensor(mutable, dtype=torch.bool, device=device)
+
+    def _tcr_contact_masks(
+        self,
+        *,
+        binder_length: int,
+        target_chain_lengths: Sequence[int],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Dict[str, torch.Tensor]:
+        key = (
+            int(binder_length),
+            tuple(int(v) for v in target_chain_lengths),
+            str(device),
+            str(dtype),
+        )
+        cached = self._tcr_contact_mask_cache.get(key)
+        if cached is None:
+            from bindcraft.hallucination.tcr_contact import (
+                annotation_from_config,
+                build_tcr_contact_masks,
+            )
+
+            annotation = annotation_from_config(
+                self._tcr_contact_config,
+                binder_length=int(binder_length),
+            )
+            cached = build_tcr_contact_masks(
+                binder_length=int(binder_length),
+                target_chain_lengths=target_chain_lengths,
+                annotation=annotation,
+                config=self._tcr_contact_config,
+                device=device,
+                dtype=dtype,
+            )
+            self._tcr_contact_mask_cache[key] = cached
+        return cached
+
+    def compute_tcr_contact_terms(
+        self,
+        distogram_logits: torch.Tensor,
+        *,
+        binder_length: int,
+        target_chain_lengths: Sequence[int],
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """TCR contact objective for one folded complex, or None if disabled."""
+
+        if not self.tcr_contact_enabled:
+            return None
+        from bindcraft.hallucination.tcr_contact import tcr_contact_losses
+
+        masks = self._tcr_contact_masks(
+            binder_length=int(binder_length),
+            target_chain_lengths=target_chain_lengths,
+            device=distogram_logits.device,
+            dtype=distogram_logits.dtype,
+        )
+        return tcr_contact_losses(
+            distogram_logits,
+            masks,
+            config=self._tcr_contact_config,
+        )
+
+    def compute_tcr_prior_soft_loss(
+        self,
+        logits: torch.Tensor,
+        *,
+        binder_length: int,
+    ) -> Optional[torch.Tensor]:
+        """Differentiable TCR sequence-prior loss over the design logits.
+
+        ESMFold2 design logits are [B, L, 20] in ESM_AA_ORDER, which is the
+        same ordering the prior scorer uses, so they are passed through without
+        permutation.
+        """
+
+        scorer = self.tcr_prior_scorer
+        if scorer is None or float(scorer.gradient_weight) == 0.0:
+            return None
+        region = self._tcr_prior_region_mask(int(binder_length), logits.device)
+        flat = logits[0] if logits.dim() == 3 else logits
+        return scorer.soft_prior_loss(flat, region)
+
+    def _tcr_gradient_terms(
+        self,
+        *,
+        logits: torch.Tensor,
+        fold_result: Mapping[str, Any],
+        targets: Sequence[str],
+        current_seq: str,
+        structure_grad: Optional[torch.Tensor],
+        esmc_grad: Optional[torch.Tensor],
+        retain_graph: bool,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, float]]:
+        """Contact and sequence-prior gradients w.r.t. the design logits.
+
+        The contact term reads the *same* distogram_logits the structure
+        loss used, so it inherits a live graph back to logits.  Callers must
+        therefore retain the structure graph when the contact loss is enabled.
+        """
+
+        diagnostics: Dict[str, float] = {}
+        contact_grad: Optional[torch.Tensor] = None
+        tcr_grad: Optional[torch.Tensor] = None
+
+        if self.tcr_contact_enabled:
+            terms = self.compute_tcr_contact_terms(
+                fold_result["distogram_logits"],
+                binder_length=len(current_seq),
+                target_chain_lengths=[len(sequence) for sequence in targets],
+            )
+            if terms is not None:
+                for key, value in terms.items():
+                    diagnostics[key] = float(value.mean().item())
+                if bool(self._tcr_contact_config.use_gradient):
+                    contact_grad = torch.autograd.grad(
+                        terms["tcr_contact_loss"].mean(),
+                        logits,
+                        retain_graph=retain_graph,
+                    )[0]
+
+        prior_loss = self.compute_tcr_prior_soft_loss(
+            logits,
+            binder_length=len(current_seq),
+        )
+        if prior_loss is not None:
+            tcr_grad = torch.autograd.grad(prior_loss.mean(), logits)[0]
+            diagnostics["tcr_prior_soft_loss"] = float(prior_loss.mean().item())
+
+        def _norm(tensor: Optional[torch.Tensor]) -> float:
+            if tensor is None:
+                return 0.0
+            return float(tensor.detach().norm().item())
+
+        def _cos(
+            first: Optional[torch.Tensor],
+            second: Optional[torch.Tensor],
+        ) -> float:
+            if first is None or second is None:
+                return 0.0
+            a = first.detach().flatten()
+            b = second.detach().flatten()
+            denom = a.norm() * b.norm()
+            if float(denom.item()) <= 0.0:
+                return 0.0
+            return float((torch.dot(a, b) / denom).item())
+
+        diagnostics.update(
+            {
+                "contact_grad_norm": _norm(contact_grad),
+                "tcr_grad_norm": _norm(tcr_grad),
+                "structure_grad_norm": _norm(structure_grad),
+                "cos_contact_structure": _cos(contact_grad, structure_grad),
+                "cos_contact_native_esmc": _cos(contact_grad, esmc_grad),
+                "cos_contact_tcr_prior": _cos(contact_grad, tcr_grad),
+                "cos_tcr_structure": _cos(tcr_grad, structure_grad),
+                "cos_tcr_native_esmc": _cos(tcr_grad, esmc_grad),
+            }
+        )
+        self._last_tcr_diagnostics = diagnostics
+        return contact_grad, tcr_grad, diagnostics
+
+    def _mix_tcr_gradients(
+        self,
+        combined_grad: torch.Tensor,
+        *,
+        contact_grad: Optional[torch.Tensor],
+        tcr_grad: Optional[torch.Tensor],
+        gradient_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Add normalised TCR directions, matching the lambda_esmc convention.
+
+        Both coefficients scale a unit-norm direction, so they are NOT
+        comparable to a scalar loss weight in a summed objective.
+        """
+
+        if contact_grad is not None:
+            combined_grad = combined_grad + float(
+                self._tcr_contact_config.lambda_contact
+            ) * normalized_gradient_tensor(contact_grad, gradient_mask)
+        if tcr_grad is not None:
+            weight = float(
+                self._tcr_prior_raw_config.get("tcr_prior_gradient_weight", 0.1)
+            )
+            combined_grad = combined_grad + weight * normalized_gradient_tensor(
+                tcr_grad,
+                gradient_mask,
+            )
+        return combined_grad
 
     def _fold_verifier_with_raw_output(
         self,
@@ -1008,6 +1249,7 @@ class ESMFold2RuntimeBackend:
             summary.update(hotspot_metrics)
         coordinate = _fold_result_coordinates(fold_result)
         aligned_loss_dict = None
+        tcr_contact_terms: Optional[Dict[str, float]] = None
         raw_common_loss_dict: dict[str, float] = {}
         plddt_logits = None
         if raw_features is not None and raw_output is not None:
@@ -1027,6 +1269,20 @@ class ESMFold2RuntimeBackend:
                 hotspot_cutoff=float(self.config.hotspot_cutoff),
                 hotspot_interface_mode="additive",
             )
+            if self.tcr_contact_enabled:
+                with torch.no_grad():
+                    _terms = self.compute_tcr_contact_terms(
+                        raw_output["distogram_logits"],
+                        binder_length=len(binder_seq),
+                        target_chain_lengths=[
+                            len(sequence) for sequence in targets
+                        ],
+                    )
+                if _terms is not None:
+                    tcr_contact_terms = {
+                        key: float(value.mean().item())
+                        for key, value in _terms.items()
+                    }
             _, raw_common_losses = compute_esmfold2_common_losses(
                 coordinates=raw_output["sample_atom_coords"],
                 plddt_logits=raw_output["plddt_logits"],
@@ -1058,7 +1314,7 @@ class ESMFold2RuntimeBackend:
             f"raw_common_{key}": value
             for key, value in raw_common_loss_dict.items()
         }
-        return build_esm_verifier_result(
+        result = build_esm_verifier_result(
             binder_seq=binder_seq,
             target_seq=target_seq,
             summary_confidence=summary,
@@ -1080,6 +1336,51 @@ class ESMFold2RuntimeBackend:
             hotspot_too_close_weight=hotspot_too_close_weight,
             aligned_loss_dict=aligned_loss_dict,
         )
+        return self._apply_tcr_verifier_terms(
+            result,
+            contact_terms=tcr_contact_terms,
+        )
+
+    def _apply_tcr_verifier_terms(
+        self,
+        result: Any,
+        *,
+        contact_terms: Optional[Mapping[str, float]],
+    ) -> Any:
+        """Fold the TCR contact loss and hard sequence prior into a result.
+
+        Called from inside verify so the adjusted result is what lands in
+        the pipeline's verifier_cache; adding these terms after the cache
+        lookup would re-accumulate them every time a sequence is revisited.
+        """
+
+        if contact_terms:
+            if result.loss_dict is None:
+                result.loss_dict = {}
+            for key, value in contact_terms.items():
+                result.loss_dict[key] = float(value)
+            if bool(self._tcr_contact_config.use_verifier):
+                weighted = float(
+                    self._tcr_contact_config.verifier_weight
+                ) * float(contact_terms["tcr_contact_loss"])
+                result.total_loss = float(result.total_loss) + weighted
+                result.loss_dict["tcr_contact_weighted"] = weighted
+                result.loss_dict["total"] = float(result.total_loss)
+
+        scorer = self.tcr_prior_scorer
+        if scorer is not None and float(scorer.verifier_weight) != 0.0:
+            from bindcraft.hallucination.tcr_prior import (
+                apply_tcr_verifier_score,
+            )
+
+            region = self._tcr_prior_region_mask(
+                len(result.binder_seq),
+                torch.device("cpu"),
+            )
+            result = apply_tcr_verifier_score(result, scorer, region_mask=region)
+            if result.loss_dict is not None:
+                result.loss_dict["total"] = float(result.total_loss)
+        return result
 
     def propose(
         self,
@@ -1893,7 +2194,7 @@ class ESMFold2RuntimeBackend:
             structure_grad = torch.autograd.grad(
                 structure_loss.mean(),
                 logits,
-                retain_graph=run_scheduled_one_step,
+                retain_graph=run_scheduled_one_step or self.tcr_contact_enabled,
             )[0]
 
             esmc_grad = None
@@ -1912,6 +2213,21 @@ class ESMFold2RuntimeBackend:
                 esmc_grad,
                 gradient_mask=gradient_mask,
                 lambda_esmc=lambda_esmc,
+            )
+            tcr_contact_grad, tcr_prior_grad, _ = self._tcr_gradient_terms(
+                logits=logits,
+                fold_result=fold_result,
+                targets=targets,
+                current_seq=current_seq,
+                structure_grad=structure_grad,
+                esmc_grad=esmc_grad,
+                retain_graph=run_scheduled_one_step,
+            )
+            combined_grad = self._mix_tcr_gradients(
+                combined_grad,
+                contact_grad=tcr_contact_grad,
+                tcr_grad=tcr_prior_grad,
+                gradient_mask=gradient_mask,
             )
             scheduled_one_step: Optional[Dict[str, Any]] = None
             if run_scheduled_one_step:
@@ -2199,6 +2515,21 @@ class ESMFold2RuntimeBackend:
             combined_grad = combined_grad + float(
                 self.config.one_step_diffusion_weight
             ) * normalized_gradient_tensor(diffusion_grad, gradient_mask)
+            tcr_contact_grad, tcr_prior_grad, _ = self._tcr_gradient_terms(
+                logits=logits,
+                fold_result=fold_result,
+                targets=targets,
+                current_seq=current_seq,
+                structure_grad=structure_grad,
+                esmc_grad=esmc_grad,
+                retain_graph=False,
+            )
+            combined_grad = self._mix_tcr_gradients(
+                combined_grad,
+                contact_grad=tcr_contact_grad,
+                tcr_grad=tcr_prior_grad,
+                gradient_mask=gradient_mask,
+            )
             logits.grad = combined_grad * gradient_mask
             for group in optimizer.param_groups:
                 group["lr"] = float(self.config.learning_rate) * final_temperature

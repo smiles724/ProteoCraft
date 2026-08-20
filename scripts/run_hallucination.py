@@ -384,6 +384,64 @@ def load_protenix_model(
     return model, configs
 
 
+def build_tcr_prior_config(args) -> dict:
+    """Collect the TCR sequence-prior flags into the scorer's config dict."""
+
+    return {
+        "use_tcr_prior_gradient": args.use_tcr_prior_gradient,
+        "tcr_prior_gradient_weight": args.tcr_prior_gradient_weight,
+        "use_tcr_prior_verifier": args.use_tcr_prior_verifier,
+        "tcr_prior_verifier_weight": args.tcr_prior_verifier_weight,
+        "tcr_prior_region": args.tcr_prior_region,
+        "tcr_prior_model_name": args.tcr_prior_model_name,
+        "tcr_prior_checkpoint": args.tcr_prior_checkpoint,
+        "tcr_prior_masked": args.tcr_prior_masked,
+        "require_real_tcr_prior": args.require_real_tcr_prior,
+    }
+
+
+def build_tcr_contact_config(args) -> dict:
+    """Collect the TCR contact-loss flags and resolve the scaffold CDR spans.
+
+    Spans are resolved here, while ``init_binder_seq`` is still the untouched
+    natural scaffold: CDR3 mutates during the run, so a later digest lookup
+    would no longer match.
+    """
+
+    enabled = bool(getattr(args, "use_tcr_contact_loss", False))
+    raw_indices = str(
+        getattr(args, "tcr_contact_mhc_chain_indices", "1") or ""
+    ).strip()
+    mhc_indices = tuple(
+        int(token) for token in raw_indices.split(",") if token.strip()
+    )
+    payload = {
+        "enabled": enabled,
+        "lambda_contact": args.tcr_contact_lambda,
+        "lambda_fw": args.tcr_contact_lambda_fw,
+        "fw_hinge": args.tcr_contact_fw_hinge,
+        "verifier_weight": args.tcr_contact_verifier_weight,
+        "use_gradient": args.tcr_contact_use_gradient,
+        "use_verifier": args.tcr_contact_use_verifier,
+        "peptide_chain_index": args.tcr_contact_peptide_chain_index,
+        "mhc_chain_indices": mhc_indices,
+        "cdr3_cutoff": args.tcr_contact_cdr3_cutoff,
+        "fw_cutoff": args.tcr_contact_fw_cutoff,
+    }
+    if not enabled:
+        return payload
+
+    scaffold = getattr(args, "init_binder_seq", None)
+    if not scaffold:
+        raise ValueError(
+            "--use_tcr_contact_loss requires --init_binder_seq so the "
+            "CDR1/2/3 spans can be resolved from the natural scaffold"
+        )
+    from bindcraft.hallucination.tcr_contact import resolve_contact_config_spans
+
+    return resolve_contact_config_spans(payload, scaffold_sequence=scaffold)
+
+
 def load_esmfold2_backend(
     args,
     device: str = "cuda",
@@ -461,6 +519,8 @@ def load_esmfold2_backend(
             if mutable_mask is None
             else tuple(bool(value) for value in mutable_mask)
         ),
+        tcr_prior_config=build_tcr_prior_config(args),
+        tcr_contact_config=build_tcr_contact_config(args),
     )
     return ESMFold2RuntimeBackend(
         config=config,
@@ -1133,6 +1193,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--require_real_tcr_prior", type=lambda x: x.lower() == "true", default=False,
                        help="严格模式：指定 tcrlm/esmc/ligandmpnn 后端但未真实加载/无真实输出/回退 no-op 时直接报错（默认：false）")
 
+    # === TCR 特异性接触损失（可选，默认关闭；关闭时行为与之前完全一致） ===
+    parser.add_argument("--use_tcr_contact_loss", type=lambda x: x.lower() == "true", default=False,
+                       help="启用 TCR 特异性接触损失：CDR3-肽接触奖励 + 框架-pMHC 接触惩罚（默认：false）")
+    parser.add_argument("--tcr_contact_lambda", type=float, default=0.1,
+                       help="提议路径接触梯度的归一化方向混合系数，与 lambda_esmc 同一约定（默认：0.1）")
+    parser.add_argument("--tcr_contact_lambda_fw", type=float, default=1.0,
+                       help="L_contact 内框架-pMHC 铰链惩罚的权重（默认：1.0）")
+    parser.add_argument("--tcr_contact_fw_hinge", type=float, default=6.0,
+                       help="框架惩罚铰链阈值：框架接触 nll 低于此值才开始惩罚（默认：6.0）")
+    parser.add_argument("--tcr_contact_verifier_weight", type=float, default=1.0,
+                       help="verifier/MCTS 路径的硬接触损失权重（默认：1.0）")
+    parser.add_argument("--tcr_contact_use_gradient", type=lambda x: x.lower() == "true", default=True,
+                       help="接触损失参与提议梯度路径（默认：true）")
+    parser.add_argument("--tcr_contact_use_verifier", type=lambda x: x.lower() == "true", default=True,
+                       help="接触损失进入 verifier/MCTS 树值（默认：true）")
+    parser.add_argument("--tcr_contact_peptide_chain_index", type=int, default=0,
+                       help="哪条非 binder 链是 9-mer 肽，按索引而非 role 选择（默认：0）")
+    parser.add_argument("--tcr_contact_mhc_chain_indices", type=str, default="1",
+                       help="哪些非 binder 链是 MHC，逗号分隔。HLA 与配对 TCR 链的 role 同为 scaffold，必须按索引区分（默认：1）")
+    parser.add_argument("--tcr_contact_cdr3_cutoff", type=float, default=8.0,
+                       help="CDR3-肽接触距离阈值，单位 Å（默认：8.0）")
+    parser.add_argument("--tcr_contact_fw_cutoff", type=float, default=8.0,
+                       help="框架-pMHC 接触距离阈值，单位 Å（默认：8.0）")
+
     # === 损失函数权重（key 必须与 DEFAULT_LOSS_WEIGHTS 一致） ===
     parser.add_argument("--loss_preset", type=str, default="tuned",
                        choices=sorted(LOSS_WEIGHT_PRESETS.keys()),
@@ -1672,17 +1756,7 @@ def main(argv=None):
         if val is not None:
             loss_weights[key] = val
 
-    tcr_prior_config = {
-        "use_tcr_prior_gradient": args.use_tcr_prior_gradient,
-        "tcr_prior_gradient_weight": args.tcr_prior_gradient_weight,
-        "use_tcr_prior_verifier": args.use_tcr_prior_verifier,
-        "tcr_prior_verifier_weight": args.tcr_prior_verifier_weight,
-        "tcr_prior_region": args.tcr_prior_region,
-        "tcr_prior_model_name": args.tcr_prior_model_name,
-        "tcr_prior_checkpoint": args.tcr_prior_checkpoint,
-        "tcr_prior_masked": args.tcr_prior_masked,
-        "require_real_tcr_prior": args.require_real_tcr_prior,
-    }
+    tcr_prior_config = build_tcr_prior_config(args)
 
     if model_backend == "esmfold2":
         from bindcraft.hallucination.esmfold2_pipeline import (
@@ -1881,7 +1955,6 @@ def main(argv=None):
             hotspot_params=hotspot_params,
             seed=args.seed,
             target_template_path=args.target_template_path,
-            tcr_prior_config=tcr_prior_config,
         )
     else:
         from bindcraft.hallucination.pipeline import run_mcts_hallucination
