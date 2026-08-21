@@ -2,7 +2,27 @@
 
 本文档说明当前推荐的 ESMFold2 默认配置，以及 De novo binder design、TCR binder design、TCR CDR redesign 和 VHH all-CDR redesign 四种任务的启动方式。以下命令均需在仓库根目录执行。
 
-运行前需要激活能够加载 `biohub/ESMFold2`、`biohub/ESMFold2-Experimental-Fast` 和 ESMC 的项目环境，并确保 CUDA GPU 与对应模型文件可用。
+运行前先使用 [`environment/esmfold2/`](../environment/esmfold2/README.md)
+创建独立环境并下载固定 revision 的 `biohub/ESMFold2`、
+`biohub/ESMFold2-Experimental-Fast` 和 `biohub/ESMC-6B`。不要在 Protenix
+环境中直接加装 ESMFold2：`fair-esm` 与 Biohub `esm` 使用相同的 Python
+namespace，混装可能加载错误实现。
+
+```bash
+bash environment/esmfold2/install.sh
+conda activate proteocraft_esmfold2_py312
+python environment/esmfold2/download_models.py \
+  --cache-dir /path/to/proteocraft_hf_cache
+```
+
+模型下载脚本会打印 `HF_HOME`、`HF_HUB_OFFLINE`、`TRANSFORMERS_OFFLINE` 和
+`ESMCFOLD_CCD_PATH` 的设置。导出这些变量后，可执行以下自检：
+
+```bash
+python environment/esmfold2/check_environment.py \
+  --require-cuda \
+  --require-models
+```
 
 ## 1. 默认配置
 
