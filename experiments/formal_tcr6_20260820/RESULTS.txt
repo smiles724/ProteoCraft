@@ -1,0 +1,178 @@
+evaluated cells: 24   cases: 6
+
+==========================================================================
+1. STRUCTURE / INTERFACE  (arm-comparable: excludes all TCR terms)
+==========================================================================
+
+--- esm_verify_loss ---
+    (lower better)
+case                  A off/off      B TCRLM    C contact       D both
+ALGRRIPPV_alpha          0.4581       0.5226       0.5710       0.5129
+ALGRRIPPV_beta           0.4870       0.4275       0.5278       0.5551
+KLNPRIPRI_alpha          0.3795       0.3566       0.4468       0.4798
+KLNPRIPRI_beta           0.5354       0.3581       0.5220       0.5611
+YLNPRVARI_alpha          0.3615       0.3377       0.4547       0.4920
+YLNPRVARI_beta           0.4019       0.3671       0.6273       0.3328
+mean delta vs A         +0.0000      -0.0423      +0.0877      +0.0517
+better than A               0/6          5/6          1/6          1/6
+
+--- pair_chain_iptm_loss ---
+    (lower better)
+case                  A off/off      B TCRLM    C contact       D both
+ALGRRIPPV_alpha          0.4007       0.4585       0.5069       0.4493
+ALGRRIPPV_beta           0.4380       0.3802       0.4759       0.4974
+KLNPRIPRI_alpha          0.3202       0.3001       0.3836       0.4099
+KLNPRIPRI_beta           0.4795       0.3127       0.4691       0.5092
+YLNPRVARI_alpha          0.3066       0.2815       0.3922       0.4256
+YLNPRVARI_beta           0.3546       0.3201       0.5690       0.2911
+mean delta vs A         +0.0000      -0.0411      +0.0829      +0.0471
+better than A               0/6          5/6          1/6          1/6
+
+--- interface PAE ---
+    (lower better)
+case                  A off/off      B TCRLM    C contact       D both
+ALGRRIPPV_alpha          0.0983       0.1476       0.1665       0.1885
+ALGRRIPPV_beta           0.1089       0.1715       0.2263       0.2319
+KLNPRIPRI_alpha          0.0936       0.0662       0.1391       0.2276
+KLNPRIPRI_beta           0.2302       0.1009       0.1943       0.1926
+YLNPRVARI_alpha          0.0570       0.0637       0.1362       0.2181
+YLNPRVARI_beta           0.2196       0.1535       0.2960       0.0607
+mean delta vs A         +0.0000      -0.0174      +0.0585      +0.0520
+better than A               0/6          3/6          1/6          2/6
+
+--- clash ---
+    (lower better)
+case                  A off/off      B TCRLM    C contact       D both
+ALGRRIPPV_alpha          0.0000       0.0000       0.0000       0.0000
+ALGRRIPPV_beta           0.0000       0.0000       0.0000       0.0000
+KLNPRIPRI_alpha          0.0000       0.0000       0.0000       0.0000
+KLNPRIPRI_beta           0.0000       0.0000       0.0000       0.0000
+YLNPRVARI_alpha          0.0000       0.0000       0.0000       0.0000
+YLNPRVARI_beta           0.0000       0.0000       0.0000       0.0000
+mean delta vs A         +0.0000      +0.0000      +0.0000      +0.0000
+better than A               0/6          0/6          0/6          0/6
+
+==========================================================================
+2. TCR NATURALNESS  (cross-evaluated with BOTH scorers)
+==========================================================================
+
+--- TCRLM NLL ---
+    (lower = more TCR-like)
+case                  A off/off      B TCRLM    C contact       D both
+ALGRRIPPV_alpha          3.8021       2.1218       3.4312       3.3847
+ALGRRIPPV_beta           3.2987       2.8557       2.8192       3.6469
+KLNPRIPRI_alpha          3.6409       2.9060       3.5551       2.8791
+KLNPRIPRI_beta           3.3353       2.4977       3.4518       2.9167
+YLNPRVARI_alpha          3.4691       2.5208       3.4420       2.3700
+YLNPRVARI_beta           2.7418       3.2401       3.2576       2.8338
+mean delta vs A         +0.0000      -0.6910      -0.0552      -0.3761
+better than A               0/6          5/6          4/6          4/6
+
+--- ESM-C NLL ---
+    (lower = more natural)
+case                  A off/off      B TCRLM    C contact       D both
+ALGRRIPPV_alpha          2.7264       2.6545       2.5157       2.9442
+ALGRRIPPV_beta           2.6676       2.4888       2.7422       3.2617
+KLNPRIPRI_alpha          2.6727       2.4792       2.6620       2.7708
+KLNPRIPRI_beta           2.7993       2.9220       2.9326       2.5899
+YLNPRVARI_alpha          2.8548       2.9250       2.6898       1.8922
+YLNPRVARI_beta           2.5608       3.0638       3.1137       2.2820
+mean delta vs A         +0.0000      +0.0420      +0.0624      -0.0901
+better than A               0/6          3/6          3/6          3/6
+
+  natural A6 CDR3 reference (evaluation-only, never optimised):
+    ALGRRIPPV_alpha    tcrlm=3.2263  esmc=1.7086
+    ALGRRIPPV_beta     tcrlm=2.0675  esmc=2.1114
+    KLNPRIPRI_alpha    tcrlm=3.2263  esmc=1.7086
+    KLNPRIPRI_beta     tcrlm=2.0675  esmc=2.1114
+    YLNPRVARI_alpha    tcrlm=3.2263  esmc=1.7086
+    YLNPRVARI_beta     tcrlm=2.0675  esmc=2.1114
+
+==========================================================================
+3. CONTACT  (recomputed identically for every arm)
+==========================================================================
+
+--- CDR3-peptide contact nll ---
+    (lower = more contact)
+case                  A off/off      B TCRLM    C contact       D both
+ALGRRIPPV_alpha          9.4715       8.9831       9.0949       8.2836
+ALGRRIPPV_beta           9.5482       8.9909       7.8974       8.2207
+KLNPRIPRI_alpha          9.5966       9.9656       8.0394       7.4739
+KLNPRIPRI_beta           7.9187       9.2788       7.9601       7.2106
+YLNPRVARI_alpha          9.7189       9.8674       8.2334       7.3281
+YLNPRVARI_beta           7.3419       8.0264       6.8703       8.6667
+mean delta vs A         +0.0000      +0.2527      -0.9167      -1.0687
+better than A               0/6          2/6          5/6          5/6
+
+--- framework-pMHC contact nll ---
+    (HIGHER is better here)
+case                  A off/off      B TCRLM    C contact       D both
+ALGRRIPPV_alpha         13.7363      12.8335      13.0370      13.0242
+ALGRRIPPV_beta          12.7516      13.0340      12.7844      12.4917
+KLNPRIPRI_alpha         13.3723      13.9193      13.4082      12.7480
+KLNPRIPRI_beta          12.0463      13.5609      12.5439      12.2905
+YLNPRVARI_alpha         14.6615      14.3367      13.0662      12.8255
+YLNPRVARI_beta          13.2990      13.3622      11.5653      14.0770
+mean delta vs A         +0.0000      +0.1966      -0.5770      -0.4017
+better than A               6/6          4/6          3/6          2/6
+
+--- framework hinge penalty ---
+    (0 = guardrail never fired)
+case                  A off/off      B TCRLM    C contact       D both
+ALGRRIPPV_alpha          0.0000       0.0000       0.0000       0.0000
+ALGRRIPPV_beta           0.0000       0.0000       0.0000       0.0083
+KLNPRIPRI_alpha          0.0000       0.0000       0.0000       0.0000
+KLNPRIPRI_beta           0.4537       0.0000       0.0000       0.2095
+YLNPRVARI_alpha          0.0000       0.0000       0.0000       0.0000
+YLNPRVARI_beta           0.0000       0.0000       0.9347       0.0000
+mean delta vs A         +0.0000      -0.0756      +0.0802      -0.0393
+better than A               0/6          1/6          1/6          1/6
+
+--- r_pep = CDR3-pep / TCR-pMHC contact mass ---
+    (diagnostic only, higher = more peptide-centric)
+case                  A off/off      B TCRLM    C contact       D both
+ALGRRIPPV_alpha          0.1614       0.1511       0.0181       0.2392
+ALGRRIPPV_beta           0.3172       0.4376       0.3649       0.6615
+KLNPRIPRI_alpha          0.3364       0.3440       0.3232       0.2715
+KLNPRIPRI_beta           0.3083       0.6205       0.3175       0.4056
+YLNPRVARI_alpha          0.4514       0.3701       0.0251       0.2505
+YLNPRVARI_beta           0.4090       0.3815       0.2563       0.6747
+mean delta vs A         +0.0000      +0.0535      -0.1131      +0.0865
+better than A               6/6          3/6          2/6          4/6
+
+==========================================================================
+4. SEQUENCES / CONTROLS
+==========================================================================
+  ALGRRIPPV_alpha
+    A off/off    ATLEDDDAGEQ        fw_unchanged=True n_mut_outside=0
+    B TCRLM      ATERADRPRDR        fw_unchanged=True n_mut_outside=0
+    C contact    ATDSDDEIMSY        fw_unchanged=True n_mut_outside=0
+    D both       FIGDGDEIGFA        fw_unchanged=True n_mut_outside=0
+  ALGRRIPPV_beta
+    A off/off    GTWNPDNFAAEGYI     fw_unchanged=True n_mut_outside=0
+    B TCRLM      ETRDTDNILAGGYI     fw_unchanged=True n_mut_outside=0
+    C contact    FTATGYYGRDDASP     fw_unchanged=True n_mut_outside=0
+    D both       HIKGLHMLQDGMVN     fw_unchanged=True n_mut_outside=0
+  KLNPRIPRI_alpha
+    A off/off    AELDDEFDVSP        fw_unchanged=True n_mut_outside=0
+    B TCRLM      ATLSDDRNRWT        fw_unchanged=True n_mut_outside=0
+    C contact    AQDEDGRYMYP        fw_unchanged=True n_mut_outside=0
+    D both       NRDHDGISYAR        fw_unchanged=True n_mut_outside=0
+  KLNPRIPRI_beta
+    A off/off    YDTSHYIEDGDDSP     fw_unchanged=True n_mut_outside=0
+    B TCRLM      LPYSRDINSRRDLA     fw_unchanged=True n_mut_outside=0
+    C contact    RTVLDWYGMVDAAY     fw_unchanged=True n_mut_outside=0
+    D both       GPSLYNLGGGDASL     fw_unchanged=True n_mut_outside=0
+  YLNPRVARI_alpha
+    A off/off    SIDIDDLKPNI        fw_unchanged=True n_mut_outside=0
+    B TCRLM      STGNDVRDRSW        fw_unchanged=True n_mut_outside=0
+    C contact    ATHGTPDEIQN        fw_unchanged=True n_mut_outside=0
+    D both       ARDDTGARVVS        fw_unchanged=True n_mut_outside=0
+  YLNPRVARI_beta
+    A off/off    AGKGWLGVALDGAA     fw_unchanged=True n_mut_outside=0
+    B TCRLM      FQRGTDGTMRNSNQ     fw_unchanged=True n_mut_outside=0
+    C contact    KIDSLFVGGLGSQM     fw_unchanged=True n_mut_outside=0
+    D both       GTRSADGSTGNAGL     fw_unchanged=True n_mut_outside=0
+
+  distinct CDR3 across all evaluated cells: 24/24
+  framework violations: 0
