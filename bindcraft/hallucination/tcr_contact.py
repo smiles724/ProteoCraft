@@ -217,6 +217,18 @@ class TCRContactConfig:
     verifier_weight: float = 1.0
     use_gradient: bool = True
     use_verifier: bool = True
+    # Objective form.
+    #   "nll_hinge"    -- the original absolute CDR3-peptide term plus the
+    #                     framework hinge.
+    #   "r_pep_target" -- match the empirical contact ratio measured on real
+    #                     TCR-pMHC structures.  Immune to the "squeeze the
+    #                     whole complex together" shortcut, because numerator
+    #                     and denominator rise together and the ratio does not
+    #                     move.
+    objective: str = "nll_hinge"
+    # Target for the r_pep_target objective.  Resolve from
+    # tcr_natural_prior.natural_r_pep(chain) at launch time.
+    r_pep_target: Optional[float] = None
     # Explicit spans for scaffolds not in KNOWN_SCAFFOLDS.
     cdr1_span: Optional[tuple[int, int]] = None
     cdr2_span: Optional[tuple[int, int]] = None
@@ -481,7 +493,10 @@ def tcr_contact_losses(
 
     total = cdr3_peptide_nll + float(config.lambda_fw) * framework_penalty
 
-    with torch.no_grad():
+    # r_pep must carry gradient when it *is* the objective; keep the cheap
+    # detached path when it is only a diagnostic.
+    objective = str(config.objective).strip().lower()
+    if objective == "r_pep_target":
         cdr3_peptide_mass = _soft_contact_mass(
             distogram_logits,
             bin_distance,
@@ -497,9 +512,43 @@ def tcr_contact_losses(
             mask_b=masks["pmhc"],
         )
         r_pep = cdr3_peptide_mass / (tcr_pmhc_mass + 1e-8)
+        if config.r_pep_target is None:
+            raise ValueError(
+                "objective='r_pep_target' requires r_pep_target; resolve it "
+                "from tcr_natural_prior.natural_r_pep(chain) at launch time"
+            )
+        target = torch.as_tensor(
+            float(config.r_pep_target), device=r_pep.device, dtype=r_pep.dtype
+        )
+        total = (r_pep - target).pow(2)
+    else:
+        with torch.no_grad():
+            cdr3_peptide_mass = _soft_contact_mass(
+                distogram_logits,
+                bin_distance,
+                cutoff=float(config.r_pep_cutoff),
+                mask_a=masks["cdr3"],
+                mask_b=masks["peptide"],
+            )
+            tcr_pmhc_mass = _soft_contact_mass(
+                distogram_logits,
+                bin_distance,
+                cutoff=float(config.r_pep_cutoff),
+                mask_a=masks["binder"],
+                mask_b=masks["pmhc"],
+            )
+            r_pep = cdr3_peptide_mass / (tcr_pmhc_mass + 1e-8)
 
+    out_target = (
+        float(config.r_pep_target)
+        if config.r_pep_target is not None
+        else float("nan")
+    )
     return {
         "tcr_contact_loss": total,
+        "r_pep_target": torch.as_tensor(
+            out_target, device=distogram_logits.device
+        ),
         "cdr3_peptide_contact_nll": cdr3_peptide_nll,
         "framework_pmhc_contact_nll": framework_pmhc_nll,
         "framework_penalty": framework_penalty,

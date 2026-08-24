@@ -428,6 +428,7 @@ def build_tcr_contact_config(args) -> dict:
         "mhc_chain_indices": mhc_indices,
         "cdr3_cutoff": args.tcr_contact_cdr3_cutoff,
         "fw_cutoff": args.tcr_contact_fw_cutoff,
+        "objective": getattr(args, "tcr_contact_objective", "nll_hinge"),
     }
     partner_index = int(getattr(args, "tcr_contact_partner_tcr_chain_index", 2))
     if partner_index >= 0:
@@ -441,6 +442,21 @@ def build_tcr_contact_config(args) -> dict:
             "--use_tcr_contact_loss requires --init_binder_seq so the "
             "CDR1/2/3 spans can be resolved from the natural scaffold"
         )
+    if str(getattr(args, "tcr_contact_objective", "nll_hinge")) == "r_pep_target":
+        raw_target = str(getattr(args, "tcr_contact_r_pep_target", "natural"))
+        if raw_target.strip().lower() == "natural":
+            chain = getattr(args, "tcr_contact_chain", None)
+            if not chain:
+                raise ValueError(
+                    "--tcr_contact_r_pep_target natural requires "
+                    "--tcr_contact_chain alpha|beta"
+                )
+            from bindcraft.hallucination.tcr_natural_prior import natural_r_pep
+
+            payload["r_pep_target"] = float(natural_r_pep(chain))
+        else:
+            payload["r_pep_target"] = float(raw_target)
+
     from bindcraft.hallucination.tcr_contact import resolve_contact_config_spans
 
     partner_sequence = None
@@ -1219,6 +1235,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tcr_contact_fw_hinge_verifier", type=float, default=12.5,
                        help="verifier 路径的铰链阈值；full ESMFold2 与 fast experimental model 的 "
                             "distogram 尺度不同，自然值约 13.5-14.8（默认：12.5）")
+    parser.add_argument("--tcr_contact_objective", type=str, default="nll_hinge",
+                       choices=["nll_hinge", "r_pep_target"],
+                       help="contact 目标函数形式：nll_hinge 绝对接触项+framework hinge / "
+                            "r_pep_target 匹配真实结构的接触比例（默认：nll_hinge）")
+    parser.add_argument("--tcr_contact_r_pep_target", type=str, default="natural",
+                       help="r_pep_target 目标值：'natural' 从 216 个真实 TCR-pMHC 结构解析，"
+                            "或直接给一个浮点数（默认：natural）")
+    parser.add_argument("--tcr_contact_chain", type=str, default=None,
+                       choices=["alpha", "beta"],
+                       help="被重设计的链，用于查天然 r_pep 目标（默认：None）")
     parser.add_argument("--tcr_contact_verifier_weight", type=float, default=1.0,
                        help="verifier/MCTS 路径的硬接触损失权重（默认：1.0）")
     parser.add_argument("--tcr_contact_use_gradient", type=lambda x: x.lower() == "true", default=True,
