@@ -1,0 +1,504 @@
+<title>TCR-Specific Loss 消融实验</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Serif:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Serif+SC:wght@400;600&family=Noto+Sans+SC:wght@500;700&display=swap">
+<style>
+:root{
+  --ground:#F5F6F8; --panel:#FFFFFF; --ink:#14181D; --ink-soft:#454E59;
+  --muted:#6B7480; --rule:#DDE1E7; --rule-soft:#EBEEF2;
+  --teal:#0E6B6B; --teal-soft:#D5E6E5; --clay:#B4482F; --clay-soft:#F2DED8;
+  --amber:#9A6B12; --shadow:0 1px 2px rgba(20,24,29,.06),0 8px 24px rgba(20,24,29,.05);
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#0E1215; --panel:#171C21; --ink:#E8EBEE; --ink-soft:#B4BCC5;
+    --muted:#8A939E; --rule:#2A3138; --rule-soft:#212831;
+    --teal:#5FBDB6; --teal-soft:#12312F; --clay:#E58265; --clay-soft:#3A2019;
+    --amber:#D9A441; --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.3);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0E1215; --panel:#171C21; --ink:#E8EBEE; --ink-soft:#B4BCC5;
+  --muted:#8A939E; --rule:#2A3138; --rule-soft:#212831;
+  --teal:#5FBDB6; --teal-soft:#12312F; --clay:#E58265; --clay-soft:#3A2019;
+  --amber:#D9A441; --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.3);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);
+  font-family:"IBM Plex Serif","Noto Serif SC",Georgia,serif;
+  font-size:16.5px;line-height:1.72;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1080px;margin:0 auto;padding:0 28px 96px}
+.col{max-width:660px}
+h1,h2,h3,h4,.lbl,th,figcaption{font-family:"IBM Plex Sans Condensed","Noto Sans SC",system-ui,sans-serif}
+.mono,td.n,th.n,.stat-v{font-family:"IBM Plex Mono",ui-monospace,monospace;font-variant-numeric:tabular-nums}
+.lbl{font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);font-weight:600}
+
+header{padding:76px 0 44px;border-bottom:1px solid var(--rule)}
+h1{font-size:clamp(32px,4.8vw,50px);line-height:1.08;margin:16px 0 0;font-weight:700;letter-spacing:-.02em;text-wrap:balance}
+.q{max-width:660px;margin:26px 0 0;padding:20px 24px;background:var(--panel);border:1px solid var(--rule);border-left:3px solid var(--ink);border-radius:0 3px 3px 0;box-shadow:var(--shadow)}
+.q .lbl{display:block;margin-bottom:8px}
+.q p{margin:0;font-size:17px;color:var(--ink);line-height:1.62}
+.meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
+.chip{font-family:"IBM Plex Mono",monospace;font-size:11.5px;padding:5px 10px;border:1px solid var(--rule);border-radius:2px;color:var(--muted);background:var(--panel)}
+
+.chans{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:36px 0 0}
+.ch{background:var(--panel);border:1px solid var(--rule);border-radius:3px;padding:22px;box-shadow:var(--shadow);border-top:3px solid var(--teal)}
+.ch.two{border-top-color:var(--clay)}
+.ch .tag{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.08em;font-weight:600;color:var(--teal)}
+.ch.two .tag{color:var(--clay)}
+.ch h3{margin:7px 0 0;font-size:19px;font-weight:600}
+.ch p{margin:8px 0 0;font-size:14.5px;color:var(--ink-soft);line-height:1.6}
+.ch .path{margin-top:14px;padding-top:12px;border-top:1px solid var(--rule-soft);font-family:"IBM Plex Mono",monospace;font-size:11.5px;color:var(--muted);line-height:1.75}
+
+section{padding-top:64px}
+h2{font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);font-weight:600;margin:0 0 6px;display:flex;align-items:baseline;gap:12px}
+h2 .num{font-family:"IBM Plex Mono",monospace;color:var(--clay);font-size:12px}
+.h2t{font-size:clamp(23px,3.2vw,31px);line-height:1.2;margin:0 0 18px;font-weight:700;letter-spacing:-.015em;text-wrap:balance;font-family:"IBM Plex Sans Condensed","Noto Sans SC",sans-serif}
+p{margin:0 0 16px}
+strong{font-weight:600}
+.k{font-family:"IBM Plex Mono",monospace;font-size:.88em;background:var(--rule-soft);padding:1px 5px;border-radius:2px}
+
+figure{margin:28px 0;background:var(--panel);border:1px solid var(--rule);border-radius:3px;padding:24px;box-shadow:var(--shadow);overflow-x:auto}
+figcaption{font-size:13.5px;color:var(--muted);margin-top:16px;line-height:1.58}
+figcaption b{color:var(--ink-soft);font-weight:600}
+svg{display:block;max-width:100%;height:auto}
+
+table{border-collapse:collapse;width:100%;font-size:14px;margin:8px 0}
+th,td{padding:9px 10px;text-align:right;border-bottom:1px solid var(--rule-soft)}
+th:first-child,td:first-child{text-align:left}
+thead th{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--rule);font-weight:600}
+tbody tr:last-child td{border-bottom:none}
+.pos{color:var(--teal);font-weight:600}
+.neg{color:var(--clay);font-weight:600}
+.dim{color:var(--muted)}
+.sm{font-weight:400;font-size:12px}
+
+.mf{display:grid;grid-template-columns:1fr 1fr;border:1px solid var(--rule);border-radius:3px;overflow:hidden;background:var(--panel);margin:24px 0;box-shadow:var(--shadow)}
+.mf>div{padding:20px 22px;border-bottom:1px solid var(--rule-soft)}
+.mf>div:nth-child(odd){border-right:1px solid var(--rule);background:linear-gradient(90deg,var(--clay-soft) 0 3px,transparent 3px)}
+.mf>div:nth-child(even){background:linear-gradient(90deg,var(--teal-soft) 0 3px,transparent 3px)}
+.mf>div:nth-last-child(-n+2){border-bottom:none}
+.mf .hd{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.1em;text-transform:uppercase;margin-bottom:7px;font-weight:600}
+.mf>div:nth-child(odd) .hd{color:var(--clay)}
+.mf>div:nth-child(even) .hd{color:var(--teal)}
+.mf h4{margin:0 0 6px;font-size:16.5px;font-weight:600}
+.mf p{margin:0;font-size:14.5px;color:var(--ink-soft);line-height:1.6}
+
+.callout{border-left:3px solid var(--amber);background:var(--panel);padding:18px 22px;margin:26px 0;border-radius:0 3px 3px 0;box-shadow:var(--shadow)}
+.callout .lbl{color:var(--amber);margin-bottom:6px;display:block}
+.callout p{margin:0;font-size:15px;color:var(--ink-soft)}
+.callout p+p{margin-top:10px}
+
+ul{margin:0 0 16px;padding-left:20px}
+li{margin-bottom:9px}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:24px 0}
+.stat{background:var(--panel);border:1px solid var(--rule);border-radius:3px;padding:16px;box-shadow:var(--shadow)}
+.stat-v{font-size:25px;font-weight:600;letter-spacing:-.02em;line-height:1.1}
+.stat-k{font-size:11.5px;color:var(--muted);margin-top:5px;font-family:"IBM Plex Sans Condensed","Noto Sans SC",sans-serif;line-height:1.35}
+footer{margin-top:72px;padding-top:24px;border-top:1px solid var(--rule);font-size:13px;color:var(--muted)}
+@media (max-width:720px){
+  .chans,.mf{grid-template-columns:1fr}
+  .mf>div:nth-child(odd){border-right:none}
+  .stats{grid-template-columns:repeat(2,1fr)}
+}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="wrap">
+<header>
+  <div class="lbl">ESMFold2 / ProteoCraft · Scaffold-Constrained de novo CDR3 Design · 组会内部</div>
+  <h1>TCR-Specific Loss 消融实验</h1>
+
+  <div class="q">
+    <span class="lbl">核心问题</span>
+    <p>在 A6 scaffold 固定、仅重设计 CDR3 的条件下，显式引入 <strong>TCR-specific</strong> 的约束，能否把设计出的 CDR3 推向<strong>更接近天然 TCR repertoire 的序列空间</strong>，同时不牺牲结构与 interface 质量？</p>
+  </div>
+
+  <div class="meta">
+    <span class="chip">HLA-A*0201 · 3 peptides × α/β = 6 cases</span>
+    <span class="chip">2×2 ablation · 24/24 jobs · 0 failed</span>
+    <span class="chip">seed 42 · CDR3-only</span>
+    <span class="chip">backbone 7bf6251</span>
+  </div>
+
+  <div class="chans">
+    <div class="ch">
+      <div class="tag">通道一 · 直接作用于序列空间</div>
+      <h3>TCR sequence prior</h3>
+      <p>用 TCRLM（在天然 TCR repertoire 上训练）对 CDR3 打分，把「像不像真实 TCR」变成一个可优化的量。</p>
+      <div class="path">soft prior → proposal gradient<br>hard prior → verifier / MCTS tree value</div>
+    </div>
+    <div class="ch two">
+      <div class="tag">通道二 · 通过相互作用模式间接约束</div>
+      <h3>TCR contact loss</h3>
+      <p>奖励 CDR3 真正接触 peptide、惩罚 framework 介导的 pMHC 结合，防止设计退化成泛化的 MHC binder。</p>
+      <div class="path">contact grad → proposal gradient<br>hard contact → verifier / MCTS tree value</div>
+    </div>
+  </div>
+</header>
+
+<section>
+  <h2><span class="num">01</span>实验设计</h2>
+  <div class="col">
+    <div class="h2t">两条通道各自独立开关，2×2 四个 arm</div>
+    <p>两条通道刻意做成<strong>可分别 ablate</strong> 的独立信号，注入位置也完全对称（proposal 梯度 + verifier/MCTS 两条路径）。所有 arm 共用同一 scaffold、同一 seed、同一 search budget。</p>
+    <p>评估上有一条硬性纪律：全部 arm 由<strong>同一个 verifier、同一个固定 eval seed</strong> 重新打分，contact 指标对没有优化过它的 arm 也照样计算。因此下面没有任何一列依赖 arm-specific 的 <span class="k">total_loss</span>——这正是上一轮 Protenix 分析被污染的地方。</p>
+  </div>
+
+  <figure>
+    <table>
+      <thead><tr><th>Arm</th><th style="text-align:left">sequence prior</th><th style="text-align:left">contact loss</th><th style="text-align:left">回答的问题</th></tr></thead>
+      <tbody>
+        <tr><td><b>A</b></td><td class="dim">OFF</td><td class="dim">OFF</td><td class="dim">基线（注意：ESMFold2 自带 ESM-C guidance，并非「无先验」）</td></tr>
+        <tr><td><b>B</b></td><td class="pos">ON</td><td class="dim">OFF</td><td>B−A：序列先验单独的效果</td></tr>
+        <tr><td><b>C</b></td><td class="dim">OFF</td><td class="neg">ON</td><td>C−A：接触约束单独的效果</td></tr>
+        <tr><td><b>D</b></td><td class="pos">ON</td><td class="neg">ON</td><td>D−C / D−B：两者的条件增益</td></tr>
+      </tbody>
+    </table>
+  </figure>
+</section>
+
+<section>
+  <h2><span class="num">02</span>主结论</h2>
+  <div class="col">
+    <div class="h2t">序列先验成立：CDR3 确实被推向了天然 TCR 空间</div>
+    <p>这是对核心问题的正面回答。TCRLM prior 让 CDR3 的 repertoire typicality 显著提升（<span class="k">−0.69</span> nats，5/6 case），<strong>而且结构质量同时变好</strong>（5/6）——没有 trade-off。</p>
+    <p>更直观的看法是把设计序列和<strong>天然 A6 自身的 CDR3</strong> 放在同一把尺子上：</p>
+  </div>
+
+  <figure>
+    <svg viewBox="0 0 900 300" role="img" aria-label="每个 case 的 TCRLM NLL，arm A 到 arm B 的移动，与天然 A6 CDR3 参考线对比">
+      <g font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">
+        <text x="0" y="12" opacity=".55" letter-spacing="1">TCRLM NLL（越低 = 越接近天然 TCR repertoire）</text>
+        <g transform="translate(118,40)">
+          <line x1="0" y1="0" x2="0" y2="196" stroke="currentColor" stroke-opacity=".18"/>
+          <line x1="190" y1="0" x2="190" y2="196" stroke="currentColor" stroke-opacity=".1" stroke-dasharray="2 3"/>
+          <line x1="380" y1="0" x2="380" y2="196" stroke="currentColor" stroke-opacity=".1" stroke-dasharray="2 3"/>
+          <line x1="570" y1="0" x2="570" y2="196" stroke="currentColor" stroke-opacity=".1" stroke-dasharray="2 3"/>
+          <line x1="760" y1="0" x2="760" y2="196" stroke="currentColor" stroke-opacity=".1" stroke-dasharray="2 3"/>
+          <text x="0" y="212" text-anchor="middle" opacity=".5">2.0</text><text x="190" y="212" text-anchor="middle" opacity=".5">2.5</text>
+          <text x="380" y="212" text-anchor="middle" opacity=".5">3.0</text><text x="570" y="212" text-anchor="middle" opacity=".5">3.5</text>
+          <text x="760" y="212" text-anchor="middle" opacity=".5">4.0</text>
+
+          <!-- alpha group -->
+          <text x="-108" y="-4" font-family="IBM Plex Sans Condensed, sans-serif" font-size="12" font-weight="600" fill="var(--teal)">α 链 · 3/3 越过天然线</text>
+          <line x1="466" y1="4" x2="466" y2="86" stroke="var(--ink-soft)" stroke-width="2" stroke-dasharray="4 3"/>
+          <text x="472" y="14" font-size="11" font-weight="600" fill="var(--ink-soft)">天然 A6 α = 3.23</text>
+          <g>
+            <text x="-14" y="26" text-anchor="end" font-size="11.5">ALGRRIPPV_α</text>
+            <line x1="46.4" y1="22" x2="684.8" y2="22" stroke="var(--teal)" stroke-width="1.5" stroke-opacity=".45"/>
+            <circle cx="684.8" cy="22" r="5" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="1.5"/>
+            <circle cx="46.4" cy="22" r="5" fill="var(--teal)"/>
+          </g>
+          <g>
+            <text x="-14" y="54" text-anchor="end" font-size="11.5">KLNPRIPRI_α</text>
+            <line x1="344.3" y1="50" x2="623.6" y2="50" stroke="var(--teal)" stroke-width="1.5" stroke-opacity=".45"/>
+            <circle cx="623.6" cy="50" r="5" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="1.5"/>
+            <circle cx="344.3" cy="50" r="5" fill="var(--teal)"/>
+          </g>
+          <g>
+            <text x="-14" y="82" text-anchor="end" font-size="11.5">YLNPRVARI_α</text>
+            <line x1="198" y1="78" x2="558.2" y2="78" stroke="var(--teal)" stroke-width="1.5" stroke-opacity=".45"/>
+            <circle cx="558.2" cy="78" r="5" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="1.5"/>
+            <circle cx="198" cy="78" r="5" fill="var(--teal)"/>
+          </g>
+
+          <!-- beta group -->
+          <line x1="-118" y1="100" x2="790" y2="100" stroke="currentColor" stroke-opacity=".12"/>
+          <text x="-108" y="118" font-family="IBM Plex Sans Condensed, sans-serif" font-size="12" font-weight="600" fill="var(--muted)">β 链 · 0/3 越过天然线</text>
+          <line x1="25.6" y1="126" x2="25.6" y2="196" stroke="var(--ink-soft)" stroke-width="2" stroke-dasharray="4 3"/>
+          <text x="31" y="136" font-size="11" font-weight="600" fill="var(--ink-soft)">天然 A6 β = 2.07</text>
+          <g>
+            <text x="-14" y="152" text-anchor="end" font-size="11.5">ALGRRIPPV_β</text>
+            <line x1="325.3" y1="148" x2="493.6" y2="148" stroke="var(--teal)" stroke-width="1.5" stroke-opacity=".45"/>
+            <circle cx="493.6" cy="148" r="5" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="1.5"/>
+            <circle cx="325.3" cy="148" r="5" fill="var(--teal)"/>
+          </g>
+          <g>
+            <text x="-14" y="176" text-anchor="end" font-size="11.5">KLNPRIPRI_β</text>
+            <line x1="189.2" y1="172" x2="507.3" y2="172" stroke="var(--teal)" stroke-width="1.5" stroke-opacity=".45"/>
+            <circle cx="507.3" cy="172" r="5" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="1.5"/>
+            <circle cx="189.2" cy="172" r="5" fill="var(--teal)"/>
+          </g>
+          <g>
+            <text x="-14" y="200" text-anchor="end" font-size="11.5">YLNPRVARI_β</text>
+            <line x1="282" y1="196" x2="471.2" y2="196" stroke="var(--clay)" stroke-width="1.5" stroke-opacity=".45"/>
+            <circle cx="282" cy="196" r="5" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="1.5"/>
+            <circle cx="471.2" cy="196" r="5" fill="var(--clay)"/>
+          </g>
+        </g>
+        <g transform="translate(118,288)" font-size="11.5">
+          <circle cx="6" cy="-4" r="5" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="1.5"/><text x="18" y="0" opacity=".7">arm A 基线</text>
+          <circle cx="122" cy="-4" r="5" fill="var(--teal)"/><text x="134" y="0" opacity=".7">arm B 更接近天然</text>
+          <circle cx="286" cy="-4" r="5" fill="var(--clay)"/><text x="298" y="0" opacity=".7">arm B 更远离</text>
+        </g>
+      </g>
+    </svg>
+    <figcaption>虚线是<b>天然 A6 自身 CDR3</b> 的 TCRLM NLL（仅作参照，全程不参与优化）。<b>三个 α case 全部越过这条线</b>——设计出的 CDR3 比 A6 本身更「repertoire-典型」。β 链改善但都没越线，且 YLNPRVARI_β 是唯一变差的 case。这个 α/β 不对称值得单独追。</figcaption>
+  </figure>
+
+  <div class="col">
+    <div class="h2t" style="margin-top:44px">接触约束不成立：达成了指标，毁掉了目的</div>
+    <p>通道二的结果相反。CDR3–peptide 接触确实上去了（5/6），但结构变差（5/6），而且 <span class="k">r_pep</span>——CDR3 接触在总 TCR–pMHC 接触中的占比——<strong>反而下降</strong>。也就是说它正在制造它本该阻止的那种泛化 MHC binder。</p>
+  </div>
+
+  <figure>
+    <table>
+      <thead><tr>
+        <th>对比</th><th class="n">结构 loss</th><th class="n">TCRLM NLL</th><th class="n">ESM-C NLL</th><th class="n">CDR3–pep</th><th class="n">FW–pMHC 间隔</th><th class="n">r_pep</th>
+      </tr></thead>
+      <tbody>
+        <tr><td><b>B − A</b><br><span class="dim sm">只加先验</span></td>
+          <td class="n pos">−0.042<br><span class="dim sm">5/6</span></td><td class="n pos">−0.691<br><span class="dim sm">5/6</span></td>
+          <td class="n dim">+0.042<br><span class="sm">3/6</span></td><td class="n dim">+0.253<br><span class="sm">2/6</span></td>
+          <td class="n pos">+0.197<br><span class="dim sm">4/6</span></td><td class="n dim">+0.054<br><span class="sm">3/6</span></td></tr>
+        <tr><td><b>C − A</b><br><span class="dim sm">只加接触</span></td>
+          <td class="n neg">+0.088<br><span class="dim sm">1/6</span></td><td class="n dim">−0.055<br><span class="sm">4/6</span></td>
+          <td class="n dim">+0.062<br><span class="sm">3/6</span></td><td class="n pos">−0.917<br><span class="dim sm">5/6</span></td>
+          <td class="n neg">−0.577<br><span class="dim sm">3/6</span></td><td class="n neg">−0.113<br><span class="dim sm">2/6</span></td></tr>
+        <tr><td><b>D − C</b><br><span class="dim sm">接触上加先验</span></td>
+          <td class="n pos">−0.036<br><span class="dim sm">4/6</span></td><td class="n pos">−0.321<br><span class="dim sm">5/6</span></td>
+          <td class="n dim">−0.153<br><span class="sm">3/6</span></td><td class="n dim">−0.152<br><span class="sm">4/6</span></td>
+          <td class="n pos">+0.175<br><span class="dim sm">5/6</span></td><td class="n pos">+0.200<br><span class="dim sm">5/6</span></td></tr>
+        <tr><td><b>D − B</b><br><span class="dim sm">先验上加接触</span></td>
+          <td class="n neg">+0.094<br><span class="dim sm">2/6</span></td><td class="n neg">+0.315<br><span class="dim sm">3/6</span></td>
+          <td class="n dim">−0.132<br><span class="sm">3/6</span></td><td class="n pos">−1.321<br><span class="dim sm">5/6</span></td>
+          <td class="n neg">−0.598<br><span class="dim sm">2/6</span></td><td class="n dim">+0.033<br><span class="sm">3/6</span></td></tr>
+      </tbody>
+    </table>
+    <figcaption>6 个 case 的均值差；下方分数是「多少 case 朝好的方向动」。<b>绿 = 更好，红 = 更差，灰 = 3:3 等于抛硬币。</b>注意 ESM-C NLL 整列都是灰的——没有任何 arm 改善了通用蛋白 naturalness，这一点在第 04 节展开。r_pep 一列请按<b>与天然值的距离</b>读，而非数值高低——见下一节的更正。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2><span class="num">03</span>接触约束为何失效</h2>
+  <div class="col">
+    <div class="h2t">三层机制，都是直接测到的</div>
+    <p>失效原因不是推测。我在 proposal 路径上记录了每一步的梯度夹角，跨 6 个 case、<strong>1056 个优化步</strong>：</p>
+  </div>
+
+  <figure>
+    <svg viewBox="0 0 940 300" role="img" aria-label="cos(contact, structure) 分布直方图，77% 的优化步落在负半轴">
+      <text x="0" y="14" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor" opacity=".55" letter-spacing="1">COS(CONTACT_GRAD, STRUCTURE_GRAD) — ARM C, 1056 STEPS</text>
+      <g transform="translate(0,32)">
+        <line x1="0" y1="200" x2="900" y2="200" stroke="currentColor" stroke-opacity=".22"/>
+        <line x1="450" y1="0" x2="450" y2="212" stroke="currentColor" stroke-opacity=".35" stroke-dasharray="3 3"/>
+        <text x="450" y="232" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor" opacity=".55">0</text>
+        <text x="0" y="232" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor" opacity=".55">−1</text>
+        <text x="900" y="232" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor" opacity=".55">+1</text>
+        <g fill="var(--clay)">
+          <rect x="1" y="48.3" width="43" height="151.7"/><rect x="46" y="6.7" width="43" height="193.3"/>
+          <rect x="91" y="38.3" width="43" height="161.7"/><rect x="136" y="31.7" width="43" height="168.3"/>
+          <rect x="181" y="50" width="43" height="150"/><rect x="226" y="68.3" width="43" height="131.7"/>
+          <rect x="271" y="95" width="43" height="105"/><rect x="316" y="88.3" width="43" height="111.7"/>
+          <rect x="361" y="106.7" width="43" height="93.3"/><rect x="406" y="116.7" width="43" height="83.3"/>
+        </g>
+        <g fill="var(--teal)" fill-opacity=".55">
+          <rect x="451" y="130" width="43" height="70"/><rect x="496" y="140" width="43" height="60"/>
+          <rect x="541" y="138.3" width="43" height="61.7"/><rect x="586" y="150" width="43" height="50"/>
+          <rect x="631" y="156.7" width="43" height="43.3"/><rect x="676" y="161.7" width="43" height="38.3"/>
+          <rect x="721" y="168.3" width="43" height="31.7"/><rect x="766" y="170" width="43" height="30"/>
+          <rect x="811" y="181.7" width="43" height="18.3"/><rect x="856" y="193.3" width="43" height="6.7"/>
+        </g>
+        <rect x="1" y="-6" width="448" height="3" fill="var(--clay)"/>
+        <text x="225" y="-12" text-anchor="middle" font-family="IBM Plex Sans Condensed, sans-serif" font-size="14" font-weight="600" fill="var(--clay)">反向 · 810 步 (76.7%)</text>
+        <rect x="451" y="-6" width="448" height="3" fill="var(--teal)" fill-opacity=".55"/>
+        <text x="675" y="-12" text-anchor="middle" font-family="IBM Plex Sans Condensed, sans-serif" font-size="14" font-weight="600" fill="var(--teal)">同向 · 246 步 (23.3%)</text>
+        <line x1="293" y1="0" x2="293" y2="200" stroke="currentColor" stroke-opacity=".5" stroke-width="1.5"/>
+        <text x="285" y="16" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="12" font-weight="600" fill="currentColor">mean −0.348</text>
+      </g>
+    </svg>
+    <figcaption><b>机制一：梯度反向。</b>如果接触约束只是「在结构允许的方向上加一点偏好」，分布应集中在 0 附近或偏正。实际它 77% 的时间指向结构梯度的反方向，均值 −0.348（arm D 为 −0.326 / 74%，几乎一致）。原始梯度模长还是 structure 的 <b>3.2 倍</b>——它不是在引导结构，是在拉扯结构。</figcaption>
+  </figure>
+
+  <figure>
+    <svg viewBox="0 0 900 240" role="img" aria-label="arm A 到 arm C，CDR3-peptide 与 framework-pMHC 的 contact nll 同时下降">
+      <g font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">
+        <text x="0" y="12" opacity=".55" letter-spacing="1">CONTACT NLL 均值（越低 = 越近）· 两侧同一刻度</text>
+        <g transform="translate(40,42)">
+          <text x="0" y="-8" font-family="IBM Plex Sans Condensed, sans-serif" font-size="14" font-weight="600" opacity=".85">CDR3 – peptide（我们想要的）</text>
+          <line x1="0" y1="20" x2="0" y2="150" stroke="currentColor" stroke-opacity=".2"/>
+          <line x1="330" y1="20" x2="330" y2="150" stroke="currentColor" stroke-opacity=".2"/>
+          <text x="0" y="168" text-anchor="middle" opacity=".55">arm A</text><text x="330" y="168" text-anchor="middle" opacity=".55">arm C</text>
+          <line x1="0" y1="42" x2="330" y2="116" stroke="var(--teal)" stroke-width="2.5"/>
+          <circle cx="0" cy="42" r="5" fill="var(--teal)"/><circle cx="330" cy="116" r="5" fill="var(--teal)"/>
+          <text x="-12" y="46" text-anchor="end" font-weight="600">8.93</text>
+          <text x="342" y="120" font-weight="600" fill="var(--teal)">8.02</text>
+          <text x="165" y="70" text-anchor="middle" font-size="12" font-weight="600" fill="var(--teal)">−0.92 ✓</text>
+        </g>
+        <g transform="translate(520,42)">
+          <text x="0" y="-8" font-family="IBM Plex Sans Condensed, sans-serif" font-size="14" font-weight="600" opacity=".85">framework – pMHC（我们不想要的）</text>
+          <line x1="0" y1="20" x2="0" y2="150" stroke="currentColor" stroke-opacity=".2"/>
+          <line x1="290" y1="20" x2="290" y2="150" stroke="currentColor" stroke-opacity=".2"/>
+          <text x="0" y="168" text-anchor="middle" opacity=".55">arm A</text><text x="290" y="168" text-anchor="middle" opacity=".55">arm C</text>
+          <line x1="0" y1="42" x2="290" y2="88" stroke="var(--clay)" stroke-width="2.5"/>
+          <circle cx="0" cy="42" r="5" fill="var(--clay)"/><circle cx="290" cy="88" r="5" fill="var(--clay)"/>
+          <text x="-12" y="46" text-anchor="end" font-weight="600">13.31</text>
+          <text x="302" y="92" font-weight="600" fill="var(--clay)">12.73</text>
+          <text x="145" y="62" text-anchor="middle" font-size="12" font-weight="600" fill="var(--clay)">−0.58 ✗</text>
+        </g>
+      </g>
+    </svg>
+    <figcaption><b>机制二：它拉近的是整个复合物，不是 CDR3。</b>distogram 是全局预测，所以降低 <span class="k">contact_nll(CDR3,pep)</span> 最省力的路径是让模型预测一个整体更紧的复合物。两侧<b>同向下降</b>正是这个签名：CDR3 靠近 peptide 的同时 framework 也在靠近 pMHC。目标函数分辨不了这两种情况——因为它只约束分子，完全不管分母。</figcaption>
+  </figure>
+
+  <figure>
+    <svg viewBox="0 0 900 300" role="img" aria-label="每个 case 的 r_pep，与真实结构测得的天然目标值对比">
+      <g font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">
+        <text x="0" y="12" opacity=".55" letter-spacing="1">r_pep 与天然目标值（216 个真实结构测得）</text>
+        <g transform="translate(150,38)">
+          <line x1="0" y1="0" x2="0" y2="212" stroke="currentColor" stroke-opacity=".18"/>
+          <line x1="175" y1="0" x2="175" y2="212" stroke="currentColor" stroke-opacity=".1" stroke-dasharray="2 3"/>
+          <line x1="350" y1="0" x2="350" y2="212" stroke="currentColor" stroke-opacity=".1" stroke-dasharray="2 3"/>
+          <line x1="525" y1="0" x2="525" y2="212" stroke="currentColor" stroke-opacity=".1" stroke-dasharray="2 3"/>
+          <line x1="700" y1="0" x2="700" y2="212" stroke="currentColor" stroke-opacity=".1" stroke-dasharray="2 3"/>
+          <text x="0" y="228" text-anchor="middle" opacity=".5">0</text><text x="175" y="228" text-anchor="middle" opacity=".5">0.2</text>
+          <text x="350" y="228" text-anchor="middle" opacity=".5">0.4</text><text x="525" y="228" text-anchor="middle" opacity=".5">0.6</text>
+          <text x="700" y="228" text-anchor="middle" opacity=".5">0.8</text>
+
+          <text x="-140" y="-6" font-size="12" font-weight="600" fill="var(--ink-soft)" font-family="IBM Plex Sans Condensed, sans-serif">α 链</text>
+          <line x1="258.4" y1="2" x2="258.4" y2="92" stroke="var(--ink-soft)" stroke-width="2" stroke-dasharray="4 3"/>
+          <text x="264" y="12" font-size="11" font-weight="600" fill="var(--ink-soft)">天然 0.295</text>
+          <g><text x="-14" y="24" text-anchor="end" font-size="11.5">ALGRRIPPV_α</text>
+            <line x1="15.8" y1="20" x2="141.2" y2="20" stroke="var(--clay)" stroke-width="1.5" stroke-opacity=".45"/>
+            <circle cx="141.2" cy="20" r="5" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="1.5"/><circle cx="15.8" cy="20" r="5" fill="var(--clay)"/></g>
+          <g><text x="-14" y="52" text-anchor="end" font-size="11.5">KLNPRIPRI_α</text>
+            <line x1="282.8" y1="48" x2="294.4" y2="48" stroke="currentColor" stroke-width="1.5" stroke-opacity=".3"/>
+            <circle cx="294.4" cy="48" r="5" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="1.5"/><circle cx="282.8" cy="48" r="5" fill="var(--teal)" fill-opacity=".6"/></g>
+          <g><text x="-14" y="80" text-anchor="end" font-size="11.5">YLNPRVARI_α</text>
+            <line x1="22" y1="76" x2="394.9" y2="76" stroke="var(--clay)" stroke-width="1.5" stroke-opacity=".45"/>
+            <circle cx="394.9" cy="76" r="5" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="1.5"/><circle cx="22" cy="76" r="5" fill="var(--clay)"/></g>
+
+          <line x1="-140" y1="104" x2="790" y2="104" stroke="currentColor" stroke-opacity=".12"/>
+          <text x="-140" y="122" font-size="12" font-weight="600" fill="var(--ink-soft)" font-family="IBM Plex Sans Condensed, sans-serif">β 链</text>
+          <line x1="303.5" y1="118" x2="303.5" y2="208" stroke="var(--ink-soft)" stroke-width="2" stroke-dasharray="4 3"/>
+          <text x="309" y="128" font-size="11" font-weight="600" fill="var(--ink-soft)">天然 0.347</text>
+          <g><text x="-14" y="144" text-anchor="end" font-size="11.5">ALGRRIPPV_β</text>
+            <line x1="277.6" y1="140" x2="319.3" y2="140" stroke="currentColor" stroke-width="1.5" stroke-opacity=".3"/>
+            <circle cx="277.6" cy="140" r="5" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="1.5"/><circle cx="319.3" cy="140" r="5" fill="var(--teal)" fill-opacity=".6"/></g>
+          <g><text x="-14" y="172" text-anchor="end" font-size="11.5">KLNPRIPRI_β</text>
+            <line x1="269.8" y1="168" x2="277.8" y2="168" stroke="currentColor" stroke-width="1.5" stroke-opacity=".3"/>
+            <circle cx="269.8" cy="168" r="5" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="1.5"/><circle cx="277.8" cy="168" r="5" fill="var(--teal)" fill-opacity=".6"/></g>
+          <g><text x="-14" y="200" text-anchor="end" font-size="11.5">YLNPRVARI_β</text>
+            <line x1="224.3" y1="196" x2="357.9" y2="196" stroke="var(--clay)" stroke-width="1.5" stroke-opacity=".45"/>
+            <circle cx="357.9" cy="196" r="5" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="1.5"/><circle cx="224.3" cy="196" r="5" fill="var(--clay)"/></g>
+        </g>
+        <g transform="translate(150,288)" font-size="11.5">
+          <circle cx="6" cy="-4" r="5" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="1.5"/><text x="18" y="0" opacity=".7">arm A 基线</text>
+          <circle cx="136" cy="-4" r="5" fill="var(--clay)"/><text x="148" y="0" opacity=".7">arm C 远离天然值</text>
+          <circle cx="286" cy="-4" r="5" fill="var(--teal)" fill-opacity=".6"/><text x="298" y="0" opacity=".7">arm C 基本持平</text>
+        </g>
+      </g>
+    </svg>
+    <figcaption><b>关键更正：r_pep 不是「越高越好」，它有经验目标值。</b>虚线是 216 个真实人类 class I TCR–pMHC 结构测得的天然比例（α 0.295 / β 0.347）。按 <b>|r_pep − 天然值|</b> 重新评分，结论反转：<b>arm A 基线本来就最接近天然（0.082）</b>，arm B 0.111、arm C 0.119，而 <b>arm D 偏离最远（0.138）</b>——它冲到 0.66–0.68，约为天然值的两倍。arm C 掉到 0.02 不自然，arm D 冲到 0.67 同样不自然，只是方向相反。<b>据此，「最大化 r_pep」这个改法是错的。</b></figcaption>
+  </figure>
+
+  <figure>
+    <svg viewBox="0 0 900 190" role="img" aria-label="24 个 cell 的 framework-pMHC nll 分布与 hinge 位置">
+      <g font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">
+        <text x="0" y="12" opacity=".55" letter-spacing="1">FRAMEWORK–pMHC NLL 分布与 HINGE 位置</text>
+        <g transform="translate(30,46)">
+          <line x1="0" y1="80" x2="840" y2="80" stroke="currentColor" stroke-opacity=".22"/>
+          <text x="0" y="100" text-anchor="middle" opacity=".5">11.0</text><text x="210" y="100" text-anchor="middle" opacity=".5">12.0</text>
+          <text x="420" y="100" text-anchor="middle" opacity=".5">13.0</text><text x="630" y="100" text-anchor="middle" opacity=".5">14.0</text>
+          <text x="840" y="100" text-anchor="middle" opacity=".5">15.0</text>
+          <line x1="315" y1="-16" x2="315" y2="80" stroke="var(--clay)" stroke-width="2"/>
+          <text x="309" y="-22" text-anchor="end" font-size="12" font-weight="600" fill="var(--clay)">现在 hinge 12.5 · 24 格只触发 4 次</text>
+          <line x1="525" y1="-16" x2="525" y2="80" stroke="var(--teal)" stroke-width="2" stroke-dasharray="5 3"/>
+          <text x="531" y="-22" font-size="12" font-weight="600" fill="var(--teal)">建议 13.5</text>
+          <g fill="currentColor" fill-opacity=".5">
+            <circle cx="574.6" cy="20" r="4.5"/><circle cx="367.9" cy="20" r="4.5"/><circle cx="498.1" cy="20" r="4.5"/>
+            <circle cx="219.7" cy="20" r="4.5"/><circle cx="769" cy="20" r="4.5"/><circle cx="482.8" cy="20" r="4.5"/></g>
+          <text x="-10" y="24" text-anchor="end" font-size="11">A</text>
+          <g fill="var(--clay)">
+            <circle cx="427.8" cy="50" r="4.5"/><circle cx="374.6" cy="50" r="4.5"/><circle cx="505.7" cy="50" r="4.5"/>
+            <circle cx="324.2" cy="50" r="4.5"/><circle cx="433.9" cy="50" r="4.5"/><circle cx="118.7" cy="50" r="4.5"/></g>
+          <text x="-10" y="54" text-anchor="end" font-size="11" fill="var(--clay)" font-weight="600">C</text>
+        </g>
+      </g>
+    </svg>
+    <figcaption><b>机制三：hinge 一直在触发，但拦不住。</b>更正一个说法——「24 格只触发 4 次」只统计了<b>最终选出的序列</b>。按搜索过程统计完全不同：arm C 的 780 个候选里 <b>591 个（75.8%）触发了惩罚</b>，触发时均值 0.950（arm D 为 73.6%）。惩罚项不是形同虚设，它在四分之三的候选上都在响，只是<b>力度不够</b>：约 0.95 对上 CDR3 项约 8，只占目标函数 ~12%，framework 最终仍净靠近 0.58。改法因此不是抬高阈值，而是加大 λ_FW。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2><span class="num">04</span>改法</h2>
+  <div class="col">
+    <div class="h2t">三个机制，三个对应的改动</div>
+    <p>左右严格一一对应。其中 <strong>02 是根本性的</strong>，01 和 03 是补丁——只做一件事的话，做 02。</p>
+  </div>
+
+  <div class="mf">
+    <div><div class="hd">机制 01</div><h4>梯度反向</h4>
+      <p>接触梯度 77% 的步骤与结构梯度夹角为负，均值 −0.348，在系统性对抗结构优化。</p></div>
+    <div><div class="hd">改法 01 · 补丁</div><h4>梯度投影（PCGrad 式）</h4>
+      <p>混合前把接触梯度中与结构梯度反向的分量投影掉，只保留正交/同向部分。每步一次点积，几乎免费。退一步的做法是把 <span class="k">λ_contact</span> 从 0.1 降到 0.03。</p></div>
+    <div><div class="hd">机制 02</div><h4>目标函数只约束分子</h4>
+      <p>降低 <span class="k">contact_nll(CDR3,pep)</span> 最省力的路径是把整个复合物压紧，因为分母 <span class="k">Contact(TCR,pMHC)</span> 根本不在目标里。</p></div>
+    <div><div class="hd">改法 02 · 根本</div><h4>优化 r_pep 对天然值的偏离</h4>
+      <p><span class="k">L = (r_pep − r_natural)²</span>，目标是<b>匹配</b>天然值而非最大化。比值天然免疫「整体压紧」：分子分母同涨，比值不动。<b>已实现并验证</b>。</p></div>
+    <div><div class="hd">机制 03</div><h4>framework 惩罚力度不足</h4>
+      <p>hinge 在搜索中触发 75.8%（591/780），并非失效，但只占目标函数 ~12%，拦不住 0.58 的净漂移。</p></div>
+    <div><div class="hd">改法 03 · 补丁</div><h4>加大 λ_FW</h4>
+      <p>提高 framework 项权重而非抬高阈值。若采用 02 的比值形式，则不再需要阈值。</p></div>
+  </div>
+
+  <div class="callout">
+    <span class="lbl">一个额外的好消息</span>
+    <p><span class="k">cos(contact, tcr_prior) = 0.000</span>（arm C）/ <span class="k">−0.008</span>（arm D）。两条通道在梯度空间里<strong>几乎完全正交</strong>。</p>
+    <p>这正是当初把它们设计成可分别 ablate 时想要的性质，也解释了 arm D 的效果大致等于 B 与 C 的叠加。<strong>所以接触约束的问题出在目标函数的形式上，不在它与序列先验的耦合上</strong>——改 02 就够，不需要重构整条通路。</p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <div class="h2t" style="margin-top:46px">改法 02 已实现并验证：梯度符号翻转了</div>
+    <p>把目标换成 <span class="k">L = (r_pep − r_natural)²</span> 之后，重跑了一轮 λ 扫描（2 cases × λ ∈ {0.02, 0.05, 0.10}，先验关闭，6/6 完成）。机制层面的修复<strong>得到确认</strong>：</p>
+  </div>
+
+  <figure>
+    <table>
+      <thead><tr><th>目标函数</th><th class="n">cos(contact, structure)</th><th class="n">为负比例</th><th class="n">|contact| / |structure|</th></tr></thead>
+      <tbody>
+        <tr><td>旧 nll_hinge λ=0.10</td><td class="n neg">−0.325</td><td class="n neg">75.6%</td><td class="n neg">2.70</td></tr>
+        <tr><td>新 r_pep_target λ=0.02</td><td class="n pos">+0.284</td><td class="n pos">29.5%</td><td class="n pos">0.05</td></tr>
+        <tr><td>新 r_pep_target λ=0.05</td><td class="n pos">+0.203</td><td class="n pos">33.5%</td><td class="n pos">0.05</td></tr>
+        <tr><td>新 r_pep_target λ=0.10</td><td class="n pos">+0.249</td><td class="n pos">33.0%</td><td class="n pos">0.05</td></tr>
+      </tbody>
+    </table>
+    <figcaption>接触梯度从<b>对抗</b>结构梯度变成<b>同向</b>，三个 λ 一致，每 arm 352 步 × 2 case。这与机制二的预测完全吻合：绝对接触项之所以对抗结构，是因为「整体压紧」和结构模型想要的方向相反；比值形式没有这个捷径。原始梯度模长也从 2.70× 降到 0.05×。<br><br><b>但结果指标尚不成立。</b>|r_pep − 天然值| 上 λ=0.05 看似最好（0.054，优于基线 0.082），可 λ 响应非单调、两个 case 互相矛盾（α 上 λ=0.10 最好、β 上最差），n=2 不足以排序。<b>机制修好了，结果还没证明。</b>第二轮（λ ∈ {0.1, 0.3, 1.0} × 全部 6 case）正在跑——既然梯度已同向且模长仅 0.05×，当初压小 λ 的理由不再成立，这轮向上探。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2><span class="num">05</span>可信度</h2>
+  <div class="col"><div class="h2t">哪些能说，哪些还不能说</div></div>
+
+  <div class="stats">
+    <div class="stat"><div class="stat-v">24/24</div><div class="stat-k">job 完成，0 失败</div></div>
+    <div class="stat"><div class="stat-v">24/24</div><div class="stat-k">CDR3 互不相同</div></div>
+    <div class="stat"><div class="stat-v">0</div><div class="stat-k">framework 被改动</div></div>
+    <div class="stat"><div class="stat-v">0</div><div class="stat-k">clash</div></div>
+  </div>
+
+  <div class="col">
+    <p><strong>能说的：</strong>符号一致的两条——TCRLM prior 提升 CDR3 的 repertoire typicality（5/6）、接触约束提高 CDR3–peptide 接触（5/6）。加上梯度诊断，失效机制是<strong>被直接测量到的</strong>，不是推测。</p>
+    <p><strong>不能说的：</strong></p>
+    <ul>
+      <li><strong>只有 1 个 seed。</strong>结构那几个 delta（±0.04~0.09）小到一个 seed 分不开 run-to-run variance，要下结论得补 seed 43 / 44。</li>
+      <li><strong>ESM-C NLL 每个 arm 都是 3/6</strong>，纯抛硬币——没有任何 arm 改善了通用蛋白 naturalness。</li>
+      <li><strong>self-scoring 问题。</strong>TCRLM prior 让 TCRLM NLL 变好，但 ESM-C NLL 没动，这与上一轮 Protenix audit 抓到的是同一个模式。所以对核心问题的正确表述是「<strong>推向了 TCR repertoire 的典型区域</strong>」，而不是笼统的「更 natural」。建议汇报时主动先说这一点。</li>
+    </ul>
+  </div>
+
+  <div class="callout">
+    <span class="lbl">下一轮</span>
+    <p>先跑 <strong>改法 02 + 03</strong>（r_pep 作为优化目标 + hinge 13.5），仍然 6 cases、seed 42、与本轮完全 matched，直接看 r_pep 与结构能否同时守住。并行补 <strong>arm B 的 seed 43 / 44</strong>，把唯一的正面结论钉死。两件事成本约为本轮的一半。另外 α/β 不对称（α 3/3 越过天然线、β 0/3）值得单独追一下。</p>
+  </div>
+</section>
+
+<footer>
+  ProteoCraft / ESMFold2 · backbone <span class="mono">7bf6251</span> · 实验分支 <span class="mono">tcr-esmfold2-20260820</span> · 结果 commit <span class="mono">e969afe</span><br>
+  全部 arm 由同一 verifier 在固定 eval seed 下重新打分；contact 指标对未优化它的 arm 同样计算。已知 cognate TCR 全程仅用于评估。
+</footer>
+</div>
