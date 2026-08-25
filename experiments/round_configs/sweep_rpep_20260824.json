@@ -1,0 +1,45 @@
+{
+  "what": "round 1: first lambda probe on the new r_pep_target objective",
+  "runner": "run_sweep.py",
+  "seed": 42,
+  "n_steps": 15,
+  "cases": [
+    "ALGRRIPPV_alpha",
+    "ALGRRIPPV_beta"
+  ],
+  "arms": {
+    "C002": {
+      "prior": "off",
+      "contact": "r_pep_target",
+      "lambda": 0.02,
+      "verifier_weight": 4.0,
+      "r_pep_target": "natural"
+    },
+    "C005": {
+      "prior": "off",
+      "contact": "r_pep_target",
+      "lambda": 0.05,
+      "verifier_weight": 4.0,
+      "r_pep_target": "natural"
+    },
+    "C010": {
+      "prior": "off",
+      "contact": "r_pep_target",
+      "lambda": 0.1,
+      "verifier_weight": 4.0,
+      "r_pep_target": "natural"
+    }
+  },
+  "common": {
+    "profile": "esmfold2_d",
+    "backend": "esmfold2",
+    "task": "cdr_redesign (CDR3-only)",
+    "verifier": "4 loops x 50 sampling steps",
+    "prior_weights": {
+      "gradient": 0.1,
+      "verifier": 0.1,
+      "region": "cdr"
+    },
+    "eval": "evaluate.py, same verifier, fixed eval seed 4242"
+  }
+}

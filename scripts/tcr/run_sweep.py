@@ -63,10 +63,19 @@ CONTACT_FLAGS = {
 }
 # lambda sweep on the new r_pep_target objective (prior OFF, to isolate it).
 # "C010" reproduces the previous lambda; the rest probe smaller mixing weights.
+# Round 2: probe UPWARD. Round 1 showed the ratio gradient is aligned with the
+# structure gradient (+0.20..+0.28) and only 0.05x its magnitude, so the reason
+# for keeping lambda small no longer applies.
+# Round 3: complete the 2x2 under the NEW objective. A and B come from the
+# formal run (contact was off there, so the objective change cannot touch
+# them) and C030 from round 2; only the combined arm is missing.
+# Round 4: hold lambda at 0.3 and vary the contact VERIFIER weight, to test
+# whether the structure gain that B and C each deliver alone comes back once
+# the auxiliary share of *selection pressure* (measured as std, not mean) drops
+# from D030's 47.4% toward B's 22.1%.  w=1.0 targets ~30%, w=2.0 targets ~34%.
 ARMS = {
-    "C002": ("off", "rpep", 0.02),
-    "C005": ("off", "rpep", 0.05),
-    "C010": ("off", "rpep", 0.10),
+    "D030w10": ("tcrlm", "rpep", 0.30, "1.0"),
+    "D030w20": ("tcrlm", "rpep", 0.30, "2.0"),
 }
 
 
@@ -74,7 +83,7 @@ def build_command(case_id: str, arm: str, out_root: Path, args) -> tuple[list[st
     case = json.loads((SPEC_DIR / f"{case_id}.json").read_text())
     case_dir = out_root / case_id / f"arm_{arm}"
     case_dir.mkdir(parents=True, exist_ok=True)
-    prior_key, contact_key, lam = ARMS[arm]
+    prior_key, contact_key, lam, vweight = ARMS[arm]
     mutable = "".join("1" if v else "0" for v in case["mutable_mask"])
     command = [
         PYTHON, str(REPO / "scripts" / "run_hallucination.py"),
@@ -111,7 +120,7 @@ def build_command(case_id: str, arm: str, out_root: Path, args) -> tuple[list[st
             # (r_pep-target)^2 lives on a much smaller scale than the old
             # absolute-nll objective; 4.0 puts the hard term at ~19% of
             # total_loss instead of 95% (old) or 5% (unscaled).
-            "--tcr_contact_verifier_weight", "4.0",
+            "--tcr_contact_verifier_weight", vweight,
             "--tcr_contact_peptide_chain_index", "0",
             "--tcr_contact_mhc_chain_indices", "1",
             "--tcr_contact_partner_tcr_chain_index", "2",
@@ -124,10 +133,10 @@ def build_command(case_id: str, arm: str, out_root: Path, args) -> tuple[list[st
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--arms", default="C002,C005,C010")
-    parser.add_argument("--cases", default="ALGRRIPPV_alpha,ALGRRIPPV_beta")
+    parser.add_argument("--arms", default="D030w10,D030w20")
+    parser.add_argument("--cases", default=",".join(CASES))
     parser.add_argument("--gpus", default="4,6,7")
-    parser.add_argument("--out", default="/root/mingxuan/sweep_rpep_20260824")
+    parser.add_argument("--out", default="/root/mingxuan/sweep_rpep_r4_20260825")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-steps", dest="n_steps", type=int, default=15)
     parser.add_argument("--verifier-loops", dest="verifier_loops", type=int, default=4)

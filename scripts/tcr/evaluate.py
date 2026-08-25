@@ -24,7 +24,7 @@ SPEC_DIR = Path(
 )
 TCRLM_REPO = "/root/mingxuan/tcr_prior_backends/tcrLM"
 TCRLM_CKPT = f"{TCRLM_REPO}/pretrained_model/pretrained_model_tcr.bin"
-ARMS = ["A", "B", "C", "D", "E", "F"]
+ARMS = ["A", "B", "C", "D", "E", "F"]  # overridden by --arms
 
 
 def load_rh():
@@ -51,8 +51,17 @@ def main() -> None:
     parser.add_argument("--root", default="/root/mingxuan/formal_tcr6_20260820")
     parser.add_argument("--out", default="/root/mingxuan/formal_eval.json")
     parser.add_argument("--seed", type=int, default=4242)  # fixed eval seed
+    parser.add_argument("--arms", default=None,
+                        help="comma list of arm names; default A..F")
+    parser.add_argument("--cases", default=None,
+                        help="comma list of case ids; default all")
     args_cli = parser.parse_args()
     root = Path(args_cli.root)
+    global ARMS
+    if args_cli.arms:
+        ARMS = [a.strip() for a in args_cli.arms.split(",") if a.strip()]
+    only_cases = ({c.strip() for c in args_cli.cases.split(",") if c.strip()}
+                  if args_cli.cases else None)
 
     rh = load_rh()
     results: dict = {}
@@ -60,6 +69,8 @@ def main() -> None:
     for case_path in sorted(SPEC_DIR.glob("*.json")):
         case = json.loads(case_path.read_text())
         case_id = case["case_id"]
+        if only_cases is not None and case_id not in only_cases:
+            continue
         binder0 = case["binder_sequence"]
         start = case["cdr_start_0based"]
         end = case["cdr_end_0based_exclusive"]

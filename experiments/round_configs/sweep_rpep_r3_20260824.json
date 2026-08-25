@@ -1,0 +1,28 @@
+{
+  "what": "round 3: combined arm, completing the 2x2 under the new objective",
+  "runner": "run_sweep.py",
+  "seed": 42,
+  "n_steps": 15,
+  "cases": 6,
+  "arms": {
+    "D030": {
+      "prior": "tcrlm",
+      "contact": "r_pep_target",
+      "lambda": 0.3,
+      "verifier_weight": 4.0,
+      "r_pep_target": "natural"
+    }
+  },
+  "common": {
+    "profile": "esmfold2_d",
+    "backend": "esmfold2",
+    "task": "cdr_redesign (CDR3-only)",
+    "verifier": "4 loops x 50 sampling steps",
+    "prior_weights": {
+      "gradient": 0.1,
+      "verifier": 0.1,
+      "region": "cdr"
+    },
+    "eval": "evaluate.py, same verifier, fixed eval seed 4242"
+  }
+}
