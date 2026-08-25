@@ -28,6 +28,7 @@ from bindcraft.hallucination.esmfold2_backend import (
     ESMFOLD2_ACTION_GROUP_PROPOSAL_LOSS_KEYS,
     ESM_AA_ORDER,
     anchor_binder_logits_to_sequence,
+    build_logit_delta_candidate_batch,
     build_esm_verifier_result,
     build_gradient_mask,
     combine_normalized_gradients,
@@ -35,7 +36,6 @@ from bindcraft.hallucination.esmfold2_backend import (
     init_binder_logits,
     logit_delta_mutation_scores,
     normalized_gradient_tensor,
-    propose_sequences_from_logit_delta,
     resolve_lambda_esmc,
     sequence_from_logits_argmax,
 )
@@ -47,6 +47,7 @@ from bindcraft.hallucination.esmfold2_one_step import (
     compute_esmfold2_common_losses,
     remap_reference_coordinates,
     run_esmfold2_one_step_diffusion,
+    run_esmfold2_truncated_diffusion,
 )
 
 
@@ -865,6 +866,14 @@ class ESMFold2RuntimeBackend:
         self.tcr_prior_region_mask: Optional[List[bool]] = None
         self.tcr_prior_lambda: float = 0.0
 
+        # === TCR contact loss; inert unless tcr_contact_config is enabled. ===
+        from bindcraft.hallucination.tcr_contact import TCRContactConfig
+
+        self._tcr_contact_config = TCRContactConfig.from_mapping(
+            getattr(config, "tcr_contact_config", None)
+        )
+        self._tcr_contact_mask_cache: Dict[Any, Dict[str, torch.Tensor]] = {}
+
     def attach_tcr_prior(
         self,
         scorer: Optional[Any],
@@ -916,6 +925,40 @@ class ESMFold2RuntimeBackend:
             return None
         grad = torch.autograd.grad(prior_loss, logits, allow_unused=True)[0]
         return grad
+
+    def _tcr_contact_gradient(
+        self,
+        logits: torch.Tensor,
+        *,
+        fold_result: Mapping[str, Any],
+        targets: Sequence[str],
+        current_seq: str,
+        retain_graph: bool,
+    ) -> Optional[torch.Tensor]:
+        """Gradient of the TCR contact objective w.r.t. the design logits.
+
+        Reads the *same* distogram_logits the structure loss used, so the graph
+        is live; callers must therefore retain the structure graph whenever the
+        contact loss is on.
+        """
+
+        if not self.tcr_contact_enabled:
+            return None
+        if not bool(self._tcr_contact_config.use_gradient):
+            return None
+        terms = self.compute_tcr_contact_terms(
+            fold_result["distogram_logits"],
+            binder_length=len(current_seq),
+            target_chain_lengths=[len(sequence) for sequence in targets],
+        )
+        if terms is None:
+            return None
+        return torch.autograd.grad(
+            terms["tcr_contact_loss"].mean(),
+            logits,
+            retain_graph=retain_graph,
+            allow_unused=True,
+        )[0]
 
     @staticmethod
     def _masked_cosine(
@@ -980,6 +1023,74 @@ class ESMFold2RuntimeBackend:
             "n/a" if diagnostics["cos_tcr_esmc"] is None else f"{diagnostics['cos_tcr_esmc']:.4f}",
         )
         return diagnostics
+
+    @property
+    def tcr_contact_enabled(self) -> bool:
+        return bool(self._tcr_contact_config.enabled)
+
+
+    def _tcr_contact_masks(
+        self,
+        *,
+        binder_length: int,
+        target_chain_lengths: Sequence[int],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Dict[str, torch.Tensor]:
+        key = (
+            int(binder_length),
+            tuple(int(v) for v in target_chain_lengths),
+            str(device),
+            str(dtype),
+        )
+        cached = self._tcr_contact_mask_cache.get(key)
+        if cached is None:
+            from bindcraft.hallucination.tcr_contact import (
+                annotation_from_config,
+                build_tcr_contact_masks,
+            )
+
+            annotation = annotation_from_config(
+                self._tcr_contact_config,
+                binder_length=int(binder_length),
+            )
+            cached = build_tcr_contact_masks(
+                binder_length=int(binder_length),
+                target_chain_lengths=target_chain_lengths,
+                annotation=annotation,
+                config=self._tcr_contact_config,
+                device=device,
+                dtype=dtype,
+            )
+            self._tcr_contact_mask_cache[key] = cached
+        return cached
+
+    def compute_tcr_contact_terms(
+        self,
+        distogram_logits: torch.Tensor,
+        *,
+        binder_length: int,
+        target_chain_lengths: Sequence[int],
+        verifier_path: bool = False,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """TCR contact objective for one folded complex, or None if disabled."""
+
+        if not self.tcr_contact_enabled:
+            return None
+        from bindcraft.hallucination.tcr_contact import tcr_contact_losses
+
+        masks = self._tcr_contact_masks(
+            binder_length=int(binder_length),
+            target_chain_lengths=target_chain_lengths,
+            device=distogram_logits.device,
+            dtype=distogram_logits.dtype,
+        )
+        return tcr_contact_losses(
+            distogram_logits,
+            masks,
+            config=self._tcr_contact_config,
+            verifier_path=verifier_path,
+        )
 
     def _fold_verifier_with_raw_output(
         self,
@@ -1127,6 +1238,7 @@ class ESMFold2RuntimeBackend:
             summary.update(hotspot_metrics)
         coordinate = _fold_result_coordinates(fold_result)
         aligned_loss_dict = None
+        tcr_contact_terms: Optional[Dict[str, float]] = None
         raw_common_loss_dict: dict[str, float] = {}
         plddt_logits = None
         if raw_features is not None and raw_output is not None:
@@ -1146,6 +1258,21 @@ class ESMFold2RuntimeBackend:
                 hotspot_cutoff=float(self.config.hotspot_cutoff),
                 hotspot_interface_mode="additive",
             )
+            if self.tcr_contact_enabled:
+                with torch.no_grad():
+                    _terms = self.compute_tcr_contact_terms(
+                        raw_output["distogram_logits"],
+                        binder_length=len(binder_seq),
+                        target_chain_lengths=[
+                            len(sequence) for sequence in targets
+                        ],
+                        verifier_path=True,
+                    )
+                if _terms is not None:
+                    tcr_contact_terms = {
+                        key: float(value.mean().item())
+                        for key, value in _terms.items()
+                    }
             _, raw_common_losses = compute_esmfold2_common_losses(
                 coordinates=raw_output["sample_atom_coords"],
                 plddt_logits=raw_output["plddt_logits"],
@@ -1177,7 +1304,7 @@ class ESMFold2RuntimeBackend:
             f"raw_common_{key}": value
             for key, value in raw_common_loss_dict.items()
         }
-        return build_esm_verifier_result(
+        result = build_esm_verifier_result(
             binder_seq=binder_seq,
             target_seq=target_seq,
             summary_confidence=summary,
@@ -1199,6 +1326,41 @@ class ESMFold2RuntimeBackend:
             hotspot_too_close_weight=hotspot_too_close_weight,
             aligned_loss_dict=aligned_loss_dict,
         )
+        return self._apply_tcr_verifier_terms(
+            result,
+            contact_terms=tcr_contact_terms,
+        )
+
+    def _apply_tcr_verifier_terms(
+        self,
+        result: Any,
+        *,
+        contact_terms: Optional[Mapping[str, float]],
+    ) -> Any:
+        """Fold the TCR contact loss and hard sequence prior into a result.
+
+        Called from inside verify so the adjusted result is what lands in
+        the pipeline's verifier_cache; adding these terms after the cache
+        lookup would re-accumulate them every time a sequence is revisited.
+        """
+
+        if contact_terms:
+            if result.loss_dict is None:
+                result.loss_dict = {}
+            for key, value in contact_terms.items():
+                result.loss_dict[key] = float(value)
+            if bool(self._tcr_contact_config.use_verifier):
+                weighted = float(
+                    self._tcr_contact_config.verifier_weight
+                ) * float(contact_terms["tcr_contact_loss"])
+                result.total_loss = float(result.total_loss) + weighted
+                result.loss_dict["tcr_contact_weighted"] = weighted
+                result.loss_dict["total"] = float(result.total_loss)
+
+        # The hard sequence prior is applied one level up, in the pipeline's
+        # _verify_with_cache() on cache misses only. Applying it here as well
+        # would score the same candidate twice.
+        return result
 
     def propose(
         self,
@@ -1210,6 +1372,9 @@ class ESMFold2RuntimeBackend:
         B_candidates: int,
         T_sample: float,
         max_mutations_per_seq: int,
+        mutation_fraction: Optional[float] = None,
+        candidate_strategy: str = "legacy",
+        include_argmax_candidate: Optional[bool] = None,
         seed: Optional[int] = None,
         mutable_mask: Optional[Sequence[bool]] = None,
         action_group: Optional[str] = None,
@@ -1243,8 +1408,13 @@ class ESMFold2RuntimeBackend:
             preserve_proposal_logits=preserve_proposal_logits,
         )
         confidence_sequences = self._top_confidence_sequences(confidence_candidates)
+        include_logit_candidates = (
+            action_group is None
+            if include_argmax_candidate is None
+            else bool(include_argmax_candidate) and action_group is None
+        )
         with _seed_context(seed):
-            candidates = propose_sequences_from_logit_delta(
+            discrete_batch = build_logit_delta_candidate_batch(
                 logits_before,
                 logits_after,
                 current_seq=current_seq,
@@ -1253,15 +1423,58 @@ class ESMFold2RuntimeBackend:
                 B_candidates=B_candidates,
                 T_sample=T_sample,
                 max_mutations_per_seq=max_mutations_per_seq,
-                include_logit_candidates=(action_group is None),
+                mutation_fraction=mutation_fraction,
+                include_logit_candidates=include_logit_candidates,
+                candidate_strategy=candidate_strategy,
             )
-        candidates = list(dict.fromkeys([*confidence_sequences, *candidates]))
+        # The positive-score experiment requires every returned sequence to
+        # obey the same mutation-count contract. Confidence snapshots are
+        # retained for diagnostics, but cannot enter this candidate pool.
+        returned_confidence_sequences = (
+            [] if str(candidate_strategy).strip().lower() == "positive_score"
+            else confidence_sequences
+        )
+        candidates = list(
+            dict.fromkeys(
+                [*returned_confidence_sequences, *discrete_batch.sequences]
+            )
+        )
+        metadata_by_sequence = {
+            str(item.get("sequence")): dict(item)
+            for item in discrete_batch.candidate_metadata
+            if item.get("sequence")
+        }
+        for sequence in returned_confidence_sequences:
+            metadata_by_sequence.setdefault(
+                str(sequence),
+                {
+                    "sequence": str(sequence),
+                    "source": "proposal_confidence",
+                },
+            )
+        candidate_metadata = [
+            metadata_by_sequence.get(
+                sequence,
+                {"sequence": sequence, "source": "unknown"},
+            )
+            for sequence in candidates
+        ]
+        proposal_diagnostics = dict(discrete_batch.diagnostics)
+        proposal_diagnostics["confidence_candidate_count"] = len(
+            confidence_sequences
+        )
+        proposal_diagnostics["returned_confidence_candidate_count"] = len(
+            returned_confidence_sequences
+        )
+        proposal_diagnostics["returned_candidate_count"] = len(candidates)
         return ESMFold2ProposalBatch(
             sequences=candidates,
             logits_before=logits_before,
             logits_after=logits_after,
             confidence_candidates=confidence_candidates,
             soft_step_metrics=soft_step_metrics,
+            candidate_metadata=candidate_metadata,
+            proposal_diagnostics=proposal_diagnostics,
         )
 
     def continuous_design(
@@ -1622,32 +1835,51 @@ class ESMFold2RuntimeBackend:
         current_seq: str,
         mutable_mask: Optional[Sequence[bool]],
         target_chain_roles: Sequence[str],
-        reference_coordinates: torch.Tensor,
+        reference_coordinates: Optional[torch.Tensor],
         reference_features: Optional[Mapping[str, torch.Tensor]],
         diffusion_seed: Optional[int],
         hotspot_params: Optional[Dict[str, Any]],
         effective_hotspot_weight: float,
     ) -> Dict[str, Any]:
-        source_features = reference_features
-        if source_features is None:
-            source_features = self._prepare_sequence_atom_features(
-                targets,
-                current_seq,
+        one_step_mode = str(self.config.one_step_diffusion_mode).strip().lower()
+        if one_step_mode == "truncated_trajectory":
+            one_step = run_esmfold2_truncated_diffusion(
+                model=self.experimental_model,
+                captured=fold_result["_captured"],
+                features=fold_result["_features"],
+                tau=float(self.config.one_step_diffusion_tau),
+                seed=diffusion_seed,
+                num_sampling_steps=int(
+                    self.config.one_step_diffusion_truncated_num_sampling_steps
+                ),
+            )
+            source_coordinates = one_step["source_coordinates"]
+        else:
+            if reference_coordinates is None:
+                raise ValueError(
+                    "reference_noising one-step diffusion requires verifier coordinates"
+                )
+            source_features = reference_features
+            if source_features is None:
+                source_features = self._prepare_sequence_atom_features(
+                    targets,
+                    current_seq,
+                    seed=diffusion_seed,
+                )
+            remapped_reference = remap_reference_coordinates(
+                reference_coordinates,
+                source_features=source_features,
+                destination_features=fold_result["_features"],
+            )
+            one_step = run_esmfold2_one_step_diffusion(
+                model=self.experimental_model,
+                captured=fold_result["_captured"],
+                features=fold_result["_features"],
+                reference_coordinates=remapped_reference,
+                tau=float(self.config.one_step_diffusion_tau),
                 seed=diffusion_seed,
             )
-        remapped_reference = remap_reference_coordinates(
-            reference_coordinates,
-            source_features=source_features,
-            destination_features=fold_result["_features"],
-        )
-        one_step = run_esmfold2_one_step_diffusion(
-            model=self.experimental_model,
-            captured=fold_result["_captured"],
-            features=fold_result["_features"],
-            reference_coordinates=remapped_reference,
-            tau=float(self.config.one_step_diffusion_tau),
-            seed=diffusion_seed,
-        )
+            source_coordinates = remapped_reference
         diffusion_total, diffusion_losses = compute_esmfold2_common_losses(
             coordinates=one_step["coordinates"],
             plddt_logits=one_step["plddt_logits"],
@@ -1680,7 +1912,7 @@ class ESMFold2RuntimeBackend:
         diffusion_grad = torch.autograd.grad(diffusion_total, logits)[0]
 
         denoised_sample = _first_coordinate_sample(one_step["coordinates"])
-        reference_sample = _first_coordinate_sample(remapped_reference).to(
+        reference_sample = _first_coordinate_sample(source_coordinates).to(
             device=denoised_sample.device,
             dtype=denoised_sample.dtype,
         )
@@ -1702,6 +1934,8 @@ class ESMFold2RuntimeBackend:
             "coordinates": one_step["coordinates"],
             "features": fold_result["_features"],
             "reference_rmsd": coordinate_rmsd,
+            "mode": one_step_mode,
+            "truncated_steps": int(one_step.get("truncated_steps", 0)),
         }
 
     def _run_soft_update_impl(
@@ -1846,7 +2080,12 @@ class ESMFold2RuntimeBackend:
             if one_step_enabled
             else ()
         )
-        if one_step_enabled and reference_coordinates is None:
+        one_step_mode = str(self.config.one_step_diffusion_mode).strip().lower()
+        if (
+            one_step_enabled
+            and one_step_mode == "reference_noising"
+            and reference_coordinates is None
+        ):
             raise ValueError(
                 "ESMFold2 one-step diffusion requires coordinates from the "
                 "selected verifier node"
@@ -1935,7 +2174,7 @@ class ESMFold2RuntimeBackend:
             structure_grad = torch.autograd.grad(
                 structure_loss.mean(),
                 logits,
-                retain_graph=run_scheduled_one_step,
+                retain_graph=run_scheduled_one_step or self.tcr_contact_enabled,
             )[0]
 
             esmc_grad = None
@@ -1971,6 +2210,13 @@ class ESMFold2RuntimeBackend:
                     gradient_mask=gradient_mask,
                 )
 
+            contact_grad = self._tcr_contact_gradient(
+                logits,
+                fold_result=fold_result,
+                targets=targets,
+                current_seq=current_seq,
+                retain_graph=run_scheduled_one_step or self.tcr_contact_enabled,
+            )
             combined_grad = combine_normalized_gradients(
                 structure_grad,
                 esmc_grad,
@@ -1978,6 +2224,12 @@ class ESMFold2RuntimeBackend:
                 lambda_esmc=lambda_esmc,
                 tcr_grad=tcr_grad,
                 lambda_tcr=self.tcr_prior_lambda,
+                contact_grad=contact_grad,
+                lambda_contact=(
+                    float(self._tcr_contact_config.lambda_contact)
+                    if self.tcr_contact_enabled
+                    else 0.0
+                ),
             )
             scheduled_one_step: Optional[Dict[str, Any]] = None
             if run_scheduled_one_step:
@@ -2121,6 +2373,12 @@ class ESMFold2RuntimeBackend:
                         "one_step_diffusion_tau": float(
                             self.config.one_step_diffusion_tau
                         ),
+                        "one_step_diffusion_mode": str(
+                            scheduled_one_step.get("mode", one_step_mode)
+                        ),
+                        "one_step_diffusion_truncated_steps": int(
+                            scheduled_one_step.get("truncated_steps", 0)
+                        ),
                         "one_step_diffusion_weight": float(
                             self.config.one_step_diffusion_weight
                         ),
@@ -2234,54 +2492,22 @@ class ESMFold2RuntimeBackend:
                     )
                 esmc_grad = torch.autograd.grad(esmc_loss.mean(), logits)[0]
 
-            one_step = run_esmfold2_one_step_diffusion(
-                model=self.experimental_model,
-                captured=fold_result["_captured"],
-                features=fold_result["_features"],
-                reference_coordinates=remap_reference_coordinates(
-                    reference_coordinates,
-                    source_features=self._prepare_sequence_atom_features(
-                        targets,
-                        current_seq,
-                        seed=diffusion_seed,
-                    ),
-                    destination_features=fold_result["_features"],
-                ),
-                tau=float(self.config.one_step_diffusion_tau),
-                seed=diffusion_seed,
-            )
-            diffusion_total, diffusion_losses = compute_esmfold2_common_losses(
-                coordinates=one_step["coordinates"],
-                plddt_logits=one_step["plddt_logits"],
-                pae_logits=one_step["pae_logits"],
-                distogram_logits=fold_result["distogram_logits"],
-                features=fold_result["_features"],
-                binder_length=len(current_seq),
-                task_type=self.task_type,
+            one_step = self._one_step_diffusion_gradient(
+                logits=logits,
+                fold_result=fold_result,
+                targets=targets,
+                current_seq=current_seq,
+                mutable_mask=mutable_mask,
                 target_chain_roles=target_chain_roles,
-                binder_mutable_mask=mutable_mask,
-                distogram_losses=None,
-                weights={
-                    "con": 0.0,
-                    "i_con": 0.0,
-                    "helix": 0.0,
-                    "rg": float(self.config.one_step_diffusion_rg_weight),
-                },
-                hotspot_params=(
-                    hotspot_params
-                    if self.config.one_step_diffusion_hotspot_enabled
-                    else None
-                ),
-                hotspot_weight=(
-                    effective_hotspot_weight
-                    if self.config.one_step_diffusion_hotspot_enabled
-                    else 0.0
-                ),
-                hotspot_interface_mode=str(
-                    self.config.hotspot_interface_mode
-                ),
+                reference_coordinates=reference_coordinates,
+                reference_features=reference_features,
+                diffusion_seed=diffusion_seed,
+                hotspot_params=hotspot_params,
+                effective_hotspot_weight=effective_hotspot_weight,
             )
-            diffusion_grad = torch.autograd.grad(diffusion_total, logits)[0]
+            diffusion_total = one_step["total"]
+            diffusion_losses = one_step["losses"]
+            diffusion_grad = one_step["gradient"]
             tcr_grad = self._tcr_prior_gradient(
                 logits,
                 temperature=final_temperature,
@@ -2303,6 +2529,13 @@ class ESMFold2RuntimeBackend:
                     tcr_grad=tcr_grad,
                     gradient_mask=gradient_mask,
                 )
+            contact_grad = self._tcr_contact_gradient(
+                logits,
+                fold_result=fold_result,
+                targets=targets,
+                current_seq=current_seq,
+                retain_graph=run_scheduled_one_step or self.tcr_contact_enabled,
+            )
             combined_grad = combine_normalized_gradients(
                 structure_grad,
                 esmc_grad,
@@ -2310,6 +2543,12 @@ class ESMFold2RuntimeBackend:
                 lambda_esmc=lambda_esmc,
                 tcr_grad=tcr_grad,
                 lambda_tcr=self.tcr_prior_lambda,
+                contact_grad=contact_grad,
+                lambda_contact=(
+                    float(self._tcr_contact_config.lambda_contact)
+                    if self.tcr_contact_enabled
+                    else 0.0
+                ),
             )
             combined_grad = combined_grad + float(
                 self.config.one_step_diffusion_weight
@@ -2332,6 +2571,10 @@ class ESMFold2RuntimeBackend:
                 "one_step_diffusion_used_recycled_coordinates": False,
                 "one_step_diffusion_tau": float(
                     self.config.one_step_diffusion_tau
+                ),
+                "one_step_diffusion_mode": str(one_step["mode"]),
+                "one_step_diffusion_truncated_steps": int(
+                    one_step["truncated_steps"]
                 ),
                 "one_step_diffusion_weight": float(
                     self.config.one_step_diffusion_weight
@@ -2693,12 +2936,38 @@ class ESMFold2RuntimeBackend:
                     dtype=torch.bfloat16,
                     enabled=device.type == "cuda",
                 ):
-                    hidden, *_ = self.esmc_model.esmc.transformer(
-                        chunk @ self.esmc_model.esmc.embed.weight.to(chunk.dtype),
-                        sequence_id=None,
-                        layers_to_collect=[],
-                        output_attentions=False,
+                    embedded = chunk @ self.esmc_model.esmc.embed.weight.to(
+                        chunk.dtype
                     )
+                    if self.config.esmc_activation_checkpointing:
+                        from torch.utils.checkpoint import checkpoint
+
+                        transformer = self.esmc_model.esmc.transformer
+                        hidden = embedded
+                        for block in transformer.blocks:
+                            def block_forward(
+                                value: torch.Tensor,
+                                current_block: Any = block,
+                            ) -> torch.Tensor:
+                                return current_block(
+                                    value,
+                                    None,
+                                    output_attentions=False,
+                                )[0]
+
+                            hidden = checkpoint(
+                                block_forward,
+                                hidden,
+                                use_reentrant=False,
+                            )
+                        hidden = transformer.norm(hidden)
+                    else:
+                        hidden, *_ = self.esmc_model.esmc.transformer(
+                            embedded,
+                            sequence_id=None,
+                            layers_to_collect=[],
+                            output_attentions=False,
+                        )
                     logits = self.esmc_model.lm_head(hidden)
                 log_probs = logits.log_softmax(dim=-1)[:, 1:-1, 4:24]
                 nlls = -(log_probs * target_weights.to(log_probs.dtype).unsqueeze(0)).sum(dim=-1)

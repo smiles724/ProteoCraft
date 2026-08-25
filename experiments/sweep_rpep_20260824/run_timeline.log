@@ -1,0 +1,7 @@
+[gpu7] END   ALGRRIPPV_alpha/arm_C010 rc=0 (87.7 min)
+[gpu4] END   ALGRRIPPV_alpha/arm_C002 rc=0 (89.1 min)
+[gpu6] END   ALGRRIPPV_alpha/arm_C005 rc=0 (89.2 min)
+[gpu7] END   ALGRRIPPV_beta/arm_C002 rc=0 (92.0 min)
+[gpu4] END   ALGRRIPPV_beta/arm_C005 rc=0 (91.9 min)
+[gpu6] END   ALGRRIPPV_beta/arm_C010 rc=0 (92.3 min)
+done: 6 jobs, 0 failed

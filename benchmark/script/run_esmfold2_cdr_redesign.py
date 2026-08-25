@@ -150,11 +150,23 @@ def build_hallucination_command(
         "t_sample": "t_sample",
         "max_mutations_per_seq": "max_mutations_per_seq",
         "stagea_max_mutations_per_seq": "stagea_max_mutations_per_seq",
+        "esmfold2_stagea_mutation_fraction": (
+            "esmfold2_stagea_mutation_fraction"
+        ),
+        "esmfold2_stagea_candidate_strategy": (
+            "esmfold2_stagea_candidate_strategy"
+        ),
+        "esmfold2_stagea_include_argmax_candidate": (
+            "esmfold2_stagea_include_argmax_candidate"
+        ),
         "stageb_max_mutations_per_seq": "stageb_max_mutations_per_seq",
         "mcts_num_beams": "mcts_num_beams",
         "mcts_strategy": "mcts_strategy",
         "mcts_bootstrap_steps": "mcts_bootstrap_steps",
+        "mcts_bootstrap_patience": "mcts_bootstrap_patience",
+        "mcts_bootstrap_min_delta": "mcts_bootstrap_min_delta",
         "mcts_bootstrap_max_steps": "mcts_bootstrap_max_steps",
+        "mcts_handoff_top_k": "mcts_handoff_top_k",
         "mcts_expand_actions_per_step": "mcts_expand_actions_per_step",
         "mcts_prior_mode": "mcts_prior_mode",
         "esmfold2_stagea_soft_steps": "esmfold2_stagea_soft_steps",
@@ -183,6 +195,22 @@ def build_hallucination_command(
         "tcr_prior_checkpoint": "tcr_prior_checkpoint",
         "tcr_prior_masked": "tcr_prior_masked",
         "require_real_tcr_prior": "require_real_tcr_prior",
+        "esmfold2_stageb_discrete_rerank": (
+            "esmfold2_stageb_discrete_rerank"
+        ),
+        "esmfold2_stageb_rerank_pool_size": (
+            "esmfold2_stageb_rerank_pool_size"
+        ),
+        "esmfold2_stageb_exploration_actions": (
+            "esmfold2_stageb_exploration_actions"
+        ),
+        "esmfold2_stageb_verifier_candidates": (
+            "esmfold2_stageb_verifier_candidates"
+        ),
+        "esmfold2_stageb_paired_verifier_seed": (
+            "esmfold2_stageb_paired_verifier_seed"
+        ),
+        "esmfold2_stageb_verifier_seed": "esmfold2_stageb_verifier_seed",
         "esmfold2_experimental_model": "esmfold2_experimental_model",
         "esmfold2_verifier_model": "esmfold2_verifier_model",
         "esmfold2_verifier_num_loops": "esmfold2_verifier_num_loops",
@@ -194,6 +222,10 @@ def build_hallucination_command(
         "esmfold2_force_proposal_lm_dropout": "esmfold2_force_proposal_lm_dropout",
         "esmfold2_one_step_diffusion": "esmfold2_one_step_diffusion",
         "esmfold2_one_step_diffusion_tau": "esmfold2_one_step_diffusion_tau",
+        "esmfold2_one_step_diffusion_mode": "esmfold2_one_step_diffusion_mode",
+        "esmfold2_one_step_truncated_num_sampling_steps": (
+            "esmfold2_one_step_truncated_num_sampling_steps"
+        ),
         "esmfold2_one_step_diffusion_weight": "esmfold2_one_step_diffusion_weight",
         "esmfold2_one_step_diffusion_rg_weight": "esmfold2_one_step_diffusion_rg_weight",
         "esmfold2_one_step_diffusion_interval": "esmfold2_one_step_diffusion_interval",

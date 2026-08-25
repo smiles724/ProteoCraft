@@ -1,5 +1,6 @@
 import pytest
 import torch
+from torch import nn
 
 from bindcraft.hallucination.esmfold2_one_step import (
     ESMFOLD2_COMMON_LOSS_WEIGHTS,
@@ -8,6 +9,7 @@ from bindcraft.hallucination.esmfold2_one_step import (
     compute_esmfold2_bounded_verifier_losses,
     compute_esmfold2_common_losses,
     remap_reference_coordinates,
+    run_esmfold2_truncated_diffusion,
     scatter_reference_coordinates,
 )
 
@@ -589,3 +591,94 @@ def test_remap_reference_coordinates_accepts_cuda_features_and_cpu_coordinates()
 
     assert remapped.device.type == "cpu"
     assert torch.equal(remapped, source_coordinates)
+
+
+class _FakeDiffusionModule(nn.Module):
+    def forward(self, *, x_noisy, z_trunk, **kwargs):
+        signal = z_trunk.mean(dim=(1, 2, 3))[:, None, None]
+        return {
+            "x_denoised": 0.5 * x_noisy + signal,
+            "token_repr": z_trunk.mean(dim=-2),
+        }
+
+
+class _FakeStructureHead:
+    def __init__(self):
+        self.diffusion_module = _FakeDiffusionModule()
+        self.noise_scale = 1.0
+        self.step_scale = 1.0
+        self.gamma_min = 1000.0
+        self.gamma_0 = 0.0
+
+    def inference_noise_schedule(self, num_steps, device):
+        assert num_steps == 4
+        return torch.tensor([10.0, 4.0, 1.0, 0.0], device=device)
+
+    def _center_random_augmentation(self, x, atom_mask, second_coords=None):
+        return x, second_coords
+
+    def _weighted_rigid_align(self, x, x_gt, w, mask):
+        return x
+
+
+class _FakeConfidenceHead(nn.Module):
+    def forward(self, *, s_inputs, x_pred, **kwargs):
+        n_tokens = s_inputs.shape[1]
+        signal = x_pred.mean() + s_inputs.mean()
+        return {
+            "plddt_logits": signal.expand(1, n_tokens, 50),
+            "pae_logits": signal.expand(1, n_tokens, n_tokens, 64),
+        }
+
+
+class _FakeExperimentalModel:
+    def __init__(self):
+        self.structure_head = _FakeStructureHead()
+        self.confidence_head = _FakeConfidenceHead()
+
+
+def _truncated_features() -> dict[str, torch.Tensor]:
+    return {
+        "atom_attention_mask": torch.ones(1, 3, dtype=torch.bool),
+        "ref_element": torch.tensor([[6, 6, 8]]),
+        "ref_atom_name_chars": torch.zeros(1, 3, 4, dtype=torch.long),
+        "atom_to_token": torch.tensor([[0, 1, 1]]),
+        "ref_pos": torch.zeros(1, 3, 3),
+        "ref_charge": torch.zeros(1, 3),
+        "ref_space_uid": torch.zeros(1, 3, dtype=torch.long),
+        "asym_id": torch.tensor([[0, 1]]),
+        "residue_index": torch.tensor([[0, 0]]),
+        "entity_id": torch.tensor([[0, 1]]),
+        "token_index": torch.tensor([[0, 1]]),
+        "sym_id": torch.zeros(1, 2, dtype=torch.long),
+        "token_attention_mask": torch.ones(1, 2, dtype=torch.bool),
+        "distogram_atom_idx": torch.tensor([[0, 1]]),
+        "mol_type": torch.zeros(1, 2, dtype=torch.long),
+    }
+
+
+def test_truncated_diffusion_reaches_tau_without_tracking_trajectory_gradients():
+    s_inputs = torch.randn(1, 2, 4, requires_grad=True)
+    z_trunk = torch.randn(1, 2, 2, 3, requires_grad=True)
+    captured = {
+        "s_inputs": s_inputs,
+        "z_trunk": z_trunk,
+        "relative_position_encoding": torch.zeros(1, 2, 2, 3),
+    }
+
+    result = run_esmfold2_truncated_diffusion(
+        model=_FakeExperimentalModel(),
+        captured=captured,
+        features=_truncated_features(),
+        tau=2.0,
+        seed=7,
+        num_sampling_steps=4,
+        max_inference_sigma=10.0,
+    )
+
+    assert result["truncated_steps"] == 3
+    assert result["source_coordinates"].requires_grad is False
+    assert result["coordinates"].requires_grad is True
+    result["coordinates"].sum().backward()
+    assert z_trunk.grad is not None
+    assert torch.isfinite(z_trunk.grad).all()

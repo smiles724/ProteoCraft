@@ -36,6 +36,7 @@ import os
 import sys
 import argparse
 import logging
+import math
 import torch
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -51,22 +52,13 @@ from bindcraft.hallucination.profile_loader import (
 from bindcraft.utils import LOSS_WEIGHT_PRESETS
 
 
-ESMFOLD2_VERIFIER_DEFAULTS_BY_TASK = {
-    "tcr": (4, 50),
-}
-ESMFOLD2_VERIFIER_DEFAULT = (20, 200)
+ESMFOLD2_VERIFIER_DEFAULT = (4, 50)
 
 
 def resolve_esmfold2_verifier_precision_defaults(args):
-    """Apply task-aware verifier defaults while preserving explicit values."""
+    """Apply search-time verifier defaults while preserving explicit values."""
 
-    task_type = str(args.esmfold2_task_type).strip().lower()
-    default_loops, default_sampling_steps = (
-        ESMFOLD2_VERIFIER_DEFAULTS_BY_TASK.get(
-            task_type,
-            ESMFOLD2_VERIFIER_DEFAULT,
-        )
-    )
+    default_loops, default_sampling_steps = ESMFOLD2_VERIFIER_DEFAULT
     if args.esmfold2_verifier_num_loops is None:
         args.esmfold2_verifier_num_loops = default_loops
     if args.esmfold2_verifier_num_sampling_steps is None:
@@ -392,6 +384,93 @@ def load_protenix_model(
     return model, configs
 
 
+def build_tcr_prior_config(args) -> dict:
+    """Collect the TCR sequence-prior flags into the scorer's config dict."""
+
+    return {
+        "use_tcr_prior_gradient": args.use_tcr_prior_gradient,
+        "tcr_prior_gradient_weight": args.tcr_prior_gradient_weight,
+        "use_tcr_prior_verifier": args.use_tcr_prior_verifier,
+        "tcr_prior_verifier_weight": args.tcr_prior_verifier_weight,
+        "tcr_prior_region": args.tcr_prior_region,
+        "tcr_prior_model_name": args.tcr_prior_model_name,
+        "tcr_prior_checkpoint": args.tcr_prior_checkpoint,
+        "tcr_prior_masked": args.tcr_prior_masked,
+        "require_real_tcr_prior": args.require_real_tcr_prior,
+    }
+
+
+def build_tcr_contact_config(args) -> dict:
+    """Collect the TCR contact-loss flags and resolve the scaffold CDR spans.
+
+    Spans are resolved here, while ``init_binder_seq`` is still the untouched
+    natural scaffold: CDR3 mutates during the run, so a later digest lookup
+    would no longer match.
+    """
+
+    enabled = bool(getattr(args, "use_tcr_contact_loss", False))
+    raw_indices = str(
+        getattr(args, "tcr_contact_mhc_chain_indices", "1") or ""
+    ).strip()
+    mhc_indices = tuple(
+        int(token) for token in raw_indices.split(",") if token.strip()
+    )
+    payload = {
+        "enabled": enabled,
+        "lambda_contact": args.tcr_contact_lambda,
+        "lambda_fw": args.tcr_contact_lambda_fw,
+        "fw_hinge": args.tcr_contact_fw_hinge,
+        "fw_hinge_verifier": args.tcr_contact_fw_hinge_verifier,
+        "verifier_weight": args.tcr_contact_verifier_weight,
+        "use_gradient": args.tcr_contact_use_gradient,
+        "use_verifier": args.tcr_contact_use_verifier,
+        "peptide_chain_index": args.tcr_contact_peptide_chain_index,
+        "mhc_chain_indices": mhc_indices,
+        "cdr3_cutoff": args.tcr_contact_cdr3_cutoff,
+        "fw_cutoff": args.tcr_contact_fw_cutoff,
+        "objective": getattr(args, "tcr_contact_objective", "nll_hinge"),
+    }
+    partner_index = int(getattr(args, "tcr_contact_partner_tcr_chain_index", 2))
+    if partner_index >= 0:
+        payload["partner_tcr_chain_index"] = partner_index
+    if not enabled:
+        return payload
+
+    scaffold = getattr(args, "init_binder_seq", None)
+    if not scaffold:
+        raise ValueError(
+            "--use_tcr_contact_loss requires --init_binder_seq so the "
+            "CDR1/2/3 spans can be resolved from the natural scaffold"
+        )
+    if str(getattr(args, "tcr_contact_objective", "nll_hinge")) == "r_pep_target":
+        raw_target = str(getattr(args, "tcr_contact_r_pep_target", "natural"))
+        if raw_target.strip().lower() == "natural":
+            chain = getattr(args, "tcr_contact_chain", None)
+            if not chain:
+                raise ValueError(
+                    "--tcr_contact_r_pep_target natural requires "
+                    "--tcr_contact_chain alpha|beta"
+                )
+            from bindcraft.hallucination.tcr_natural_prior import natural_r_pep
+
+            payload["r_pep_target"] = float(natural_r_pep(chain))
+        else:
+            payload["r_pep_target"] = float(raw_target)
+
+    from bindcraft.hallucination.tcr_contact import resolve_contact_config_spans
+
+    partner_sequence = None
+    if partner_index >= 0:
+        chains = [c for c in str(getattr(args, "target", "") or "").split("|") if c]
+        if partner_index < len(chains):
+            partner_sequence = chains[partner_index]
+    return resolve_contact_config_spans(
+        payload,
+        scaffold_sequence=scaffold,
+        partner_sequence=partner_sequence,
+    )
+
+
 def load_esmfold2_backend(
     args,
     device: str = "cuda",
@@ -410,16 +489,24 @@ def load_esmfold2_backend(
         verifier_num_loops=args.esmfold2_verifier_num_loops,
         verifier_num_sampling_steps=args.esmfold2_verifier_num_sampling_steps,
         soft_steps=stagea_soft_steps,
+        learning_rate=args.learning_rate,
         temperature_min=args.esmfold2_temperature_min,
         temperature_max=args.esmfold2_temperature_max,
         lambda_esmc=args.esmfold2_lambda_esmc,
+        esmc_activation_checkpointing=(
+            args.esmfold2_esmc_activation_checkpointing
+        ),
         num_loops=args.esmfold2_proposal_num_loops,
         num_sampling_steps=args.esmfold2_proposal_num_sampling_steps,
         proposal_load_internal_esmc=args.esmfold2_proposal_load_internal_esmc,
         proposal_lm_dropout=args.esmfold2_proposal_lm_dropout,
         force_proposal_lm_dropout=args.esmfold2_force_proposal_lm_dropout,
         one_step_diffusion_enabled=args.esmfold2_one_step_diffusion,
+        one_step_diffusion_mode=args.esmfold2_one_step_diffusion_mode,
         one_step_diffusion_tau=args.esmfold2_one_step_diffusion_tau,
+        one_step_diffusion_truncated_num_sampling_steps=(
+            args.esmfold2_one_step_truncated_num_sampling_steps
+        ),
         one_step_diffusion_weight=args.esmfold2_one_step_diffusion_weight,
         one_step_diffusion_rg_weight=(
             args.esmfold2_one_step_diffusion_rg_weight
@@ -461,6 +548,8 @@ def load_esmfold2_backend(
             if mutable_mask is None
             else tuple(bool(value) for value in mutable_mask)
         ),
+        tcr_prior_config=build_tcr_prior_config(args),
+        tcr_contact_config=build_tcr_contact_config(args),
     )
     return ESMFold2RuntimeBackend(
         config=config,
@@ -492,8 +581,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # === Binder 与优化参数 ===
     parser.add_argument("--binder_length", type=int, default=40,
                        help="Binder 长度（默认：40）")
-    parser.add_argument("--n_steps", type=int, default=200,
-                       help="优化步数（默认：200）")
+    parser.add_argument("--n_steps", type=int, default=None,
+                       help=("优化步数；默认按 backend 解析："
+                             "Protenix=200，ESMFold2=110"))
     parser.add_argument("--learning_rate", type=float, default=0.05,
                        help="Adam 学习率（默认：0.05）")
     parser.add_argument("--tau_noise", type=float, default=4.0,
@@ -565,8 +655,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--esmfold2_stagea_cumulative_annealing",
         type=lambda x: x.lower() == "true",
-        default=True,
-        help="Stage A 是否沿 MCTS 路径累计温度退火进度（默认：true）",
+        default=False,
+        help="Stage A 是否沿 MCTS 路径累计温度退火进度（默认：false）",
     )
     parser.add_argument(
         "--esmfold2_stagea_annealing_horizon",
@@ -701,6 +791,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help="Stage B 是否让所有 sequence 使用同一个 run-level verifier seed（默认：true）",
     )
+    parser.add_argument(
+        "--esmfold2_stageb_verifier_seed",
+        type=int,
+        default=None,
+        help="Stage B paired verifier 的显式 seed；默认按 run seed 和 target 派生",
+    )
     parser.add_argument("--esmfold2_lambda_esmc", type=str, default="auto",
                        help="ESMC sequence prior 权重；auto 按任务类型选择，或传入数值字符串")
     parser.add_argument("--esmfold2_task_type", type=str, default="denovo",
@@ -740,6 +836,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "默认 false，不生成 PDB"
         ),
     )
+    parser.add_argument(
+        "--esmfold2_save_visualization_trace",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help=(
+            "是否保存 ESMFold2 proposal 前后 logits、完整 mutation-score "
+            "矩阵和候选元数据；仅用于可视化，默认 false"
+        ),
+    )
     parser.add_argument("--esmfold2_stagea_handoff_checkpoint_interval", type=int, default=10,
                        help="Stage A handoff checkpoint 保存间隔；默认每 10 step，0 表示仅保存最终 handoff")
     parser.add_argument("--esmfold2_resume_handoff_checkpoint", type=str, default=None,
@@ -756,7 +861,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "ESMFold2 verifier full fold loop 数；"
-            "默认 TCR=4，其他任务=20，可显式覆盖"
+            "所有任务搜索期默认 4，可显式覆盖"
         ),
     )
     parser.add_argument(
@@ -765,7 +870,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "ESMFold2 verifier diffusion sampling steps；"
-            "默认 TCR=50，其他任务=200，可显式覆盖"
+            "所有任务搜索期默认 50，可显式覆盖"
         ),
     )
     parser.add_argument("--esmfold2_proposal_num_loops", type=int, default=1,
@@ -774,6 +879,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2 proposal distogram forward diffusion steps（默认：1）")
     parser.add_argument("--esmfold2_proposal_load_internal_esmc", type=lambda x: x.lower() == "true", default=True,
                        help="是否为 ESMFold2Experimental proposal model 加载内部 ESMC（官方 binder design 为 true）")
+    parser.add_argument(
+        "--esmfold2_esmc_activation_checkpointing",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help="ESMC sequence-prior 是否逐层 activation checkpoint（默认：false）",
+    )
     parser.add_argument("--esmfold2_proposal_lm_dropout", type=float, default=0.5,
                        help="ESMFold2Experimental proposal LM dropout；官方 binder design inversion/proposal 使用 0.5")
     parser.add_argument("--esmfold2_force_proposal_lm_dropout", type=lambda x: x.lower() == "true", default=True,
@@ -788,10 +899,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--esmfold2_one_step_diffusion_mode",
+        choices=("reference_noising", "truncated_trajectory"),
+        default="truncated_trajectory",
+        help=(
+            "One-step 坐标来源：reference_noising 使用 verifier 结构加噪；"
+            "truncated_trajectory 从标准高噪声初态无梯度采样到 tau"
+        ),
+    )
+    parser.add_argument(
         "--esmfold2_one_step_diffusion_tau",
         type=float,
-        default=2.0,
-        help="ESMFold2 one-step diffusion 固定噪声尺度 tau（默认：2.0）",
+        default=1.0,
+        help="ESMFold2 one-step diffusion 固定噪声尺度 tau（默认：1.0）",
+    )
+    parser.add_argument(
+        "--esmfold2_one_step_truncated_num_sampling_steps",
+        type=int,
+        default=50,
+        help=(
+            "truncated_trajectory 构造官方 Karras schedule 的采样步数"
+            "（默认：50）"
+        ),
     )
     parser.add_argument(
         "--esmfold2_one_step_diffusion_weight",
@@ -953,8 +1082,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="可选的初始 Binder 单字母序列；长度必须与 --binder_length 一致")
     parser.add_argument("--target_hotspots", type=str, default=None,
                        help="Target hotspot residues，使用 1-based 序号；支持逗号/空格/范围，如 10,11,45-47")
-    parser.add_argument("--seed", type=int, default=42,
-                       help="随机种子；用于固定 Phase0、mutation sampling 和 verifier diffusion（默认：42）")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "随机种子；用于固定 Phase0、mutation sampling 和 verifier "
+            "diffusion。默认按 backend 解析：Protenix=42，ESMFold2=43"
+        ),
+    )
     parser.add_argument("--target_template_path", type=str, default=None,
                        help="可选 target template 结构文件（.cif/.mmcif/.pdb），只作用于 target 链")
 
@@ -969,8 +1105,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="每条序列的最大突变数（默认：3）")
     parser.add_argument("--stagea_max_mutations_per_seq", type=int, default=None,
                        help="ESMFold2/两阶段搜索 StageA 每条候选最大突变数；默认沿用 --max_mutations_per_seq")
+    parser.add_argument(
+        "--esmfold2_stagea_mutation_fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "ESMFold2 StageA sampled candidate 的最大唯一突变位点比例，"
+            "按 mutable mask 长度计算（默认：0.5）"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_candidate_strategy",
+        type=str,
+        choices=["legacy", "positive_score"],
+        default="positive_score",
+        help=(
+            "StageA 离散候选策略；positive_score 仅使用正 logit-delta "
+            "突变，并要求设置 mutation fraction（默认：positive_score）"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_stagea_include_argmax_candidate",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help=(
+            "StageA 是否加入不受突变比例限制的 logits argmax 候选"
+            "（默认：true）"
+        ),
+    )
     parser.add_argument("--stageb_max_mutations_per_seq", type=int, default=None,
-                       help="ESMFold2/两阶段搜索 StageB 每条候选最大突变数；默认沿用 --max_mutations_per_seq")
+                       help="ESMFold2 StageB 每条候选最大突变数（默认：1）")
     parser.add_argument("--use_annealing", type=lambda x: x.lower() == "true", default=True,
                        help="是否启用模拟退火（默认：true）")
     parser.add_argument("--t_init", type=float, default=1.0,
@@ -994,23 +1158,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
                            "best_of_n_chunked 将 --n_steps 总 outer-step 预算"
                            "均分给独立分段轨迹，不做逐步 verifier 选择；"
                            "其余为 StageA/两阶段 MCTS 模式；默认按 backend 解析："
-                           "Protenix=two_stage，ESMFold2=stage_a_only"
+                           "Protenix=two_stage，ESMFold2=two_stage"
                        ))
-    parser.add_argument("--mcts_bootstrap_steps", type=int, default=50,
-                       help="two_stage: StageA 原版 MCTS 至少运行步数（默认：50）")
+    parser.add_argument("--mcts_bootstrap_steps", type=int, default=None,
+                       help=("two_stage: StageA 至少运行步数；默认按 backend "
+                             "解析：Protenix=50，ESMFold2=70"))
     parser.add_argument("--mcts_bootstrap_patience", type=int, default=10,
                        help="two_stage: StageA 停滞 patience（默认：10）")
     parser.add_argument("--mcts_bootstrap_min_delta", type=float, default=0.02,
                        help="two_stage: 判断 StageA 有效改善的 loss 阈值（默认：0.02）")
-    parser.add_argument("--mcts_bootstrap_max_steps", type=int, default=80,
-                       help="two_stage: StageA 最大运行步数（默认：80）")
+    parser.add_argument("--mcts_bootstrap_max_steps", type=int, default=None,
+                       help=("two_stage: StageA 最大运行步数；默认按 backend "
+                             "解析：Protenix=80，ESMFold2=70"))
     parser.add_argument("--mcts_handoff_top_k", type=int, default=None,
-                       help="two_stage: 交给 StageB 的 top 序列数（Protenix 默认 mcts_num_beams；ESMFold2 默认 4）")
+                       help="two_stage: 交给 StageB 的 top 序列数（Protenix 默认 mcts_num_beams；ESMFold2 默认 2）")
     parser.add_argument("--mcts_expand_actions_per_step", type=int, default=None,
-                       help="MCTS StageB 每步最多扩展并验证的 action 数（Protenix 默认 2；ESMFold2 默认 4）")
-    parser.add_argument("--mcts_prior_mode", type=str, default="full",
-                       choices=["full", "uniform", "no_gradient", "no_group", "no_sequence"],
-                       help="MCTS StageB prior 消融模式（默认：full，保持当前完整逻辑）")
+                       help="MCTS StageB 每步最多扩展并验证的 action 数（默认：2）")
+    parser.add_argument("--mcts_prior_mode", type=str, default=None,
+                       choices=[
+                           "full",
+                           "uniform",
+                           "no_gradient",
+                           "no_group",
+                           "no_group_matched_compute",
+                           "no_sequence",
+                       ],
+                       help=("MCTS StageB prior 模式；默认按 backend 解析："
+                             "Protenix=full，ESMFold2=no_group；"
+                             "no_group_matched_compute 用三条 unified-loss proposal "
+                             "对齐 Full StageB 的 proposal 计算量）"))
     parser.add_argument("--mcts_proposal_method", type=str, default="one_step_fixed",
                        choices=["one_step_fixed", "one_step_adaptive", "two_step_truncated"],
                        help="MCTS StageB proposal 消融方法（默认：one_step_fixed，保持当前逻辑）")
@@ -1045,6 +1221,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESM-C 使用 masked-marginal 伪对数似然（更精确但更慢，默认：false）")
     parser.add_argument("--require_real_tcr_prior", type=lambda x: x.lower() == "true", default=False,
                        help="严格模式：指定 tcrlm/esmc/ligandmpnn 后端但未真实加载/无真实输出/回退 no-op 时直接报错（默认：false）")
+
+    # === TCR 特异性接触损失（可选，默认关闭；关闭时行为与之前完全一致） ===
+    parser.add_argument("--use_tcr_contact_loss", type=lambda x: x.lower() == "true", default=False,
+                       help="启用 TCR 特异性接触损失：CDR3-肽接触奖励 + 框架-pMHC 接触惩罚（默认：false）")
+    parser.add_argument("--tcr_contact_lambda", type=float, default=0.1,
+                       help="提议路径接触梯度的归一化方向混合系数，与 lambda_esmc 同一约定（默认：0.1）")
+    parser.add_argument("--tcr_contact_lambda_fw", type=float, default=1.0,
+                       help="L_contact 内框架-pMHC 铰链惩罚的权重（默认：1.0）")
+    parser.add_argument("--tcr_contact_fw_hinge", type=float, default=7.0,
+                       help="proposal 路径框架惩罚铰链阈值：框架接触 nll 低于此值才惩罚。"
+                            "A6 scaffold 自然值约 8.0-8.8，因此 7.0 只在真正异常靠近时触发（默认：7.0）")
+    parser.add_argument("--tcr_contact_fw_hinge_verifier", type=float, default=12.5,
+                       help="verifier 路径的铰链阈值；full ESMFold2 与 fast experimental model 的 "
+                            "distogram 尺度不同，自然值约 13.5-14.8（默认：12.5）")
+    parser.add_argument("--tcr_contact_objective", type=str, default="nll_hinge",
+                       choices=["nll_hinge", "r_pep_target"],
+                       help="contact 目标函数形式：nll_hinge 绝对接触项+framework hinge / "
+                            "r_pep_target 匹配真实结构的接触比例（默认：nll_hinge）")
+    parser.add_argument("--tcr_contact_r_pep_target", type=str, default="natural",
+                       help="r_pep_target 目标值：'natural' 从 216 个真实 TCR-pMHC 结构解析，"
+                            "或直接给一个浮点数（默认：natural）")
+    parser.add_argument("--tcr_contact_chain", type=str, default=None,
+                       choices=["alpha", "beta"],
+                       help="被重设计的链，用于查天然 r_pep 目标（默认：None）")
+    parser.add_argument("--tcr_contact_verifier_weight", type=float, default=1.0,
+                       help="verifier/MCTS 路径的硬接触损失权重（默认：1.0）")
+    parser.add_argument("--tcr_contact_use_gradient", type=lambda x: x.lower() == "true", default=True,
+                       help="接触损失参与提议梯度路径（默认：true）")
+    parser.add_argument("--tcr_contact_use_verifier", type=lambda x: x.lower() == "true", default=True,
+                       help="接触损失进入 verifier/MCTS 树值（默认：true）")
+    parser.add_argument("--tcr_contact_peptide_chain_index", type=int, default=0,
+                       help="哪条非 binder 链是 9-mer 肽，按索引而非 role 选择（默认：0）")
+    parser.add_argument("--tcr_contact_mhc_chain_indices", type=str, default="1",
+                       help="哪些非 binder 链是 MHC，逗号分隔。HLA 与配对 TCR 链的 role 同为 scaffold，必须按索引区分（默认：1）")
+    parser.add_argument("--tcr_contact_cdr3_cutoff", type=float, default=8.0,
+                       help="CDR3-肽接触距离阈值，单位 Å（默认：8.0）")
+    parser.add_argument("--tcr_contact_fw_cutoff", type=float, default=8.0,
+                       help="框架-pMHC 接触距离阈值，单位 Å（默认：8.0）")
+    parser.add_argument("--tcr_contact_partner_tcr_chain_index", type=int, default=2,
+                       help="配对 TCR 链（设计 beta 时的 alpha，反之亦然）的链索引；其 FR1-FR4 同样计入 "
+                            "framework 惩罚。设为 -1 表示只用 binder 自身的 framework（默认：2）")
 
     # === 损失函数权重（key 必须与 DEFAULT_LOSS_WEIGHTS 一致） ===
     parser.add_argument("--loss_preset", type=str, default="tuned",
@@ -1095,8 +1312,18 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             parser.error(message)
         raise ValueError(message)
     if getattr(args, "mcts_strategy", None) is None:
-        args.mcts_strategy = (
-            "stage_a_only" if backend == "esmfold2" else "two_stage"
+        args.mcts_strategy = "two_stage"
+    if getattr(args, "seed", None) is None:
+        args.seed = 43 if backend == "esmfold2" else 42
+    if getattr(args, "n_steps", None) is None:
+        args.n_steps = 110 if backend == "esmfold2" else 200
+    if getattr(args, "mcts_bootstrap_steps", None) is None:
+        args.mcts_bootstrap_steps = 70 if backend == "esmfold2" else 50
+    if getattr(args, "mcts_bootstrap_max_steps", None) is None:
+        args.mcts_bootstrap_max_steps = 70 if backend == "esmfold2" else 80
+    if getattr(args, "mcts_prior_mode", None) is None:
+        args.mcts_prior_mode = (
+            "no_group" if backend == "esmfold2" else "full"
         )
     if backend == "esmfold2" and getattr(args, "mode", None) != "mcts":
         message = "ESMFold2 backend first version only supports --mode mcts"
@@ -1181,6 +1408,25 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             raise ValueError(message)
         if getattr(args, "stageb_max_mutations_per_seq", None) is None:
             args.stageb_max_mutations_per_seq = 1
+        if args.esmfold2_stagea_mutation_fraction is not None and (
+            not math.isfinite(args.esmfold2_stagea_mutation_fraction)
+            or not 0.0 < args.esmfold2_stagea_mutation_fraction <= 1.0
+        ):
+            message = "--esmfold2_stagea_mutation_fraction must be in (0, 1]"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if (
+            args.esmfold2_stagea_candidate_strategy == "positive_score"
+            and args.esmfold2_stagea_mutation_fraction is None
+        ):
+            message = (
+                "--esmfold2_stagea_candidate_strategy positive_score requires "
+                "--esmfold2_stagea_mutation_fraction"
+            )
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
         if getattr(args, "mcts_handoff_top_k", None) is None:
             args.mcts_handoff_top_k = 2
         if args.esmfold2_stageb_rerank_pool_size <= 0:
@@ -1228,8 +1474,15 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
-        if args.esmfold2_resume_handoff_checkpoint and args.mcts_strategy not in {"two_stage", "strict"}:
-            message = "--esmfold2_resume_handoff_checkpoint requires --mcts_strategy two_stage"
+        if args.esmfold2_resume_handoff_checkpoint and args.mcts_strategy not in {
+            "stage_a_only",
+            "two_stage",
+            "strict",
+        }:
+            message = (
+                "--esmfold2_resume_handoff_checkpoint requires --mcts_strategy "
+                "stage_a_only or two_stage"
+            )
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
@@ -1403,6 +1656,13 @@ def main(argv=None):
         )
     if (
         model_backend == "esmfold2"
+        and args.esmfold2_one_step_truncated_num_sampling_steps <= 1
+    ):
+        parser.error(
+            "--esmfold2_one_step_truncated_num_sampling_steps must be greater than 1"
+        )
+    if (
+        model_backend == "esmfold2"
         and args.esmfold2_one_step_diffusion_interval < 0
     ):
         parser.error(
@@ -1416,6 +1676,15 @@ def main(argv=None):
         parser.error(
             "--esmfold2_one_step_diffusion_interval > 0 requires "
             "--esmfold2_one_step_diffusion true"
+        )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_one_step_recycle_coordinates
+        and args.esmfold2_one_step_diffusion_mode != "reference_noising"
+    ):
+        parser.error(
+            "--esmfold2_one_step_recycle_coordinates is only supported by "
+            "reference_noising mode"
         )
     if (
         model_backend == "esmfold2"
@@ -1533,17 +1802,7 @@ def main(argv=None):
         if val is not None:
             loss_weights[key] = val
 
-    tcr_prior_config = {
-        "use_tcr_prior_gradient": args.use_tcr_prior_gradient,
-        "tcr_prior_gradient_weight": args.tcr_prior_gradient_weight,
-        "use_tcr_prior_verifier": args.use_tcr_prior_verifier,
-        "tcr_prior_verifier_weight": args.tcr_prior_verifier_weight,
-        "tcr_prior_region": args.tcr_prior_region,
-        "tcr_prior_model_name": args.tcr_prior_model_name,
-        "tcr_prior_checkpoint": args.tcr_prior_checkpoint,
-        "tcr_prior_masked": args.tcr_prior_masked,
-        "require_real_tcr_prior": args.require_real_tcr_prior,
-    }
+    tcr_prior_config = build_tcr_prior_config(args)
 
     if model_backend == "esmfold2":
         from bindcraft.hallucination.esmfold2_pipeline import (
@@ -1633,6 +1892,15 @@ def main(argv=None):
                 T_sample=args.t_sample,
                 max_mutations_per_seq=args.max_mutations_per_seq,
                 stagea_max_mutations_per_seq=args.stagea_max_mutations_per_seq,
+                esmfold2_stagea_mutation_fraction=(
+                    args.esmfold2_stagea_mutation_fraction
+                ),
+                esmfold2_stagea_candidate_strategy=(
+                    args.esmfold2_stagea_candidate_strategy
+                ),
+                esmfold2_stagea_include_argmax_candidate=(
+                    args.esmfold2_stagea_include_argmax_candidate
+                ),
                 stageb_max_mutations_per_seq=args.stageb_max_mutations_per_seq,
                 num_beams=args.mcts_num_beams,
                 init_binder_seq=args.init_binder_seq,
@@ -1653,6 +1921,9 @@ def main(argv=None):
                 artifact_dir=esmfold2_artifact_dir,
                 save_verified_candidate_cif=(
                     args.esmfold2_save_verified_candidate_cif
+                ),
+                save_visualization_trace=(
+                    args.esmfold2_save_visualization_trace
                 ),
                 esmfold2_logit_init_mode=args.esmfold2_logit_init_mode,
                 esmfold2_stagea_soft_steps=args.esmfold2_stagea_soft_steps,
@@ -1681,6 +1952,7 @@ def main(argv=None):
                 esmfold2_stageb_min_pair_chain_iptm=args.esmfold2_stageb_min_pair_chain_iptm,
                 esmfold2_stageb_handoff_quality_tolerance=args.esmfold2_stageb_handoff_quality_tolerance,
                 esmfold2_stageb_paired_verifier_seed=args.esmfold2_stageb_paired_verifier_seed,
+                esmfold2_stageb_verifier_seed=args.esmfold2_stageb_verifier_seed,
                 esmfold2_final_polish=args.esmfold2_final_polish,
                 esmfold2_stagea_handoff_checkpoint_interval=args.esmfold2_stagea_handoff_checkpoint_interval,
                 esmfold2_resume_handoff_checkpoint=args.esmfold2_resume_handoff_checkpoint,
@@ -1730,7 +2002,6 @@ def main(argv=None):
             hotspot_params=hotspot_params,
             seed=args.seed,
             target_template_path=args.target_template_path,
-            tcr_prior_config=tcr_prior_config,
         )
     else:
         from bindcraft.hallucination.pipeline import run_mcts_hallucination
@@ -1879,6 +2150,10 @@ def main(argv=None):
                 "ESMFold2 Stage B Paired Verifier Seed: "
                 f"{args.esmfold2_stageb_paired_verifier_seed}\n"
             )
+            f.write(
+                "ESMFold2 Stage B Verifier Seed: "
+                f"{args.esmfold2_stageb_verifier_seed or 'AUTO'}\n"
+            )
             f.write(f"ESMFold2 Lambda ESMC: {args.esmfold2_lambda_esmc}\n")
             f.write(f"ESMFold2 Task Type: {args.esmfold2_task_type}\n")
             f.write(f"ESMFold2 Logit Init Mode: {args.esmfold2_logit_init_mode}\n")
@@ -1888,6 +2163,14 @@ def main(argv=None):
             )
             f.write(f"ESMFold2 Mutable Mask: {args.esmfold2_mutable_mask or 'ALL'}\n")
             f.write(
+                "ESMFold2 StageA Candidate Strategy: "
+                f"{args.esmfold2_stagea_candidate_strategy}\n"
+            )
+            f.write(
+                "ESMFold2 StageA Include Argmax Candidate: "
+                f"{args.esmfold2_stagea_include_argmax_candidate}\n"
+            )
+            f.write(
                 "ESMFold2 Target Chain Roles: "
                 f"{args.esmfold2_target_chain_roles or 'ALL_TARGET'}\n"
             )
@@ -1895,6 +2178,10 @@ def main(argv=None):
             f.write(f"ESMFold2 Resume Handoff Checkpoint: {args.esmfold2_resume_handoff_checkpoint or 'NONE'}\n")
             f.write(f"ESMFold2 Resume Reverify Roots: {args.esmfold2_resume_reverify_roots}\n")
             f.write(f"ESMFold2 Proposal Load Internal ESMC: {args.esmfold2_proposal_load_internal_esmc}\n")
+            f.write(
+                "ESMFold2 ESMC Activation Checkpointing: "
+                f"{args.esmfold2_esmc_activation_checkpointing}\n"
+            )
             f.write(f"ESMFold2 Proposal LM Dropout: {args.esmfold2_proposal_lm_dropout}\n")
             f.write(f"ESMFold2 Force Proposal LM Dropout: {args.esmfold2_force_proposal_lm_dropout}\n")
             f.write(f"ESMFold2 Track Proposal Confidence: {args.esmfold2_track_proposal_confidence}\n")
@@ -1910,8 +2197,16 @@ def main(argv=None):
                 f"{args.esmfold2_one_step_diffusion}\n"
             )
             f.write(
+                "ESMFold2 One-step Diffusion Mode: "
+                f"{args.esmfold2_one_step_diffusion_mode}\n"
+            )
+            f.write(
                 "ESMFold2 One-step Diffusion Tau: "
                 f"{args.esmfold2_one_step_diffusion_tau}\n"
+            )
+            f.write(
+                "ESMFold2 One-step Truncated Sampling Steps: "
+                f"{args.esmfold2_one_step_truncated_num_sampling_steps}\n"
             )
             f.write(
                 "ESMFold2 One-step Diffusion Weight: "

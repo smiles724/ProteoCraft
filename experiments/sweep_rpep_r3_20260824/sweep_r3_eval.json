@@ -1,0 +1,164 @@
+{
+  "ALGRRIPPV_alpha": {
+    "D030": {
+      "cdr3": "ARDPADRDILI",
+      "framework_unchanged": true,
+      "n_mut_outside_cdr3": 0,
+      "esm_verify_loss": 0.5122011194149851,
+      "pair_chain_iptm_loss": 0.44697219133377075,
+      "raw_common_iptm": 0.44697219133377075,
+      "raw_common_i_pae": 0.14390720427036285,
+      "raw_common_i_con": 4.507280349731445,
+      "raw_common_plddt": 0.1995895504951477,
+      "raw_common_clash": 0.0,
+      "cdr3_peptide_contact_nll": 9.133780479431152,
+      "framework_pmhc_contact_nll": 12.997321128845215,
+      "framework_penalty": 0.0,
+      "cdr3_peptide_contact_mass": 0.462184876203537,
+      "tcr_pmhc_contact_mass": 2.759002447128296,
+      "r_pep": 0.16751883924007416,
+      "best_sequence": "KEVEQNSGPLSVPEGAIASLNCTYSDRGSQSFFWYRQYSGKSPELIMSIYSNGDKEDGRFTAQLNKASQYVSLLIRDSQPSDSATYLCARDPADRDILIFGAGTQVVVTPDIQNPDPAVYQLRDSKSSDKSVCLFTDFDSQTNVSQSKDKDVYITDKTVLDMRSMDFKSNSAVAWSNKSDFACANAFNNSIIPEDTFFPS",
+      "tcrlm_nll": 2.3113,
+      "esmc_nll": 2.3667
+    },
+    "_natural_A6": {
+      "tcrlm_nll": 3.2263,
+      "esmc_nll": 1.7086
+    }
+  },
+  "ALGRRIPPV_beta": {
+    "D030": {
+      "cdr3": "EGKSTWDAIVDALI",
+      "framework_unchanged": true,
+      "n_mut_outside_cdr3": 0,
+      "esm_verify_loss": 0.5353769576494904,
+      "pair_chain_iptm_loss": 0.48439037799835205,
+      "raw_common_iptm": 0.48439037799835205,
+      "raw_common_i_pae": 0.2024088054895401,
+      "raw_common_i_con": 4.274502754211426,
+      "raw_common_plddt": 0.2857118248939514,
+      "raw_common_clash": 5.594775487338666e-08,
+      "cdr3_peptide_contact_nll": 8.250373840332031,
+      "framework_pmhc_contact_nll": 13.120355606079102,
+      "framework_penalty": 0.0,
+      "cdr3_peptide_contact_mass": 0.19471599161624908,
+      "tcr_pmhc_contact_mass": 0.6900160312652588,
+      "r_pep": 0.2821905314922333,
+      "best_sequence": "GVTQTPKFQVLKTGQSMTLQCAQDMNHEYMSWYRQDPGMGLRLIHYSVGAGITDQGEVPNGYNVSRSTTEDFPLRLLSAAPSQTSVYFCEGKSTWDAIVDALIFGPGTRLTVTEDLKNVFPPEVAVFEPSAEEISHTQKATLVCLATGFYPDHVELSWWVNGKEVHSGVSTDPQPLKEQPALNDSRYALSSRLRVSATFWQNPRNHFRCQVQFYGLSENDEWTQDRAKPVTQIVSAEAWGRAD",
+      "tcrlm_nll": 3.3166,
+      "esmc_nll": 2.8358
+    },
+    "_natural_A6": {
+      "tcrlm_nll": 2.0675,
+      "esmc_nll": 2.1114
+    }
+  },
+  "KLNPRIPRI_alpha": {
+    "D030": {
+      "cdr3": "STLNEVSRLAE",
+      "framework_unchanged": true,
+      "n_mut_outside_cdr3": 0,
+      "esm_verify_loss": 0.41479180041245833,
+      "pair_chain_iptm_loss": 0.3542434573173523,
+      "raw_common_iptm": 0.3542434573173523,
+      "raw_common_i_pae": 0.1364951729774475,
+      "raw_common_i_con": 4.547182083129883,
+      "raw_common_plddt": 0.14358586072921753,
+      "raw_common_clash": 0.0,
+      "cdr3_peptide_contact_nll": 9.093018531799316,
+      "framework_pmhc_contact_nll": 12.933977127075195,
+      "framework_penalty": 0.0,
+      "cdr3_peptide_contact_mass": 0.6351709961891174,
+      "tcr_pmhc_contact_mass": 2.5238332748413086,
+      "r_pep": 0.25166916847229004,
+      "best_sequence": "KEVEQNSGPLSVPEGAIASLNCTYSDRGSQSFFWYRQYSGKSPELIMSIYSNGDKEDGRFTAQLNKASQYVSLLIRDSQPSDSATYLCSTLNEVSRLAEFGAGTQVVVTPDIQNPDPAVYQLRDSKSSDKSVCLFTDFDSQTNVSQSKDKDVYITDKTVLDMRSMDFKSNSAVAWSNKSDFACANAFNNSIIPEDTFFPS",
+      "tcrlm_nll": 2.7596,
+      "esmc_nll": 2.7722
+    },
+    "_natural_A6": {
+      "tcrlm_nll": 3.2263,
+      "esmc_nll": 1.7086
+    }
+  },
+  "KLNPRIPRI_beta": {
+    "D030": {
+      "cdr3": "FTKTTDDFGGGARQ",
+      "framework_unchanged": true,
+      "n_mut_outside_cdr3": 0,
+      "esm_verify_loss": 0.37270262181014935,
+      "pair_chain_iptm_loss": 0.32928937673568726,
+      "raw_common_iptm": 0.32928937673568726,
+      "raw_common_i_pae": 0.0854371190071106,
+      "raw_common_i_con": 3.7038090229034424,
+      "raw_common_plddt": 0.10207170248031616,
+      "raw_common_clash": 0.0,
+      "cdr3_peptide_contact_nll": 8.91470718383789,
+      "framework_pmhc_contact_nll": 13.493269920349121,
+      "framework_penalty": 0.0,
+      "cdr3_peptide_contact_mass": 0.7720354795455933,
+      "tcr_pmhc_contact_mass": 2.348302125930786,
+      "r_pep": 0.32876327633857727,
+      "best_sequence": "GVTQTPKFQVLKTGQSMTLQCAQDMNHEYMSWYRQDPGMGLRLIHYSVGAGITDQGEVPNGYNVSRSTTEDFPLRLLSAAPSQTSVYFCFTKTTDDFGGGARQFGPGTRLTVTEDLKNVFPPEVAVFEPSAEEISHTQKATLVCLATGFYPDHVELSWWVNGKEVHSGVSTDPQPLKEQPALNDSRYALSSRLRVSATFWQNPRNHFRCQVQFYGLSENDEWTQDRAKPVTQIVSAEAWGRAD",
+      "tcrlm_nll": 3.0903,
+      "esmc_nll": 2.9181
+    },
+    "_natural_A6": {
+      "tcrlm_nll": 2.0675,
+      "esmc_nll": 2.1114
+    }
+  },
+  "YLNPRVARI_alpha": {
+    "D030": {
+      "cdr3": "ATFNDEFYEDR",
+      "framework_unchanged": true,
+      "n_mut_outside_cdr3": 0,
+      "esm_verify_loss": 0.3492323284505067,
+      "pair_chain_iptm_loss": 0.29068273305892944,
+      "raw_common_iptm": 0.29068273305892944,
+      "raw_common_i_pae": 0.0750504732131958,
+      "raw_common_i_con": 4.512749671936035,
+      "raw_common_plddt": 0.11046373844146729,
+      "raw_common_clash": 2.0504910480667604e-07,
+      "cdr3_peptide_contact_nll": 9.589729309082031,
+      "framework_pmhc_contact_nll": 14.023621559143066,
+      "framework_penalty": 0.0,
+      "cdr3_peptide_contact_mass": 0.8911415934562683,
+      "tcr_pmhc_contact_mass": 2.567587375640869,
+      "r_pep": 0.3470735251903534,
+      "best_sequence": "KEVEQNSGPLSVPEGAIASLNCTYSDRGSQSFFWYRQYSGKSPELIMSIYSNGDKEDGRFTAQLNKASQYVSLLIRDSQPSDSATYLCATFNDEFYEDRFGAGTQVVVTPDIQNPDPAVYQLRDSKSSDKSVCLFTDFDSQTNVSQSKDKDVYITDKTVLDMRSMDFKSNSAVAWSNKSDFACANAFNNSIIPEDTFFPS",
+      "tcrlm_nll": 3.2981,
+      "esmc_nll": 2.6768
+    },
+    "_natural_A6": {
+      "tcrlm_nll": 3.2263,
+      "esmc_nll": 1.7086
+    }
+  },
+  "YLNPRVARI_beta": {
+    "D030": {
+      "cdr3": "IGRSLEDVRANMKP",
+      "framework_unchanged": true,
+      "n_mut_outside_cdr3": 0,
+      "esm_verify_loss": 0.4283297620901524,
+      "pair_chain_iptm_loss": 0.3770902156829834,
+      "raw_common_iptm": 0.3770902156829834,
+      "raw_common_i_pae": 0.28506341576576233,
+      "raw_common_i_con": 3.985907554626465,
+      "raw_common_plddt": 0.42918646335601807,
+      "raw_common_clash": 0.0,
+      "cdr3_peptide_contact_nll": 7.4971160888671875,
+      "framework_pmhc_contact_nll": 12.97238826751709,
+      "framework_penalty": 0.0,
+      "cdr3_peptide_contact_mass": 0.5067313313484192,
+      "tcr_pmhc_contact_mass": 1.451195478439331,
+      "r_pep": 0.34918197989463806,
+      "best_sequence": "GVTQTPKFQVLKTGQSMTLQCAQDMNHEYMSWYRQDPGMGLRLIHYSVGAGITDQGEVPNGYNVSRSTTEDFPLRLLSAAPSQTSVYFCIGRSLEDVRANMKPFGPGTRLTVTEDLKNVFPPEVAVFEPSAEEISHTQKATLVCLATGFYPDHVELSWWVNGKEVHSGVSTDPQPLKEQPALNDSRYALSSRLRVSATFWQNPRNHFRCQVQFYGLSENDEWTQDRAKPVTQIVSAEAWGRAD",
+      "tcrlm_nll": 3.0791,
+      "esmc_nll": 3.0221
+    },
+    "_natural_A6": {
+      "tcrlm_nll": 2.0675,
+      "esmc_nll": 2.1114
+    }
+  }
+}

@@ -61,19 +61,22 @@ class ESMFold2ProposalConfig:
     verifier_num_loops: int = 20
     verifier_num_sampling_steps: int = 200
     soft_steps: int = 30
-    learning_rate: float = 0.1
+    learning_rate: float = 0.05
     temperature_min: float = 1e-2
     temperature_max: float = 1.0
     lambda_esmc: Union[str, float] = "auto"
     esmc_n_passes: int = 4
     esmc_batch_size: int = 4
+    esmc_activation_checkpointing: bool = False
     num_loops: int = 1
     num_sampling_steps: int = 1
     proposal_load_internal_esmc: bool = True
     proposal_lm_dropout: Optional[float] = 0.5
     force_proposal_lm_dropout: bool = True
     one_step_diffusion_enabled: bool = True
-    one_step_diffusion_tau: float = 2.0
+    one_step_diffusion_mode: str = "truncated_trajectory"
+    one_step_diffusion_tau: float = 1.0
+    one_step_diffusion_truncated_num_sampling_steps: int = 50
     one_step_diffusion_weight: float = 0.25
     one_step_diffusion_rg_weight: float = 0.1
     one_step_diffusion_interval: int = 5
@@ -100,6 +103,11 @@ class ESMFold2ProposalConfig:
     proposal_confidence_tail_steps: int = 0
     target_chain_roles: Optional[Tuple[str, ...]] = None
     binder_mutable_mask: Optional[Tuple[bool, ...]] = None
+    # === TCR-specific extensions (default OFF; identical behaviour when off) ===
+    # Raw mappings rather than dataclasses so the frozen config stays hashable
+    # to construct and trivially serialisable into run artifacts.
+    tcr_prior_config: Optional[Mapping[str, Any]] = None
+    tcr_contact_config: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
         if int(self.verifier_num_loops) <= 0:
@@ -171,6 +179,16 @@ class ESMFold2ProposalConfig:
                 raise ValueError("proposal_lm_dropout must be in [0, 1)")
         if float(self.one_step_diffusion_tau) <= 0.0:
             raise ValueError("one_step_diffusion_tau must be positive")
+        one_step_mode = str(self.one_step_diffusion_mode).strip().lower()
+        if one_step_mode not in {"reference_noising", "truncated_trajectory"}:
+            raise ValueError(
+                "one_step_diffusion_mode must be 'reference_noising' or "
+                "'truncated_trajectory'"
+            )
+        if int(self.one_step_diffusion_truncated_num_sampling_steps) <= 1:
+            raise ValueError(
+                "one_step_diffusion_truncated_num_sampling_steps must be greater than 1"
+            )
         if float(self.one_step_diffusion_weight) < 0.0:
             raise ValueError("one_step_diffusion_weight must be non-negative")
         if float(self.one_step_diffusion_rg_weight) < 0.0:
@@ -199,6 +217,14 @@ class ESMFold2ProposalConfig:
             raise ValueError(
                 "one_step_diffusion_recycle_coordinates requires a positive "
                 "one_step_diffusion_interval"
+            )
+        if (
+            bool(self.one_step_diffusion_recycle_coordinates)
+            and one_step_mode != "reference_noising"
+        ):
+            raise ValueError(
+                "one_step_diffusion_recycle_coordinates is only supported by "
+                "reference_noising mode"
             )
         verifier_loss_mode = str(self.verifier_loss_mode).strip().lower()
         if verifier_loss_mode not in {"pair_chain_iptm", "aligned_common"}:
@@ -253,6 +279,20 @@ class ESMFold2VerifierResult:
 
 
 @dataclass
+class ESMFold2DiscreteCandidateBatch:
+    """Discrete sequences plus diagnostics from one soft-logit update."""
+
+    sequences: Sequence[str]
+    candidate_metadata: Sequence[Mapping[str, Any]] = field(default_factory=list)
+    diagnostics: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.sequences = [str(sequence) for sequence in self.sequences]
+        self.candidate_metadata = [dict(item) for item in self.candidate_metadata]
+        self.diagnostics = dict(self.diagnostics)
+
+
+@dataclass
 class ESMFold2ProposalBatch:
     """Mutation proposal output plus optional persistent soft-logit state."""
 
@@ -261,9 +301,13 @@ class ESMFold2ProposalBatch:
     logits_after: Optional[torch.Tensor] = field(default=None, repr=False)
     confidence_candidates: Sequence[Mapping[str, Any]] = field(default_factory=list)
     soft_step_metrics: Sequence[Mapping[str, Any]] = field(default_factory=list)
+    candidate_metadata: Sequence[Mapping[str, Any]] = field(default_factory=list)
+    proposal_diagnostics: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.sequences = [str(sequence) for sequence in self.sequences]
+        self.candidate_metadata = [dict(item) for item in self.candidate_metadata]
+        self.proposal_diagnostics = dict(self.proposal_diagnostics)
 
     def __iter__(self) -> Iterator[str]:
         return iter(self.sequences)
@@ -671,6 +715,79 @@ def anchor_binder_logits_to_sequence(
     return anchored.detach().cpu().clone()
 
 
+def minimally_align_binder_logits_to_sequence(
+    logits: torch.Tensor,
+    sequence: str,
+    mutable_mask: Optional[Sequence[bool]] = None,
+    *,
+    fixed_logit: float = 10.0,
+    anchor_margin: float = 0.1,
+    suppress_cys: bool = True,
+) -> torch.Tensor:
+    """Align a verified sequence while preserving its saved soft-logit state.
+
+    Mutable rows that already select the verified residue are left unchanged.
+    Only mismatched or tied rows are lifted just above their strongest allowed
+    competitor. Fixed rows retain the existing hard sequence constraint.
+    """
+
+    if logits.ndim == 3:
+        if logits.shape[0] != 1:
+            raise ValueError("node-local ESM logits must have batch size 1")
+        logits_2d = logits[0]
+    elif logits.ndim == 2:
+        logits_2d = logits
+    else:
+        raise ValueError("node-local ESM logits must have shape [L, 20] or [1, L, 20]")
+
+    sequence = str(sequence)
+    length = len(sequence)
+    if logits_2d.shape != (length, len(ESM_AA_ORDER)):
+        raise ValueError(
+            f"logits shape {tuple(logits_2d.shape)} does not match sequence shape "
+            f"({length}, {len(ESM_AA_ORDER)})"
+        )
+    if float(anchor_margin) <= 0.0:
+        raise ValueError("anchor_margin must be positive")
+
+    aligned = logits_2d.detach().clone()
+    sequence_idx = _sequence_indices(sequence).to(device=aligned.device)
+    mutable = _as_bool_mask(mutable_mask, length, device=aligned.device)
+
+    for pos in range(length):
+        aa_idx = int(sequence_idx[pos].item())
+        if not bool(mutable[pos].item()):
+            aligned[pos, :] = 0.0
+            if suppress_cys:
+                aligned[pos, CYS_INDEX] = float("-inf")
+            aligned[pos, aa_idx] = float(fixed_logit)
+            continue
+        if suppress_cys and aa_idx == CYS_INDEX:
+            raise ValueError("cysteine mutations are disabled for ESMFold2 proposals")
+
+        row = aligned[pos]
+        if suppress_cys:
+            row[CYS_INDEX] = float("-inf")
+        competitor_mask = torch.ones(
+            len(ESM_AA_ORDER),
+            dtype=torch.bool,
+            device=row.device,
+        )
+        competitor_mask[aa_idx] = False
+        competitors = row[competitor_mask]
+        finite_competitors = competitors[torch.isfinite(competitors)]
+        competitor_max = (
+            float(finite_competitors.max().item())
+            if finite_competitors.numel()
+            else 0.0
+        )
+        current = float(row[aa_idx].item())
+        if not torch.isfinite(row[aa_idx]) or current <= competitor_max:
+            row[aa_idx] = competitor_max + float(anchor_margin)
+
+    return aligned.detach().cpu().clone()
+
+
 def softly_anchor_mutation_logits(
     logits: torch.Tensor,
     parent_sequence: str,
@@ -799,6 +916,8 @@ def combine_normalized_gradients(
     lambda_esmc: float,
     tcr_grad: Optional[torch.Tensor] = None,
     lambda_tcr: float = 0.0,
+    contact_grad: Optional[torch.Tensor] = None,
+    lambda_contact: float = 0.0,
 ) -> torch.Tensor:
     """Combine ESMFold2 structural gradient and optional sequence priors.
 
@@ -808,6 +927,9 @@ def combine_normalized_gradients(
     touching the native term. Both are mixed after per-tensor normalization,
     so ``lambda_tcr`` is a normalized-gradient mixing weight — it is NOT
     numerically comparable to the scalar loss weight used on the Protenix path.
+    ``contact_grad`` is the TCR contact objective
+    (`bindcraft.hallucination.tcr_contact`), mixed the same way and on the
+    same normalized footing, so it too can be ablated independently.
     """
 
     combined = normalized_gradient_tensor(structure_grad, gradient_mask)
@@ -819,6 +941,11 @@ def combine_normalized_gradients(
     if tcr_grad is not None and float(lambda_tcr) != 0.0:
         combined = combined + float(lambda_tcr) * normalized_gradient_tensor(
             tcr_grad,
+            gradient_mask,
+        )
+    if contact_grad is not None and float(lambda_contact) != 0.0:
+        combined = combined + float(lambda_contact) * normalized_gradient_tensor(
+            contact_grad,
             gradient_mask,
         )
     return combined * gradient_mask
@@ -975,6 +1102,362 @@ def _scores_to_gradient_like_matrix(scores: torch.Tensor) -> torch.Tensor:
     return converted
 
 
+def _candidate_metadata_from_sequence(
+    *,
+    current_seq: str,
+    sequence: str,
+    scores: torch.Tensor,
+    source: str,
+) -> Dict[str, Any]:
+    positions = [
+        index
+        for index, (current_aa, new_aa) in enumerate(zip(current_seq, sequence))
+        if current_aa != new_aa
+    ]
+    mutation_scores = []
+    changes = []
+    for position in positions:
+        new_aa = sequence[position]
+        score = scores[position, AA_TO_ESM_IDX[new_aa]]
+        mutation_scores.append(
+            float(score.item()) if torch.isfinite(score) else None
+        )
+        changes.append(f"{current_seq[position]}{position + 1}{new_aa}")
+    return {
+        "sequence": sequence,
+        "source": source,
+        "mutation_count": len(positions),
+        "mutation_positions": positions,
+        "mutation_changes": changes,
+        "mutation_scores": mutation_scores,
+    }
+
+
+def build_logit_delta_candidate_batch(
+    logits_before: torch.Tensor,
+    logits_after: torch.Tensor,
+    *,
+    current_seq: str,
+    mutable_mask: Optional[Sequence[bool]] = None,
+    K_top: int = 10,
+    B_candidates: int = 8,
+    T_sample: float = 1.0,
+    max_mutations_per_seq: int = 3,
+    mutation_fraction: Optional[float] = None,
+    include_logit_candidates: bool = False,
+    candidate_strategy: str = "legacy",
+) -> ESMFold2DiscreteCandidateBatch:
+    """Generate discrete candidates and proposal diagnostics.
+
+    ``legacy`` preserves the original Top-K action sampler. ``positive_score``
+    keeps only beneficial per-position logit-delta edits, uses one deterministic
+    top-K candidate, then samples the remaining candidates with exactly the same
+    number of distinct positions.
+    """
+
+    from bindcraft.hallucination.mutation_proposer import (
+        AA_1LETTER,
+        PROTEIN_RESIDUE_NAMES,
+        sample_candidate_sequences,
+        select_top_k_mutations,
+    )
+
+    strategy = str(candidate_strategy or "legacy").strip().lower()
+    if strategy not in {"legacy", "positive_score"}:
+        raise ValueError(
+            "candidate_strategy must be 'legacy' or 'positive_score'"
+        )
+    if strategy == "positive_score" and mutation_fraction is None:
+        raise ValueError(
+            "positive_score candidate_strategy requires mutation_fraction"
+        )
+
+    candidate_limit = max(int(B_candidates), 1)
+    current_indices = [AA_TO_ESM_IDX[aa] for aa in current_seq]
+    scores = logit_delta_mutation_scores(
+        logits_before,
+        logits_after,
+        current_seq=current_seq,
+        mutable_mask=mutable_mask,
+    ).detach().cpu()
+    candidates: list[str] = []
+    candidate_metadata: list[Dict[str, Any]] = []
+
+    def append_candidate(sequence: str, source: str) -> bool:
+        sequence = str(sequence)
+        if sequence == current_seq or sequence in candidates:
+            return False
+        if len(candidates) >= candidate_limit:
+            return False
+        candidates.append(sequence)
+        candidate_metadata.append(
+            _candidate_metadata_from_sequence(
+                current_seq=current_seq,
+                sequence=sequence,
+                scores=scores,
+                source=source,
+            )
+        )
+        return True
+
+    argmax_seq = None
+    if include_logit_candidates:
+        argmax_seq = sequence_from_logits_argmax(
+            logits_after,
+            current_seq=current_seq,
+            mutable_mask=mutable_mask,
+        )
+        append_candidate(argmax_seq, "unrestricted_argmax")
+
+    if strategy == "positive_score":
+        fraction = float(mutation_fraction)
+        if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
+            raise ValueError("mutation_fraction must be in (0, 1]")
+
+        mutable = _as_bool_mask(mutable_mask, len(current_seq)).cpu()
+        mutable_count = int(mutable.sum().item())
+        mutation_cap = (
+            max(1, math.ceil(fraction * mutable_count))
+            if mutable_count > 0
+            else 0
+        )
+        best_benefits, best_aas = scores.max(dim=-1)
+        positive_mask = (
+            mutable
+            & torch.isfinite(best_benefits)
+            & (best_benefits > 0.0)
+        )
+        positive_positions = torch.nonzero(
+            positive_mask,
+            as_tuple=False,
+        ).flatten()
+        positive_benefits = best_benefits[positive_positions]
+        actual_mutation_count = min(
+            int(positive_positions.numel()),
+            int(mutation_cap),
+        )
+        diagnostics: Dict[str, Any] = {
+            "candidate_strategy": strategy,
+            "include_argmax_candidate": bool(include_logit_candidates),
+            "mutable_residue_count": mutable_count,
+            "mutation_fraction": fraction,
+            "mutation_cap": mutation_cap,
+            "positive_position_count": int(positive_positions.numel()),
+            "actual_mutation_count": actual_mutation_count,
+            "positive_score_min": None,
+            "positive_score_mean": None,
+            "positive_score_max": None,
+        }
+        if positive_benefits.numel() > 0:
+            diagnostics.update(
+                positive_score_min=float(positive_benefits.min().item()),
+                positive_score_mean=float(positive_benefits.mean().item()),
+                positive_score_max=float(positive_benefits.max().item()),
+            )
+
+        if actual_mutation_count > 0 and len(candidates) < candidate_limit:
+            _, deterministic_indices = torch.topk(
+                positive_benefits,
+                actual_mutation_count,
+            )
+            deterministic_positions = positive_positions[deterministic_indices]
+            deterministic_sequence = list(current_seq)
+            for position in deterministic_positions.tolist():
+                deterministic_sequence[position] = ESM_AA_ORDER[
+                    int(best_aas[position].item())
+                ]
+            append_candidate(
+                "".join(deterministic_sequence),
+                "positive_score_topk",
+            )
+
+            temperature = max(float(T_sample), 1.0e-8)
+            position_probabilities = torch.softmax(
+                positive_benefits / temperature,
+                dim=0,
+            )
+            max_attempts = max(candidate_limit * 20, 20)
+            for _ in range(max_attempts):
+                if len(candidates) >= candidate_limit:
+                    break
+                chosen_local = torch.multinomial(
+                    position_probabilities,
+                    actual_mutation_count,
+                    replacement=False,
+                )
+                chosen_positions = positive_positions[chosen_local]
+                sampled_sequence = list(current_seq)
+                for position in chosen_positions.tolist():
+                    aa_scores = scores[position]
+                    positive_aa_indices = torch.nonzero(
+                        torch.isfinite(aa_scores) & (aa_scores > 0.0),
+                        as_tuple=False,
+                    ).flatten()
+                    aa_probabilities = torch.softmax(
+                        aa_scores[positive_aa_indices] / temperature,
+                        dim=0,
+                    )
+                    chosen_aa_local = int(
+                        torch.multinomial(
+                            aa_probabilities,
+                            1,
+                            replacement=False,
+                        ).item()
+                    )
+                    chosen_aa = int(
+                        positive_aa_indices[chosen_aa_local].item()
+                    )
+                    sampled_sequence[position] = ESM_AA_ORDER[chosen_aa]
+                append_candidate(
+                    "".join(sampled_sequence),
+                    "positive_score_weighted",
+                )
+
+        diagnostics["generated_candidate_count"] = len(candidates)
+        diagnostics["generated_unique_candidate_count"] = len(set(candidates))
+        return ESMFold2DiscreteCandidateBatch(
+            sequences=candidates,
+            candidate_metadata=candidate_metadata,
+            diagnostics=diagnostics,
+        )
+
+    if mutation_fraction is None:
+        delta_like = _scores_to_gradient_like_matrix(scores)
+        positions, new_aas, benefits = select_top_k_mutations(
+            delta_like,
+            current_indices,
+            K_top,
+        )
+        sampled_mutation_cap = int(max_mutations_per_seq)
+    else:
+        fraction = float(mutation_fraction)
+        if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
+            raise ValueError("mutation_fraction must be in (0, 1]")
+
+        mutable = _as_bool_mask(mutable_mask, len(current_seq)).cpu()
+        mutable_count = int(mutable.sum().item())
+        sampled_mutation_cap = (
+            max(1, math.ceil(fraction * mutable_count))
+            if mutable_count > 0
+            else 0
+        )
+
+        # Fraction-based experiments count distinct residue positions. Keep only
+        # the strongest amino-acid edit per mutable residue before sampling.
+        best_benefits, best_aas = scores.max(dim=-1)
+        valid_positions = torch.nonzero(
+            mutable & torch.isfinite(best_benefits),
+            as_tuple=False,
+        ).flatten()
+        if valid_positions.numel() == 0:
+            positions = torch.empty(0, dtype=torch.long)
+            new_aas = torch.empty(0, dtype=torch.long)
+            benefits = torch.empty(0, dtype=scores.dtype)
+        else:
+            position_benefits = best_benefits[valid_positions]
+            pool_size = min(
+                int(valid_positions.numel()),
+                max(int(K_top), int(sampled_mutation_cap)),
+            )
+            top_benefits, top_indices = torch.topk(
+                position_benefits,
+                pool_size,
+            )
+            positions = valid_positions[top_indices]
+            new_aas = best_aas[positions]
+            benefits = top_benefits
+    if positions.numel() == 0:
+        while len(candidates) < candidate_limit:
+            candidates.append(current_seq)
+            candidate_metadata.append(
+                _candidate_metadata_from_sequence(
+                    current_seq=current_seq,
+                    sequence=current_seq,
+                    scores=scores,
+                    source="legacy_no_mutation",
+                )
+            )
+        diagnostics = {
+            "candidate_strategy": strategy,
+            "include_argmax_candidate": bool(include_logit_candidates),
+            "mutation_fraction": mutation_fraction,
+            "mutation_cap": sampled_mutation_cap,
+            "generated_candidate_count": len(candidates),
+            "generated_unique_candidate_count": len(set(candidates)),
+        }
+        return ESMFold2DiscreteCandidateBatch(
+            sequences=candidates,
+            candidate_metadata=candidate_metadata,
+            diagnostics=diagnostics,
+        )
+
+    candidate_indices = sample_candidate_sequences(
+        current_indices,
+        positions,
+        new_aas,
+        benefits,
+        candidate_limit,
+        T_sample,
+        sampled_mutation_cap,
+    )
+
+    def indices_to_sequence(indices: Sequence[int]) -> str:
+        return "".join(AA_1LETTER[PROTEIN_RESIDUE_NAMES[int(idx)]] for idx in indices)
+
+    sampled_sequences = [indices_to_sequence(indices) for indices in candidate_indices]
+    if not include_logit_candidates:
+        candidates = sampled_sequences[:candidate_limit]
+        candidate_metadata = [
+            _candidate_metadata_from_sequence(
+                current_seq=current_seq,
+                sequence=sequence,
+                scores=scores,
+                source="legacy_weighted",
+            )
+            for sequence in candidates
+        ]
+    else:
+        for sequence in sampled_sequences:
+            append_candidate(sequence, "legacy_weighted")
+        sampled_index = 0
+        while len(candidates) < candidate_limit and sampled_sequences:
+            sequence = sampled_sequences[sampled_index % len(sampled_sequences)]
+            candidates.append(sequence)
+            candidate_metadata.append(
+                _candidate_metadata_from_sequence(
+                    current_seq=current_seq,
+                    sequence=sequence,
+                    scores=scores,
+                    source="legacy_weighted_repeat",
+                )
+            )
+            sampled_index += 1
+        while len(candidates) < candidate_limit:
+            candidates.append(current_seq)
+            candidate_metadata.append(
+                _candidate_metadata_from_sequence(
+                    current_seq=current_seq,
+                    sequence=current_seq,
+                    scores=scores,
+                    source="legacy_no_mutation",
+                )
+            )
+
+    diagnostics = {
+        "candidate_strategy": strategy,
+        "include_argmax_candidate": bool(include_logit_candidates),
+        "mutation_fraction": mutation_fraction,
+        "mutation_cap": sampled_mutation_cap,
+        "generated_candidate_count": len(candidates),
+        "generated_unique_candidate_count": len(set(candidates)),
+    }
+    return ESMFold2DiscreteCandidateBatch(
+        sequences=candidates,
+        candidate_metadata=candidate_metadata,
+        diagnostics=diagnostics,
+    )
+
+
 def propose_sequences_from_logit_delta(
     logits_before: torch.Tensor,
     logits_after: torch.Tensor,
@@ -985,85 +1468,23 @@ def propose_sequences_from_logit_delta(
     B_candidates: int = 8,
     T_sample: float = 1.0,
     max_mutations_per_seq: int = 3,
+    mutation_fraction: Optional[float] = None,
     include_logit_candidates: bool = False,
+    candidate_strategy: str = "legacy",
 ) -> list[str]:
-    """Generate discrete candidate sequences from ESMFold2 soft-logit updates.
+    """Return only sequence strings for the legacy public helper contract."""
 
-    The output side deliberately reuses the existing Stage-A Top-K + sampling
-    contract: first select top single mutations, then sample up to
-    ``max_mutations_per_seq`` edits per candidate.  When requested, it also
-    prepends the direct ``argmax(logits_after)`` sequence so Stage A can test
-    the soft optimizer's full current sequence instead of only sampled local
-    edits.
-    """
-
-    from bindcraft.hallucination.mutation_proposer import (
-        AA_1LETTER,
-        PROTEIN_RESIDUE_NAMES,
-        sample_candidate_sequences,
-        select_top_k_mutations,
-    )
-
-    current_indices = [AA_TO_ESM_IDX[aa] for aa in current_seq]
-    candidates: list[str] = []
-    if include_logit_candidates:
-        # Stage A intentionally keeps this unrestricted argmax candidate: it may
-        # change every mutable position. ``max_mutations_per_seq`` only limits
-        # the sampled Top-K candidates below; it is not a global Stage-A cap.
-        argmax_seq = sequence_from_logits_argmax(
-            logits_after,
-            current_seq=current_seq,
-            mutable_mask=mutable_mask,
-        )
-        if argmax_seq != current_seq:
-            candidates.append(argmax_seq)
-
-    scores = logit_delta_mutation_scores(
+    batch = build_logit_delta_candidate_batch(
         logits_before,
         logits_after,
         current_seq=current_seq,
         mutable_mask=mutable_mask,
-    ).detach().cpu()
-    delta_like = _scores_to_gradient_like_matrix(scores)
-    positions, new_aas, benefits = select_top_k_mutations(
-        delta_like,
-        current_indices,
-        K_top,
+        K_top=K_top,
+        B_candidates=B_candidates,
+        T_sample=T_sample,
+        max_mutations_per_seq=max_mutations_per_seq,
+        mutation_fraction=mutation_fraction,
+        include_logit_candidates=include_logit_candidates,
+        candidate_strategy=candidate_strategy,
     )
-    if positions.numel() == 0:
-        while len(candidates) < int(B_candidates):
-            candidates.append(current_seq)
-        return candidates[: int(B_candidates)]
-
-    candidate_indices = sample_candidate_sequences(
-        current_indices,
-        positions,
-        new_aas,
-        benefits,
-        B_candidates,
-        T_sample,
-        max_mutations_per_seq,
-    )
-
-    def indices_to_sequence(indices: Sequence[int]) -> str:
-        return "".join(AA_1LETTER[PROTEIN_RESIDUE_NAMES[int(idx)]] for idx in indices)
-
-    sampled_sequences = [indices_to_sequence(indices) for indices in candidate_indices]
-    if not include_logit_candidates:
-        return sampled_sequences
-
-    ordered: list[str] = []
-    for sequence in [*candidates, *sampled_sequences]:
-        if sequence not in ordered:
-            ordered.append(sequence)
-        if len(ordered) >= int(B_candidates):
-            return ordered[: int(B_candidates)]
-    for sequence in sampled_sequences:
-        ordered.append(sequence)
-        if len(ordered) >= int(B_candidates):
-            return ordered[: int(B_candidates)]
-    while len(ordered) < int(B_candidates):
-        ordered.append(current_seq)
-    if not ordered:
-        return [current_seq] * int(B_candidates)
-    return ordered[: int(B_candidates)]
+    return list(batch.sequences)

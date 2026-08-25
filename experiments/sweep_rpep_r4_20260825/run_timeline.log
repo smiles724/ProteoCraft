@@ -1,0 +1,13 @@
+[gpu6] END   YLNPRVARI_alpha/arm_D030w10 rc=0 (93.6 min)
+[gpu2] END   ALGRRIPPV_beta/arm_D030w10 rc=0 (94.5 min)
+[gpu3] END   ALGRRIPPV_beta/arm_D030w20 rc=0 (94.8 min)
+[gpu7] END   YLNPRVARI_alpha/arm_D030w20 rc=0 (99.0 min)
+[gpu0] END   ALGRRIPPV_alpha/arm_D030w10 rc=0 (150.6 min)
+[gpu1] END   ALGRRIPPV_alpha/arm_D030w20 rc=0 (153.2 min)
+[gpu6] END   YLNPRVARI_beta/arm_D030w10 rc=0 (94.3 min)
+[gpu3] END   KLNPRIPRI_alpha/arm_D030w10 rc=0 (93.3 min)
+[gpu2] END   YLNPRVARI_beta/arm_D030w20 rc=0 (94.7 min)
+[gpu7] END   KLNPRIPRI_alpha/arm_D030w20 rc=0 (93.4 min)
+[gpu0] END   KLNPRIPRI_beta/arm_D030w10 rc=0 (101.8 min)
+[gpu1] END   KLNPRIPRI_beta/arm_D030w20 rc=0 (103.0 min)
+done: 12 jobs, 0 failed

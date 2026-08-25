@@ -1,6 +1,6 @@
 schema_version: 1
 name: esmfold2_d
-description: Primary ESMFold2 Stage-A MCTS with hierarchical Root-UCB.
+description: Primary two-stage ESMFold2 ProteoCraft pipeline.
 
 defaults:
   mode: mcts
@@ -9,18 +9,21 @@ defaults:
   esmfold2_verifier_model: biohub/ESMFold2
   esmfold2_experimental_model: biohub/ESMFold2-Experimental-Fast
   binder_length: 120
-  n_steps: 70
+  n_steps: 110
   learning_rate: 0.05
-  seed: 42
+  seed: 43
   k_top: 10
   b_candidates: 8
-  max_mutations_per_seq: 8
-  stagea_max_mutations_per_seq: 8
   stageb_max_mutations_per_seq: 1
   mcts_num_beams: 8
-  mcts_strategy: stage_a_only
+  mcts_strategy: two_stage
+  mcts_bootstrap_steps: 70
+  mcts_bootstrap_patience: 10
+  mcts_bootstrap_min_delta: 0.02
+  mcts_bootstrap_max_steps: 70
+  mcts_handoff_top_k: 2
   mcts_expand_actions_per_step: 2
-  mcts_prior_mode: full
+  mcts_prior_mode: no_group
   esmfold2_stagea_soft_steps: 30
   esmfold2_stageb_soft_steps: 20
   esmfold2_stagea_tree_children: 2
@@ -28,17 +31,29 @@ defaults:
   esmfold2_stagea_min_root_expansions: 2
   esmfold2_stagea_preserve_soft_state: true
   esmfold2_stagea_cumulative_annealing: false
+  esmfold2_stagea_mutation_fraction: 0.5
+  esmfold2_stagea_candidate_strategy: positive_score
+  esmfold2_stagea_include_argmax_candidate: true
   esmfold2_stagea_paired_verifier_seed: true
+  esmfold2_stageb_discrete_rerank: true
+  esmfold2_stageb_rerank_pool_size: 20
+  esmfold2_stageb_exploration_actions: 1
+  esmfold2_stageb_verifier_candidates: 8
+  esmfold2_stageb_paired_verifier_seed: true
   esmfold2_logit_init_mode: official_exact
   esmfold2_proposal_num_loops: 1
   esmfold2_proposal_num_sampling_steps: 1
+  esmfold2_verifier_num_loops: 4
+  esmfold2_verifier_num_sampling_steps: 50
   esmfold2_proposal_load_internal_esmc: true
   esmfold2_proposal_lm_dropout: 0.5
   esmfold2_force_proposal_lm_dropout: true
   esmfold2_lambda_esmc: auto
   esmfold2_verifier_loss_mode: aligned_common
   esmfold2_one_step_diffusion: true
-  esmfold2_one_step_diffusion_tau: 2.0
+  esmfold2_one_step_diffusion_mode: truncated_trajectory
+  esmfold2_one_step_diffusion_tau: 1.0
+  esmfold2_one_step_truncated_num_sampling_steps: 50
   esmfold2_one_step_diffusion_weight: 0.25
   esmfold2_one_step_diffusion_rg_weight: 0.1
   esmfold2_one_step_diffusion_interval: 5
