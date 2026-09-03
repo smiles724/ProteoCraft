@@ -117,7 +117,8 @@ def test_vhh_launcher_uses_recommended_profile_without_changing_core_modes(tmp_p
     assert args.init_binder_seq == VHH_7EOW_SEQUENCE
     assert args.esmfold2_mutable_mask == VHH_7EOW_MASK
     assert args.mcts_strategy == "two_stage"
-    assert args.mcts_bootstrap_steps == 70
+    assert args.mcts_bootstrap_steps == 20
+    assert args.esmfold2_early_stop_patience == 10
     assert args.mcts_prior_mode == "no_group"
     assert args.seed == 43
     assert args.esmfold2_stagea_candidate_strategy == "positive_score"

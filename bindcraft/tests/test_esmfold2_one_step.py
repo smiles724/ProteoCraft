@@ -36,6 +36,17 @@ def _three_chain_features() -> dict[str, torch.Tensor]:
     }
 
 
+def _four_chain_features() -> dict[str, torch.Tensor]:
+    return {
+        "token_attention_mask": torch.ones(1, 5, dtype=torch.bool),
+        "asym_id": torch.tensor([[0, 1, 2, 3, 3]]),
+        "atom_attention_mask": torch.ones(1, 5, dtype=torch.bool),
+        "atom_to_token": torch.tensor([[0, 1, 2, 3, 4]]),
+        "distogram_atom_idx": torch.tensor([[0, 1, 2, 3, 4]]),
+        "residue_index": torch.tensor([[0, 0, 0, 0, 1]]),
+    }
+
+
 def _context_uncertain_pae_logits() -> torch.Tensor:
     logits = torch.full((1, 4, 4, 64), -20.0)
     logits[..., 0] = 20.0
@@ -350,7 +361,7 @@ def test_tcr_hotspot_indices_use_all_target_chain_offsets():
         )
 
 
-def test_cdr_hotspot_indices_preserve_target_only_mapping():
+def test_cdr_hotspot_indices_use_full_non_binder_chain_offsets():
     weights = {name: 0.0 for name in ESMFOLD2_COMMON_LOSS_WEIGHTS}
     weights["i_pae"] = 1.0
     common = {
@@ -368,16 +379,49 @@ def test_cdr_hotspot_indices_preserve_target_only_mapping():
 
     total, losses = compute_esmfold2_common_losses(
         **common,
-        hotspot_params={"target_hotspot_concat_indices": [0]},
+        hotspot_params={"target_hotspot_concat_indices": [1]},
     )
 
     assert torch.isfinite(total)
     assert torch.isfinite(losses["i_pae_hotspot"])
-    with pytest.raises(ValueError, match="out of range"):
+    with pytest.raises(ValueError, match="role=target"):
         compute_esmfold2_common_losses(
             **common,
-            hotspot_params={"target_hotspot_concat_indices": [1]},
+            hotspot_params={"target_hotspot_concat_indices": [0]},
         )
+
+
+def test_affibody_hotspot_uses_hla_and_beta2m_offsets_but_targets_peptide():
+    weights = {name: 0.0 for name in ESMFOLD2_COMMON_LOSS_WEIGHTS}
+    weights["i_pae"] = 1.0
+    common = {
+        "coordinates": torch.zeros(1, 5, 3),
+        "plddt_logits": torch.zeros(1, 5, 50),
+        "pae_logits": torch.zeros(1, 5, 5, 64),
+        "distogram_logits": torch.zeros(1, 5, 5, 128),
+        "features": _four_chain_features(),
+        "binder_length": 2,
+        "task_type": "affibody_redesign",
+        "target_chain_roles": ("scaffold", "scaffold", "target"),
+        "weights": weights,
+        "hotspot_weight": 0.5,
+    }
+
+    total, losses = compute_esmfold2_common_losses(
+        **common,
+        hotspot_params={"target_hotspot_concat_indices": [2]},
+    )
+
+    assert torch.isfinite(total)
+    assert torch.isfinite(losses["i_pae_hotspot"])
+    for scaffold_index in (0, 1):
+        with pytest.raises(ValueError, match="role=target"):
+            compute_esmfold2_common_losses(
+                **common,
+                hotspot_params={
+                    "target_hotspot_concat_indices": [scaffold_index]
+                },
+            )
 
 
 def test_tcr_interface_clash_includes_non_selected_target_chain():

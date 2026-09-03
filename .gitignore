@@ -88,7 +88,7 @@ ipython_config.py
 # data cache and checkpoints
 data_cache/
 checkpoints/
-
+datafolder/
 .pdm.toml
 
 # PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
@@ -189,3 +189,6 @@ protenix/model/tri_attention/TriAttentionCache/
 
 # ESM embeddings (large pre-computed features, do not push)
 esm_embeddings/
+*.out
+validation/
+data_prepared/

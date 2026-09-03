@@ -35,6 +35,7 @@ from bindcraft.hallucination.esmfold2_backend import (
     esm_temperature,
     init_binder_logits,
     logit_delta_mutation_scores,
+    mask_binder_logits_allowed_aas,
     normalized_gradient_tensor,
     resolve_lambda_esmc,
     sequence_from_logits_argmax,
@@ -1145,6 +1146,7 @@ class ESMFold2RuntimeBackend:
                 mutation_fraction=mutation_fraction,
                 include_logit_candidates=include_logit_candidates,
                 candidate_strategy=candidate_strategy,
+                allowed_aas=self.config.binder_allowed_aas,
             )
         # The positive-score experiment requires every returned sequence to
         # obey the same mutation-count contract. Confidence snapshots are
@@ -1243,6 +1245,7 @@ class ESMFold2RuntimeBackend:
             logits_after,
             current_seq=current_seq,
             mutable_mask=mutable_mask,
+            allowed_aas=self.config.binder_allowed_aas,
         )
         confidence_sequences = self._top_confidence_sequences(confidence_candidates)
         return ESMFold2ProposalBatch(
@@ -1766,6 +1769,7 @@ class ESMFold2RuntimeBackend:
             mutable_mask=mutable_mask,
             batch_size=1,
             device=self.device,
+            allowed_aas=self.config.binder_allowed_aas,
         )
         optimizer = optim.SGD([logits], lr=float(self.config.learning_rate))
         lambda_esmc = resolve_lambda_esmc(self.config.lambda_esmc, task_type=self.task_type)
@@ -1978,6 +1982,7 @@ class ESMFold2RuntimeBackend:
                 logits.detach()[0],
                 current_seq=current_seq,
                 mutable_mask=mutable_mask,
+                allowed_aas=self.config.binder_allowed_aas,
             )
             metrics = {
                 "global_step": int(global_step),
@@ -2255,6 +2260,7 @@ class ESMFold2RuntimeBackend:
                     logits.detach()[0],
                     current_seq=current_seq,
                     mutable_mask=mutable_mask,
+                    allowed_aas=self.config.binder_allowed_aas,
                 ),
                 "logits_snapshot": logits.detach().clone()[0].cpu(),
             }
@@ -2316,6 +2322,7 @@ class ESMFold2RuntimeBackend:
             logits.detach()[0],
             current_seq=current_seq,
             mutable_mask=mutable_mask,
+            allowed_aas=self.config.binder_allowed_aas,
         )
         record: Dict[str, Any] = {
             "sequence": sequence,
@@ -2364,6 +2371,7 @@ class ESMFold2RuntimeBackend:
                     proposal_logits,
                     current_seq=current_seq,
                     mutable_mask=mutable_mask,
+                    allowed_aas=self.config.binder_allowed_aas,
                 )
                 == current_seq
             ):
@@ -2373,7 +2381,13 @@ class ESMFold2RuntimeBackend:
                     proposal_logits,
                     current_seq,
                     mutable_mask=mutable_mask,
+                    allowed_aas=self.config.binder_allowed_aas,
                 ).to(device=self.device)
+            logits = mask_binder_logits_allowed_aas(
+                logits,
+                mutable_mask=mutable_mask,
+                allowed_aas=self.config.binder_allowed_aas,
+            ).to(device=self.device)
             return logits.unsqueeze(0).detach().clone().requires_grad_(True)
 
         logits = init_binder_logits(
@@ -2382,6 +2396,7 @@ class ESMFold2RuntimeBackend:
             batch_size=1,
             random_scale=0.0,
             device=self.device,
+            allowed_aas=self.config.binder_allowed_aas,
         )
         with torch.no_grad():
             from bindcraft.hallucination.esmfold2_backend import AA_TO_ESM_IDX, CYS_INDEX

@@ -4,7 +4,11 @@ import sys
 
 from bindcraft.hallucination.esmfold2_backend import build_esm_verifier_result
 import scripts.run_hallucination as run_hallucination_script
-from scripts.run_hallucination import build_arg_parser, resolve_model_backend
+from scripts.run_hallucination import (
+    build_arg_parser,
+    parse_esmfold2_allowed_binder_aas,
+    resolve_model_backend,
+)
 
 
 def _parse(extra_args):
@@ -21,9 +25,24 @@ def test_default_model_backend_preserves_protenix_path():
     assert args.mcts_strategy == "two_stage"
     assert args.mcts_prior_mode == "full"
     assert args.n_steps == 200
+    assert args.esmfold2_early_stop_patience == 0
+    assert args.esmfold2_early_stop_min_delta == pytest.approx(0.0)
     assert args.mcts_bootstrap_steps == 50
     assert args.mcts_bootstrap_max_steps == 80
     assert args.mcts_expand_actions_per_step == 2
+
+
+def test_esmfold2_allowed_binder_alphabet_accepts_compact_and_csv_forms():
+    parser = build_arg_parser()
+
+    assert parse_esmfold2_allowed_binder_aas("ADEF", parser) == (
+        "A", "D", "E", "F"
+    )
+    assert parse_esmfold2_allowed_binder_aas("A,D,E,F", parser) == (
+        "A", "D", "E", "F"
+    )
+    with pytest.raises(SystemExit):
+        parse_esmfold2_allowed_binder_aas("A,Z", parser)
 
 
 def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
@@ -38,6 +57,8 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.mcts_prior_mode == "no_group"
     assert args.seed == 43
     assert args.n_steps == 110
+    assert args.esmfold2_early_stop_patience == 0
+    assert args.esmfold2_early_stop_min_delta == pytest.approx(0.0)
     assert args.mcts_bootstrap_steps == 70
     assert args.mcts_bootstrap_max_steps == 70
     assert args.esmfold2_soft_steps is None
@@ -74,6 +95,7 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.stageb_max_mutations_per_seq == 1
     assert args.esmfold2_logit_init_mode == "official_exact"
     assert args.esmfold2_initial_logits_checkpoint is None
+    assert args.esmfold2_allowed_binder_aas is None
     assert args.esmfold2_save_verified_candidate_cif is False
     assert args.esmfold2_save_visualization_trace is False
     assert args.esmfold2_proposal_load_internal_esmc is True
@@ -110,6 +132,39 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_hotspot_verify_near_cutoff == pytest.approx(8.0)
     assert args.esmfold2_hotspot_verify_far_cutoff == pytest.approx(20.0)
     assert args.esmfold2_hotspot_verify_too_close_weight == pytest.approx(0.0)
+
+
+def test_esmfold2_early_stop_arguments_are_resolved_and_validated():
+    args, parser = _parse(
+        [
+            "--model_backend",
+            "esmfold2",
+            "--mode",
+            "mcts",
+            "--esmfold2_early_stop_patience",
+            "12",
+            "--esmfold2_early_stop_min_delta",
+            "0.005",
+        ]
+    )
+
+    resolve_model_backend(args, parser)
+
+    assert args.esmfold2_early_stop_patience == 12
+    assert args.esmfold2_early_stop_min_delta == pytest.approx(0.005)
+
+    invalid_args, invalid_parser = _parse(
+        [
+            "--model_backend",
+            "esmfold2",
+            "--mode",
+            "mcts",
+            "--esmfold2_early_stop_patience",
+            "-1",
+        ]
+    )
+    with pytest.raises(SystemExit):
+        resolve_model_backend(invalid_args, invalid_parser)
 
 
 def test_esmfold2_stagea_mutation_fraction_is_configurable_and_validated():
@@ -620,6 +675,10 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
             "3",
             "--n_steps",
             "1",
+            "--esmfold2_early_stop_patience",
+            "9",
+            "--esmfold2_early_stop_min_delta",
+            "0.003",
             "--mcts_num_beams",
             "1",
             "--b_candidates",
@@ -674,6 +733,8 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     result_text = (tmp_path / "hallucination_result.txt").read_text()
     log_text = (tmp_path / "run.log").read_text()
     assert "Model Backend: esmfold2" in result_text
+    assert "ESMFold2 Target Chain Roles: ALL_TARGET" in result_text
+    assert "ESMFold2 Verifier Loss Mode: pair_chain_iptm" in result_text
     assert "Best Sequence: AAY" in result_text
     assert "ESMFold2 hotspot contact configured" in log_text
     assert "ESMFold2 Hotspot Weight: 0.4" in result_text
@@ -686,6 +747,8 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     assert "ESMFold2 backend received target_template_path but does not use templates yet" in log_text
     assert captured["mcts_strategy"] == "two_stage"
     assert captured["mcts_bootstrap_steps"] == 70
+    assert captured["early_stop_patience"] == 9
+    assert captured["early_stop_min_delta"] == pytest.approx(0.003)
     assert captured["mcts_expand_actions_per_step"] == 2
     assert captured["mcts_handoff_top_k"] == 2
     assert captured["mcts_prior_mode"] == "no_group"
@@ -722,6 +785,8 @@ def test_main_dispatches_esmfold2_without_loading_protenix(monkeypatch, tmp_path
     assert captured["esmfold2_resume_handoff_checkpoint"] is None
     assert captured["esmfold2_resume_reverify_roots"] is False
     assert captured["task_type_arg"] == "tcr"
+    assert "ESMFold2 Early Stop Patience: 9" in result_text
+    assert "ESMFold2 Early Stop Min Delta: 0.003" in result_text
 
 
 def test_main_dispatches_best_of_n_without_entering_mcts(monkeypatch, tmp_path):

@@ -47,6 +47,7 @@ AUTO_ESMC_LAMBDA_BY_TASK = {
     "tcr": 0.05,
     "cdr": 0.05,
     "cdr_redesign": 0.05,
+    "affibody_redesign": 0.05,
     "vhh_redesign": 0.05,
     "antibody": 0.05,
     "antibody_like": 0.05,
@@ -104,6 +105,7 @@ class ESMFold2ProposalConfig:
     proposal_confidence_tail_steps: int = 0
     target_chain_roles: Optional[Tuple[str, ...]] = None
     binder_mutable_mask: Optional[Tuple[bool, ...]] = None
+    binder_allowed_aas: Optional[Tuple[str, ...]] = None
 
     def __post_init__(self) -> None:
         if int(self.verifier_num_loops) <= 0:
@@ -259,6 +261,24 @@ class ESMFold2ProposalConfig:
                 raise ValueError("binder_mutable_mask cannot be empty")
             if not any(mutable_mask):
                 raise ValueError("binder_mutable_mask must select at least one residue")
+        if self.binder_allowed_aas is not None:
+            allowed_aas = tuple(
+                dict.fromkeys(
+                    str(aa).strip().upper() for aa in self.binder_allowed_aas
+                )
+            )
+            invalid = sorted(
+                aa for aa in allowed_aas
+                if len(aa) != 1 or aa not in AA_TO_ESM_IDX
+            )
+            if invalid:
+                raise ValueError(
+                    "binder_allowed_aas contains invalid amino acid(s): "
+                    f"{invalid}"
+                )
+            if not allowed_aas:
+                raise ValueError("binder_allowed_aas cannot be empty")
+            object.__setattr__(self, "binder_allowed_aas", allowed_aas)
 
 
 @dataclass
@@ -334,11 +354,82 @@ def _as_bool_mask(
     return mask.reshape(length)
 
 
+def _as_allowed_aa_mask(
+    allowed_aas: Optional[Sequence[str]],
+    *,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """Return a [20] mask for residues allowed at mutable positions."""
+
+    if allowed_aas is None:
+        return torch.ones(len(ESM_AA_ORDER), dtype=torch.bool, device=device)
+    normalized = tuple(
+        dict.fromkeys(str(aa).strip().upper() for aa in allowed_aas)
+    )
+    invalid = sorted(
+        aa for aa in normalized if len(aa) != 1 or aa not in AA_TO_ESM_IDX
+    )
+    if invalid:
+        raise ValueError(f"allowed_aas contains invalid amino acid(s): {invalid}")
+    if not normalized:
+        raise ValueError("allowed_aas cannot be empty")
+    mask = torch.zeros(len(ESM_AA_ORDER), dtype=torch.bool, device=device)
+    mask[[AA_TO_ESM_IDX[aa] for aa in normalized]] = True
+    return mask
+
+
 def _sequence_indices(sequence: str) -> torch.Tensor:
     missing = sorted({aa for aa in sequence if aa not in AA_TO_ESM_IDX})
     if missing:
         raise ValueError(f"Unsupported amino acid(s) for ESMFold2 backend: {missing}")
     return torch.tensor([AA_TO_ESM_IDX[aa] for aa in sequence], dtype=torch.long)
+
+
+def validate_sequence_alphabet(
+    sequence: str,
+    *,
+    mutable_mask: Optional[Sequence[bool]] = None,
+    allowed_aas: Optional[Sequence[str]] = None,
+) -> str:
+    """Validate mutable residues against an optional experimental alphabet."""
+
+    sequence = str(sequence)
+    _sequence_indices(sequence)
+    mutable = _as_bool_mask(mutable_mask, len(sequence)).cpu()
+    allowed = _as_allowed_aa_mask(allowed_aas).cpu()
+    for index, aa in enumerate(sequence):
+        if bool(mutable[index]) and not bool(allowed[AA_TO_ESM_IDX[aa]]):
+            raise ValueError(
+                f"binder position {index + 1} residue {aa} is outside allowed_aas"
+            )
+    return sequence
+
+
+def mask_binder_logits_allowed_aas(
+    logits: torch.Tensor,
+    *,
+    mutable_mask: Optional[Sequence[bool]] = None,
+    allowed_aas: Optional[Sequence[str]] = None,
+    clone: bool = True,
+) -> torch.Tensor:
+    """Mask forbidden amino-acid logits at mutable binder positions.
+
+    This is deliberately separate from sequence anchoring: a caller may want
+    to preserve a saved soft-logit landscape while still enforcing an
+    experimental library alphabet.
+    """
+
+    if logits.ndim not in {2, 3} or logits.shape[-1] != len(ESM_AA_ORDER):
+        raise ValueError("logits must have shape [L, 20] or [B, L, 20]")
+    length = int(logits.shape[-2])
+    masked = logits.detach().clone() if clone else logits
+    mutable = _as_bool_mask(mutable_mask, length, device=masked.device)
+    allowed = _as_allowed_aa_mask(allowed_aas, device=masked.device)
+    invalid = mutable.unsqueeze(-1) & (~allowed).unsqueeze(0)
+    if masked.ndim == 3:
+        invalid = invalid.unsqueeze(0)
+    masked.masked_fill_(invalid, float("-inf"))
+    return masked
 
 
 def _finite_float(value: Any) -> Optional[float]:
@@ -603,6 +694,7 @@ def init_binder_logits(
     sequence: str,
     mutable_mask: Optional[Sequence[bool]] = None,
     *,
+    allowed_aas: Optional[Sequence[str]] = None,
     batch_size: int = 1,
     random_scale: float = 0.01,
     fixed_logit: float = 10.0,
@@ -620,6 +712,12 @@ def init_binder_logits(
     length = len(sequence)
     current_idx = _sequence_indices(sequence).to(device=device)
     mutable = _as_bool_mask(mutable_mask, length, device=device)
+    allowed = _as_allowed_aa_mask(allowed_aas, device=device)
+    validate_sequence_alphabet(
+        sequence,
+        mutable_mask=mutable_mask,
+        allowed_aas=allowed_aas,
+    )
 
     if random_scale > 0.0:
         logits = torch.randn(
@@ -645,6 +743,9 @@ def init_binder_logits(
         if mutable_positions.numel() > 0:
             logits[:, mutable_positions, CYS_INDEX] = float("-inf")
 
+    disallowed = mutable.unsqueeze(-1) & (~allowed).unsqueeze(0)
+    logits.masked_fill_(disallowed.unsqueeze(0), float("-inf"))
+
     logits.requires_grad_(requires_grad)
     return logits
 
@@ -654,6 +755,7 @@ def anchor_binder_logits_to_sequence(
     sequence: str,
     mutable_mask: Optional[Sequence[bool]] = None,
     *,
+    allowed_aas: Optional[Sequence[str]] = None,
     anchor_logit: float = 2.0,
     fixed_logit: float = 10.0,
     anchor_margin: float = 0.1,
@@ -687,6 +789,12 @@ def anchor_binder_logits_to_sequence(
     anchored = logits_2d.detach().clone() if clone else logits_2d
     current_idx = _sequence_indices(sequence).to(device=anchored.device)
     mutable = _as_bool_mask(mutable_mask, length, device=anchored.device)
+    allowed = _as_allowed_aa_mask(allowed_aas, device=anchored.device)
+    validate_sequence_alphabet(
+        sequence,
+        mutable_mask=mutable_mask,
+        allowed_aas=allowed_aas,
+    )
 
     if suppress_cys:
         anchored[:, CYS_INDEX] = float("-inf")
@@ -701,6 +809,7 @@ def anchor_binder_logits_to_sequence(
             continue
 
         row = anchored[pos]
+        row[~allowed] = float("-inf")
         finite_row = row[torch.isfinite(row)]
         row_max = float(finite_row.max().item()) if finite_row.numel() else 0.0
         desired = max(float(row[aa_idx].item()), float(anchor_logit))
@@ -716,6 +825,7 @@ def minimally_align_binder_logits_to_sequence(
     sequence: str,
     mutable_mask: Optional[Sequence[bool]] = None,
     *,
+    allowed_aas: Optional[Sequence[str]] = None,
     fixed_logit: float = 10.0,
     anchor_margin: float = 0.1,
     suppress_cys: bool = True,
@@ -749,6 +859,12 @@ def minimally_align_binder_logits_to_sequence(
     aligned = logits_2d.detach().clone()
     sequence_idx = _sequence_indices(sequence).to(device=aligned.device)
     mutable = _as_bool_mask(mutable_mask, length, device=aligned.device)
+    allowed = _as_allowed_aa_mask(allowed_aas, device=aligned.device)
+    validate_sequence_alphabet(
+        sequence,
+        mutable_mask=mutable_mask,
+        allowed_aas=allowed_aas,
+    )
 
     for pos in range(length):
         aa_idx = int(sequence_idx[pos].item())
@@ -762,6 +878,7 @@ def minimally_align_binder_logits_to_sequence(
             raise ValueError("cysteine mutations are disabled for ESMFold2 proposals")
 
         row = aligned[pos]
+        row[~allowed] = float("-inf")
         if suppress_cys:
             row[CYS_INDEX] = float("-inf")
         competitor_mask = torch.ones(
@@ -790,6 +907,7 @@ def softly_anchor_mutation_logits(
     child_sequence: str,
     mutable_mask: Optional[Sequence[bool]] = None,
     *,
+    allowed_aas: Optional[Sequence[str]] = None,
     anchor_margin: float = 0.1,
     suppress_cys: bool = True,
 ) -> torch.Tensor:
@@ -826,7 +944,13 @@ def softly_anchor_mutation_logits(
 
     anchored = logits_2d.detach().clone()
     mutable = _as_bool_mask(mutable_mask, length, device=anchored.device)
+    allowed = _as_allowed_aa_mask(allowed_aas, device=anchored.device)
     child_idx = _sequence_indices(child_sequence).to(device=anchored.device)
+    validate_sequence_alphabet(
+        child_sequence,
+        mutable_mask=mutable_mask,
+        allowed_aas=allowed_aas,
+    )
 
     for pos, (parent_aa, child_aa) in enumerate(zip(parent_sequence, child_sequence)):
         if parent_aa == child_aa:
@@ -837,6 +961,7 @@ def softly_anchor_mutation_logits(
         if suppress_cys and aa_idx == CYS_INDEX:
             raise ValueError("cysteine mutations are disabled for ESMFold2 proposals")
         row = anchored[pos]
+        row[~allowed] = float("-inf")
         finite_row = row[torch.isfinite(row)]
         row_max = float(finite_row.max().item()) if finite_row.numel() else 0.0
         if not torch.isfinite(row[aa_idx]) or float(row[aa_idx].item()) <= row_max:
@@ -849,6 +974,7 @@ def build_gradient_mask(
     sequence: str,
     mutable_mask: Optional[Sequence[bool]] = None,
     *,
+    allowed_aas: Optional[Sequence[str]] = None,
     batch_size: int = 1,
     suppress_cys: bool = True,
     device: Optional[Union[str, torch.device]] = None,
@@ -862,6 +988,7 @@ def build_gradient_mask(
     length = len(sequence)
     _sequence_indices(sequence)
     mutable = _as_bool_mask(mutable_mask, length, device=device)
+    allowed = _as_allowed_aa_mask(allowed_aas, device=device)
     mask = torch.zeros(
         (batch_size, length, len(ESM_AA_ORDER)),
         device=device,
@@ -869,6 +996,7 @@ def build_gradient_mask(
     )
     if mutable.any():
         mask[:, mutable, :] = 1.0
+        mask[:, mutable, :] *= allowed.to(dtype=dtype)
     if suppress_cys:
         mask[:, :, CYS_INDEX] = 0.0
     return mask
@@ -970,6 +1098,7 @@ def logit_delta_mutation_scores(
     *,
     current_seq: str,
     mutable_mask: Optional[Sequence[bool]] = None,
+    allowed_aas: Optional[Sequence[str]] = None,
     suppress_cys: bool = True,
 ) -> torch.Tensor:
     """Score discrete mutations from a short ESMFold2/ESMC soft-logit update.
@@ -997,6 +1126,7 @@ def logit_delta_mutation_scores(
 
     current_idx = _sequence_indices(current_seq).to(device=logits_before.device)
     mutable = _as_bool_mask(mutable_mask, length, device=logits_before.device)
+    allowed = _as_allowed_aa_mask(allowed_aas, device=logits_before.device)
     delta = torch.nan_to_num(
         logits_after - logits_before,
         nan=0.0,
@@ -1008,6 +1138,7 @@ def logit_delta_mutation_scores(
 
     invalid = torch.zeros_like(scores, dtype=torch.bool)
     invalid |= ~mutable.unsqueeze(-1)
+    invalid |= ~allowed.unsqueeze(0)
     invalid[torch.arange(length, device=delta.device), current_idx] = True
     if suppress_cys:
         invalid[:, CYS_INDEX] = True
@@ -1020,6 +1151,7 @@ def sequence_from_logits_argmax(
     *,
     current_seq: str,
     mutable_mask: Optional[Sequence[bool]] = None,
+    allowed_aas: Optional[Sequence[str]] = None,
     suppress_cys: bool = True,
 ) -> str:
     """Convert binder logits to a discrete sequence by argmax.
@@ -1052,6 +1184,12 @@ def sequence_from_logits_argmax(
     )
     if suppress_cys:
         scores[:, CYS_INDEX] = float("-inf")
+    allowed = _as_allowed_aa_mask(allowed_aas, device=scores.device)
+    mutable_tensor = _as_bool_mask(mutable_mask, length, device=scores.device)
+    scores.masked_fill_(
+        mutable_tensor.unsqueeze(-1) & (~allowed).unsqueeze(0),
+        float("-inf"),
+    )
     indices = torch.argmax(scores, dim=-1).detach().cpu().tolist()
     mutable = [bool(item) for item in _as_bool_mask(mutable_mask, length).cpu().tolist()]
 
@@ -1110,6 +1248,7 @@ def build_logit_delta_candidate_batch(
     *,
     current_seq: str,
     mutable_mask: Optional[Sequence[bool]] = None,
+    allowed_aas: Optional[Sequence[str]] = None,
     K_top: int = 10,
     B_candidates: int = 8,
     T_sample: float = 1.0,
@@ -1150,6 +1289,7 @@ def build_logit_delta_candidate_batch(
         logits_after,
         current_seq=current_seq,
         mutable_mask=mutable_mask,
+        allowed_aas=allowed_aas,
     ).detach().cpu()
     candidates: list[str] = []
     candidate_metadata: list[Dict[str, Any]] = []
@@ -1177,6 +1317,7 @@ def build_logit_delta_candidate_batch(
             logits_after,
             current_seq=current_seq,
             mutable_mask=mutable_mask,
+            allowed_aas=allowed_aas,
         )
         append_candidate(argmax_seq, "unrestricted_argmax")
 
@@ -1435,6 +1576,7 @@ def propose_sequences_from_logit_delta(
     *,
     current_seq: str,
     mutable_mask: Optional[Sequence[bool]] = None,
+    allowed_aas: Optional[Sequence[str]] = None,
     K_top: int = 10,
     B_candidates: int = 8,
     T_sample: float = 1.0,
@@ -1450,6 +1592,7 @@ def propose_sequences_from_logit_delta(
         logits_after,
         current_seq=current_seq,
         mutable_mask=mutable_mask,
+        allowed_aas=allowed_aas,
         K_top=K_top,
         B_candidates=B_candidates,
         T_sample=T_sample,

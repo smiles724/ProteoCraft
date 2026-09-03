@@ -231,7 +231,7 @@ def _hotspot_token_mask(
     *,
     task_type: Optional[str] = None,
 ) -> Optional[torch.Tensor]:
-    """Map target-concatenated hotspot indices onto ESMFold2 token indices."""
+    """Map full non-binder-concatenated hotspots onto role=target tokens."""
 
     if hotspot_params is None:
         return None
@@ -239,13 +239,11 @@ def _hotspot_token_mask(
     if not concat_indices:
         return None
 
-    # TCR hotspot indices refer to the original alpha+beta concatenation, even
-    # when only one chain has role=target. Other tasks retain the established
-    # target-only indexing contract.
-    hotspot_index_mask = (
-        masks["all_target"] if _is_tcr_task(task_type) else masks["target"]
-    )
-    target_indices = hotspot_index_mask.nonzero(as_tuple=True)[0]
+    # CLI hotspot indices always refer to the full concatenation supplied via
+    # --target, including chains marked as scaffold. Map that absolute index
+    # first, then reject hotspots that do not land on a role=target chain.
+    # This preserves peptide offsets in HLA|beta2m|peptide Affibody inputs.
+    target_indices = masks["all_target"].nonzero(as_tuple=True)[0]
     normalized = [int(index) for index in concat_indices]
     invalid = [
         index

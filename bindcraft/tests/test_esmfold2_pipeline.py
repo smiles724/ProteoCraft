@@ -22,6 +22,7 @@ from bindcraft.hallucination.esmfold2_pipeline import (
 from bindcraft.hallucination.esmfold2_pipeline import (
     _ESMArtifactRecorder,
     _ESMFold2StageBMCTSTree,
+    _LossEarlyStopper,
     _allocate_chunked_best_of_n_steps,
     _allocate_group_budgets,
     _deduplicate_actions_by_sequence,
@@ -40,6 +41,17 @@ from bindcraft.hallucination.esmfold2_pipeline import (
     _stageb_preview_objective,
     _write_proposal_visualization_trace,
 )
+
+
+def test_loss_early_stopper_resets_only_after_min_delta_improvement():
+    stopper = _LossEarlyStopper(patience=2, min_delta=0.01, best_loss=1.0)
+
+    assert stopper.update(0.995) is False
+    assert stopper.stale_steps == 1
+    assert stopper.update(0.98) is False
+    assert stopper.stale_steps == 0
+    assert stopper.update(0.975) is False
+    assert stopper.update(0.974) is True
 
 
 def test_proposal_visualization_trace_is_opt_in(tmp_path):
@@ -1274,6 +1286,77 @@ def test_esmfold2_stagea_pipeline_uses_backend_for_verify_and_proposal():
     assert [call[0] for call in backend.verify_calls] == ["AAA", "AAY", "AAF", "AYY"]
     assert [call["current_seq"] for call in backend.propose_calls] == ["AAA", "AAY"]
     assert [call["action_group"] for call in backend.propose_calls] == [None, None]
+
+
+def test_stagea_only_early_stops_after_consecutive_stale_outer_steps(tmp_path):
+    backend = FakeESMFold2Backend()
+    artifact_dir = tmp_path / "early_stop_stagea"
+
+    best_seq, final_seq, losses = run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=8,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=2,
+        seed=7,
+        mcts_strategy="stage_a_only",
+        early_stop_patience=2,
+        artifact_dir=artifact_dir,
+        esmfold2_stagea_handoff_checkpoint_interval=0,
+    )
+
+    assert best_seq == final_seq == "AYY"
+    assert losses == pytest.approx([0.2, 0.1, 0.1, 0.1])
+    assert len(backend.propose_calls) == 4
+
+    summary = json.loads((artifact_dir / "run_summary.json").read_text())
+    assert summary["n_steps"] == 4
+    assert summary["early_stopping"] == {
+        "enabled": True,
+        "patience": 2,
+        "min_delta": 0.0,
+        "triggered": True,
+        "stage": "stage_a",
+        "step": 3,
+        "stale_steps": 2,
+    }
+
+
+def test_two_stage_early_stopping_uses_fresh_stageb_patience_window(tmp_path):
+    backend = FakeESMFold2Backend()
+    artifact_dir = tmp_path / "early_stop_stageb"
+
+    best_seq, final_seq, losses = run_esmfold2_mcts_hallucination(
+        backend=backend,
+        target_seq="TTTT",
+        L_binder=3,
+        N_steps=8,
+        num_beams=1,
+        init_binder_seq="AAA",
+        K_top=4,
+        B_candidates=2,
+        seed=7,
+        mcts_strategy="two_stage",
+        mcts_bootstrap_steps=1,
+        mcts_bootstrap_max_steps=1,
+        mcts_expand_actions_per_step=1,
+        early_stop_patience=2,
+        artifact_dir=artifact_dir,
+        esmfold2_stagea_handoff_checkpoint_interval=0,
+    )
+
+    assert best_seq == final_seq == "AYY"
+    assert losses == pytest.approx([0.2, 0.1, 0.1, 0.1])
+
+    summary = json.loads((artifact_dir / "run_summary.json").read_text())
+    assert summary["n_steps"] == 4
+    assert summary["early_stopping"]["triggered"] is True
+    assert summary["early_stopping"]["stage"] == "stage_b"
+    assert summary["early_stopping"]["step"] == 3
+    assert summary["early_stopping"]["stale_steps"] == 2
 
 
 def test_stagea_legacy_tree_selects_lower_average_loss_path():

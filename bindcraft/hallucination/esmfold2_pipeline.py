@@ -31,10 +31,12 @@ from bindcraft.hallucination.esmfold2_backend import (
     anchor_binder_logits_to_sequence,
     init_binder_logits,
     logit_delta_mutation_scores,
+    mask_binder_logits_allowed_aas,
     minimally_align_binder_logits_to_sequence,
     select_esmfold2_action_group,
     sequence_from_logits_argmax,
     softly_anchor_mutation_logits,
+    validate_sequence_alphabet,
 )
 from bindcraft.hallucination.mcts_legacy import (
     LEGACY_SELECTION_MODES,
@@ -58,6 +60,47 @@ ESMFOLD2_STAGEB_HOTSPOT_COVERAGE_WEIGHT = 0.25
 ESMFOLD2_STAGEB_HOTSPOT_MISS_PENALTY = 0.0
 ESMFOLD2_STAGEB_PAIR_CHAIN_FLOOR_PENALTY = 2.0
 ESMFOLD2_STAGEB_QUALITY_FLOOR_KEY = "stageb_pair_chain_quality_floor"
+
+
+@dataclass
+class _LossEarlyStopper:
+    """Track consecutive outer steps without a meaningful best-loss decrease."""
+
+    patience: int
+    min_delta: float
+    best_loss: float
+    stale_steps: int = 0
+
+    def update(self, loss: float) -> bool:
+        loss = float(loss)
+        if loss < self.best_loss - self.min_delta:
+            self.best_loss = loss
+            self.stale_steps = 0
+        else:
+            self.stale_steps += 1
+        return self.stale_steps >= self.patience
+
+
+def _phase0_allowed_alphabet(
+    allowed_aas: Optional[Sequence[str]],
+) -> Tuple[str, ...]:
+    alphabet = tuple(
+        aa
+        for aa in dict.fromkeys(
+            str(item).strip().upper()
+            for item in (allowed_aas or VALID_ESM_BINDER_AAS)
+        )
+        if aa != "C"
+    )
+    invalid = sorted(
+        aa for aa in alphabet if len(aa) != 1 or aa not in ESM_AA_ORDER
+    )
+    if invalid or not alphabet:
+        raise ValueError(
+            "allowed_aas must contain at least one valid non-cysteine residue; "
+            f"invalid={invalid}"
+        )
+    return alphabet
 
 
 @dataclass(frozen=True)
@@ -563,6 +606,7 @@ def _write_proposal_visualization_trace(
     selected_sequence: str,
     batch: ESMFold2ProposalBatch,
     mutable_mask: Optional[Sequence[bool]],
+    allowed_aas: Optional[Sequence[str]] = None,
     action_group: Optional[str] = None,
     trace_label: Optional[str] = None,
 ) -> None:
@@ -577,6 +621,7 @@ def _write_proposal_visualization_trace(
         logits_after,
         current_seq=str(selected_sequence),
         mutable_mask=mutable_mask,
+        allowed_aas=allowed_aas,
     )
     recorder.write_proposal_trace(
         stage=stage,
@@ -752,6 +797,7 @@ def _placeholder_logits(sequence: str) -> torch.Tensor:
 def _initial_proposal_logits(
     sequence: str,
     mutable_mask: Optional[Sequence[bool]],
+    allowed_aas: Optional[Sequence[str]] = None,
 ) -> torch.Tensor:
     logits = init_binder_logits(
         sequence,
@@ -759,6 +805,7 @@ def _initial_proposal_logits(
         batch_size=1,
         random_scale=0.0,
         requires_grad=False,
+        allowed_aas=allowed_aas,
     )[0]
     with torch.no_grad():
         for pos, aa in enumerate(str(sequence)):
@@ -769,6 +816,7 @@ def _initial_proposal_logits(
         logits,
         str(sequence),
         mutable_mask=mutable_mask,
+        allowed_aas=allowed_aas,
     )
 
 
@@ -776,13 +824,15 @@ def _anchor_proposal_logits(
     logits: Optional[torch.Tensor],
     sequence: str,
     mutable_mask: Optional[Sequence[bool]],
+    allowed_aas: Optional[Sequence[str]] = None,
 ) -> torch.Tensor:
     if logits is None:
-        return _initial_proposal_logits(sequence, mutable_mask)
+        return _initial_proposal_logits(sequence, mutable_mask, allowed_aas)
     return anchor_binder_logits_to_sequence(
         logits,
         str(sequence),
         mutable_mask=mutable_mask,
+        allowed_aas=allowed_aas,
     )
 
 
@@ -790,13 +840,15 @@ def _minimally_align_proposal_logits(
     logits: Optional[torch.Tensor],
     sequence: str,
     mutable_mask: Optional[Sequence[bool]],
+    allowed_aas: Optional[Sequence[str]] = None,
 ) -> torch.Tensor:
     if logits is None:
-        return _initial_proposal_logits(sequence, mutable_mask)
+        return _initial_proposal_logits(sequence, mutable_mask, allowed_aas)
     return minimally_align_binder_logits_to_sequence(
         logits,
         str(sequence),
         mutable_mask=mutable_mask,
+        allowed_aas=allowed_aas,
     )
 
 
@@ -847,18 +899,29 @@ def _stagea_child_logits(
     mutable_mask: Optional[Sequence[bool]],
     preserve_soft_state: bool,
     soft_anchor_margin: float,
+    allowed_aas: Optional[Sequence[str]] = None,
 ) -> torch.Tensor:
     if logits_after is None:
-        return _initial_proposal_logits(child_sequence, mutable_mask)
+        return _initial_proposal_logits(child_sequence, mutable_mask, allowed_aas)
     if argmax_sequence is not None and str(child_sequence) == str(argmax_sequence):
-        return logits_after.detach().cpu().clone()
+        return mask_binder_logits_allowed_aas(
+            logits_after,
+            mutable_mask=mutable_mask,
+            allowed_aas=allowed_aas,
+        ).cpu()
     if preserve_soft_state:
         return _minimally_align_proposal_logits(
             logits_after,
             str(child_sequence),
             mutable_mask,
+            allowed_aas,
         )
-    return _anchor_proposal_logits(logits_after, child_sequence, mutable_mask)
+    return _anchor_proposal_logits(
+        logits_after,
+        child_sequence,
+        mutable_mask,
+        allowed_aas,
+    )
 
 
 def _normalize_proposal_batch(raw: Any) -> ESMFold2ProposalBatch:
@@ -1613,10 +1676,12 @@ def _make_phase0_seed_sequences(
     L_binder: int,
     seed: Optional[int],
     mutable_mask: Optional[Sequence[bool]] = None,
+    allowed_aas: Optional[Sequence[str]] = None,
 ) -> List[str]:
     num_beams = max(int(num_beams), 1)
     rng = random.Random(seed)
     mask = _normalize_mutable_mask(mutable_mask, L_binder)
+    alphabet = _phase0_allowed_alphabet(allowed_aas)
 
     if init_binder_seq is not None:
         init = str(init_binder_seq).strip().upper()
@@ -1627,12 +1692,19 @@ def _make_phase0_seed_sequences(
         invalid = sorted(set(init) - set(ESM_AA_ORDER))
         if invalid:
             raise ValueError(f"Invalid amino acid(s) in init_binder_seq: {invalid}")
+        validate_sequence_alphabet(
+            init,
+            mutable_mask=mask,
+            allowed_aas=alphabet,
+        )
         mutable_positions = [idx for idx, is_mutable in enumerate(mask) if is_mutable]
         seeds = [init]
         while len(seeds) < num_beams and mutable_positions:
             seq = list(init)
             pos = rng.choice(mutable_positions)
-            aa_choices = [aa for aa in VALID_ESM_BINDER_AAS if aa != seq[pos]]
+            aa_choices = [aa for aa in alphabet if aa != seq[pos]]
+            if not aa_choices:
+                break
             seq[pos] = rng.choice(aa_choices)
             candidate = "".join(seq)
             if candidate not in seeds:
@@ -1641,7 +1713,7 @@ def _make_phase0_seed_sequences(
 
     seeds: List[str] = []
     while len(seeds) < num_beams:
-        candidate = "".join(rng.choice(VALID_ESM_BINDER_AAS) for _ in range(L_binder))
+        candidate = "".join(rng.choice(alphabet) for _ in range(L_binder))
         if candidate not in seeds:
             seeds.append(candidate)
     return seeds
@@ -1679,6 +1751,7 @@ def _make_official_free_phase0_seed_states(
     seed: Optional[int],
     mutable_mask: Sequence[bool],
     base_sequence: Optional[str] = None,
+    allowed_aas: Optional[Sequence[str]] = None,
 ) -> List[Tuple[str, torch.Tensor]]:
     """Create official-style free mutable logits and matching argmax roots.
 
@@ -1689,6 +1762,7 @@ def _make_official_free_phase0_seed_states(
     an arbitrary starting sequence.
     """
 
+    alphabet = _phase0_allowed_alphabet(allowed_aas)
     if base_sequence is not None:
         base_sequence = str(base_sequence).strip().upper()
         if len(base_sequence) != int(L_binder):
@@ -1698,6 +1772,11 @@ def _make_official_free_phase0_seed_states(
         invalid = sorted(set(base_sequence) - set(ESM_AA_ORDER))
         if invalid:
             raise ValueError(f"Invalid amino acid(s) in init_binder_seq: {invalid}")
+        validate_sequence_alphabet(
+            base_sequence,
+            mutable_mask=mutable_mask,
+            allowed_aas=alphabet,
+        )
     elif not all(bool(item) for item in mutable_mask):
         raise ValueError(
             "official_free ESMFold2 root initialization without init_binder_seq "
@@ -1712,7 +1791,8 @@ def _make_official_free_phase0_seed_states(
     while len(states) < max(int(num_beams), 1) and attempts < max_attempts:
         attempts += 1
         base_seq = base_sequence or "".join(
-            base_rng.choice(VALID_ESM_BINDER_AAS) for _ in range(L_binder)
+            base_rng.choice(alphabet)
+            for _ in range(L_binder)
         )
         generator = torch.Generator()
         generator.manual_seed(_stable_seed(seed, "esm_phase0_free_logits", attempts))
@@ -1723,11 +1803,13 @@ def _make_official_free_phase0_seed_states(
             random_scale=0.01,
             requires_grad=False,
             generator=generator,
+            allowed_aas=alphabet,
         )[0].detach().cpu()
         seq = sequence_from_logits_argmax(
             logits,
             current_seq=base_seq,
             mutable_mask=mutable_mask,
+            allowed_aas=alphabet,
         )
         if seq in seen:
             continue
@@ -1746,9 +1828,11 @@ def _make_official_exact_phase0_seed_states(
     mutable_mask: Sequence[bool],
     base_sequence: Optional[str] = None,
     device: Optional[Union[str, torch.device]] = None,
+    allowed_aas: Optional[Sequence[str]] = None,
 ) -> List[Tuple[str, torch.Tensor]]:
     """Create official-seed logits for exact official-binder-design diagnosis."""
 
+    alphabet = _phase0_allowed_alphabet(allowed_aas)
     if base_sequence is not None:
         base_sequence = str(base_sequence).strip().upper()
         if len(base_sequence) != int(L_binder):
@@ -1758,13 +1842,18 @@ def _make_official_exact_phase0_seed_states(
         invalid = sorted(set(base_sequence) - set(ESM_AA_ORDER))
         if invalid:
             raise ValueError(f"Invalid amino acid(s) in init_binder_seq: {invalid}")
+        validate_sequence_alphabet(
+            base_sequence,
+            mutable_mask=mutable_mask,
+            allowed_aas=alphabet,
+        )
     elif not all(bool(item) for item in mutable_mask):
         raise ValueError(
             "official_exact ESMFold2 root initialization without init_binder_seq "
             "requires all binder positions to be mutable"
         )
 
-    template_seq = base_sequence or ("A" * int(L_binder))
+    template_seq = base_sequence or (alphabet[0] * int(L_binder))
     batch_size = max(int(num_beams), 1)
     torch_device = torch.device(device) if device is not None else torch.device("cpu")
     with _torch_seed_context(seed, torch_device):
@@ -1775,6 +1864,7 @@ def _make_official_exact_phase0_seed_states(
             random_scale=0.01,
             requires_grad=False,
             device=torch_device,
+            allowed_aas=alphabet,
         ).detach().cpu()
     states: List[Tuple[str, torch.Tensor]] = []
     for idx in range(batch_size):
@@ -1783,6 +1873,7 @@ def _make_official_exact_phase0_seed_states(
             logits,
             current_seq=template_seq,
             mutable_mask=mutable_mask,
+            allowed_aas=alphabet,
         )
         states.append((seq, logits))
     return states
@@ -1797,6 +1888,7 @@ def _make_phase0_seed_states(
     mutable_mask: Sequence[bool],
     logit_init_mode: str,
     device: Optional[Union[str, torch.device]] = None,
+    allowed_aas: Optional[Sequence[str]] = None,
 ) -> List[Tuple[str, Optional[torch.Tensor]]]:
     mode = _normalize_logit_init_mode(logit_init_mode)
     if mode == "official_free":
@@ -1806,6 +1898,7 @@ def _make_phase0_seed_states(
             seed=seed,
             mutable_mask=mutable_mask,
             base_sequence=init_binder_seq,
+            allowed_aas=allowed_aas,
         )
     if mode == "official_exact":
         return _make_official_exact_phase0_seed_states(
@@ -1815,6 +1908,7 @@ def _make_phase0_seed_states(
             mutable_mask=mutable_mask,
             base_sequence=init_binder_seq,
             device=device,
+            allowed_aas=allowed_aas,
         )
     return [
         (seq, None)
@@ -1824,6 +1918,7 @@ def _make_phase0_seed_states(
             L_binder=L_binder,
             seed=seed,
             mutable_mask=mutable_mask,
+            allowed_aas=allowed_aas,
         )
     ]
 
@@ -1867,6 +1962,7 @@ def _load_initial_logits_checkpoint_states(
     init_binder_seq: Optional[str],
     mutable_mask: Sequence[bool],
     allow_extra_checkpoints: bool = False,
+    allowed_aas: Optional[Sequence[str]] = None,
 ) -> Tuple[List[Tuple[str, torch.Tensor]], List[str]]:
     """Load exact MCTS Phase-0 roots from saved Best-of-N logits."""
 
@@ -1881,6 +1977,7 @@ def _load_initial_logits_checkpoint_states(
         )
     checkpoint_paths = checkpoint_paths[:expected_count]
 
+    alphabet = _phase0_allowed_alphabet(allowed_aas)
     reference_sequence = None
     if init_binder_seq is not None:
         reference_sequence = str(init_binder_seq).strip().upper()
@@ -1892,6 +1989,11 @@ def _load_initial_logits_checkpoint_states(
         invalid = sorted(set(reference_sequence) - set(ESM_AA_ORDER))
         if invalid:
             raise ValueError(f"Invalid amino acid(s) in init_binder_seq: {invalid}")
+        validate_sequence_alphabet(
+            reference_sequence,
+            mutable_mask=mutable_mask,
+            allowed_aas=allowed_aas,
+        )
     elif not all(bool(item) for item in mutable_mask):
         raise ValueError(
             "loading initial logits with fixed binder positions requires "
@@ -1959,6 +2061,11 @@ def _load_initial_logits_checkpoint_states(
                     f"checkpoint sequence contains invalid amino acid(s) "
                     f"{invalid}: {checkpoint_path}"
                 )
+            validate_sequence_alphabet(
+                stored_sequence,
+                mutable_mask=mutable_mask,
+                allowed_aas=allowed_aas,
+            )
             if stored_hash is not None and str(stored_hash) != _sequence_hash(
                 stored_sequence
             ):
@@ -1967,11 +2074,27 @@ def _load_initial_logits_checkpoint_states(
                     f"{checkpoint_path}"
                 )
 
-        base_sequence = reference_sequence or stored_sequence or ("A" * int(L_binder))
+        if allowed_aas is not None:
+            logits = mask_binder_logits_allowed_aas(
+                logits,
+                mutable_mask=mutable_mask,
+                allowed_aas=allowed_aas,
+            ).cpu()
+            if torch.isneginf(logits).all(dim=-1).any():
+                raise ValueError(
+                    "checkpoint has no allowed amino acid at one or more mutable "
+                    f"positions: {checkpoint_path}"
+                )
+        base_sequence = (
+            reference_sequence
+            or stored_sequence
+            or (alphabet[0] * int(L_binder))
+        )
         derived_sequence = sequence_from_logits_argmax(
             logits,
             current_seq=base_sequence,
             mutable_mask=mutable_mask,
+            allowed_aas=allowed_aas,
         )
         if stored_sequence is not None and stored_sequence != derived_sequence:
             raise ValueError(
@@ -2049,6 +2172,7 @@ def run_esmfold2_best_of_n(
         for index in (hotspot_params or {}).get("target_hotspot_concat_indices", [])
     ]
     backend_config = getattr(backend, "config", None)
+    allowed_aas = getattr(backend_config, "binder_allowed_aas", None)
     hotspot_weight = float(getattr(backend_config, "hotspot_weight", 0.0))
     hotspot_verify_weight = float(
         getattr(backend_config, "hotspot_verify_weight", 0.0)
@@ -2084,6 +2208,7 @@ def run_esmfold2_best_of_n(
                 num_beams=best_of_n,
                 init_binder_seq=init_binder_seq,
                 mutable_mask=mutable_mask,
+                allowed_aas=allowed_aas,
             )
         )
         initial_logits_checkpoint_source = str(
@@ -2246,6 +2371,11 @@ def run_esmfold2_best_of_n(
                     if logit_init_mode == "official_exact"
                     else None
                 ),
+                allowed_aas=getattr(
+                    getattr(backend, "config", None),
+                    "binder_allowed_aas",
+                    None,
+                ),
             )
             initial_sequence, initial_logits = initial_states[0]
         one_step_enabled = bool(
@@ -2367,6 +2497,7 @@ def run_esmfold2_best_of_n(
                 proposal_batch.logits_after,
                 current_seq=initial_sequence,
                 mutable_mask=mutable_mask,
+                allowed_aas=allowed_aas,
             )
             if proposal_batch.logits_after is not None
             else str(trajectory_best.binder_seq)
@@ -2631,6 +2762,7 @@ def run_esmfold2_chunked_best_of_n(
         )
     ]
     backend_config = getattr(backend, "config", None)
+    allowed_aas = getattr(backend_config, "binder_allowed_aas", None)
     hotspot_weight = float(getattr(backend_config, "hotspot_weight", 0.0))
     hotspot_verify_weight = float(
         getattr(backend_config, "hotspot_verify_weight", 0.0)
@@ -2714,6 +2846,7 @@ def run_esmfold2_chunked_best_of_n(
                 init_binder_seq=init_binder_seq,
                 mutable_mask=mutable_mask,
                 allow_extra_checkpoints=True,
+                allowed_aas=allowed_aas,
             )
         )
         initial_logits_checkpoint_source = str(
@@ -2732,6 +2865,7 @@ def run_esmfold2_chunked_best_of_n(
                 if logit_init_mode == "official_exact"
                 else None
             ),
+            allowed_aas=allowed_aas,
         )
 
     artifact_path = Path(artifact_dir) if artifact_dir is not None else None
@@ -3046,6 +3180,7 @@ def run_esmfold2_chunked_best_of_n(
                 next_logits,
                 current_seq=current_sequence,
                 mutable_mask=mutable_mask,
+                allowed_aas=allowed_aas,
             )
             next_sequence = _clip_sequence_by_mutable_mask(
                 next_sequence,
@@ -3133,6 +3268,7 @@ def run_esmfold2_chunked_best_of_n(
                         child_sequence=continuation_sequence,
                         mutable_mask=mutable_mask,
                         anchor_margin=continuation_soft_anchor_margin,
+                        allowed_aas=allowed_aas,
                     )
                     verifier_feedback_applied = True
             if trajectory_dir is not None:
@@ -3757,6 +3893,7 @@ def _stagea_handoff_verifier_contract(backend_config: Any) -> Dict[str, Any]:
         "hotspot_verify_too_close_weight",
         "target_chain_roles",
         "binder_mutable_mask",
+        "binder_allowed_aas",
     )
     return {
         field: _checkpoint_cpu_value(getattr(backend_config, field, None))
@@ -3796,7 +3933,11 @@ def _save_stagea_handoff_checkpoint(
         sequence = str(result.binder_seq)
         logits = proposal_logits_by_sequence.get(sequence)
         if logits is None:
-            logits = _initial_proposal_logits(sequence, mutable_mask)
+            logits = _initial_proposal_logits(
+                sequence,
+                mutable_mask,
+                verifier_contract.get("binder_allowed_aas"),
+            )
         entries.append(
             {
                 "result": _serialize_handoff_result(result),
@@ -3914,11 +4055,17 @@ def _make_stageb_proposals(
     mutable_mask: Optional[Sequence[bool]] = None,
     use_gradient_prior: bool = True,
     rerank_scores: Optional[Mapping[str, Mapping[str, float]]] = None,
+    allowed_aas: Optional[Sequence[str]] = None,
 ) -> List[ESMFold2MutationProposal]:
     unique = []
     edits_by_sequence: Dict[str, List[Tuple[int, str, str]]] = {}
     for item in candidates:
         sequence = str(item)
+        validate_sequence_alphabet(
+            sequence,
+            mutable_mask=mutable_mask,
+            allowed_aas=allowed_aas,
+        )
         edits = _sequence_edits(current_seq, sequence)
         if sequence == current_seq or len(edits) != 1 or sequence in edits_by_sequence:
             continue
@@ -3934,6 +4081,7 @@ def _make_stageb_proposals(
             logits_after,
             current_seq=current_seq,
             mutable_mask=mutable_mask,
+            allowed_aas=allowed_aas,
         ).detach().cpu()
         for index, sequence in enumerate(unique):
             pos, _, new_aa = edits_by_sequence[sequence][0]
@@ -4009,6 +4157,8 @@ def run_esmfold2_mcts_hallucination(
     mcts_bootstrap_patience: int = 10,
     mcts_bootstrap_min_delta: float = 0.02,
     mcts_bootstrap_max_steps: int = 80,
+    early_stop_patience: int = 0,
+    early_stop_min_delta: float = 0.0,
     mcts_handoff_top_k: Optional[int] = None,
     mcts_expand_actions_per_step: int = 2,
     mcts_prior_mode: str = "full",
@@ -4066,6 +4216,12 @@ def run_esmfold2_mcts_hallucination(
         raise ValueError("backend is required for ESMFold2 MCTS")
     L_binder = int(L_binder)
     N_steps = max(int(N_steps), 0)
+    early_stop_patience = int(early_stop_patience or 0)
+    early_stop_min_delta = float(early_stop_min_delta)
+    if early_stop_patience < 0:
+        raise ValueError("early_stop_patience must be non-negative")
+    if not math.isfinite(early_stop_min_delta) or early_stop_min_delta < 0.0:
+        raise ValueError("early_stop_min_delta must be finite and non-negative")
     K_top = max(int(K_top), 1)
     B_candidates = max(int(B_candidates), 1)
     max_mutations_per_seq = max(int(max_mutations_per_seq), 1)
@@ -4123,6 +4279,14 @@ def run_esmfold2_mcts_hallucination(
             "ESMFold2 backend supports mcts_strategy stage_a_only, "
             "two_stage, continuous_stage_a, or raw_lineage_stage_a"
         )
+    if early_stop_patience > 0 and strategy in {
+        "continuous_stage_a",
+        "raw_lineage_stage_a",
+    }:
+        raise ValueError(
+            "early_stop_patience requires stepwise full-verifier feedback; "
+            "use stage_a_only or two_stage"
+        )
     target_key = _normalize_target_key(target_seq)
     stagea_paired_verifier_seed = bool(esmfold2_stagea_paired_verifier_seed)
     stagea_shared_verify_seed = (
@@ -4162,6 +4326,7 @@ def run_esmfold2_mcts_hallucination(
         for index in (hotspot_params or {}).get("target_hotspot_concat_indices", [])
     ]
     backend_config = getattr(backend, "config", None)
+    allowed_aas = getattr(backend_config, "binder_allowed_aas", None)
     hotspot_weight = float(getattr(backend_config, "hotspot_weight", 0.0))
     hotspot_satisfied_proposal_weight = float(
         getattr(backend_config, "hotspot_satisfied_proposal_weight", 0.0)
@@ -4392,6 +4557,17 @@ def run_esmfold2_mcts_hallucination(
         logit_init_mode,
     )
     logger.info(
+        "ESMFold2 terminal-stage early stopping: %s",
+        (
+            "disabled"
+            if early_stop_patience == 0
+            else (
+                f"patience={early_stop_patience} "
+                f"min_delta={early_stop_min_delta:.6g}"
+            )
+        ),
+    )
+    logger.info(
         "ESMFold2 soft_steps: stage_a=%s stage_b=%s",
         str(stagea_soft_steps or "backend_default"),
         str(stageb_soft_steps or "backend_default"),
@@ -4486,6 +4662,7 @@ def run_esmfold2_mcts_hallucination(
                 num_beams=num_beams,
                 init_binder_seq=init_binder_seq,
                 mutable_mask=mutable_mask,
+                allowed_aas=allowed_aas,
             )
         )
     elif resume_state is None:
@@ -4497,6 +4674,11 @@ def run_esmfold2_mcts_hallucination(
             mutable_mask=mutable_mask,
             logit_init_mode=logit_init_mode,
             device=getattr(backend, "device", None) if logit_init_mode == "official_exact" else None,
+            allowed_aas=getattr(
+                getattr(backend, "config", None),
+                "binder_allowed_aas",
+                None,
+            ),
         )
     else:
         phase0_states = [
@@ -4506,10 +4688,27 @@ def run_esmfold2_mcts_hallucination(
                     entry["proposal_logits"].detach().cpu().clone(),
                     str(entry["result"]["binder_seq"]),
                     mutable_mask,
+                    allowed_aas,
                 ),
             )
             for entry in resume_state["handoff_entries"]
         ]
+    normalized_phase0_states = []
+    for phase0_sequence, phase0_logits in phase0_states:
+        phase0_sequence = validate_sequence_alphabet(
+            str(phase0_sequence),
+            mutable_mask=mutable_mask,
+            allowed_aas=allowed_aas,
+        )
+        if phase0_logits is not None and allowed_aas is not None:
+            phase0_logits = minimally_align_binder_logits_to_sequence(
+                phase0_logits,
+                phase0_sequence,
+                mutable_mask,
+                allowed_aas=allowed_aas,
+            )
+        normalized_phase0_states.append((phase0_sequence, phase0_logits))
+    phase0_states = normalized_phase0_states
     phase0_logits_by_sequence = {
         str(seq): logits.detach().cpu().clone()
         for seq, logits in phase0_states
@@ -4562,7 +4761,11 @@ def run_esmfold2_mcts_hallucination(
     for result in phase0_results[: max(int(num_beams), 1)]:
         root_logits = phase0_logits_by_sequence.get(str(result.binder_seq))
         if root_logits is None:
-            root_logits = _initial_proposal_logits(result.binder_seq, mutable_mask)
+            root_logits = _initial_proposal_logits(
+                result.binder_seq,
+                mutable_mask,
+                allowed_aas,
+            )
         root_node = tree.add_root_node(
             sequence=result.binder_seq,
             logits=root_logits,
@@ -4598,6 +4801,60 @@ def run_esmfold2_mcts_hallucination(
         else []
     )
     latest_handoff_checkpoint: Optional[Path] = None
+    early_stop_triggered = False
+    early_stop_stage: Optional[str] = None
+    early_stop_step: Optional[int] = None
+    early_stop_stale_steps = 0
+
+    def _new_early_stopper(initial_loss: float) -> Optional[_LossEarlyStopper]:
+        if early_stop_patience == 0:
+            return None
+        return _LossEarlyStopper(
+            patience=early_stop_patience,
+            min_delta=early_stop_min_delta,
+            best_loss=float(initial_loss),
+        )
+
+    def _observe_early_stop(
+        stopper: Optional[_LossEarlyStopper],
+        *,
+        stage: str,
+        step: int,
+    ) -> bool:
+        nonlocal early_stop_triggered
+        nonlocal early_stop_stage
+        nonlocal early_stop_step
+        nonlocal early_stop_stale_steps
+        if stopper is None:
+            return False
+        should_stop = stopper.update(best_loss)
+        early_stop_stale_steps = int(stopper.stale_steps)
+        if not should_stop:
+            return False
+        early_stop_triggered = True
+        early_stop_stage = stage
+        early_stop_step = int(step)
+        logger.info(
+            "ESM early stop at %s step %d: best loss did not improve by "
+            "more than %.6g for %d consecutive outer steps (best=%.4f)",
+            stage,
+            step,
+            early_stop_min_delta,
+            stopper.stale_steps,
+            stopper.best_loss,
+        )
+        return True
+
+    def _early_stop_summary() -> Dict[str, Any]:
+        return {
+            "enabled": early_stop_patience > 0,
+            "patience": early_stop_patience,
+            "min_delta": early_stop_min_delta,
+            "triggered": early_stop_triggered,
+            "stage": early_stop_stage,
+            "step": early_stop_step,
+            "stale_steps": early_stop_stale_steps,
+        }
 
     def _save_handoff_state(*, final: bool = False) -> Optional[Path]:
         nonlocal latest_handoff_checkpoint
@@ -4641,6 +4898,8 @@ def run_esmfold2_mcts_hallucination(
                 "mcts_bootstrap_patience": mcts_bootstrap_patience,
                 "mcts_bootstrap_min_delta": mcts_bootstrap_min_delta,
                 "mcts_bootstrap_max_steps": mcts_bootstrap_max_steps,
+                "early_stop_patience": early_stop_patience,
+                "early_stop_min_delta": early_stop_min_delta,
                 "esmfold2_logit_init_mode": logit_init_mode,
                 "esmfold2_stagea_soft_steps": stagea_soft_steps,
                 "esmfold2_stagea_tree_children": stagea_tree_children,
@@ -4690,6 +4949,7 @@ def run_esmfold2_mcts_hallucination(
                 source_logits,
                 seq,
                 mutable_mask,
+                allowed_aas,
             ).detach().cpu().clone()
         proposal_logits_by_sequence[seq] = best_logits
 
@@ -4731,6 +4991,7 @@ def run_esmfold2_mcts_hallucination(
             polish_logits,
             current_best_seq,
             mutable_mask,
+            allowed_aas,
         ).detach().cpu().clone()
         proposal_hotspot_weight = _hotspot_proposal_weight_for_verified_state(
             current_best_result,
@@ -4902,6 +5163,7 @@ def run_esmfold2_mcts_hallucination(
                     proposal_batch.logits_after,
                     node.sequence,
                     mutable_mask,
+                    allowed_aas,
                 )
                 proposal_logits_by_sequence[str(node.sequence)] = node.logits
                 artifact_recorder.write_mcts_node(
@@ -4958,6 +5220,7 @@ def run_esmfold2_mcts_hallucination(
                 else None
             ),
             initial_logits_checkpoint_paths=initial_logits_checkpoint_paths,
+            early_stopping=_early_stop_summary(),
             **hotspot_summary,
         )
         logger.info(
@@ -5019,6 +5282,7 @@ def run_esmfold2_mcts_hallucination(
                 raw_logits,
                 current_seq=raw_sequence,
                 mutable_mask=mutable_mask,
+                allowed_aas=allowed_aas,
             )
             losses_history.append(best_loss)
             artifact_recorder.write_step(
@@ -5118,6 +5382,7 @@ def run_esmfold2_mcts_hallucination(
                 else None
             ),
             initial_logits_checkpoint_paths=initial_logits_checkpoint_paths,
+            early_stopping=_early_stop_summary(),
             **hotspot_summary,
         )
         logger.info(
@@ -5151,6 +5416,9 @@ def run_esmfold2_mcts_hallucination(
 
     stagea_best = best_loss
     stagea_stale = 0
+    stagea_early_stopper = (
+        _new_early_stopper(best_loss) if strategy == "stage_a_only" else None
+    )
     for step in range(stagea_start_step, stagea_steps):
         selected_node = tree.select()
         root_selection = tree.last_selection
@@ -5208,12 +5476,14 @@ def run_esmfold2_mcts_hallucination(
             selected_sequence=current_seq,
             batch=proposal_batch,
             mutable_mask=mutable_mask,
+            allowed_aas=allowed_aas,
         )
         if proposal_batch.logits_after is not None:
             argmax_sequence = sequence_from_logits_argmax(
                 proposal_batch.logits_after,
                 current_seq=current_seq,
                 mutable_mask=mutable_mask,
+                allowed_aas=allowed_aas,
             )
         else:
             argmax_sequence = None
@@ -5239,6 +5509,12 @@ def run_esmfold2_mcts_hallucination(
             logger.warning("ESM StageA step %d: no candidates from backend", step)
             losses_history.append(best_loss)
             _save_handoff_state()
+            if _observe_early_stop(
+                stagea_early_stopper,
+                stage="stage_a",
+                step=step,
+            ):
+                break
             continue
 
         round_results = []
@@ -5280,6 +5556,7 @@ def run_esmfold2_mcts_hallucination(
                 mutable_mask=mutable_mask,
                 preserve_soft_state=stagea_preserve_soft_state,
                 soft_anchor_margin=stagea_soft_anchor_margin,
+                allowed_aas=allowed_aas,
             )
             node.soft_step = (
                 int(getattr(selected_node, "soft_step", 0))
@@ -5332,6 +5609,7 @@ def run_esmfold2_mcts_hallucination(
                 mutable_mask=mutable_mask,
                 preserve_soft_state=stagea_preserve_soft_state,
                 soft_anchor_margin=stagea_soft_anchor_margin,
+                allowed_aas=allowed_aas,
             )
             _remember_global_best(
                 round_best,
@@ -5415,6 +5693,12 @@ def run_esmfold2_mcts_hallucination(
             round_best.total_loss,
             best_loss,
         )
+        if _observe_early_stop(
+            stagea_early_stopper,
+            stage="stage_a",
+            step=step,
+        ):
+            break
         if (
             strategy == "two_stage"
             and step + 1 >= max(int(mcts_bootstrap_steps), 0)
@@ -5460,6 +5744,7 @@ def run_esmfold2_mcts_hallucination(
                 "min_root_expansions": stagea_min_root_expansions,
                 "root_expansion_counts": tree.root_expansion_counts,
             },
+            early_stopping=_early_stop_summary(),
             **hotspot_summary,
         )
         return best_seq, final_seq, losses_history
@@ -5528,6 +5813,7 @@ def run_esmfold2_mcts_hallucination(
             stageb_root_logits = _initial_proposal_logits(
                 str(result.binder_seq),
                 mutable_mask,
+                allowed_aas,
             )
             alignment_changed_positions = None
         else:
@@ -5535,6 +5821,7 @@ def run_esmfold2_mcts_hallucination(
                 handoff_logits,
                 str(result.binder_seq),
                 mutable_mask,
+                allowed_aas=allowed_aas,
             )
             source_handoff_logits = (
                 handoff_logits[0]
@@ -5622,6 +5909,9 @@ def run_esmfold2_mcts_hallucination(
         logits=proposal_logits_by_sequence.get(str(best_by_guarded.binder_seq)),
         anchor_logits=False,
     )
+    # Stage B uses a separately seeded verifier and a guarded ranking surface,
+    # so its patience window starts fresh at handoff.
+    stageb_early_stopper = _new_early_stopper(best_loss)
 
     for step in range(len(losses_history), N_steps):
         selection = strict_tree.select_decision()
@@ -5663,6 +5953,12 @@ def run_esmfold2_mcts_hallucination(
         )
         if tree_child_budget <= 0:
             losses_history.append(best_loss)
+            if _observe_early_stop(
+                stageb_early_stopper,
+                stage="stage_b",
+                step=step,
+            ):
+                break
             continue
 
         proposal_pool_budget = max(
@@ -5726,6 +6022,7 @@ def run_esmfold2_mcts_hallucination(
                 selected_sequence=current_seq,
                 batch=proposal_batch,
                 mutable_mask=mutable_mask,
+                allowed_aas=allowed_aas,
                 action_group=group_name,
                 trace_label=proposal_seed_label,
             )
@@ -5759,6 +6056,7 @@ def run_esmfold2_mcts_hallucination(
                     mutable_mask=mutable_mask,
                     use_gradient_prior=use_gradient_prior,
                     rerank_scores=rerank_scores,
+                    allowed_aas=allowed_aas,
                 )
             )
 
@@ -5769,6 +6067,12 @@ def run_esmfold2_mcts_hallucination(
         if not proposal_pool:
             logger.warning("ESM StageB step %d: no candidates from backend", step)
             losses_history.append(best_loss)
+            if _observe_early_stop(
+                stageb_early_stopper,
+                stage="stage_b",
+                step=step,
+            ):
+                break
             continue
 
         registered_actions = strict_tree.register_action_proposals(selected_node, proposal_pool)
@@ -5796,6 +6100,12 @@ def run_esmfold2_mcts_hallucination(
         )
         if not verifier_actions:
             losses_history.append(best_loss)
+            if _observe_early_stop(
+                stageb_early_stopper,
+                stage="stage_b",
+                step=step,
+            ):
+                break
             continue
 
         verified_actions: List[Any] = []
@@ -5875,6 +6185,7 @@ def run_esmfold2_mcts_hallucination(
                 getattr(proposal, "proposal_logits", None),
                 node.sequence,
                 mutable_mask,
+                allowed_aas,
             )
             proposal_logits_by_sequence[str(node.sequence)] = node.logits
             reward_by_sequence[node.sequence] = node.tree_reward
@@ -5995,6 +6306,7 @@ def run_esmfold2_mcts_hallucination(
                     guarded_logits,
                     str(best_by_guarded.binder_seq),
                     mutable_mask,
+                    allowed_aas,
                 )
                 _remember_global_best(
                     best_by_guarded,
@@ -6097,6 +6409,12 @@ def run_esmfold2_mcts_hallucination(
             len(tree_actions),
             best_loss,
         )
+        if _observe_early_stop(
+            stageb_early_stopper,
+            stage="stage_b",
+            step=step,
+        ):
+            break
 
     best_result, best_seq, final_seq, best_loss = _run_final_polish_if_enabled(
         current_best_result=best_result,
@@ -6161,6 +6479,7 @@ def run_esmfold2_mcts_hallucination(
                 quality_floor=final_quality_floor,
             ),
         },
+        early_stopping=_early_stop_summary(),
         **hotspot_summary,
     )
     return best_seq, final_seq, losses_history

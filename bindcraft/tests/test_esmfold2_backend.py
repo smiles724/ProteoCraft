@@ -13,15 +13,60 @@ from bindcraft.hallucination.esmfold2_backend import (
     esm_temperature,
     init_binder_logits,
     logit_delta_mutation_scores,
+    mask_binder_logits_allowed_aas,
     minimally_align_binder_logits_to_sequence,
     normalized_gradient_tensor,
     propose_sequences_from_logit_delta,
     resolve_esm_verifier_loss,
     resolve_lambda_esmc,
+    sequence_from_logits_argmax,
     select_esmfold2_action_group,
     softly_anchor_mutation_logits,
 )
 from bindcraft.hallucination.mcts_controller import MCTSTree
+
+
+def test_allowed_alphabet_masks_mutable_logits_but_not_fixed_framework():
+    logits = init_binder_logits(
+        "YAA",
+        mutable_mask=[False, True, True],
+        allowed_aas="AF",
+        random_scale=0.0,
+        requires_grad=False,
+    )
+    allowed_indices = {ESM_AA_ORDER.index("A"), ESM_AA_ORDER.index("F")}
+
+    for aa_index in range(len(ESM_AA_ORDER)):
+        if aa_index not in allowed_indices:
+            assert torch.isneginf(logits[0, 1, aa_index])
+    assert ESM_AA_ORDER[int(logits[0, 0].argmax())] == "Y"
+
+
+def test_argmax_and_saved_logits_cannot_select_forbidden_mutable_residue():
+    logits = torch.zeros(2, len(ESM_AA_ORDER))
+    logits[0, ESM_AA_ORDER.index("W")] = 100.0
+    logits[0, ESM_AA_ORDER.index("F")] = 2.0
+    logits[1, ESM_AA_ORDER.index("Y")] = 100.0
+    masked = mask_binder_logits_allowed_aas(
+        logits,
+        mutable_mask=[True, False],
+        allowed_aas="AF",
+    )
+
+    assert torch.isneginf(masked[0, ESM_AA_ORDER.index("W")])
+    assert masked[1, ESM_AA_ORDER.index("Y")] == 100.0
+    assert sequence_from_logits_argmax(
+        logits,
+        current_seq="AY",
+        mutable_mask=[True, False],
+        allowed_aas="AF",
+    ) == "FY"
+
+
+def test_affibody_redesign_uses_local_redesign_esmc_prior():
+    assert resolve_lambda_esmc("auto", task_type="affibody_redesign") == pytest.approx(
+        0.05
+    )
 
 
 def test_soft_mutation_anchor_changes_only_explicit_edit_positions():

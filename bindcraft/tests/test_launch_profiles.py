@@ -64,8 +64,12 @@ def test_esmfold2_d_profile_matches_formal_method_defaults():
     )
     assert args.mcts_strategy == "two_stage"
     assert args.n_steps == 110
-    assert args.mcts_bootstrap_steps == 70
+    assert args.mcts_bootstrap_steps == 20
+    assert args.mcts_bootstrap_patience == 10
+    assert args.mcts_bootstrap_min_delta == pytest.approx(0.001)
     assert args.mcts_bootstrap_max_steps == 70
+    assert args.esmfold2_early_stop_patience == 10
+    assert args.esmfold2_early_stop_min_delta == pytest.approx(0.001)
     assert args.mcts_handoff_top_k == 2
     assert args.mcts_prior_mode == "no_group"
     assert args.seed == 43
@@ -161,8 +165,9 @@ def test_esmfold2_profile_covers_all_formal_task_modes(
     assert args.esmfold2_task_type == task_type
     assert args.mcts_strategy == "two_stage"
     assert args.n_steps == 110
-    assert args.mcts_bootstrap_steps == 70
+    assert args.mcts_bootstrap_steps == 20
     assert args.mcts_bootstrap_max_steps == 70
+    assert args.esmfold2_early_stop_patience == 10
     assert args.mcts_prior_mode == "no_group"
     assert args.seed == 43
     assert args.b_candidates == 8

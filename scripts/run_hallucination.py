@@ -227,6 +227,38 @@ def parse_esmfold2_mutable_mask(raw_mask, binder_length: int, parser: argparse.A
     return mask
 
 
+def parse_esmfold2_allowed_binder_aas(
+    raw_alphabet,
+    parser: argparse.ArgumentParser,
+):
+    """Parse a compact or comma-separated mutable-position alphabet."""
+
+    if raw_alphabet is None or not str(raw_alphabet).strip():
+        return None
+    raw_text = str(raw_alphabet).strip().upper()
+    if any(separator in raw_text for separator in ",; "):
+        tokens = [
+            token.strip()
+            for token in raw_text.replace(";", ",").replace(" ", ",").split(",")
+            if token.strip()
+        ]
+    else:
+        tokens = list(raw_text)
+    alphabet = tuple(dict.fromkeys(tokens))
+    standard = set("ACDEFGHIKLMNPQRSTVWY")
+    invalid = sorted(
+        token for token in alphabet if len(token) != 1 or token not in standard
+    )
+    if invalid:
+        parser.error(
+            "--esmfold2_allowed_binder_aas 只能包含标准氨基酸单字母代码；"
+            f"检测到: {','.join(invalid)}"
+        )
+    if not alphabet:
+        parser.error("--esmfold2_allowed_binder_aas 不能为空")
+    return alphabet
+
+
 def parse_esmfold2_target_chain_roles(
     raw_roles,
     *,
@@ -389,6 +421,7 @@ def load_esmfold2_backend(
     device: str = "cuda",
     *,
     mutable_mask=None,
+    allowed_aas=None,
     target_chain_roles=None,
 ):
     """Lazy-load the real ESMFold2 backend only when explicitly requested."""
@@ -461,6 +494,9 @@ def load_esmfold2_backend(
             if mutable_mask is None
             else tuple(bool(value) for value in mutable_mask)
         ),
+        binder_allowed_aas=(
+            None if allowed_aas is None else tuple(allowed_aas)
+        ),
     )
     return ESMFold2RuntimeBackend(
         config=config,
@@ -495,6 +531,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n_steps", type=int, default=None,
                        help=("优化步数；默认按 backend 解析："
                              "Protenix=200，ESMFold2=110"))
+    parser.add_argument(
+        "--esmfold2_early_stop_patience",
+        type=int,
+        default=0,
+        help=(
+            "ESMFold2 MCTS 终止搜索阶段连续多少个 outer step 无 loss 改善后提前停止；"
+            "two_stage 作用于 StageB，stage_a_only 作用于 StageA；0 表示关闭（默认：0）"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_early_stop_min_delta",
+        type=float,
+        default=0.0,
+        help="ESMFold2 early stop 视为有效改善所需的最小 loss 降幅（默认：0）",
+    )
     parser.add_argument("--learning_rate", type=float, default=0.05,
                        help="Adam 学习率（默认：0.05）")
     parser.add_argument("--tau_noise", type=float, default=4.0,
@@ -711,7 +762,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--esmfold2_lambda_esmc", type=str, default="auto",
                        help="ESMC sequence prior 权重；auto 按任务类型选择，或传入数值字符串")
     parser.add_argument("--esmfold2_task_type", type=str, default="denovo",
-                       choices=["denovo", "de_novo", "minibinder", "binder", "tcr", "cdr", "cdr_redesign", "vhh_redesign", "antibody", "antibody_like"],
+                       choices=[
+                           "denovo", "de_novo", "minibinder", "binder", "tcr",
+                           "cdr", "cdr_redesign", "affibody_redesign",
+                           "vhh_redesign", "antibody", "antibody_like",
+                       ],
                        help="ESMFold2/ESMC 任务类型；用于解析 lambda_ESMC=auto（默认：denovo）")
     parser.add_argument("--esmfold2_logit_init_mode", type=str, default="official_exact",
                        choices=["official_free", "official_exact", "legacy_anchor"],
@@ -727,6 +782,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--esmfold2_mutable_mask", type=str, default=None,
                        help="ESMFold2 可变位点 mask；长度需等于 binder_length，支持 01101 或 0,1,1,true")
+    parser.add_argument(
+        "--esmfold2_allowed_binder_aas",
+        type=str,
+        default=None,
+        help=(
+            "ESMFold2 可变位点允许使用的氨基酸字母表；"
+            "支持 ADEF... 或 A,D,E,F...。固定位点不受此限制"
+        ),
+    )
     parser.add_argument(
         "--esmfold2_target_chain_roles",
         type=str,
@@ -1191,6 +1255,33 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
+        if args.esmfold2_early_stop_patience < 0:
+            message = "--esmfold2_early_stop_patience must be non-negative"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if (
+            args.esmfold2_early_stop_patience > 0
+            and args.mcts_strategy
+            in {"best_of_n", "best_of_n_chunked", "continuous_stage_a", "raw_lineage_stage_a"}
+        ):
+            message = (
+                "--esmfold2_early_stop_patience requires a stepwise MCTS strategy "
+                "(stage_a_only or two_stage)"
+            )
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        if (
+            not math.isfinite(args.esmfold2_early_stop_min_delta)
+            or args.esmfold2_early_stop_min_delta < 0.0
+        ):
+            message = (
+                "--esmfold2_early_stop_min_delta must be finite and non-negative"
+            )
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
         if args.esmfold2_stagea_tree_children <= 0:
             message = "--esmfold2_stagea_tree_children must be positive"
             if parser is not None:
@@ -1406,6 +1497,7 @@ def main(argv=None):
                 f"检测到非法字符: {','.join(invalid)}"
             )
     esmfold2_mutable_mask = None
+    esmfold2_allowed_binder_aas = None
     esmfold2_target_chain_roles = None
     if model_backend == "esmfold2":
         esmfold2_mutable_mask = parse_esmfold2_mutable_mask(
@@ -1413,6 +1505,24 @@ def main(argv=None):
             args.binder_length,
             parser,
         )
+        esmfold2_allowed_binder_aas = parse_esmfold2_allowed_binder_aas(
+            args.esmfold2_allowed_binder_aas,
+            parser,
+        )
+        if args.init_binder_seq is not None and esmfold2_allowed_binder_aas is not None:
+            mutable = esmfold2_mutable_mask or [True] * args.binder_length
+            outside = [
+                f"{index + 1}:{aa}"
+                for index, (aa, is_mutable) in enumerate(
+                    zip(args.init_binder_seq, mutable)
+                )
+                if is_mutable and aa not in esmfold2_allowed_binder_aas
+            ]
+            if outside:
+                parser.error(
+                    "--init_binder_seq 的可变位点超出允许字母表: "
+                    + ", ".join(outside)
+                )
         esmfold2_target_chain_roles = parse_esmfold2_target_chain_roles(
             args.esmfold2_target_chain_roles,
             n_target_chains=len(
@@ -1631,6 +1741,7 @@ def main(argv=None):
             args,
             device=args.device,
             mutable_mask=esmfold2_mutable_mask,
+            allowed_aas=esmfold2_allowed_binder_aas,
             target_chain_roles=esmfold2_target_chain_roles,
         )
 
@@ -1758,6 +1869,8 @@ def main(argv=None):
                 mcts_bootstrap_patience=args.mcts_bootstrap_patience,
                 mcts_bootstrap_min_delta=args.mcts_bootstrap_min_delta,
                 mcts_bootstrap_max_steps=args.mcts_bootstrap_max_steps,
+                early_stop_patience=args.esmfold2_early_stop_patience,
+                early_stop_min_delta=args.esmfold2_early_stop_min_delta,
                 mcts_handoff_top_k=args.mcts_handoff_top_k,
                 mcts_expand_actions_per_step=args.mcts_expand_actions_per_step,
                 mcts_prior_mode=args.mcts_prior_mode,
@@ -1948,6 +2061,14 @@ def main(argv=None):
                 f"{args.esmfold2_raw_lineage_annealing_horizon}\n"
             )
             f.write(f"ESMFold2 Stage B Soft Steps: {args.esmfold2_stageb_soft_steps}\n")
+            f.write(
+                "ESMFold2 Early Stop Patience: "
+                f"{args.esmfold2_early_stop_patience or 'DISABLED'}\n"
+            )
+            f.write(
+                "ESMFold2 Early Stop Min Delta: "
+                f"{args.esmfold2_early_stop_min_delta}\n"
+            )
             f.write(f"ESMFold2 Best-of-N: {args.esmfold2_best_of_n}\n")
             if args.mcts_strategy == "best_of_n_chunked":
                 f.write(
@@ -2007,6 +2128,10 @@ def main(argv=None):
             )
             f.write(f"ESMFold2 Mutable Mask: {args.esmfold2_mutable_mask or 'ALL'}\n")
             f.write(
+                "ESMFold2 Allowed Binder AAs: "
+                f"{args.esmfold2_allowed_binder_aas or 'ALL'}\n"
+            )
+            f.write(
                 "ESMFold2 StageA Candidate Strategy: "
                 f"{args.esmfold2_stagea_candidate_strategy}\n"
             )
@@ -2017,6 +2142,10 @@ def main(argv=None):
             f.write(
                 "ESMFold2 Target Chain Roles: "
                 f"{args.esmfold2_target_chain_roles or 'ALL_TARGET'}\n"
+            )
+            f.write(
+                "ESMFold2 Verifier Loss Mode: "
+                f"{args.esmfold2_verifier_loss_mode}\n"
             )
             f.write(f"ESMFold2 Stage A Handoff Checkpoint Interval: {args.esmfold2_stagea_handoff_checkpoint_interval}\n")
             f.write(f"ESMFold2 Resume Handoff Checkpoint: {args.esmfold2_resume_handoff_checkpoint or 'NONE'}\n")

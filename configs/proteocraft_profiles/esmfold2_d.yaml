@@ -17,10 +17,12 @@ defaults:
   stageb_max_mutations_per_seq: 1
   mcts_num_beams: 8
   mcts_strategy: two_stage
-  mcts_bootstrap_steps: 70
+  mcts_bootstrap_steps: 20
   mcts_bootstrap_patience: 10
-  mcts_bootstrap_min_delta: 0.02
+  mcts_bootstrap_min_delta: 0.001
   mcts_bootstrap_max_steps: 70
+  esmfold2_early_stop_patience: 10
+  esmfold2_early_stop_min_delta: 0.001
   mcts_handoff_top_k: 2
   mcts_expand_actions_per_step: 2
   mcts_prior_mode: no_group

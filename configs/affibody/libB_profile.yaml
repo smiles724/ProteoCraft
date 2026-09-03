@@ -1,0 +1,7 @@
+schema_version: 1
+name: LibB
+scaffold_template: VDNKNKFXKEFXNAXXEIXHLPNLNEEQFDAFVQSLFDDPSQSANLLAEAKKLNDAQAPK
+mutable_positions_1based: [8, 12, 15, 16, 19]
+allowed_aas: ADEFIKLMNSTVY
+default_tuple: NNYYF
+assay_time_min: 30

@@ -1,0 +1,2 @@
+candidate_id,target_id,library,affibody_sequence,design_score,design_rank,source_run
+EXAMPLE_NYESO,T001,LibB,VDNKNKFNKEFNNAYYEIFHLPNLNEEQFDAFVQSLFDDPSQSANLLAEAKKLNDAQAPK,,1,known_positive_control

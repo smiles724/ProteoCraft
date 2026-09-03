@@ -193,8 +193,9 @@ def test_formal_cdr_configs_inherit_recommended_two_stage_profile(
     assert args.esmfold2_task_type == "cdr_redesign"
     assert args.mcts_strategy == "two_stage"
     assert args.n_steps == 110
-    assert args.mcts_bootstrap_steps == 70
+    assert args.mcts_bootstrap_steps == 20
     assert args.mcts_bootstrap_max_steps == 70
+    assert args.esmfold2_early_stop_patience == 10
     assert args.mcts_prior_mode == "no_group"
     assert args.seed == 43
     assert args.esmfold2_stagea_candidate_strategy == "positive_score"

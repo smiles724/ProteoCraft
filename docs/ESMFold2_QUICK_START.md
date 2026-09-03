@@ -44,7 +44,8 @@ configs/proteocraft_profiles/esmfold2_d.yaml
 |---|---|
 | Model backend | ESMFold2 |
 | Search | Two-stage MCTS |
-| Stage A / Stage B | 70 / 40 outer steps |
+| Stage A / Stage B | Stage A 20–70；Stage B 使用剩余预算 |
+| Early stopping | Stage A/Stage B patience=10，min delta=0.001 |
 | Initial roots | 8 |
 | Random seed | 43 |
 | One-step diffusion | Strict truncated, `tau=1` |
@@ -54,6 +55,20 @@ configs/proteocraft_profiles/esmfold2_d.yaml
 | Search-time verifier | 4 loops x 50 sampling steps |
 
 命令行中显式提供的参数会覆盖 profile。例如，如果希望整次搜索使用更高精度的 full verifier，可以显式使用 `--esmfold2_verifier_num_loops 20 --esmfold2_verifier_num_sampling_steps 200`。只对最终候选进行高精度复评时，应在搜索结束后单独运行统一的 20 x 200 rescoring，而不是修改搜索期默认值。
+
+为了在 loss 已进入平台期时节省计算，可启用可选 early stopping。例如，连续
+10 个 outer step 没有至少 `0.001` 的 best-loss 降幅就停止：
+
+```bash
+--esmfold2_early_stop_patience 10 \
+--esmfold2_early_stop_min_delta 0.001
+```
+
+命令行默认 `patience=0`；推荐的 `esmfold2_d` profile 已设置为 `10`。
+`two_stage` 在最终 Stage B 中独立计数，`stage_a_only` 在 Stage A 中计数；发生有效改善时计数
+清零。Stage A 与 Stage B 的 verifier/排序口径不同，因此不会跨阶段累计 patience。
+实际执行步数和触发位置会记录在 `esmfold2_artifacts/run_summary.json` 的
+`n_steps` 与 `early_stopping` 字段中。
 
 ## 2. De novo Binder Design
 
@@ -172,7 +187,7 @@ python scripts/run_hallucination.py \
 
 - `--target` 只接受单字母氨基酸序列；多条 chain 使用 `|` 分隔。
 - `--esmfold2_target_chain_roles` 的数量必须与 `--target` 中的 chain 数一致，可取 `target` 或 `scaffold`。
-- `--target_hotspots` 使用拼接后 target sequences 的 1-based residue index。
+- `--target_hotspots` 使用全部 `--target` chains 按输入顺序拼接后的 1-based residue index；标为 `scaffold` 的链仍计入编号偏移，但 hotspot 本身必须落在 `role=target` 的链上。
 - 默认结果写入 `--output_dir`。
 - `esmfold2_artifacts/run_summary.json` 保存最终摘要。
 - `esmfold2_artifacts/candidates.jsonl` 和 `trajectory.jsonl` 保存候选与搜索轨迹。
