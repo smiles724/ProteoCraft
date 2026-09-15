@@ -1,9 +1,10 @@
-# BCv2 ESMFold2/AF3 Evaluator
+# ProteoCraft ESMFold2/AF3/AtlasFold-M Evaluator
 
 BCv2  evaluation 代码目标：
 
 - 将 method 产出的 binder design 统一整理成 manifest。
-- 用当前 ProteoCraft ESMFold2 full verifier 和 AlphaFold 3 评估 designs。
+- 用当前 ProteoCraft ESMFold2 full verifier、AlphaFold 3 和 AtlasFold-M 评估 designs。
+- AtlasFold-M 仅作为独立 sequence-only 交叉复评器，不参与搜索或候选排序。
 - 保留 2026 年 5 月加入的 HuggingFace ESMFold evaluator 以复现旧结果。
 - 汇总每个 paper case 的成功率、调用次数、运行时间和报告图表。
 - 生成后续主实验表格需要的 `table2.csv` 和 `table2.md`。
@@ -15,9 +16,11 @@ flowchart TD
     A[method outputs / raw sub-run manifests] --> B[selected paper-case manifests]
     B --> C[target MSA cache for AF3]
     B --> D[ESMFold2 evaluator lane]
+    B --> J[AtlasFold-M sequence-only lane]
     C --> E[AF3 evaluator lane]
     D --> F[per-sub-run eval CSVs]
     E --> F
+    J --> F
     F --> G[per-paper-case aggregate]
     G --> H[Table 2 CSV/Markdown]
     G --> I[per-evaluator reports and bar charts]
@@ -29,7 +32,7 @@ flowchart TD
 2. 将 sub-run 合并/筛选成每个 paper case 一份 selected manifest。
 3. 准备 AF3 target-only MSA cache。
 4. 对每个 selected sub-run 跑 ESMFold2 evaluator。
-5. 对每个 selected sub-run 跑 AF3 evaluator。
+5. 对每个 selected sub-run 跑 AF3 或 AtlasFold-M evaluator。
 6. 运行 report 命令，生成 aggregate CSV、markdown report、Table 2 和图表。
 
 ## 2. 项目结构
@@ -45,6 +48,7 @@ flowchart TD
 ├── eval_pipeline/
 │   ├── cli.py                    # evaluator 主入口，默认 esmfold2
 │   ├── af3_runner.py             # AF3 input JSON、subprocess 调用、输出解析
+│   ├── atlasfold_runner.py       # AtlasFold-M FASTA、版本检查、调用与输出解析
 │   ├── esmfold2_runner.py        # 当前 ProteoCraft full-verifier adapter
 │   ├── esmfold_runner.py         # 2026-05 legacy ESMFold wrapper
 │   ├── manifest.py               # manifest schema 加载和校验
@@ -53,7 +57,8 @@ flowchart TD
 │   └── tier_gating.py            # Tier-1 / Tier-2 pass flags
 ├── scripts/
 │   ├── prepare_af3_target_msa.py # 为 AF3 构建 target MSA cache
-│   └── af3_smoke.sh              # 单 case AF3 smoke test helper
+│   ├── af3_smoke.sh              # 单 case AF3 smoke test helper
+│   └── atlasfold_m_smoke.sh      # 单候选 AtlasFold-M GPU smoke helper
 ├── tests/                        # 单元测试和集成测试
 ├── vendor/                       # vendored Proteina-Complexa 工具代码
 ├── env_setup.sh                  # 可选 conda 环境初始化脚本
@@ -100,6 +105,19 @@ export AF3_DB_DIR=/path/to/af3-databases
 ```
 
 `AF3_MODEL_DIR` 应该是包含 `.bin.zst` 模型权重的目录，不是模型文件本身。
+
+AtlasFold-M 必须使用独立环境和完整的官方源码 checkout。固定源码、环境安装、权重
+receipt 和自检命令见 [`environment/atlasfold/README.md`](../../environment/atlasfold/README.md)。
+正式运行前设置：
+
+```bash
+export ATLASFOLD_PYTHON=/path/to/proteocraft_atlasfold_m_py312/bin/python
+export ATLASFOLD_SOURCE_ROOT=/path/to/atlasfold-v1.0.2
+export ATLASFOLD_CACHE_DIR=/path/to/atlasfold_cache
+export ATLASFOLD_MODEL_PATH=/path/to/weights/atlasfold-m-260725.pth
+export ATLASFOLD_LM_PATH=/path/to/weights/atlaslm_3b_base.pth
+export ATLASFOLD_WEIGHTS_RECEIPT=/path/to/atlasfold_m_weights_receipt.json
+```
 
 ## 4. 输入约定
 
@@ -263,6 +281,58 @@ work/eval/<paper_case>__<sub_run>__af3.csv
 
 文件名始终使用三段命名，包括 `paper_case == sub_run` 的情况，例如 `PD1__PD1__af3.csv`。
 
+### Step 5b: 运行 AtlasFold-M 独立复评
+
+AtlasFold-M 使用官方 `atlasfold multimer` sequence-only 路径。输入顺序固定为
+manifest 中的 target/scaffold chains，最后一条是 binder；输出会按同样顺序映射为
+`A, B, C, ...`。示例：
+
+```bash
+python -m eval_pipeline.cli \
+  --manifest work/manifests/<PAPER_CASE>.selected.manifest.csv \
+  --out-dir work/ \
+  --evaluator atlasfold_m \
+  --paper-case <PAPER_CASE> \
+  --sub-run <SUB_RUN> \
+  --atlasfold-python "$ATLASFOLD_PYTHON" \
+  --atlasfold-source-root "$ATLASFOLD_SOURCE_ROOT" \
+  --atlasfold-cache-dir "$ATLASFOLD_CACHE_DIR" \
+  --atlasfold-model-path "$ATLASFOLD_MODEL_PATH" \
+  --atlasfold-lm-path "$ATLASFOLD_LM_PATH" \
+  --atlasfold-weights-receipt "$ATLASFOLD_WEIGHTS_RECEIPT"
+```
+
+默认值与 AtlasFold-M v1.0.2 官方 multimer CLI 一致：10 recycles、MLM probability
+0.20、1 个 seed、每个 seed 5 个 diffusion samples、200 diffusion steps。适配器保存
+全部官方样本输出，并按官方 ranking score 选出 ranked sample 进入统一指标流水线。
+
+主要指标口径：
+
+- `atlasfold_pair_chain_iptm` / `pair_chain_iptm`：所有 role=`target` 的链分别与
+  binder 的 interface ipTM 均值。
+- `atlasfold_scaffold_pair_chain_iptm`：role=`scaffold` 的链与 binder 的 interface
+  ipTM 均值，不混入主 Pair iPTM。
+- `atlasfold_iptm`、`atlasfold_ptm`、`atlasfold_ranking_score`：AtlasFold-M 官方
+  complex-level native metrics。
+- `atlasfold_interface_iptm_json`：完整 chain-pair interface map，避免聚合后丢失信息。
+
+该 lane 不接收 template，也不使用 AtlasFold-M 分数更新 ProteoCraft 搜索。当前尚未
+为 AtlasFold-M 校准 ProteoCraft Tier-1/Tier-2 阈值，因此 tier flags 固定为 false，
+正式比较应直接报告 native metrics 和成对排序一致性。
+
+`designed_complex_pdb_path` 对 AtlasFold-M 只用于可选的 scRMSD 参考，不进入模型。
+该字段为空时仍正常完成 sequence-only 复评；为 PDB 或 mmCIF 时会额外计算 scRMSD，
+并在 `atlasfold_reference_metric_status` 中记录 `computed`、`missing` 或 `failed`。
+
+部署后先用一个候选做 10-step GPU smoke（只验证完整链路，不作为正式结果）：
+
+```bash
+PROTEOCRAFT_PYTHON=/path/to/proteocraft/python \
+  bash scripts/atlasfold_m_smoke.sh \
+  work/manifests/PD1.selected.manifest.csv \
+  work/atlasfold_smoke PD1 PD1 cuda:0
+```
+
 预期 paper-case/sub-run 矩阵：
 
 | paper_case | sub_run(s)                                                                     |
@@ -307,13 +377,18 @@ python -m eval_pipeline.report \
 | `work/eval/<paper_case>__<sub_run>__esmfold2.csv` | 当前 ESMFold2 full-verifier metrics                         |
 | `work/eval/<paper_case>__<sub_run>__esmfold_202605.csv` | 旧 ESMFold evaluator metrics                        |
 | `work/eval/<paper_case>__<sub_run>__af3.csv`     | 单个 sub-run 的 per-design AF3 metrics                        |
+| `work/eval/<paper_case>__<sub_run>__atlasfold_m.csv` | 单个 sub-run 的 AtlasFold-M metrics                      |
+| `work/atlasfold_outputs/<paper_case>/<sub_run>/` | AtlasFold-M 全部官方原始样本、confidence 与 done markers   |
+| `work/per_design/<method>/<case>/<design_id>/atlasfold_m/` | 统一命名的 ranked CIF/PDB、arrays 和 provenance |
 | `work/eval_per_paper_case_aggregate.csv`         | 按 evaluator、method、paper case 聚合的主结果表               |
 | `work/table2.csv`                                | wide format Table 2 CSV，列名形如 `method_evaluator_metric` |
 | `work/table2.md`                                 | Markdown 版 Table 2                                           |
 | `work/report_esmfold2.md`                        | 当前 ESMFold2 lane 报告                                      |
 | `work/report_af3.md`                             | AF3 lane 报告；如果有 AF3 native metrics，会单独汇总          |
+| `work/report_atlasfold_m.md`                     | AtlasFold-M 原生指标和未校准状态说明                         |
 | `work/bar_chart_esmfold2.png`                    | ESMFold2 各 paper case pass-rate 图                           |
 | `work/bar_chart_af3.png`                         | AF3 各 paper case pass-rate 图                                |
+| `work/bar_chart_atlasfold_m.png`                 | AtlasFold-M 未校准提示图，不伪造 pass-rate                    |
 
 使用 `configs/bcv2_case_roster.json` 和 `--evaluators esmfold2 af3` 时，aggregate 预期有 26 行：13 个 paper cases 乘以 2 个 evaluators。没有 accepted designs 的 case 会以 `_NO_DESIGNS` stub 表示，calls 和 successes 为 0；图里会标成 `no designs`，不会当成真实 0% pass rate。
 
@@ -339,6 +414,10 @@ python -m eval_pipeline.report \
 - 重跑单个 ESMFold design：删除 `work/per_design/<method>/<case>/<design_id>/esmfold.pdb`，然后重跑对应 sub-run。
 - 重跑单个 AF3 design：删除 `work/per_design/<method>/<case>/<design_id>/af3/af3_pred.pdb`，然后重跑对应 sub-run。
 - 重跑单个 AF3 sub-run：删除 `work/staging/<paper_case>/<sub_run>/` 和 `work/af3_outputs/<paper_case>/<sub_run>/`，然后重跑。
+- 重跑单个 AtlasFold-M design：删除对应 `per_design/.../atlasfold_m/atlasfold_m.cif`
+  和 eval CSV 中该 design 的行，或对 sub-run 使用 `--no-skip-existing`。
+- AtlasFold-M 会保留官方 `done.txt` 输出用于进程中断后的恢复；如果已有输出的参数或
+  环境 provenance 与当前运行不一致，会拒绝混用并要求显式 `--no-skip-existing`。
 - 强制重建：传入 `--no-skip-existing`。
 
 evaluator 会增量写 CSV。如果某个 sub-run 中途失败，先检查对应 `work/eval/*.csv` 里的 `error_msg`，修复底层问题后再 rerun。
@@ -374,6 +453,12 @@ $PYBIN -m pytest tests/ --ignore=tests/test_esmfold_runner.py -q -rs
 
 - 当前 evaluator env 没有安装真实 `alphafold3` Python package 时，会跳过 AF3 import validation。
 - 如果本地没有可选的 BCv1 PDL1 fixture，会跳过一个相关 fixture test。
+
+AtlasFold-M adapter 的 CPU mock 集成测试不加载权重：
+
+```bash
+python -m pytest tests/test_atlasfold_runner.py -q
+```
 
 ESMFold GPU tests 只建议在有合适 GPU 显存和模型 cache 的节点上单独运行：
 

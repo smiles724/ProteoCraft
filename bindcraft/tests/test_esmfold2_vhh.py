@@ -131,6 +131,24 @@ def test_vhh_launcher_uses_recommended_profile_without_changing_core_modes(tmp_p
     assert args.esmfold2_save_verified_candidate_cif is True
 
 
+def test_vhh_launcher_forwards_dense_truncated_schedule(tmp_path):
+    case = prepare_esmfold2_vhh_case(_vhh_case(), input_dir=tmp_path)
+    command = build_hallucination_command(
+        case,
+        {
+            "launch_profile": "esmfold2_d",
+            "esmfold2_one_step_truncated_schedule_mode": "dense",
+            "esmfold2_one_step_truncated_dense_num_sampling_steps": 41,
+        },
+        case_dir=tmp_path / "output",
+    )
+
+    args, parser = parse_args_with_profile(command[2:])
+    assert resolve_model_backend(args, parser) == "esmfold2"
+    assert args.esmfold2_one_step_truncated_schedule_mode == "dense"
+    assert args.esmfold2_one_step_truncated_dense_num_sampling_steps == 41
+
+
 def test_7eow_vhh_yaml_template_matches_adapter_contract(tmp_path):
     config_path = (
         Path(__file__).resolve().parents[2]

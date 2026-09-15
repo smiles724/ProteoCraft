@@ -190,7 +190,13 @@ def resolve_esmfold2_hotspot_defaults(
         )
 
 
-def parse_esmfold2_mutable_mask(raw_mask, binder_length: int, parser: argparse.ArgumentParser):
+def parse_esmfold2_mutable_mask(
+    raw_mask,
+    binder_length: int,
+    parser: argparse.ArgumentParser,
+    *,
+    option_name: str = "--esmfold2_mutable_mask",
+):
     if raw_mask is None:
         return None
     raw_text = str(raw_mask).strip()
@@ -216,15 +222,28 @@ def parse_esmfold2_mutable_mask(raw_mask, binder_length: int, parser: argparse.A
             mask.append(False)
         else:
             parser.error(
-                "--esmfold2_mutable_mask 只能包含 0/1 或 true/false；"
+                f"{option_name} 只能包含 0/1 或 true/false；"
                 f"检测到: {token}"
             )
     if len(mask) != int(binder_length):
         parser.error(
-            f"--esmfold2_mutable_mask 长度为 {len(mask)}，"
+            f"{option_name} 长度为 {len(mask)}，"
             f"但 --binder_length 为 {binder_length}。"
         )
     return mask
+
+
+def parse_esmfold2_template_chain_ids(raw_chain_ids):
+    if raw_chain_ids is None or not str(raw_chain_ids).strip():
+        return None
+    chain_ids = tuple(
+        token.strip()
+        for token in str(raw_chain_ids).replace(";", ",").replace(" ", ",").split(",")
+        if token.strip()
+    )
+    if len(set(chain_ids)) != len(chain_ids):
+        raise ValueError("--esmfold2_template_chain_ids 不能包含重复 chain ID")
+    return chain_ids
 
 
 def parse_esmfold2_target_chain_roles(
@@ -390,6 +409,9 @@ def load_esmfold2_backend(
     *,
     mutable_mask=None,
     target_chain_roles=None,
+    structure_regeneration_mask=None,
+    template_chain_ids=None,
+    template_chain_sequences=None,
 ):
     """Lazy-load the real ESMFold2 backend only when explicitly requested."""
     from bindcraft.hallucination.esmfold2_backend import ESMFold2ProposalConfig
@@ -419,6 +441,12 @@ def load_esmfold2_backend(
         one_step_diffusion_tau=args.esmfold2_one_step_diffusion_tau,
         one_step_diffusion_truncated_num_sampling_steps=(
             args.esmfold2_one_step_truncated_num_sampling_steps
+        ),
+        one_step_diffusion_truncated_schedule_mode=(
+            args.esmfold2_one_step_truncated_schedule_mode
+        ),
+        one_step_diffusion_truncated_dense_num_sampling_steps=(
+            args.esmfold2_one_step_truncated_dense_num_sampling_steps
         ),
         one_step_diffusion_weight=args.esmfold2_one_step_diffusion_weight,
         one_step_diffusion_rg_weight=(
@@ -460,6 +488,20 @@ def load_esmfold2_backend(
             None
             if mutable_mask is None
             else tuple(bool(value) for value in mutable_mask)
+        ),
+        template_structure_path=args.target_template_path,
+        template_chain_ids=(
+            None if template_chain_ids is None else tuple(template_chain_ids)
+        ),
+        template_chain_sequences=(
+            None
+            if template_chain_sequences is None
+            else tuple(template_chain_sequences)
+        ),
+        binder_structure_regeneration_mask=(
+            None
+            if structure_regeneration_mask is None
+            else tuple(bool(value) for value in structure_regeneration_mask)
         ),
     )
     return ESMFold2RuntimeBackend(
@@ -728,6 +770,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--esmfold2_mutable_mask", type=str, default=None,
                        help="ESMFold2 可变位点 mask；长度需等于 binder_length，支持 01101 或 0,1,1,true")
     parser.add_argument(
+        "--esmfold2_structure_regeneration_mask",
+        type=str,
+        default=None,
+        help=(
+            "template-anchored 局部结构重预测 mask；长度需等于 binder_length。"
+            "第一版 TCR CDR 使用与 mutable mask 相同的区间"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_template_chain_ids",
+        type=str,
+        default=None,
+        help=(
+            "外部复合物模板 chain ID，顺序必须与 --target 各链再加 binder 一致；"
+            "例如 C,A,E,D"
+        ),
+    )
+    parser.add_argument(
         "--esmfold2_target_chain_roles",
         type=str,
         default=None,
@@ -811,11 +871,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--esmfold2_one_step_diffusion_mode",
-        choices=("reference_noising", "truncated_trajectory"),
+        choices=(
+            "reference_noising",
+            "truncated_trajectory",
+            "template_anchored_truncated_trajectory",
+        ),
         default="truncated_trajectory",
         help=(
             "One-step 坐标来源：reference_noising 使用 verifier 结构加噪；"
-            "truncated_trajectory 从标准高噪声初态无梯度采样到 tau"
+            "truncated_trajectory 从标准高噪声初态无梯度采样到 tau；"
+            "template_anchored_truncated_trajectory 在同一路径固定外部模板区域"
         ),
     )
     parser.add_argument(
@@ -831,6 +896,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "truncated_trajectory 构造官方 Karras schedule 的采样步数"
             "（默认：50）"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_one_step_truncated_schedule_mode",
+        choices=("official_clipped", "dense"),
+        default="official_clipped",
+        help=(
+            "截断扩散 schedule：official_clipped 使用官方完整 Karras schedule "
+            "在 sigma=256 截断；dense 直接在 sigma=256 到 tau 之间加密"
+        ),
+    )
+    parser.add_argument(
+        "--esmfold2_one_step_truncated_dense_num_sampling_steps",
+        type=int,
+        default=41,
+        help=(
+            "dense schedule 从 sigma=256 到 tau 的 sigma 点数；默认 41，"
+            "对应 40 次无梯度去噪和 1 次最终可微去噪"
         ),
     )
     parser.add_argument(
@@ -1407,6 +1490,9 @@ def main(argv=None):
             )
     esmfold2_mutable_mask = None
     esmfold2_target_chain_roles = None
+    esmfold2_structure_regeneration_mask = None
+    esmfold2_template_chain_ids = None
+    esmfold2_template_chain_sequences = None
     if model_backend == "esmfold2":
         esmfold2_mutable_mask = parse_esmfold2_mutable_mask(
             args.esmfold2_mutable_mask,
@@ -1420,6 +1506,53 @@ def main(argv=None):
             ),
             parser=parser,
         )
+        esmfold2_structure_regeneration_mask = parse_esmfold2_mutable_mask(
+            args.esmfold2_structure_regeneration_mask,
+            args.binder_length,
+            parser,
+            option_name="--esmfold2_structure_regeneration_mask",
+        )
+        try:
+            esmfold2_template_chain_ids = parse_esmfold2_template_chain_ids(
+                args.esmfold2_template_chain_ids
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.esmfold2_one_step_diffusion_mode == (
+            "template_anchored_truncated_trajectory"
+        ):
+            target_sequences = tuple(
+                part.strip().upper()
+                for part in str(args.target).split("|")
+                if part.strip()
+            )
+            if args.init_binder_seq is None:
+                parser.error(
+                    "template-anchored diffusion requires --init_binder_seq"
+                )
+            if not args.target_template_path:
+                parser.error(
+                    "template-anchored diffusion requires --target_template_path"
+                )
+            if esmfold2_template_chain_ids is None:
+                parser.error(
+                    "template-anchored diffusion requires "
+                    "--esmfold2_template_chain_ids"
+                )
+            if len(esmfold2_template_chain_ids) != len(target_sequences) + 1:
+                parser.error(
+                    "--esmfold2_template_chain_ids 数量必须等于 --target 链数加 "
+                    "binder 链"
+                )
+            if esmfold2_structure_regeneration_mask is None:
+                parser.error(
+                    "template-anchored diffusion requires "
+                    "--esmfold2_structure_regeneration_mask"
+                )
+            esmfold2_template_chain_sequences = (
+                *target_sequences,
+                args.init_binder_seq,
+            )
 
     hotspot_params = _build_hotspot_params(args, parser)
     resolve_esmfold2_hotspot_defaults(
@@ -1508,6 +1641,23 @@ def main(argv=None):
     ):
         parser.error(
             "--esmfold2_one_step_truncated_num_sampling_steps must be greater than 1"
+        )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_one_step_truncated_dense_num_sampling_steps <= 1
+    ):
+        parser.error(
+            "--esmfold2_one_step_truncated_dense_num_sampling_steps must be "
+            "greater than 1"
+        )
+    if (
+        model_backend == "esmfold2"
+        and args.esmfold2_one_step_truncated_schedule_mode != "official_clipped"
+        and args.esmfold2_one_step_diffusion_mode == "reference_noising"
+    ):
+        parser.error(
+            "--esmfold2_one_step_truncated_schedule_mode only applies to "
+            "truncated trajectory modes"
         )
     if (
         model_backend == "esmfold2"
@@ -1611,10 +1761,20 @@ def main(argv=None):
             ),
         )
     if model_backend == "esmfold2" and args.target_template_path:
-        logging.info(
-            "ESMFold2 backend received target_template_path but does not use templates yet: %s",
-            args.target_template_path,
-        )
+        if args.esmfold2_one_step_diffusion_mode == (
+            "template_anchored_truncated_trajectory"
+        ):
+            logging.info(
+                "ESMFold2 template-anchored local redesign enabled: template=%s "
+                "chains=%s",
+                args.target_template_path,
+                esmfold2_template_chain_ids,
+            )
+        else:
+            logging.info(
+                "ESMFold2 backend received target_template_path but does not use templates yet: %s",
+                args.target_template_path,
+            )
 
     model = None
     configs = None
@@ -1632,6 +1792,11 @@ def main(argv=None):
             device=args.device,
             mutable_mask=esmfold2_mutable_mask,
             target_chain_roles=esmfold2_target_chain_roles,
+            structure_regeneration_mask=(
+                esmfold2_structure_regeneration_mask
+            ),
+            template_chain_ids=esmfold2_template_chain_ids,
+            template_chain_sequences=esmfold2_template_chain_sequences,
         )
 
     # 组装 loss_weights: default 不覆盖；非 default preset 覆盖整套权重。
@@ -2018,6 +2183,14 @@ def main(argv=None):
                 "ESMFold2 Target Chain Roles: "
                 f"{args.esmfold2_target_chain_roles or 'ALL_TARGET'}\n"
             )
+            f.write(
+                "ESMFold2 Structure Regeneration Mask: "
+                f"{args.esmfold2_structure_regeneration_mask or 'NONE'}\n"
+            )
+            f.write(
+                "ESMFold2 Template Chain IDs: "
+                f"{args.esmfold2_template_chain_ids or 'NONE'}\n"
+            )
             f.write(f"ESMFold2 Stage A Handoff Checkpoint Interval: {args.esmfold2_stagea_handoff_checkpoint_interval}\n")
             f.write(f"ESMFold2 Resume Handoff Checkpoint: {args.esmfold2_resume_handoff_checkpoint or 'NONE'}\n")
             f.write(f"ESMFold2 Resume Reverify Roots: {args.esmfold2_resume_reverify_roots}\n")
@@ -2051,6 +2224,14 @@ def main(argv=None):
             f.write(
                 "ESMFold2 One-step Truncated Sampling Steps: "
                 f"{args.esmfold2_one_step_truncated_num_sampling_steps}\n"
+            )
+            f.write(
+                "ESMFold2 One-step Truncated Schedule Mode: "
+                f"{args.esmfold2_one_step_truncated_schedule_mode}\n"
+            )
+            f.write(
+                "ESMFold2 One-step Truncated Dense Sampling Steps: "
+                f"{args.esmfold2_one_step_truncated_dense_num_sampling_steps}\n"
             )
             f.write(
                 "ESMFold2 One-step Diffusion Weight: "

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run sequence-only ESMFold2 CDR redesign from the four-case YAML format."""
+"""Run single-chain ESMFold2 redesign from a motif or explicit sequence regions."""
 
 from __future__ import annotations
 
@@ -129,6 +129,27 @@ def build_hallucination_command(
             str(case_dir / "run.log"),
         ]
     )
+    one_step_mode = str(
+        config.get("esmfold2_one_step_diffusion_mode", "truncated_trajectory")
+    ).strip().lower()
+    if one_step_mode == "template_anchored_truncated_trajectory":
+        from bindcraft.hallucination.esmfold2_template import validate_structure_regeneration_mask
+
+        if case.template_path is None:
+            raise ValueError(
+                f"{case.case_id}: template-anchored mode requires template_path"
+            )
+        validate_structure_regeneration_mask(case.mutable_mask)
+        command.extend(
+            [
+                "--target_template_path",
+                case.template_path,
+                "--esmfold2_template_chain_ids",
+                case.template_chain_ids_argument,
+                "--esmfold2_structure_regeneration_mask",
+                case.mutable_mask_argument,
+            ]
+        )
     option_map = {
         "device": "device",
         "n_steps": "n_steps",
@@ -205,6 +226,12 @@ def build_hallucination_command(
         "esmfold2_one_step_truncated_num_sampling_steps": (
             "esmfold2_one_step_truncated_num_sampling_steps"
         ),
+        "esmfold2_one_step_truncated_schedule_mode": (
+            "esmfold2_one_step_truncated_schedule_mode"
+        ),
+        "esmfold2_one_step_truncated_dense_num_sampling_steps": (
+            "esmfold2_one_step_truncated_dense_num_sampling_steps"
+        ),
         "esmfold2_one_step_diffusion_weight": "esmfold2_one_step_diffusion_weight",
         "esmfold2_one_step_diffusion_rg_weight": "esmfold2_one_step_diffusion_rg_weight",
         "esmfold2_one_step_diffusion_interval": "esmfold2_one_step_diffusion_interval",
@@ -239,6 +266,8 @@ def build_hallucination_command(
             "esmfold2_hotspot_verify_too_close_weight"
         ),
         "checkpoint_save_policy": "checkpoint_save_policy",
+        "esmfold2_save_verified_candidate_cif": "esmfold2_save_verified_candidate_cif",
+        "esmfold2_save_visualization_trace": "esmfold2_save_visualization_trace",
     }
     for config_key, cli_name in option_map.items():
         _append_cli_argument(command, cli_name, config.get(config_key))
@@ -270,13 +299,29 @@ def write_case_record(
         shlex.join(list(command)) + "\n",
         encoding="utf-8",
     )
+    one_step_mode = str(
+        config.get("esmfold2_one_step_diffusion_mode", "truncated_trajectory")
+    ).strip().lower()
+    template_anchored = one_step_mode == (
+        "template_anchored_truncated_trajectory"
+    )
     provenance = {
         "model_backend": "esmfold2",
         "task_type": "cdr_redesign",
         "launch_profile": config.get("launch_profile"),
-        "structure_condition": "sequence_only",
+        "structure_condition": (
+            "external_complex_template_noise_consistent_clamp"
+            if template_anchored
+            else "sequence_only"
+        ),
         "template_path": case.template_path,
-        "template_usage": "recorded_only_not_consumed_by_esmfold2",
+        "template_usage": (
+            "target_and_partner_all_atom_binder_framework_backbone"
+            if template_anchored
+            else "recorded_only_not_consumed_by_esmfold2"
+        ),
+        "template_chain_ids": list(case.template_chain_ids),
+        "structure_regeneration_mask": case.mutable_mask_argument,
         "config_path": config["config_path"],
         "target_chain_roles": list(case.target_chain_roles),
         "mutable_residue_count": sum(case.mutable_mask),

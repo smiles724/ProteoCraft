@@ -11,7 +11,7 @@ import math
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
@@ -139,8 +139,8 @@ def evaluate(
     targets = parse_target_sequences(target_seq)
     roles = parse_target_chain_roles(target_chain_roles, len(targets))
     hotspots = parse_hotspot_indices(hotspot_indices)
-    previous_roles = backend.config.target_chain_roles
-    backend.config.target_chain_roles = roles
+    previous_config = backend.config
+    backend.config = replace(previous_config, target_chain_roles=roles)
     try:
         started = time.perf_counter()
         result = backend.verify(
@@ -153,7 +153,7 @@ def evaluate(
         )
         runtime_s = time.perf_counter() - started
     finally:
-        backend.config.target_chain_roles = previous_roles
+        backend.config = previous_config
 
     mmcif = result.summary_confidence.get("mmcif")
     if not isinstance(mmcif, str) or not mmcif.strip():

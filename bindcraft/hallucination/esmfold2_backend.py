@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Iterator, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
@@ -61,6 +62,7 @@ class ESMFold2ProposalConfig:
     verifier_model_name: str = "biohub/ESMFold2"
     verifier_num_loops: int = 20
     verifier_num_sampling_steps: int = 200
+    verifier_structure_mode: str = "sequence_only"
     soft_steps: int = 30
     learning_rate: float = 0.05
     temperature_min: float = 1e-2
@@ -78,6 +80,8 @@ class ESMFold2ProposalConfig:
     one_step_diffusion_mode: str = "truncated_trajectory"
     one_step_diffusion_tau: float = 1.0
     one_step_diffusion_truncated_num_sampling_steps: int = 50
+    one_step_diffusion_truncated_schedule_mode: str = "official_clipped"
+    one_step_diffusion_truncated_dense_num_sampling_steps: int = 41
     one_step_diffusion_weight: float = 0.25
     one_step_diffusion_rg_weight: float = 0.1
     one_step_diffusion_interval: int = 5
@@ -104,12 +108,22 @@ class ESMFold2ProposalConfig:
     proposal_confidence_tail_steps: int = 0
     target_chain_roles: Optional[Tuple[str, ...]] = None
     binder_mutable_mask: Optional[Tuple[bool, ...]] = None
+    template_structure_path: Optional[str] = None
+    template_chain_ids: Optional[Tuple[str, ...]] = None
+    template_chain_sequences: Optional[Tuple[str, ...]] = None
+    binder_structure_regeneration_mask: Optional[Tuple[bool, ...]] = None
 
     def __post_init__(self) -> None:
         if int(self.verifier_num_loops) <= 0:
             raise ValueError("verifier_num_loops must be positive")
         if int(self.verifier_num_sampling_steps) <= 0:
             raise ValueError("verifier_num_sampling_steps must be positive")
+        verifier_structure_mode = str(self.verifier_structure_mode).strip().lower()
+        if verifier_structure_mode not in {"sequence_only", "scaffold_consistency"}:
+            raise ValueError(
+                "verifier_structure_mode must be 'sequence_only' or "
+                "'scaffold_consistency'"
+            )
         if int(self.soft_steps) <= 0:
             raise ValueError("soft_steps must be positive")
         if float(self.learning_rate) <= 0.0:
@@ -176,14 +190,43 @@ class ESMFold2ProposalConfig:
         if float(self.one_step_diffusion_tau) <= 0.0:
             raise ValueError("one_step_diffusion_tau must be positive")
         one_step_mode = str(self.one_step_diffusion_mode).strip().lower()
-        if one_step_mode not in {"reference_noising", "truncated_trajectory"}:
+        supported_one_step_modes = {
+            "reference_noising",
+            "truncated_trajectory",
+            "template_anchored_truncated_trajectory",
+        }
+        if one_step_mode not in supported_one_step_modes:
             raise ValueError(
                 "one_step_diffusion_mode must be 'reference_noising' or "
-                "'truncated_trajectory'"
+                "'truncated_trajectory' or "
+                "'template_anchored_truncated_trajectory'"
             )
         if int(self.one_step_diffusion_truncated_num_sampling_steps) <= 1:
             raise ValueError(
                 "one_step_diffusion_truncated_num_sampling_steps must be greater than 1"
+            )
+        truncated_schedule_mode = str(
+            self.one_step_diffusion_truncated_schedule_mode
+        ).strip().lower()
+        if truncated_schedule_mode not in {"official_clipped", "dense"}:
+            raise ValueError(
+                "one_step_diffusion_truncated_schedule_mode must be "
+                "'official_clipped' or 'dense'"
+            )
+        if int(
+            self.one_step_diffusion_truncated_dense_num_sampling_steps
+        ) <= 1:
+            raise ValueError(
+                "one_step_diffusion_truncated_dense_num_sampling_steps must be "
+                "greater than 1"
+            )
+        if (
+            truncated_schedule_mode != "official_clipped"
+            and one_step_mode == "reference_noising"
+        ):
+            raise ValueError(
+                "one_step_diffusion_truncated_schedule_mode only applies to "
+                "truncated trajectory modes"
             )
         if float(self.one_step_diffusion_weight) < 0.0:
             raise ValueError("one_step_diffusion_weight must be non-negative")
@@ -259,6 +302,63 @@ class ESMFold2ProposalConfig:
                 raise ValueError("binder_mutable_mask cannot be empty")
             if not any(mutable_mask):
                 raise ValueError("binder_mutable_mask must select at least one residue")
+        if (
+            one_step_mode == "template_anchored_truncated_trajectory"
+            or verifier_structure_mode == "scaffold_consistency"
+        ):
+            from bindcraft.hallucination.esmfold2_template import (
+                validate_structure_regeneration_mask,
+            )
+
+            if not self.template_structure_path:
+                raise ValueError(
+                    "template-anchored mode requires template_structure_path"
+                )
+            template_path = Path(self.template_structure_path).expanduser()
+            if not template_path.is_file():
+                raise ValueError(
+                    f"template_structure_path does not exist: {template_path}"
+                )
+            if not self.template_chain_ids or not self.template_chain_sequences:
+                raise ValueError(
+                    "template-anchored mode requires template chain ids and "
+                    "reference sequences"
+                )
+            if len(self.template_chain_ids) != len(self.template_chain_sequences):
+                raise ValueError(
+                    "template_chain_ids and template_chain_sequences must match"
+                )
+            if len(set(self.template_chain_ids)) != len(self.template_chain_ids):
+                raise ValueError("template_chain_ids must be unique")
+            if self.binder_structure_regeneration_mask is None:
+                raise ValueError(
+                    "template-anchored mode requires "
+                    "binder_structure_regeneration_mask"
+                )
+            structure_mask = validate_structure_regeneration_mask(
+                self.binder_structure_regeneration_mask
+            )
+            if len(structure_mask) != len(self.template_chain_sequences[-1]):
+                raise ValueError(
+                    "binder_structure_regeneration_mask length must match the "
+                    "template binder sequence"
+                )
+            if (
+                self.binder_mutable_mask is not None
+                and len(self.binder_mutable_mask) != len(structure_mask)
+            ):
+                raise ValueError(
+                    "binder mutable and structure-regeneration masks must have "
+                    "the same length"
+                )
+            if self.binder_mutable_mask is not None and any(
+                bool(is_mutable) and not structure_mask[index]
+                for index, is_mutable in enumerate(self.binder_mutable_mask)
+            ):
+                raise ValueError(
+                    "binder_structure_regeneration_mask must include every "
+                    "mutable residue"
+                )
 
 
 @dataclass

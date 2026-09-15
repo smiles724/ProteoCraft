@@ -294,6 +294,7 @@ def test_runtime_verifier_extracts_pair_chain_metrics_and_mmcif():
     assert result.loss_dict["binder_confidence_loss"] == pytest.approx(0.2)
     assert result.loss_dict["binder_rg_excess_loss"] == pytest.approx(0.0)
     assert result.summary_confidence["mmcif"] == "data_fake\n"
+    assert "verifier_structure_mode" not in result.summary_confidence
 
     _, input_spec, kwargs = builder.calls[0]
     assert [seq.id for seq in input_spec.sequences] == ["A", "B"]
@@ -301,6 +302,49 @@ def test_runtime_verifier_extracts_pair_chain_metrics_and_mmcif():
     assert kwargs["seed"] == 7
     assert kwargs["num_loops"] == backend.verifier_num_loops
     assert kwargs["num_sampling_steps"] == backend.verifier_num_sampling_steps
+
+
+def test_scaffold_consistency_verifier_requires_explicit_opt_in():
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(),
+        device="cpu",
+        verifier_model=object(),
+        input_builder=FakeInputBuilder(),
+        protein_input_cls=FakeProteinInput,
+        structure_prediction_input_cls=FakeStructurePredictionInput,
+    )
+
+    with pytest.raises(ValueError, match="verifier_structure_mode"):
+        backend.verify_scaffold_consistency(
+            binder_seq="YYY",
+            target_seq="AAAA",
+            seed=7,
+        )
+
+
+def test_scaffold_consistency_sampler_restores_standard_sampler_after_use():
+    class FakeStructureHead:
+        def sample(self, **kwargs):
+            return {"sample_atom_coords": kwargs["ref_pos"]}
+
+    class FakeVerifierModel:
+        def __init__(self):
+            self.structure_head = FakeStructureHead()
+
+    model = FakeVerifierModel()
+    original = model.structure_head.sample
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(),
+        device="cpu",
+        verifier_model=model,
+    )
+    with backend._temporary_scaffold_consistency_sampler(
+        template_coordinates=torch.zeros(1, 3, 3),
+        fixed_atom_mask=torch.tensor([[True, False, True]]),
+    ):
+        assert model.structure_head.sample.__func__ is not original.__func__
+
+    assert model.structure_head.sample.__func__ is original.__func__
 
 
 def test_runtime_verifier_uses_modern_to_mmcif_api():
@@ -891,6 +935,8 @@ def test_runtime_schedules_and_recycles_interval_one_step_coordinates(monkeypatc
             ),
             "features": {"marker": torch.tensor(float(call_index))},
             "reference_rmsd": torch.tensor(0.25),
+            "gradient_norm": 1.0,
+            "mutable_gradient_norm": 1.0,
         }
 
     monkeypatch.setattr(backend, "_fold_distogram", fake_fold_distogram)

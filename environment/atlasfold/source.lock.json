@@ -1,0 +1,13 @@
+{
+  "upstream_url": "https://github.com/SeonghwanSeo/atlasfold.git",
+  "upstream_tag": "v1.0.2",
+  "upstream_commit": "444f376d85b9954a5f2f5f3f8b3cbcae1201ebb1",
+  "python_package_version": "1.0.2",
+  "multimer_model": "SeonghwanSeo/atlasfold-m-260725",
+  "multimer_model_revision": "a9f07668b7ef544d4470795ef03aa492f243a461",
+  "multimer_weight_path": "weights/atlasfold-m-260725.pth",
+  "language_model": "SeonghwanSeo/atlaslm-3b-base",
+  "language_model_revision": "b4e6d8abb92d3432e3a65d37f1cfafc18575f78e",
+  "language_model_weight_path": "weights/atlaslm_3b_base.pth",
+  "weight_revision_policy": "Use download_models.py and retain its receipt before a formal run"
+}

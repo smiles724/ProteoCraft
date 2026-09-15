@@ -55,6 +55,15 @@ configs/proteocraft_profiles/esmfold2_d.yaml
 
 命令行中显式提供的参数会覆盖 profile。例如，如果希望整次搜索使用更高精度的 full verifier，可以显式使用 `--esmfold2_verifier_num_loops 20 --esmfold2_verifier_num_sampling_steps 200`。只对最终候选进行高精度复评时，应在搜索结束后单独运行统一的 20 x 200 rescoring，而不是修改搜索期默认值。
 
+加密的 truncated diffusion schedule 是一个可选项，不改变默认 profile：
+
+```bash
+--esmfold2_one_step_truncated_schedule_mode dense \
+--esmfold2_one_step_truncated_dense_num_sampling_steps 41
+```
+
+该设置保持 `max_sigma=256` 和 `tau=1` 不变，在两者之间直接构造 41 个 Karras sigma 点，对应 40 次无梯度去噪和最后 1 次可微去噪。默认的 `official_clipped` 仍使用官方 50-step schedule 并在 `sigma=256` 截断。
+
 ## 2. De novo Binder Design
 
 给定固定 target sequence，从头设计一条新的 binder。Binder 的全部位置默认可变。
@@ -132,6 +141,74 @@ python benchmark/script/run_esmfold2_cdr_redesign.py \
 
 该 YAML 已直接引用仓库内
 `benchmark/datasets/proteocraft_59_v1/cdr/` 的 4 个 benchmark case，无需另行准备输入。当前 ESMFold2 主流程是 sequence-only；template path 只记录数据来源并用于后续评价，不作为模型输入。
+
+### 指定多个重设计区域
+
+同一批量入口也支持单条 Fab 重链或轻链的多区域 redesign，不需要新增搜索模式。
+在 case 中用 `redesign_regions` 替代 `cdr_motif`，例如 PRAME HU-38 重链：
+
+```yaml
+id: PRAME_HU38_heavy_allcdr
+fasta_path: PRAME_HU38.fasta
+binder_chain: D
+target_chains: [C]
+scaffold_chains: [A, B, E]
+redesign_regions:
+  - [26, 33]
+  - [51, 57]
+  - [96, 107]
+```
+
+上述链名须对应输入 FASTA 的 `|Chain X|`；示例中 A/B/C/D/E 分别是 HLA、beta2m、肽、重链、轻链。
+区间是完整输入链的 **1-based、两端包含** 的序列位置，不是 PDB author 或 IMGT 编号。
+每个 case 必须且只能填写 `cdr_motif`、`redesign_regions` 之一；旧配置不需要修改。
+多个区间取并集，区间之间的 framework 和其他链的序列不变，不支持长度变化或重、轻链同时联合优化。
+输出 `case_spec.json` 记录各区间、原始片段和实际 mask；多区间的旧式单段起止字段为 `null`。
+
+默认仍为 sequence-only；序列固定不表示坐标固定。显式选择下述 template 模式时，
+批量入口使用上述区间并集作为 structure-regeneration mask，每个连续区间两侧需至少两个固定 framework 位点。
+序列 mask 与结构 mask 是不同概念；底层 CLI 保留各自独立的参数，本批量入口默认使用同一组区间。
+VHH 的专用入口与 IMGT all-CDR 校验保持不变。
+
+### 4.1 实验性 Template-Anchored 局部 Redesign
+
+`template_anchored_truncated_trajectory` 是独立实验模式，不替换上述默认配置。target 与未重设计 partner 使用 all-atom clamp，被重设计链的 framework 仅固定 `N/CA/C/O`，指定 redesign 区间的结构重新生成。外部模板在截断扩散轨迹中使用 noise-consistent clamp；Full Verifier 仍为 sequence-only 独立预测。
+
+在自己的 CDR YAML 配置中设置 `esmfold2_one_step_diffusion_mode: template_anchored_truncated_trajectory`，并为 case 提供 `template_path`。下面的配置路径和 case ID 需替换为自己的输入：
+
+```bash
+python benchmark/script/run_esmfold2_cdr_redesign.py \
+  --config /path/to/cdr_cases.yaml \
+  --case YOUR_CASE_ID \
+  --device cuda:0
+```
+
+该模式要求显式提供完整复合物 template、与模型输入顺序一致的 chain IDs，以及独立的 structure regeneration mask。部署到新环境后，正式使用前应先验证单个 case。
+
+### 4.2 Scaffold-consistency Verifier
+
+`scaffold_consistency` 是与 sequence-only Full Verifier 并列的**后处理复评模式**。它不替换默认 `verify()`，也不进入 MCTS 的候选选择。该模式在标准 ESMFold2 的完整 diffusion 轨迹中固定 target/context 的 all-atom 坐标与被 redesign binder 的 framework `N/CA/C/O`，同时允许 CDR 的全部原子重新生成；随后由同一个标准 confidence head 对该 constrained complex 打分。
+
+使用时必须显式构造带 template contract 的 `ESMFold2ProposalConfig`，并调用 `verify_scaffold_consistency()`：
+
+```python
+config = ESMFold2ProposalConfig(
+    verifier_structure_mode="scaffold_consistency",
+    verifier_num_loops=20,
+    verifier_num_sampling_steps=200,
+    template_structure_path="benchmark/datasets/.../template.cif",
+    template_chain_ids=("C", "A", "E", "D"),
+    template_chain_sequences=(target, partner_alpha, partner_beta, binder_template),
+    binder_structure_regeneration_mask=cdr_mask,
+)
+result = backend.verify_scaffold_consistency(
+    binder_seq=designed_cdr_sequence,
+    target_seq=(target, partner_alpha, partner_beta),
+    seed=43,
+)
+```
+
+输出保留正常的 `pair_chain_iptm` 等完整 verifier 字段，并另外记录 `scaffold_consistency_*` 指标、template mapping report 与 `scaffold_consistency_final_fixed_atom_rmsd`。该分数用于回答“在 template scaffold 下该 redesigned CDR 是否仍保持高置信度”，不能替代 sequence-only 的独立复评。
 
 ## 5. VHH All-CDR Redesign
 

@@ -15,6 +15,7 @@ import inspect
 import random
 from contextlib import contextmanager
 from functools import lru_cache
+from types import MethodType
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
@@ -47,8 +48,11 @@ from bindcraft.hallucination.esmfold2_one_step import (
     compute_esmfold2_common_losses,
     remap_reference_coordinates,
     run_esmfold2_one_step_diffusion,
+    run_esmfold2_scaffold_consistency_diffusion,
+    run_esmfold2_template_anchored_truncated_diffusion,
     run_esmfold2_truncated_diffusion,
 )
+from bindcraft.hallucination.esmfold2_template import build_template_clamp
 
 
 logger = logging.getLogger(__name__)
@@ -935,41 +939,145 @@ class ESMFold2RuntimeBackend:
             for name in required
         }
 
-    def verify(
+    @contextmanager
+    def _temporary_scaffold_consistency_sampler(
+        self,
+        *,
+        template_coordinates: torch.Tensor,
+        fixed_atom_mask: torch.Tensor,
+    ):
+        """Temporarily replace only the standard verifier sampling call.
+
+        ``ESMFold2Model.forward`` owns trunk and confidence evaluation.  This
+        narrow override changes only its diffusion sampler for the duration of
+        one explicit scaffold-consistency verification and is restored even if
+        the model raises.
+        """
+
+        structure_head = self.verifier_model.structure_head
+        original_sample = structure_head.sample
+        sample_trace: dict[str, torch.Tensor] = {}
+
+        def scaffold_sample(
+            _head: Any,
+            **kwargs: Any,
+        ) -> dict[str, torch.Tensor | None]:
+            unsupported = {
+                "return_atom_repr",
+                "denoising_early_exit_rmsd",
+                "use_inference_cache",
+                "noise_scale",
+                "step_scale",
+            }
+            sample_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key not in unsupported
+            }
+            result = run_esmfold2_scaffold_consistency_diffusion(
+                structure_head=_head,
+                template_coordinates=template_coordinates,
+                fixed_atom_mask=fixed_atom_mask,
+                **sample_kwargs,
+            )
+            sample_trace["template_coordinates"] = result[
+                "scaffold_template_coordinates"
+            ].detach()
+            sample_trace["fixed_atom_mask"] = result["fixed_atom_mask"].detach()
+            return result
+
+        structure_head.sample = MethodType(scaffold_sample, structure_head)
+        try:
+            yield sample_trace
+        finally:
+            structure_head.sample = original_sample
+
+    def _fold_scaffold_consistency_verifier_with_raw_output(
+        self,
+        input_spec: Any,
+        *,
+        seed: Optional[int],
+    ) -> tuple[
+        Any,
+        dict[str, torch.Tensor],
+        dict[str, torch.Tensor],
+        Mapping[str, Any],
+    ]:
+        """Run an explicit full verifier with a template-consistent scaffold."""
+
+        from esm.models.esmfold2.processor import _lm_dropout_context
+
+        features, chain_infos = self.input_builder.prepare_input(
+            input_spec,
+            seed=seed,
+            device=self.verifier_model.device,
+        )
+        template_clamp = build_template_clamp(
+            features=features,
+            template_path=str(self.config.template_structure_path),
+            template_chain_ids=self.config.template_chain_ids or (),
+            template_chain_sequences=self.config.template_chain_sequences or (),
+            binder_structure_regeneration_mask=(
+                self.config.binder_structure_regeneration_mask or ()
+            ),
+        )
+        with torch.no_grad(), _seed_context(seed), _lm_dropout_context(
+            self.verifier_model,
+            0.3,
+        ), self._temporary_scaffold_consistency_sampler(
+            template_coordinates=template_clamp.coordinates,
+            fixed_atom_mask=template_clamp.fixed_atom_mask,
+        ) as sample_trace:
+            output = self.verifier_model(
+                **features,
+                num_loops=self.verifier_num_loops,
+                num_sampling_steps=self.verifier_num_sampling_steps,
+                num_diffusion_samples=1,
+                early_exit=False,
+                msa_max_depth=1024,
+                msa_column_mask_rate=0.1,
+                msa_subsample_at_inference=True,
+            )
+        if not sample_trace:
+            raise RuntimeError("scaffold-consistency sampler did not run")
+        predicted = _first_coordinate_sample(output["sample_atom_coords"])
+        template_final = _first_coordinate_sample(
+            sample_trace["template_coordinates"]
+        ).to(device=predicted.device, dtype=predicted.dtype)
+        fixed_mask = sample_trace["fixed_atom_mask"]
+        if fixed_mask.ndim == 2:
+            fixed_mask = fixed_mask[0]
+        fixed_mask = fixed_mask.to(device=predicted.device, dtype=torch.bool)
+        fixed_delta = predicted[fixed_mask] - template_final[fixed_mask]
+        template_report = dict(template_clamp.report)
+        template_report["final_fixed_atom_rmsd"] = float(
+            fixed_delta.pow(2).sum(dim=-1).mean().sqrt().item()
+        )
+        fold_result = self.input_builder.decode(
+            output,
+            features,
+            chain_infos,
+            num_diffusion_samples=1,
+            complex_id="esmfold2_scaffold_consistency",
+        )
+        return fold_result, features, output, template_report
+
+    def _build_verifier_result_from_fold(
         self,
         *,
         binder_seq: str,
         target_seq: Union[str, Sequence[str]],
-        seed: Optional[int] = None,
-        hotspot_params: Optional[Dict[str, Any]] = None,
+        targets: Sequence[str],
+        target_chain_roles: Sequence[str],
+        hotspot_params: Optional[Dict[str, Any]],
+        fold_result: Any,
+        raw_features: Optional[dict[str, torch.Tensor]] = None,
+        raw_output: Optional[dict[str, torch.Tensor]] = None,
+        structure_mode: str = "sequence_only",
+        template_report: Optional[Mapping[str, Any]] = None,
     ):
-        self._ensure_verifier_loaded()
-        targets = _target_sequences(target_seq)
-        target_chain_roles = _normalize_target_chain_roles(
-            self.config.target_chain_roles,
-            n_target_chains=len(targets),
-        )
-        input_spec = self._build_structure_input(targets, binder_seq)
-        verifier_loss_mode = str(self.config.verifier_loss_mode).strip().lower()
-        raw_features: Optional[dict[str, torch.Tensor]] = None
-        raw_output: Optional[dict[str, torch.Tensor]] = None
-        if verifier_loss_mode == "aligned_common":
-            fold_result, raw_features, raw_output = (
-                self._fold_verifier_with_raw_output(
-                    input_spec,
-                    seed=seed,
-                )
-            )
-        else:
-            fold_result = self.input_builder.fold(
-                self.verifier_model,
-                input_spec,
-                num_loops=self.verifier_num_loops,
-                num_sampling_steps=self.verifier_num_sampling_steps,
-                num_diffusion_samples=1,
-                seed=seed,
-                complex_id="esmfold2_verify",
-            )
+        """Convert one decoded full-fold result into the stable verifier contract."""
+
         summary = self._summary_from_fold_result(
             fold_result,
             n_target_chains=len(targets),
@@ -981,6 +1089,28 @@ class ESMFold2RuntimeBackend:
                 binder_length=len(binder_seq),
             )
         )
+        if template_report is not None:
+            summary["verifier_structure_mode"] = str(structure_mode)
+            summary["scaffold_consistency_template_report"] = dict(template_report)
+            summary["scaffold_consistency_fixed_atom_count"] = int(
+                template_report.get("fixed_atom_count", 0)
+            )
+            if "final_fixed_atom_rmsd" in template_report:
+                summary["scaffold_consistency_final_fixed_atom_rmsd"] = float(
+                    template_report["final_fixed_atom_rmsd"]
+                )
+            for metric_name in (
+                "pair_chain_iptm",
+                "iptm",
+                "ptm",
+                "plddt",
+                "binder_plddt",
+            ):
+                if metric_name in summary:
+                    summary[f"scaffold_consistency_{metric_name}"] = summary[
+                        metric_name
+                    ]
+
         hotspot_verify_weight = float(self.config.hotspot_verify_weight)
         hotspot_too_close_weight = float(
             self.config.hotspot_verify_too_close_weight
@@ -1001,11 +1131,10 @@ class ESMFold2RuntimeBackend:
                 hotspot_params=hotspot_params,
                 near_cutoff=float(self.config.hotspot_verify_near_cutoff),
                 far_cutoff=float(self.config.hotspot_verify_far_cutoff),
-                min_safe_distance=float(
-                    self.config.hotspot_verify_min_distance
-                ),
+                min_safe_distance=float(self.config.hotspot_verify_min_distance),
             )
             summary.update(hotspot_metrics)
+
         coordinate = _fold_result_coordinates(fold_result)
         aligned_loss_dict = None
         raw_common_loss_dict: dict[str, float] = {}
@@ -1045,9 +1174,7 @@ class ESMFold2RuntimeBackend:
                 summary,
                 weights=ESMFOLD2_VERIFIER_LOSS_WEIGHTS,
             )
-            summary["esm_verify_loss_weights"] = dict(
-                ESMFOLD2_VERIFIER_LOSS_WEIGHTS
-            )
+            summary["esm_verify_loss_weights"] = dict(ESMFOLD2_VERIFIER_LOSS_WEIGHTS)
             summary["esm_verify_score_version"] = "bounded_pair_v1"
             summary["esm_verify_raw_common_loss"] = raw_common_loss_dict["total"]
             summary["esm_verify_raw_common_loss_weights"] = dict(
@@ -1074,11 +1201,104 @@ class ESMFold2RuntimeBackend:
             },
             hotspot_verify_loss=hotspot_metrics.get("hotspot_verify_distance_loss"),
             hotspot_verify_weight=hotspot_verify_weight,
-            hotspot_too_close_loss=hotspot_metrics.get(
-                "hotspot_too_close_loss"
-            ),
+            hotspot_too_close_loss=hotspot_metrics.get("hotspot_too_close_loss"),
             hotspot_too_close_weight=hotspot_too_close_weight,
             aligned_loss_dict=aligned_loss_dict,
+        )
+
+    def verify(
+        self,
+        *,
+        binder_seq: str,
+        target_seq: Union[str, Sequence[str]],
+        seed: Optional[int] = None,
+        hotspot_params: Optional[Dict[str, Any]] = None,
+    ):
+        self._ensure_verifier_loaded()
+        targets = _target_sequences(target_seq)
+        target_chain_roles = _normalize_target_chain_roles(
+            self.config.target_chain_roles,
+            n_target_chains=len(targets),
+        )
+        input_spec = self._build_structure_input(targets, binder_seq)
+        verifier_loss_mode = str(self.config.verifier_loss_mode).strip().lower()
+        raw_features: Optional[dict[str, torch.Tensor]] = None
+        raw_output: Optional[dict[str, torch.Tensor]] = None
+        if verifier_loss_mode == "aligned_common":
+            fold_result, raw_features, raw_output = (
+                self._fold_verifier_with_raw_output(
+                    input_spec,
+                    seed=seed,
+                )
+            )
+        else:
+            fold_result = self.input_builder.fold(
+                self.verifier_model,
+                input_spec,
+                num_loops=self.verifier_num_loops,
+                num_sampling_steps=self.verifier_num_sampling_steps,
+                num_diffusion_samples=1,
+                seed=seed,
+                complex_id="esmfold2_verify",
+            )
+        return self._build_verifier_result_from_fold(
+            binder_seq=binder_seq,
+            target_seq=target_seq,
+            targets=targets,
+            target_chain_roles=target_chain_roles,
+            hotspot_params=hotspot_params,
+            fold_result=fold_result,
+            raw_features=raw_features,
+            raw_output=raw_output,
+        )
+
+    def verify_scaffold_consistency(
+        self,
+        *,
+        binder_seq: str,
+        target_seq: Union[str, Sequence[str]],
+        seed: Optional[int] = None,
+        hotspot_params: Optional[Dict[str, Any]] = None,
+    ):
+        """Verify a local-redesign candidate with an anchored scaffold.
+
+        This is deliberately separate from :meth:`verify`: callers must opt in
+        through ``verifier_structure_mode='scaffold_consistency'`` and invoke
+        this method explicitly.  It is intended for post-hoc CDR/local-redesign
+        assessment, never for the default MCTS search cache.
+        """
+
+        if str(self.config.verifier_structure_mode).strip().lower() != (
+            "scaffold_consistency"
+        ):
+            raise ValueError(
+                "verify_scaffold_consistency requires "
+                "verifier_structure_mode='scaffold_consistency'"
+            )
+        self._ensure_verifier_loaded()
+        targets = _target_sequences(target_seq)
+        target_chain_roles = _normalize_target_chain_roles(
+            self.config.target_chain_roles,
+            n_target_chains=len(targets),
+        )
+        input_spec = self._build_structure_input(targets, binder_seq)
+        fold_result, raw_features, raw_output, template_report = (
+            self._fold_scaffold_consistency_verifier_with_raw_output(
+                input_spec,
+                seed=seed,
+            )
+        )
+        return self._build_verifier_result_from_fold(
+            binder_seq=binder_seq,
+            target_seq=target_seq,
+            targets=targets,
+            target_chain_roles=target_chain_roles,
+            hotspot_params=hotspot_params,
+            fold_result=fold_result,
+            raw_features=raw_features,
+            raw_output=raw_output,
+            structure_mode="scaffold_consistency",
+            template_report=template_report,
         )
 
     def propose(
@@ -1561,6 +1781,7 @@ class ESMFold2RuntimeBackend:
         effective_hotspot_weight: float,
     ) -> Dict[str, Any]:
         one_step_mode = str(self.config.one_step_diffusion_mode).strip().lower()
+        template_report: Optional[Mapping[str, Any]] = None
         if one_step_mode == "truncated_trajectory":
             one_step = run_esmfold2_truncated_diffusion(
                 model=self.experimental_model,
@@ -1571,9 +1792,45 @@ class ESMFold2RuntimeBackend:
                 num_sampling_steps=int(
                     self.config.one_step_diffusion_truncated_num_sampling_steps
                 ),
+                truncated_schedule_mode=str(
+                    self.config.one_step_diffusion_truncated_schedule_mode
+                ),
+                dense_num_sampling_steps=int(
+                    self.config.one_step_diffusion_truncated_dense_num_sampling_steps
+                ),
             )
             source_coordinates = one_step["source_coordinates"]
-        else:
+        elif one_step_mode == "template_anchored_truncated_trajectory":
+            template_clamp = build_template_clamp(
+                features=fold_result["_features"],
+                template_path=str(self.config.template_structure_path),
+                template_chain_ids=self.config.template_chain_ids or (),
+                template_chain_sequences=self.config.template_chain_sequences or (),
+                binder_structure_regeneration_mask=(
+                    self.config.binder_structure_regeneration_mask or ()
+                ),
+            )
+            one_step = run_esmfold2_template_anchored_truncated_diffusion(
+                model=self.experimental_model,
+                captured=fold_result["_captured"],
+                features=fold_result["_features"],
+                template_coordinates=template_clamp.coordinates,
+                fixed_atom_mask=template_clamp.fixed_atom_mask,
+                tau=float(self.config.one_step_diffusion_tau),
+                seed=diffusion_seed,
+                num_sampling_steps=int(
+                    self.config.one_step_diffusion_truncated_num_sampling_steps
+                ),
+                truncated_schedule_mode=str(
+                    self.config.one_step_diffusion_truncated_schedule_mode
+                ),
+                dense_num_sampling_steps=int(
+                    self.config.one_step_diffusion_truncated_dense_num_sampling_steps
+                ),
+            )
+            source_coordinates = one_step["template_coordinates"]
+            template_report = template_clamp.report
+        elif one_step_mode == "reference_noising":
             if reference_coordinates is None:
                 raise ValueError(
                     "reference_noising one-step diffusion requires verifier coordinates"
@@ -1599,6 +1856,8 @@ class ESMFold2RuntimeBackend:
                 seed=diffusion_seed,
             )
             source_coordinates = remapped_reference
+        else:
+            raise ValueError(f"Unsupported one-step diffusion mode: {one_step_mode}")
         diffusion_total, diffusion_losses = compute_esmfold2_common_losses(
             coordinates=one_step["coordinates"],
             plddt_logits=one_step["plddt_logits"],
@@ -1629,13 +1888,33 @@ class ESMFold2RuntimeBackend:
             hotspot_interface_mode=str(self.config.hotspot_interface_mode),
         )
         diffusion_grad = torch.autograd.grad(diffusion_total, logits)[0]
+        diffusion_grad_norm = float(diffusion_grad.detach().norm().item())
+        mutable_diffusion_grad_norm = diffusion_grad_norm
+        if mutable_mask is not None:
+            if diffusion_grad.ndim < 2 or diffusion_grad.shape[-2] != len(
+                mutable_mask
+            ):
+                raise ValueError(
+                    "one-step diffusion gradient does not match mutable mask"
+                )
+            mutable_selector = torch.as_tensor(
+                mutable_mask,
+                device=diffusion_grad.device,
+                dtype=diffusion_grad.dtype,
+            ).view(*((1,) * (diffusion_grad.ndim - 2)), -1, 1)
+            mutable_diffusion_grad_norm = float(
+                (diffusion_grad.detach() * mutable_selector).norm().item()
+            )
 
         denoised_sample = _first_coordinate_sample(one_step["coordinates"])
         reference_sample = _first_coordinate_sample(source_coordinates).to(
             device=denoised_sample.device,
             dtype=denoised_sample.dtype,
         )
-        atom_mask = fold_result["_features"]["atom_attention_mask"]
+        atom_mask = one_step.get(
+            "fixed_atom_mask",
+            fold_result["_features"]["atom_attention_mask"],
+        )
         if atom_mask.ndim > 1:
             atom_mask = atom_mask[0]
         atom_mask = atom_mask.to(device=denoised_sample.device).bool()
@@ -1646,7 +1925,7 @@ class ESMFold2RuntimeBackend:
             .sum(dim=-1)
             .mean()
         )
-        return {
+        result = {
             "gradient": diffusion_grad,
             "total": diffusion_total,
             "losses": diffusion_losses,
@@ -1655,7 +1934,17 @@ class ESMFold2RuntimeBackend:
             "reference_rmsd": coordinate_rmsd,
             "mode": one_step_mode,
             "truncated_steps": int(one_step.get("truncated_steps", 0)),
+            "truncated_schedule_mode": str(
+                self.config.one_step_diffusion_truncated_schedule_mode
+            ),
+            "gradient_norm": diffusion_grad_norm,
+            "mutable_gradient_norm": mutable_diffusion_grad_norm,
         }
+        if template_report is not None:
+            result["template_report"] = dict(template_report)
+            result["template_fixed_atom_count"] = int(atom_mask.sum().item())
+            result["template_fixed_rmsd"] = coordinate_rmsd
+        return result
 
     def _run_soft_update_impl(
         self,
@@ -2061,6 +2350,12 @@ class ESMFold2RuntimeBackend:
                         "one_step_diffusion_truncated_steps": int(
                             scheduled_one_step.get("truncated_steps", 0)
                         ),
+                        "one_step_diffusion_truncated_schedule_mode": str(
+                            scheduled_one_step.get(
+                                "truncated_schedule_mode",
+                                self.config.one_step_diffusion_truncated_schedule_mode,
+                            )
+                        ),
                         "one_step_diffusion_weight": float(
                             self.config.one_step_diffusion_weight
                         ),
@@ -2091,8 +2386,24 @@ class ESMFold2RuntimeBackend:
                         "one_step_diffusion_reference_rmsd": _as_float(
                             scheduled_one_step["reference_rmsd"]
                         ),
+                        "one_step_diffusion_gradient_norm": float(
+                            scheduled_one_step["gradient_norm"]
+                        ),
+                        "one_step_diffusion_mutable_gradient_norm": float(
+                            scheduled_one_step["mutable_gradient_norm"]
+                        ),
                     }
                 )
+                if scheduled_one_step.get("template_report") is not None:
+                    metrics["one_step_template_report"] = dict(
+                        scheduled_one_step["template_report"]
+                    )
+                    metrics["one_step_template_fixed_atom_count"] = int(
+                        scheduled_one_step["template_fixed_atom_count"]
+                    )
+                    metrics["one_step_template_fixed_rmsd"] = _as_float(
+                        scheduled_one_step["template_fixed_rmsd"]
+                    )
                 for name, value in scheduled_one_step["losses"].items():
                     metrics[f"diffusion_{name}_loss"] = _as_float(value)
                 if "rg" in scheduled_one_step["losses"]:
@@ -2222,6 +2533,12 @@ class ESMFold2RuntimeBackend:
                 "one_step_diffusion_truncated_steps": int(
                     one_step["truncated_steps"]
                 ),
+                "one_step_diffusion_truncated_schedule_mode": str(
+                    one_step.get(
+                        "truncated_schedule_mode",
+                        self.config.one_step_diffusion_truncated_schedule_mode,
+                    )
+                ),
                 "one_step_diffusion_weight": float(
                     self.config.one_step_diffusion_weight
                 ),
@@ -2247,6 +2564,15 @@ class ESMFold2RuntimeBackend:
                     effective_distogram_hotspot_weight
                 ),
                 "one_step_diffusion_loss": _as_float(diffusion_total),
+                "one_step_diffusion_reference_rmsd": _as_float(
+                    one_step["reference_rmsd"]
+                ),
+                "one_step_diffusion_gradient_norm": float(
+                    one_step["gradient_norm"]
+                ),
+                "one_step_diffusion_mutable_gradient_norm": float(
+                    one_step["mutable_gradient_norm"]
+                ),
                 "structure_total_loss": _as_float(losses["total_loss"]),
                 "backprop_loss": _as_float(structure_loss),
                 "plm_loss": None if esmc_loss is None else _as_float(esmc_loss),
@@ -2258,6 +2584,16 @@ class ESMFold2RuntimeBackend:
                 ),
                 "logits_snapshot": logits.detach().clone()[0].cpu(),
             }
+            if one_step.get("template_report") is not None:
+                one_step_metrics["one_step_template_report"] = dict(
+                    one_step["template_report"]
+                )
+                one_step_metrics["one_step_template_fixed_atom_count"] = int(
+                    one_step["template_fixed_atom_count"]
+                )
+                one_step_metrics["one_step_template_fixed_rmsd"] = _as_float(
+                    one_step["template_fixed_rmsd"]
+                )
             for name, value in diffusion_losses.items():
                 one_step_metrics[f"diffusion_{name}_loss"] = _as_float(value)
             if "rg" in diffusion_losses:

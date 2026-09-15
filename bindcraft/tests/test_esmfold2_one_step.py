@@ -9,6 +9,8 @@ from bindcraft.hallucination.esmfold2_one_step import (
     compute_esmfold2_bounded_verifier_losses,
     compute_esmfold2_common_losses,
     remap_reference_coordinates,
+    run_esmfold2_scaffold_consistency_diffusion,
+    run_esmfold2_template_anchored_truncated_diffusion,
     run_esmfold2_truncated_diffusion,
     scatter_reference_coordinates,
 )
@@ -605,6 +607,8 @@ class _FakeDiffusionModule(nn.Module):
 class _FakeStructureHead:
     def __init__(self):
         self.diffusion_module = _FakeDiffusionModule()
+        self.inference_num_steps = 4
+        self.inference_p = 7.0
         self.noise_scale = 1.0
         self.step_scale = 1.0
         self.gamma_min = 1000.0
@@ -682,3 +686,172 @@ def test_truncated_diffusion_reaches_tau_without_tracking_trajectory_gradients()
     result["coordinates"].sum().backward()
     assert z_trunk.grad is not None
     assert torch.isfinite(z_trunk.grad).all()
+
+
+def test_dense_truncated_schedule_preserves_start_and_adds_denoiser_calls():
+    model = _FakeExperimentalModel()
+    captured = {
+        "s_inputs": torch.randn(1, 2, 4, requires_grad=True),
+        "z_trunk": torch.randn(1, 2, 2, 3, requires_grad=True),
+        "relative_position_encoding": torch.zeros(1, 2, 2, 3),
+    }
+    observed: list[tuple[bool, torch.Tensor]] = []
+
+    def record_input(module, positional, keyword):
+        observed.append(
+            (torch.is_grad_enabled(), keyword["x_noisy"].detach().clone())
+        )
+
+    handle = model.structure_head.diffusion_module.register_forward_pre_hook(
+        record_input,
+        with_kwargs=True,
+    )
+    common = {
+        "model": model,
+        "captured": captured,
+        "features": _truncated_features(),
+        "tau": 2.0,
+        "seed": 7,
+        "num_sampling_steps": 4,
+        "max_inference_sigma": 10.0,
+    }
+    run_esmfold2_truncated_diffusion(**common)
+    official_first_input = observed[0][1]
+    observed.clear()
+
+    result = run_esmfold2_truncated_diffusion(
+        **common,
+        truncated_schedule_mode="dense",
+        dense_num_sampling_steps=41,
+    )
+    handle.remove()
+
+    assert result["truncated_steps"] == 40
+    assert len(observed) == 41
+    assert [grad_enabled for grad_enabled, _ in observed] == [False] * 40 + [True]
+    assert torch.equal(observed[0][1], official_first_input)
+
+
+def test_template_anchored_diffusion_clamps_fixed_atoms_and_keeps_free_gradients():
+    s_inputs = torch.randn(1, 2, 4, requires_grad=True)
+    z_trunk = torch.randn(1, 2, 2, 3, requires_grad=True)
+    captured = {
+        "s_inputs": s_inputs,
+        "z_trunk": z_trunk,
+        "relative_position_encoding": torch.zeros(1, 2, 2, 3),
+    }
+    template = torch.tensor(
+        [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]
+    )
+    fixed_mask = torch.tensor([[True, False, True]])
+
+    result = run_esmfold2_template_anchored_truncated_diffusion(
+        model=_FakeExperimentalModel(),
+        captured=captured,
+        features=_truncated_features(),
+        template_coordinates=template,
+        fixed_atom_mask=fixed_mask,
+        tau=2.0,
+        seed=7,
+        num_sampling_steps=4,
+        max_inference_sigma=10.0,
+    )
+
+    assert result["truncated_steps"] == 3
+    assert torch.equal(result["fixed_atom_mask"], fixed_mask)
+    assert torch.allclose(
+        result["coordinates"][fixed_mask],
+        result["template_coordinates"][fixed_mask],
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        torch.linalg.vector_norm(
+            result["template_coordinates"][0, 0]
+            - result["template_coordinates"][0, 2]
+        ),
+        torch.linalg.vector_norm(template[0, 0] - template[0, 2]),
+        atol=1e-5,
+    )
+    result["coordinates"][:, 1].sum().backward()
+    assert z_trunk.grad is not None
+    assert torch.isfinite(z_trunk.grad).all()
+
+
+def test_template_anchored_diffusion_accepts_dense_truncated_schedule():
+    captured = {
+        "s_inputs": torch.randn(1, 2, 4, requires_grad=True),
+        "z_trunk": torch.randn(1, 2, 2, 3, requires_grad=True),
+        "relative_position_encoding": torch.zeros(1, 2, 2, 3),
+    }
+    result = run_esmfold2_template_anchored_truncated_diffusion(
+        model=_FakeExperimentalModel(),
+        captured=captured,
+        features=_truncated_features(),
+        template_coordinates=torch.tensor(
+            [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]
+        ),
+        fixed_atom_mask=torch.tensor([[True, False, True]]),
+        tau=2.0,
+        seed=7,
+        num_sampling_steps=4,
+        max_inference_sigma=10.0,
+        truncated_schedule_mode="dense",
+        dense_num_sampling_steps=5,
+    )
+
+    assert result["truncated_steps"] == 4
+
+
+def test_scaffold_consistency_full_diffusion_clamps_template_until_zero_noise():
+    structure_head = _FakeStructureHead()
+    template = torch.tensor(
+        [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]
+    )
+    fixed_mask = torch.tensor([[True, False, True]])
+    features = _truncated_features()
+
+    torch.manual_seed(7)
+    result = run_esmfold2_scaffold_consistency_diffusion(
+        structure_head=structure_head,
+        template_coordinates=template,
+        fixed_atom_mask=fixed_mask,
+        z_trunk=torch.ones(1, 2, 2, 3),
+        s_inputs=torch.ones(1, 2, 4),
+        s_trunk=None,
+        relative_position_encoding=torch.zeros(1, 2, 2, 3),
+        ref_pos=features["ref_pos"],
+        ref_charge=features["ref_charge"],
+        ref_mask=features["atom_attention_mask"],
+        ref_element=torch.nn.functional.one_hot(
+            features["ref_element"], num_classes=128
+        ).float(),
+        ref_atom_name_chars=torch.nn.functional.one_hot(
+            features["ref_atom_name_chars"], num_classes=64
+        ).float(),
+        ref_space_uid=features["ref_space_uid"],
+        tok_idx=features["atom_to_token"],
+        asym_id=features["asym_id"],
+        residue_index=features["residue_index"],
+        entity_id=features["entity_id"],
+        token_index=features["token_index"],
+        sym_id=features["sym_id"],
+        token_attention_mask=features["token_attention_mask"],
+        num_sampling_steps=4,
+        max_inference_sigma=10.0,
+    )
+
+    coordinates = result["sample_atom_coords"]
+    template_at_final_frame = result["scaffold_template_coordinates"]
+    assert torch.allclose(
+        coordinates[fixed_mask],
+        template_at_final_frame[fixed_mask],
+        atol=1e-6,
+    )
+    assert not torch.allclose(coordinates[:, 1], template_at_final_frame[:, 1])
+    assert torch.allclose(
+        torch.linalg.vector_norm(
+            template_at_final_frame[0, 0] - template_at_final_frame[0, 2]
+        ),
+        torch.linalg.vector_norm(template[0, 0] - template[0, 2]),
+        atol=1e-5,
+    )

@@ -84,6 +84,8 @@ def test_esmfold2_backend_is_explicit_and_mcts_only_for_first_version():
     assert args.esmfold2_one_step_diffusion_mode == "truncated_trajectory"
     assert args.esmfold2_one_step_diffusion_tau == pytest.approx(1.0)
     assert args.esmfold2_one_step_truncated_num_sampling_steps == 50
+    assert args.esmfold2_one_step_truncated_schedule_mode == "official_clipped"
+    assert args.esmfold2_one_step_truncated_dense_num_sampling_steps == 41
     assert args.esmfold2_one_step_diffusion_weight == pytest.approx(0.25)
     assert args.esmfold2_one_step_diffusion_rg_weight == pytest.approx(0.1)
     assert args.esmfold2_one_step_diffusion_interval == 5

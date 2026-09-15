@@ -90,6 +90,8 @@ def test_esmfold2_d_profile_matches_formal_method_defaults():
     assert args.esmfold2_one_step_diffusion_mode == "truncated_trajectory"
     assert args.esmfold2_one_step_diffusion_interval == 5
     assert args.esmfold2_one_step_diffusion_tau == pytest.approx(1.0)
+    assert args.esmfold2_one_step_truncated_schedule_mode == "official_clipped"
+    assert args.esmfold2_one_step_truncated_dense_num_sampling_steps == 41
     assert args.esmfold2_one_step_diffusion_weight == pytest.approx(0.25)
     assert args.esmfold2_one_step_diffusion_rg_weight == pytest.approx(0.1)
     assert args.esmfold2_one_step_recycle_coordinates is False
@@ -111,6 +113,19 @@ def test_explicit_cli_value_overrides_launch_profile():
 
     assert args.n_steps == 5
     assert args.esmfold2_one_step_diffusion_weight == pytest.approx(0.5)
+
+
+def test_dense_truncated_schedule_is_an_explicit_profile_override():
+    args = _parse_profile(
+        "esmfold2_d",
+        "--esmfold2_one_step_truncated_schedule_mode",
+        "dense",
+        "--esmfold2_one_step_truncated_dense_num_sampling_steps",
+        "41",
+    )
+
+    assert args.esmfold2_one_step_truncated_schedule_mode == "dense"
+    assert args.esmfold2_one_step_truncated_dense_num_sampling_steps == 41
 
 
 def test_esmfold2_uses_low_precision_verifier_defaults():

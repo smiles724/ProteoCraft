@@ -22,6 +22,13 @@ NUMERIC_COLS = [
     "eval_n_calls", "eval_n_successes", "eval_runtime_s",
     "af3_ranking_score", "af3_iptm", "af3_ptm_native",
     "af3_has_clash", "af3_fraction_disordered",
+    "atlasfold_ranking_score", "atlasfold_pair_chain_iptm",
+    "atlasfold_scaffold_pair_chain_iptm", "atlasfold_iptm", "atlasfold_ptm",
+    "atlasfold_complex_plddt", "atlasfold_target_plddt",
+    "atlasfold_binder_plddt", "atlasfold_binder_ptm", "atlasfold_avg_pde",
+    "atlasfold_fraction_disordered", "atlasfold_num_recycles",
+    "atlasfold_mlm_prob", "atlasfold_num_samples", "atlasfold_num_steps",
+    "atlasfold_max_tokens_per_batch",
     "pair_chain_iptm", "iptm", "esmfold2_total_loss",
     "esmfold2_plddt", "esmfold2_binder_plddt", "esmfold2_binder_rg_excess",
     "esmfold2_num_loops", "esmfold2_num_sampling_steps", "esmfold2_seed",
@@ -234,6 +241,8 @@ def aggregate_per_paper_case(df: pd.DataFrame) -> pd.DataFrame:
             tier1_rate=("tier1_pass", "mean"),
             tier2_rate=("tier2_pass", "mean"),
         ).reset_index()
+        atlasfold_mask = real_agg["evaluator"].eq("atlasfold_m")
+        real_agg.loc[atlasfold_mask, ["tier1_rate", "tier2_rate"]] = float("nan")
     else:
         real_agg = pd.DataFrame(columns=[
             "evaluator", "method", "paper_case", "n_designs_evaluated", "n_calls",
@@ -266,6 +275,14 @@ AF3_NATIVE_COLS = [
     "af3_has_clash", "af3_fraction_disordered",
 ]
 
+ATLASFOLD_NATIVE_COLS = [
+    "atlasfold_ranking_score", "atlasfold_pair_chain_iptm",
+    "atlasfold_scaffold_pair_chain_iptm", "atlasfold_iptm", "atlasfold_ptm",
+    "atlasfold_complex_plddt", "atlasfold_target_plddt",
+    "atlasfold_binder_plddt", "atlasfold_binder_ptm", "atlasfold_avg_pde",
+    "atlasfold_fraction_disordered",
+]
+
 
 def _af3_native_metric_lines(df: pd.DataFrame) -> list[str]:
     present = [col for col in AF3_NATIVE_COLS if col in df.columns]
@@ -292,6 +309,26 @@ def _af3_native_metric_lines(df: pd.DataFrame) -> list[str]:
             f"{native['af3_fraction_disordered'].mean():.3f}"
         )
     lines.append("")
+    return lines
+
+
+def _atlasfold_native_metric_lines(df: pd.DataFrame) -> list[str]:
+    present = [col for col in ATLASFOLD_NATIVE_COLS if col in df.columns]
+    if len(df) == 0 or not present:
+        return []
+    native = df[present].apply(pd.to_numeric, errors="coerce")
+    if not native.notna().any().any():
+        return []
+    lines = ["## AtlasFold-M native metrics", ""]
+    for col in ATLASFOLD_NATIVE_COLS:
+        if col in native.columns and native[col].notna().any():
+            lines.append(f"- `{col} mean`: {native[col].mean():.3f}")
+    lines.extend([
+        "",
+        "AtlasFold-M is an independent sequence-only cross-evaluator. "
+        "ProteoCraft Tier-1/Tier-2 thresholds are not calibrated for it.",
+        "",
+    ])
     return lines
 
 
@@ -323,6 +360,18 @@ def render_markdown_for_evaluator(
         sub_agg.to_markdown(index=False, floatfmt=".3f")
         if len(sub_agg) > 0 else "_(empty)_"
     )
+    if evaluator == "atlasfold_m":
+        tier1_line = "- Mean Tier-1 rate: not calibrated for AtlasFold-M"
+        tier2_line = "- Mean Tier-2 rate: not calibrated for AtlasFold-M"
+    else:
+        tier1_line = (
+            f"- Mean Tier-1 rate: {tier1_mean:.3f}"
+            if not np.isnan(tier1_mean) else "- Mean Tier-1 rate: NaN"
+        )
+        tier2_line = (
+            f"- Mean Tier-2 rate: {tier2_mean:.3f}"
+            if not np.isnan(tier2_mean) else "- Mean Tier-2 rate: NaN"
+        )
 
     lines = [
         f"# {run_id} - evaluator: {evaluator}",
@@ -332,8 +381,8 @@ def render_markdown_for_evaluator(
         f"- Methods: {methods}",
         f"- paper_cases evaluated: {len(sub_agg)}",
         f"- Total designs evaluated: {n_designs}",
-        f"- Mean Tier-1 rate: {tier1_mean:.3f}" if not np.isnan(tier1_mean) else "- Mean Tier-1 rate: NaN",
-        f"- Mean Tier-2 rate: {tier2_mean:.3f}" if not np.isnan(tier2_mean) else "- Mean Tier-2 rate: NaN",
+        tier1_line,
+        tier2_line,
         "",
         "## Per-paper_case aggregate",
         "",
@@ -360,6 +409,10 @@ def render_markdown_for_evaluator(
         _af3_native_metric_lines(sub_df)
         if evaluator == "af3" else []
     )
+    atlasfold_native_lines = (
+        _atlasfold_native_metric_lines(sub_df)
+        if evaluator == "atlasfold_m" else []
+    )
     if len(sub_df) > 0 and BIO_SUMMARY_COLS <= set(sub_df.columns):
         bio = compute_bio_summary(sub_df)
         lines.extend([
@@ -372,13 +425,15 @@ def render_markdown_for_evaluator(
             f"- `n_contacts_5A > 0`: {bio['n_contacts_gt_0']}/{bio['n_total']}",
             f"- `binder_scRMSD median`: {bio['scrmsd_median']:.2f}",
         ])
-    elif af3_native_lines:
-        lines.append("- AF3 native metrics are listed below.")
+    elif af3_native_lines or atlasfold_native_lines:
+        lines.append(f"- {evaluator} native metrics are listed below.")
     else:
         lines.append("- Component metrics unavailable for this evaluator/schema.")
 
     if af3_native_lines:
         lines.extend(["", *af3_native_lines])
+    if atlasfold_native_lines:
+        lines.extend(["", *atlasfold_native_lines])
 
     lines.extend([
         "",
@@ -398,6 +453,20 @@ def render_bar_chart_paper_case(sub_agg: pd.DataFrame, evaluator: str, out_png: 
     all failed.
     """
     fig, ax = plt.subplots(figsize=(11, 5))
+    if evaluator == "atlasfold_m":
+        ax.text(
+            0.5,
+            0.5,
+            "AtlasFold-M pass thresholds are not calibrated; use native metrics.",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=140)
+        plt.close(fig)
+        return
     if "paper_case" not in sub_agg.columns or len(sub_agg) == 0:
         ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
         ax.set_axis_off()

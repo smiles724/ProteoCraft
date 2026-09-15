@@ -51,6 +51,8 @@ def test_prepare_esmfold2_cdr_case_preserves_roles_and_cdr_mask(tmp_path):
     assert case.target_chain_roles == ("target", "scaffold")
     assert case.target_sequence_argument == "AAAA|CCCC"
     assert case.mutable_mask_argument == "001111110000"
+    assert case.template_chain_ids == ("A", "B", "C")
+    assert case.template_chain_ids_argument == "A,B,C"
     assert case.cdr_start_0based == 2
     assert case.cdr_end_0based_exclusive == 8
 
@@ -108,6 +110,8 @@ def test_cdr_launcher_forwards_one_step_diffusion_options(tmp_path):
             "esmfold2_stagea_min_root_expansions": 2,
             "esmfold2_stagea_cumulative_annealing": False,
             "esmfold2_one_step_diffusion_tau": 2.0,
+            "esmfold2_one_step_truncated_schedule_mode": "dense",
+            "esmfold2_one_step_truncated_dense_num_sampling_steps": 41,
             "esmfold2_one_step_diffusion_weight": 0.5,
             "esmfold2_one_step_diffusion_rg_weight": 0.1,
             "esmfold2_one_step_diffusion_interval": 5,
@@ -133,6 +137,11 @@ def test_cdr_launcher_forwards_one_step_diffusion_options(tmp_path):
     assert options["--esmfold2_stagea_min_root_expansions"] == "2"
     assert options["--esmfold2_stagea_cumulative_annealing"] == "false"
     assert options["--esmfold2_one_step_diffusion_tau"] == "2.0"
+    assert options["--esmfold2_one_step_truncated_schedule_mode"] == "dense"
+    assert (
+        options["--esmfold2_one_step_truncated_dense_num_sampling_steps"]
+        == "41"
+    )
     assert options["--esmfold2_one_step_diffusion_weight"] == "0.5"
     assert options["--esmfold2_one_step_diffusion_rg_weight"] == "0.1"
     assert options["--esmfold2_one_step_diffusion_interval"] == "5"
@@ -205,3 +214,42 @@ def test_formal_cdr_configs_inherit_recommended_two_stage_profile(
     assert args.esmfold2_one_step_recycle_coordinates is False
     assert args.esmfold2_verifier_num_loops == 4
     assert args.esmfold2_verifier_num_sampling_steps == 50
+
+
+def test_template_anchored_cdr_config_forwards_template_and_structure_mask(tmp_path):
+    fasta_path = tmp_path / "case.fasta"
+    template_path = tmp_path / "case.cif"
+    _write_case_fasta(fasta_path)
+    template_path.write_text("data_case\n", encoding="utf-8")
+    case = prepare_esmfold2_cdr_case(
+        {
+            "id": "case_alpha",
+            "fasta_path": fasta_path.name,
+            "template_path": template_path.name,
+            "binder_chain": "C",
+            "target_chains": ["A"],
+            "scaffold_chains": ["B"],
+            "cdr_motif": "ACDEFG",
+        },
+        input_dir=tmp_path,
+    )
+    config_path = (
+        Path(__file__).resolve().parents[2]
+        / "benchmark/yaml/cdr_tcr/esmfold2_cdr_redesign_d_4cases.yaml"
+    )
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["esmfold2_one_step_diffusion_mode"] = "template_anchored_truncated_trajectory"
+    command = build_hallucination_command(
+        case,
+        config,
+        case_dir=tmp_path / "output",
+    )
+    args, parser = parse_args_with_profile(command[2:])
+
+    assert resolve_model_backend(args, parser) == "esmfold2"
+    assert args.esmfold2_one_step_diffusion_mode == (
+        "template_anchored_truncated_trajectory"
+    )
+    assert args.target_template_path == str(template_path)
+    assert args.esmfold2_template_chain_ids == "A,B,C"
+    assert args.esmfold2_structure_regeneration_mask == case.mutable_mask_argument

@@ -17,6 +17,13 @@ import torch.nn.functional as F
 from bindcraft.losses.geometry import compute_rg_loss, compute_soft_clash_loss
 
 
+# Fixed Biohub ESMFold2 atom-feature vocabulary sizes. Keeping these lightweight
+# constants local lets unit tests exercise diffusion orchestration without
+# importing the optional Transformers fork.
+ESMFOLD2_CHAR_VOCAB_SIZE = 64
+ESMFOLD2_MAX_ATOMIC_NUMBER = 128
+
+
 # Common subset of the tuned Protenix verifier weights.  ESMFold2 does not
 # expose PDE logits, so pde/i_pde are intentionally absent.
 ESMFOLD2_COMMON_LOSS_WEIGHTS: Dict[str, float] = {
@@ -48,6 +55,11 @@ ESMFOLD2_VERIFIER_LOSS_WEIGHTS: Dict[str, float] = {
     "binder_confidence_loss": 0.2,
     "global_confidence_loss": 0.1,
     "binder_rg_excess_loss": 0.1,
+}
+
+ESMFOLD2_TRUNCATED_SCHEDULE_MODES = {
+    "official_clipped",
+    "dense",
 }
 
 
@@ -777,21 +789,16 @@ def remap_reference_coordinates(
 def _diffusion_atom_inputs(
     features: Mapping[str, torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    from transformers.models.esmfold2.modeling_esmfold2_common import (
-        CHAR_VOCAB_SIZE,
-        MAX_ATOMIC_NUMBER,
-    )
-
     atom_mask = features["atom_attention_mask"].bool()
     atom_mask_f = atom_mask.float()
     ref_element = F.one_hot(
         features["ref_element"].long(),
-        num_classes=MAX_ATOMIC_NUMBER,
+        num_classes=ESMFOLD2_MAX_ATOMIC_NUMBER,
     ).float()
     ref_element = ref_element * atom_mask_f.unsqueeze(-1)
     ref_atom_name_chars = F.one_hot(
         features["ref_atom_name_chars"].long(),
-        num_classes=CHAR_VOCAB_SIZE,
+        num_classes=ESMFOLD2_CHAR_VOCAB_SIZE,
     ).float()
     ref_atom_name_chars = (
         ref_atom_name_chars * atom_mask_f.unsqueeze(-1).unsqueeze(-1)
@@ -918,6 +925,50 @@ def run_esmfold2_one_step_diffusion(
     }
 
 
+def _build_truncated_noise_schedule(
+    *,
+    structure_head: Any,
+    device: torch.device,
+    tau: float,
+    num_sampling_steps: int,
+    max_inference_sigma: float,
+    schedule_mode: str,
+    dense_num_sampling_steps: int,
+) -> torch.Tensor:
+    mode = str(schedule_mode).strip().lower()
+    if mode not in ESMFOLD2_TRUNCATED_SCHEDULE_MODES:
+        raise ValueError(
+            "truncated schedule_mode must be 'official_clipped' or 'dense'"
+        )
+
+    if mode == "official_clipped":
+        schedule = structure_head.inference_noise_schedule(
+            int(num_sampling_steps),
+            device,
+        )
+        schedule = schedule[schedule <= float(max_inference_sigma)]
+        schedule = F.pad(schedule, (1, 0), value=float(max_inference_sigma))
+        tau_tensor = torch.tensor(float(tau), device=device, dtype=torch.float32)
+        return torch.cat((schedule[schedule > tau_tensor], tau_tensor[None]))
+
+    dense_steps = int(dense_num_sampling_steps)
+    if dense_steps <= 1:
+        raise ValueError("dense_num_sampling_steps must be greater than 1")
+    power = float(structure_head.inference_p)
+    if not math.isfinite(power) or power <= 0.0:
+        raise ValueError("ESMFold2 inference_p must be finite and positive")
+    schedule = torch.linspace(
+        float(max_inference_sigma) ** (1.0 / power),
+        float(tau) ** (1.0 / power),
+        dense_steps,
+        device=device,
+        dtype=torch.float32,
+    ).pow(power)
+    schedule[0] = float(max_inference_sigma)
+    schedule[-1] = float(tau)
+    return schedule
+
+
 def run_esmfold2_truncated_diffusion(
     *,
     model: Any,
@@ -927,6 +978,8 @@ def run_esmfold2_truncated_diffusion(
     seed: Optional[int],
     num_sampling_steps: int,
     max_inference_sigma: float = 256.0,
+    truncated_schedule_mode: str = "official_clipped",
+    dense_num_sampling_steps: int = 41,
 ) -> Dict[str, torch.Tensor | int | float]:
     """Run a no-grad reverse trajectory to tau, then one differentiable denoise."""
 
@@ -952,14 +1005,15 @@ def run_esmfold2_truncated_diffusion(
     target_batch = int(captured["s_inputs"].shape[0])
     n_atoms = int(atom_to_token.shape[1])
 
-    schedule = structure_head.inference_noise_schedule(
-        int(num_sampling_steps),
-        device,
+    truncated_schedule = _build_truncated_noise_schedule(
+        structure_head=structure_head,
+        device=device,
+        tau=float(tau),
+        num_sampling_steps=int(num_sampling_steps),
+        max_inference_sigma=float(max_inference_sigma),
+        schedule_mode=truncated_schedule_mode,
+        dense_num_sampling_steps=int(dense_num_sampling_steps),
     )
-    schedule = schedule[schedule <= float(max_inference_sigma)]
-    schedule = F.pad(schedule, (1, 0), value=float(max_inference_sigma))
-    tau_tensor = torch.tensor(float(tau), device=device, dtype=torch.float32)
-    truncated_schedule = torch.cat((schedule[schedule > tau_tensor], tau_tensor[None]))
     if truncated_schedule.numel() < 2:
         raise RuntimeError("truncated diffusion schedule contains no reverse step")
 
@@ -1088,4 +1142,509 @@ def run_esmfold2_truncated_diffusion(
         "pae_logits": confidence["pae_logits"],
         "truncated_steps": len(step_pairs),
         "tau": float(tau),
+    }
+
+
+def _weighted_rigid_align_with_transform(
+    x: torch.Tensor,
+    x_gt: torch.Tensor,
+    w: torch.Tensor,
+    mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Match ESMFold2's Kabsch alignment and expose its rigid transform."""
+
+    weights = (mask * w).unsqueeze(-1)
+    denominator = weights.sum(dim=-2, keepdim=True).clamp(min=1e-8)
+    moving_center = (x * weights).sum(dim=-2, keepdim=True) / denominator
+    target_center = (x_gt * weights).sum(dim=-2, keepdim=True) / denominator
+    moving_centered = x - moving_center
+    target_centered = x_gt - target_center
+    covariance = torch.einsum(
+        "bni,bnj->bij",
+        weights * target_centered,
+        moving_centered,
+    )
+    covariance32 = covariance.float()
+    u, _, vh = torch.linalg.svd(
+        covariance32,
+        driver="gesvd" if covariance32.is_cuda else None,
+    )
+    determinant = torch.linalg.det(u @ vh)
+    ones = torch.ones_like(determinant)
+    rotation = (
+        u
+        @ torch.diag_embed(torch.stack([ones, ones, determinant], dim=-1))
+        @ vh
+    ).to(covariance.dtype)
+    aligned = moving_centered @ rotation.transpose(-1, -2) + target_center
+    return aligned, rotation, moving_center, target_center
+
+
+def _apply_rigid_transform(
+    coordinates: torch.Tensor,
+    *,
+    rotation: torch.Tensor,
+    moving_center: torch.Tensor,
+    target_center: torch.Tensor,
+) -> torch.Tensor:
+    return (
+        (coordinates - moving_center) @ rotation.transpose(-1, -2)
+        + target_center
+    )
+
+
+def run_esmfold2_template_anchored_truncated_diffusion(
+    *,
+    model: Any,
+    captured: Mapping[str, torch.Tensor],
+    features: Mapping[str, torch.Tensor],
+    template_coordinates: torch.Tensor,
+    fixed_atom_mask: torch.Tensor,
+    tau: float,
+    seed: Optional[int],
+    num_sampling_steps: int,
+    max_inference_sigma: float = 256.0,
+    truncated_schedule_mode: str = "official_clipped",
+    dense_num_sampling_steps: int = 41,
+) -> Dict[str, torch.Tensor | int | float]:
+    """Run strict truncated diffusion while clamping a noise-consistent template."""
+
+    if float(tau) <= 0.0:
+        raise ValueError("ESMFold2 template-anchored tau must be positive")
+    if int(num_sampling_steps) <= 1:
+        raise ValueError("num_sampling_steps must be greater than 1")
+    if float(tau) >= float(max_inference_sigma):
+        raise ValueError("tau must be smaller than max_inference_sigma")
+    required = {"s_inputs", "relative_position_encoding", "z_trunk"}
+    missing = sorted(required - set(captured))
+    if missing:
+        raise RuntimeError(
+            f"Failed to capture ESMFold2 proposal intermediates: {missing}"
+        )
+
+    atom_mask, ref_element, ref_atom_name_chars, atom_to_token = (
+        _diffusion_atom_inputs(features)
+    )
+    structure_head = model.structure_head
+    diffusion_module = structure_head.diffusion_module
+    device = captured["s_inputs"].device
+    target_batch = int(captured["s_inputs"].shape[0])
+    n_atoms = int(atom_to_token.shape[1])
+
+    template_clean = template_coordinates.to(device=device, dtype=torch.float32)
+    template_mask = fixed_atom_mask.to(device=device, dtype=torch.bool)
+    if template_clean.ndim == 2:
+        template_clean = template_clean.unsqueeze(0)
+    if template_mask.ndim == 1:
+        template_mask = template_mask.unsqueeze(0)
+    if template_clean.shape != (template_clean.shape[0], n_atoms, 3):
+        raise ValueError("template coordinates do not match ESMFold2 atom layout")
+    if template_mask.shape != (template_mask.shape[0], n_atoms):
+        raise ValueError("fixed_atom_mask does not match ESMFold2 atom layout")
+    if template_clean.shape[0] == 1 and target_batch > 1:
+        template_clean = template_clean.expand(target_batch, -1, -1).clone()
+    if template_mask.shape[0] == 1 and target_batch > 1:
+        template_mask = template_mask.expand(target_batch, -1).clone()
+    if template_clean.shape[0] != target_batch or template_mask.shape[0] != target_batch:
+        raise ValueError("template batch size does not match proposal batch size")
+    template_mask &= atom_mask
+    if not template_mask.any():
+        raise ValueError("fixed_atom_mask selects no valid ESMFold2 atoms")
+
+    truncated_schedule = _build_truncated_noise_schedule(
+        structure_head=structure_head,
+        device=device,
+        tau=float(tau),
+        num_sampling_steps=int(num_sampling_steps),
+        max_inference_sigma=float(max_inference_sigma),
+        schedule_mode=truncated_schedule_mode,
+        dense_num_sampling_steps=int(dense_num_sampling_steps),
+    )
+    if truncated_schedule.numel() < 2:
+        raise RuntimeError("template-anchored schedule contains no reverse step")
+
+    atom_mask_f = atom_mask.float()
+    template_mask_3d = template_mask.unsqueeze(-1)
+    lam = float(structure_head.noise_scale)
+    eta = float(structure_head.step_scale)
+    gammas = torch.where(
+        truncated_schedule > float(structure_head.gamma_min),
+        torch.full_like(truncated_schedule, float(structure_head.gamma_0)),
+        torch.zeros_like(truncated_schedule),
+    )
+    step_pairs = list(
+        zip(
+            truncated_schedule[:-1],
+            truncated_schedule[1:],
+            gammas[1:],
+        )
+    )
+    devices = [device.index or 0] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices, enabled=True):
+        if seed is not None:
+            torch.manual_seed(int(seed))
+            if device.type == "cuda":
+                torch.cuda.manual_seed_all(int(seed))
+        with torch.no_grad():
+            sigma_start = float(truncated_schedule[0].item())
+            x = truncated_schedule[0] * torch.randn(
+                target_batch,
+                n_atoms,
+                3,
+                device=device,
+                dtype=torch.float32,
+            )
+            template_generator = torch.Generator(device=device)
+            base_seed = int(seed) if seed is not None else int(torch.initial_seed())
+            template_generator.manual_seed((base_seed + 104729) % (2**63 - 1))
+            template_epsilon = torch.randn(
+                template_clean.shape,
+                generator=template_generator,
+                device=device,
+                dtype=torch.float32,
+            )
+            template_noisy = template_clean + sigma_start * template_epsilon
+            x = torch.where(template_mask_3d, template_noisy, x)
+
+            inference_cache: dict[str, torch.Tensor] = {}
+            for sigma_tm, sigma_t, gamma in step_pairs:
+                paired_template = torch.cat((template_clean, template_noisy), dim=1)
+                x, paired_template = structure_head._center_random_augmentation(
+                    x,
+                    atom_mask_f,
+                    paired_template,
+                )
+                if paired_template is None:
+                    raise RuntimeError("ESMFold2 discarded template frame coordinates")
+                template_clean, template_noisy = paired_template.split(n_atoms, dim=1)
+
+                sigma_tm_value = float(sigma_tm.item())
+                template_epsilon = (
+                    template_noisy - template_clean
+                ) / max(sigma_tm_value, torch.finfo(torch.float32).eps)
+                t_hat_value = sigma_tm_value * (1.0 + float(gamma.item()))
+                eps_std = lam * max(
+                    t_hat_value**2 - sigma_tm_value**2,
+                    0.0,
+                ) ** 0.5
+                x_noisy = x + eps_std * torch.randn_like(x)
+                template_t_hat = template_clean + t_hat_value * template_epsilon
+                x_noisy = torch.where(template_mask_3d, template_t_hat, x_noisy)
+                diffusion_output = diffusion_module(
+                    x_noisy=x_noisy,
+                    t_hat=torch.full(
+                        (target_batch,),
+                        t_hat_value,
+                        device=device,
+                        dtype=torch.float32,
+                    ),
+                    ref_pos=features["ref_pos"],
+                    ref_charge=features["ref_charge"],
+                    ref_mask=atom_mask,
+                    ref_element=ref_element,
+                    ref_atom_name_chars=ref_atom_name_chars,
+                    ref_space_uid=features["ref_space_uid"],
+                    tok_idx=atom_to_token,
+                    s_inputs=captured["s_inputs"],
+                    s_trunk=None,
+                    z_trunk=captured["z_trunk"].float(),
+                    relative_position_encoding=captured["relative_position_encoding"],
+                    asym_id=features["asym_id"],
+                    residue_index=features["residue_index"],
+                    entity_id=features["entity_id"],
+                    token_index=features["token_index"],
+                    sym_id=features["sym_id"],
+                    token_attention_mask=features["token_attention_mask"],
+                    num_diffusion_samples=1,
+                    return_token_repr=True,
+                    inference_cache=inference_cache,
+                )
+                x_denoised = diffusion_output["x_denoised"]
+                x_noisy, rotation, moving_center, target_center = (
+                    _weighted_rigid_align_with_transform(
+                        x_noisy.float(),
+                        x_denoised.float(),
+                        atom_mask_f,
+                        atom_mask_f,
+                    )
+                )
+                x_noisy = x_noisy.to(dtype=x_denoised.dtype)
+                template_clean = _apply_rigid_transform(
+                    template_clean,
+                    rotation=rotation,
+                    moving_center=moving_center,
+                    target_center=target_center,
+                )
+                template_t_hat = _apply_rigid_transform(
+                    template_t_hat,
+                    rotation=rotation,
+                    moving_center=moving_center,
+                    target_center=target_center,
+                )
+                template_epsilon = (
+                    template_t_hat - template_clean
+                ) / max(t_hat_value, torch.finfo(torch.float32).eps)
+                t_hat_safe = max(t_hat_value, torch.finfo(torch.float32).eps)
+                derivative = (x_noisy - x_denoised) / t_hat_safe
+                x = x_noisy + eta * (float(sigma_t.item()) - t_hat_value) * derivative
+                template_noisy = template_clean + float(sigma_t.item()) * template_epsilon
+                x = torch.where(template_mask_3d, template_noisy, x)
+            x_tau = x.detach()
+            clean_template_at_tau_frame = template_clean.detach()
+
+    diffusion_output = diffusion_module(
+        x_noisy=x_tau,
+        t_hat=torch.full(
+            (target_batch,),
+            float(tau),
+            device=device,
+            dtype=torch.float32,
+        ),
+        ref_pos=features["ref_pos"],
+        ref_charge=features["ref_charge"],
+        ref_mask=atom_mask,
+        ref_element=ref_element,
+        ref_atom_name_chars=ref_atom_name_chars,
+        ref_space_uid=features["ref_space_uid"],
+        tok_idx=atom_to_token,
+        s_inputs=captured["s_inputs"],
+        s_trunk=None,
+        z_trunk=captured["z_trunk"].float(),
+        relative_position_encoding=captured["relative_position_encoding"],
+        asym_id=features["asym_id"],
+        residue_index=features["residue_index"],
+        entity_id=features["entity_id"],
+        token_index=features["token_index"],
+        sym_id=features["sym_id"],
+        token_attention_mask=features["token_attention_mask"],
+        num_diffusion_samples=1,
+    )
+    x_denoised = diffusion_output["x_denoised"]
+    if x_denoised is None:
+        raise RuntimeError("ESMFold2 diffusion module returned no denoised coordinates")
+    x_denoised = torch.where(
+        template_mask_3d,
+        clean_template_at_tau_frame.to(dtype=x_denoised.dtype),
+        x_denoised,
+    )
+    confidence = _one_step_confidence(
+        model=model,
+        captured=captured,
+        features=features,
+        coordinates=x_denoised,
+        atom_mask=atom_mask,
+        atom_to_token=atom_to_token,
+    )
+    return {
+        "coordinates": x_denoised,
+        "source_coordinates": x_tau,
+        "template_coordinates": clean_template_at_tau_frame,
+        "fixed_atom_mask": template_mask,
+        "plddt_logits": confidence["plddt_logits"],
+        "pae_logits": confidence["pae_logits"],
+        "truncated_steps": len(step_pairs),
+        "tau": float(tau),
+    }
+
+
+@torch.inference_mode()
+def run_esmfold2_scaffold_consistency_diffusion(
+    *,
+    structure_head: Any,
+    template_coordinates: torch.Tensor,
+    fixed_atom_mask: torch.Tensor,
+    z_trunk: torch.Tensor,
+    s_inputs: torch.Tensor,
+    s_trunk: Optional[torch.Tensor],
+    relative_position_encoding: torch.Tensor,
+    ref_pos: torch.Tensor,
+    ref_charge: torch.Tensor,
+    ref_mask: torch.Tensor,
+    ref_element: torch.Tensor,
+    ref_atom_name_chars: torch.Tensor,
+    ref_space_uid: torch.Tensor,
+    tok_idx: torch.Tensor,
+    asym_id: torch.Tensor,
+    residue_index: torch.Tensor,
+    entity_id: torch.Tensor,
+    token_index: torch.Tensor,
+    sym_id: torch.Tensor,
+    token_attention_mask: Optional[torch.Tensor] = None,
+    num_diffusion_samples: int = 1,
+    num_sampling_steps: Optional[int] = None,
+    max_inference_sigma: float = 256.0,
+) -> Dict[str, torch.Tensor | None]:
+    """Run standard full diffusion while keeping a local scaffold consistent.
+
+    This mirrors the official ``DiffusionStructureHead.sample`` loop instead
+    of post-processing an unconstrained final structure.  At every noise
+    level, fixed atoms receive the same noise-consistent template trajectory;
+    only atoms outside ``fixed_atom_mask`` are generated freely.  The caller
+    remains responsible for passing the resulting coordinates to the standard
+    ESMFold2 confidence head.
+    """
+
+    if int(num_diffusion_samples) != 1:
+        raise ValueError(
+            "Scaffold-consistency verification currently supports one "
+            "diffusion sample per candidate"
+        )
+    if float(max_inference_sigma) <= 0.0:
+        raise ValueError("max_inference_sigma must be positive")
+
+    device = s_inputs.device
+    target_batch = int(s_inputs.shape[0])
+    n_atoms = int(tok_idx.shape[1])
+    atom_mask = ref_mask.bool()
+    if atom_mask.ndim == 1:
+        atom_mask = atom_mask.unsqueeze(0)
+    if atom_mask.shape != (target_batch, n_atoms):
+        raise ValueError("ref_mask shape does not match verifier atom layout")
+
+    template_clean = template_coordinates.to(device=device, dtype=torch.float32)
+    template_mask = fixed_atom_mask.to(device=device, dtype=torch.bool)
+    if template_clean.ndim == 2:
+        template_clean = template_clean.unsqueeze(0)
+    if template_mask.ndim == 1:
+        template_mask = template_mask.unsqueeze(0)
+    if template_clean.shape == (1, n_atoms, 3) and target_batch > 1:
+        template_clean = template_clean.expand(target_batch, -1, -1).clone()
+    if template_mask.shape == (1, n_atoms) and target_batch > 1:
+        template_mask = template_mask.expand(target_batch, -1).clone()
+    if template_clean.shape != (target_batch, n_atoms, 3):
+        raise ValueError("template coordinates do not match verifier atom layout")
+    if template_mask.shape != (target_batch, n_atoms):
+        raise ValueError("fixed_atom_mask does not match verifier atom layout")
+    template_mask &= atom_mask
+    if not template_mask.any():
+        raise ValueError("fixed_atom_mask selects no valid verifier atoms")
+
+    steps = (
+        int(structure_head.inference_num_steps)
+        if num_sampling_steps is None
+        else int(num_sampling_steps)
+    )
+    if steps <= 1:
+        raise ValueError("num_sampling_steps must be greater than 1")
+    schedule = structure_head.inference_noise_schedule(steps, device)
+    schedule = schedule[schedule <= float(max_inference_sigma)]
+    schedule = F.pad(schedule, (1, 0), value=float(max_inference_sigma))
+    if schedule.numel() < 2:
+        raise RuntimeError("scaffold-consistency schedule contains no reverse step")
+
+    atom_mask_f = atom_mask.float()
+    template_mask_3d = template_mask.unsqueeze(-1)
+    lam = float(structure_head.noise_scale)
+    eta = float(structure_head.step_scale)
+    gammas = torch.where(
+        schedule > float(structure_head.gamma_min),
+        torch.full_like(schedule, float(structure_head.gamma_0)),
+        torch.zeros_like(schedule),
+    )
+    step_pairs = list(zip(schedule[:-1], schedule[1:], gammas[1:]))
+    x = schedule[0] * torch.randn(
+        target_batch,
+        n_atoms,
+        3,
+        device=device,
+        dtype=torch.float32,
+    )
+    template_epsilon = torch.randn_like(template_clean)
+    template_noisy = template_clean + float(schedule[0].item()) * template_epsilon
+    x = torch.where(template_mask_3d, template_noisy, x)
+
+    inference_cache: dict[str, torch.Tensor] = {}
+    token_repr: Optional[torch.Tensor] = None
+    diffusion_module = structure_head.diffusion_module
+    for sigma_tm, sigma_t, gamma in step_pairs:
+        paired_template = torch.cat((template_clean, template_noisy), dim=1)
+        x, paired_template = structure_head._center_random_augmentation(
+            x,
+            atom_mask_f,
+            paired_template,
+        )
+        if paired_template is None:
+            raise RuntimeError("ESMFold2 discarded scaffold template coordinates")
+        template_clean, template_noisy = paired_template.split(n_atoms, dim=1)
+
+        sigma_tm_value = float(sigma_tm.item())
+        template_epsilon = (template_noisy - template_clean) / max(
+            sigma_tm_value,
+            torch.finfo(torch.float32).eps,
+        )
+        t_hat_value = sigma_tm_value * (1.0 + float(gamma.item()))
+        eps_std = lam * max(t_hat_value**2 - sigma_tm_value**2, 0.0) ** 0.5
+        x_noisy = x + eps_std * torch.randn_like(x)
+        template_t_hat = template_clean + t_hat_value * template_epsilon
+        x_noisy = torch.where(template_mask_3d, template_t_hat, x_noisy)
+
+        diffusion_output = diffusion_module(
+            x_noisy=x_noisy,
+            t_hat=torch.full(
+                (target_batch,),
+                t_hat_value,
+                device=device,
+                dtype=torch.float32,
+            ),
+            ref_pos=ref_pos,
+            ref_charge=ref_charge,
+            ref_mask=atom_mask,
+            ref_element=ref_element,
+            ref_atom_name_chars=ref_atom_name_chars,
+            ref_space_uid=ref_space_uid,
+            tok_idx=tok_idx,
+            s_inputs=s_inputs,
+            s_trunk=s_trunk,
+            z_trunk=z_trunk,
+            relative_position_encoding=relative_position_encoding,
+            asym_id=asym_id,
+            residue_index=residue_index,
+            entity_id=entity_id,
+            token_index=token_index,
+            sym_id=sym_id,
+            token_attention_mask=token_attention_mask,
+            num_diffusion_samples=1,
+            return_token_repr=True,
+            inference_cache=inference_cache,
+        )
+        x_denoised = diffusion_output.get("x_denoised")
+        if x_denoised is None:
+            raise RuntimeError("ESMFold2 diffusion module returned no denoised coordinates")
+        token_repr = diffusion_output.get("token_repr")
+        x_noisy, rotation, moving_center, target_center = (
+            _weighted_rigid_align_with_transform(
+                x_noisy.float(),
+                x_denoised.float(),
+                atom_mask_f,
+                atom_mask_f,
+            )
+        )
+        x_noisy = x_noisy.to(dtype=x_denoised.dtype)
+        template_clean = _apply_rigid_transform(
+            template_clean,
+            rotation=rotation,
+            moving_center=moving_center,
+            target_center=target_center,
+        )
+        template_t_hat = _apply_rigid_transform(
+            template_t_hat,
+            rotation=rotation,
+            moving_center=moving_center,
+            target_center=target_center,
+        )
+        template_epsilon = (template_t_hat - template_clean) / max(
+            t_hat_value,
+            torch.finfo(torch.float32).eps,
+        )
+        x = x_noisy + eta * (float(sigma_t.item()) - t_hat_value) * (
+            (x_noisy - x_denoised) / max(t_hat_value, torch.finfo(torch.float32).eps)
+        )
+        template_noisy = template_clean + float(sigma_t.item()) * template_epsilon
+        x = torch.where(template_mask_3d, template_noisy, x)
+
+    return {
+        "sample_atom_coords": x,
+        "diff_token_repr": token_repr,
+        "scaffold_template_coordinates": template_clean,
+        "fixed_atom_mask": template_mask,
     }

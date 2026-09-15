@@ -1,0 +1,7 @@
+name: proteocraft_atlasfold_m_py312
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - git

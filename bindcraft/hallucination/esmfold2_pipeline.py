@@ -2676,6 +2676,20 @@ def run_esmfold2_chunked_best_of_n(
                 50,
             )
         ),
+        "truncated_schedule_mode": str(
+            getattr(
+                backend_config,
+                "one_step_diffusion_truncated_schedule_mode",
+                "official_clipped",
+            )
+        ),
+        "truncated_dense_num_sampling_steps": int(
+            getattr(
+                backend_config,
+                "one_step_diffusion_truncated_dense_num_sampling_steps",
+                41,
+            )
+        ),
         "recycle_coordinates": bool(
             getattr(
                 backend_config,
@@ -2781,9 +2795,15 @@ def run_esmfold2_chunked_best_of_n(
             if one_step_enabled
             and one_step_config["mode"] == "truncated_trajectory"
             else (
-                "initial_full_verifier_coordinates_and_features_fixed"
+                "external_template_noise_consistent_clamp"
                 if one_step_enabled
-                else "unused"
+                and one_step_config["mode"]
+                == "template_anchored_truncated_trajectory"
+                else (
+                    "initial_full_verifier_coordinates_and_features_fixed"
+                    if one_step_enabled
+                    else "unused"
+                )
             )
         ),
         "verifier_loss_mode": str(

@@ -369,6 +369,14 @@ def test_temperature_schedule_and_config_match_short_esm_stage_a_contract():
     assert default_config.one_step_diffusion_mode == "truncated_trajectory"
     assert default_config.one_step_diffusion_tau == pytest.approx(1.0)
     assert default_config.one_step_diffusion_truncated_num_sampling_steps == 50
+    assert (
+        default_config.one_step_diffusion_truncated_schedule_mode
+        == "official_clipped"
+    )
+    assert (
+        default_config.one_step_diffusion_truncated_dense_num_sampling_steps
+        == 41
+    )
     assert default_config.one_step_diffusion_weight == pytest.approx(0.25)
     assert default_config.one_step_diffusion_rg_weight == pytest.approx(0.1)
     assert default_config.one_step_diffusion_interval == 5
@@ -428,6 +436,19 @@ def test_proposal_config_validates_one_step_diffusion_parameters():
         ESMFold2ProposalConfig(
             one_step_diffusion_truncated_num_sampling_steps=1
         )
+    with pytest.raises(ValueError, match="truncated_schedule_mode"):
+        ESMFold2ProposalConfig(
+            one_step_diffusion_truncated_schedule_mode="unknown"
+        )
+    with pytest.raises(ValueError, match="truncated_dense_num_sampling_steps"):
+        ESMFold2ProposalConfig(
+            one_step_diffusion_truncated_dense_num_sampling_steps=1
+        )
+    with pytest.raises(ValueError, match="only applies to truncated"):
+        ESMFold2ProposalConfig(
+            one_step_diffusion_mode="reference_noising",
+            one_step_diffusion_truncated_schedule_mode="dense",
+        )
     with pytest.raises(ValueError, match="one_step_diffusion_weight"):
         ESMFold2ProposalConfig(one_step_diffusion_weight=-0.1)
     with pytest.raises(ValueError, match="one_step_diffusion_rg_weight"):
@@ -460,6 +481,46 @@ def test_proposal_config_validates_one_step_diffusion_parameters():
         )
     with pytest.raises(ValueError, match="verifier_loss_mode"):
         ESMFold2ProposalConfig(verifier_loss_mode="unknown")
+
+
+def test_template_anchored_config_requires_complete_local_redesign_contract(tmp_path):
+    with pytest.raises(ValueError, match="template_structure_path"):
+        ESMFold2ProposalConfig(
+            one_step_diffusion_mode="template_anchored_truncated_trajectory"
+        )
+
+    template_path = tmp_path / "template.pdb"
+    template_path.write_text("END\n", encoding="utf-8")
+    config = ESMFold2ProposalConfig(
+        one_step_diffusion_mode="template_anchored_truncated_trajectory",
+        template_structure_path=str(template_path),
+        template_chain_ids=("A", "B"),
+        template_chain_sequences=("AAAA", "AACAA"),
+        binder_mutable_mask=(False, False, True, False, False),
+        binder_structure_regeneration_mask=(False, False, True, False, False),
+    )
+
+    assert config.template_chain_ids == ("A", "B")
+
+
+def test_scaffold_consistency_config_is_opt_in_and_requires_template_contract(tmp_path):
+    assert ESMFold2ProposalConfig().verifier_structure_mode == "sequence_only"
+    with pytest.raises(ValueError, match="verifier_structure_mode"):
+        ESMFold2ProposalConfig(verifier_structure_mode="unknown")
+    with pytest.raises(ValueError, match="template_structure_path"):
+        ESMFold2ProposalConfig(verifier_structure_mode="scaffold_consistency")
+
+    template_path = tmp_path / "template.pdb"
+    template_path.write_text("END\n", encoding="utf-8")
+    config = ESMFold2ProposalConfig(
+        verifier_structure_mode="scaffold_consistency",
+        template_structure_path=str(template_path),
+        template_chain_ids=("A", "B"),
+        template_chain_sequences=("AAAA", "AACAA"),
+        binder_mutable_mask=(False, False, True, False, False),
+        binder_structure_regeneration_mask=(False, False, True, False, False),
+    )
+    assert config.verifier_structure_mode == "scaffold_consistency"
 
 
 def test_logit_delta_candidates_reuse_stage_a_topk_sampling_contract():

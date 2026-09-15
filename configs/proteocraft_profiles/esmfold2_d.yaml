@@ -54,6 +54,8 @@ defaults:
   esmfold2_one_step_diffusion_mode: truncated_trajectory
   esmfold2_one_step_diffusion_tau: 1.0
   esmfold2_one_step_truncated_num_sampling_steps: 50
+  esmfold2_one_step_truncated_schedule_mode: official_clipped
+  esmfold2_one_step_truncated_dense_num_sampling_steps: 41
   esmfold2_one_step_diffusion_weight: 0.25
   esmfold2_one_step_diffusion_rg_weight: 0.1
   esmfold2_one_step_diffusion_interval: 5

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,15 +15,18 @@ from eval_pipeline.cli import (
 )
 
 
+@dataclass(frozen=True)
+class FakeConfig:
+    target_chain_roles: tuple[str, ...] | None = None
+    verifier_model_name: str = "biohub/ESMFold2"
+    verifier_num_loops: int = 20
+    verifier_num_sampling_steps: int = 200
+    verifier_loss_mode: str = "aligned_common"
+
+
 class FakeBackend:
     def __init__(self):
-        self.config = SimpleNamespace(
-            target_chain_roles=None,
-            verifier_model_name="biohub/ESMFold2",
-            verifier_num_loops=20,
-            verifier_num_sampling_steps=200,
-            verifier_loss_mode="aligned_common",
-        )
+        self.config = FakeConfig()
         self.calls = []
 
     def verify(self, **kwargs):

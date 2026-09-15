@@ -1,8 +1,9 @@
-"""Sequence-only CDR redesign input adapter for the ESMFold2 backend."""
+"""CDR redesign input adapter for sequence-only and template-anchored ESMFold2."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from numbers import Integral
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -21,10 +22,11 @@ class ESMFold2CDRCase:
     binder_sequence: str
     partner_sequences: tuple[str, ...]
     target_chain_roles: tuple[str, ...]
-    cdr_motif: str
+    cdr_motif: Optional[str]
     mutable_mask: tuple[bool, ...]
-    cdr_start_0based: int
-    cdr_end_0based_exclusive: int
+    cdr_start_0based: Optional[int]
+    cdr_end_0based_exclusive: Optional[int]
+    redesign_regions_1based: tuple[tuple[int, int], ...] = ()
 
     @property
     def target_sequence_argument(self) -> str:
@@ -38,14 +40,37 @@ class ESMFold2CDRCase:
     def mutable_mask_argument(self) -> str:
         return "".join("1" if value else "0" for value in self.mutable_mask)
 
+    @property
+    def template_chain_ids(self) -> tuple[str, ...]:
+        return (*self.target_chains, *self.scaffold_chains, self.binder_chain)
+
+    @property
+    def template_chain_ids_argument(self) -> str:
+        return ",".join(self.template_chain_ids)
+
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
+        # Preserve the legacy record shape for existing motif-based experiments.
+        payload.pop("redesign_regions_1based")
+        if self.redesign_regions_1based:
+            payload.update(
+                redesign_regions_1based=self.redesign_regions_1based,
+                redesign_region_sequences=tuple(
+                    self.binder_sequence[start - 1 : end]
+                    for start, end in self.redesign_regions_1based
+                ),
+                region_numbering="sequence_1based_inclusive",
+            )
         payload.update(
             {
                 "target_sequence_argument": self.target_sequence_argument,
                 "target_chain_roles_argument": self.target_chain_roles_argument,
                 "mutable_mask_argument": self.mutable_mask_argument,
-                "cdr_start_1based": self.cdr_start_0based + 1,
+                "template_chain_ids": self.template_chain_ids,
+                "template_chain_ids_argument": self.template_chain_ids_argument,
+                "cdr_start_1based": (
+                    None if self.cdr_start_0based is None else self.cdr_start_0based + 1
+                ),
                 "cdr_end_1based": self.cdr_end_0based_exclusive,
             }
         )
@@ -116,6 +141,40 @@ def make_cdr_mutable_mask(sequence: str, motif: str) -> tuple[tuple[bool, ...], 
     return mask, start, end
 
 
+def make_redesign_mutable_mask(
+    sequence: str,
+    regions: Sequence[Sequence[int]],
+) -> tuple[tuple[bool, ...], tuple[tuple[int, int], ...]]:
+    """Select non-overlapping, 1-based inclusive intervals in the input sequence."""
+
+    if isinstance(regions, (str, bytes)) or not isinstance(regions, Sequence) or not regions:
+        raise ValueError("redesign_regions must be a non-empty list of [start, end] pairs")
+    intervals: list[tuple[int, int]] = []
+    for region in regions:
+        if (
+            isinstance(region, (str, bytes))
+            or not isinstance(region, Sequence)
+            or len(region) != 2
+        ):
+            raise ValueError("each redesign_regions entry must be a [start, end] pair")
+        if any(isinstance(value, bool) or not isinstance(value, Integral) for value in region):
+            raise ValueError("redesign_regions endpoints must be integers")
+        start, end = map(int, region)
+        if not 1 <= start <= end <= len(sequence):
+            raise ValueError(
+                f"redesign_regions out of range: [{start}, {end}]; sequence length is {len(sequence)}"
+            )
+        intervals.append((start, end))
+    intervals.sort()
+    for previous, current in zip(intervals, intervals[1:]):
+        if current[0] <= previous[1]:
+            raise ValueError(f"redesign_regions overlap: {previous} and {current}")
+    mask = [False] * len(sequence)
+    for start, end in intervals:
+        mask[start - 1 : end] = [True] * (end - start + 1)
+    return tuple(mask), tuple(intervals)
+
+
 def prepare_esmfold2_cdr_case(
     case: Mapping[str, Any],
     *,
@@ -147,11 +206,19 @@ def prepare_esmfold2_cdr_case(
         raise ValueError(f"{case_id}: chains missing from FASTA: {missing}")
 
     binder_sequence = records[binder_chain]
-    motif = str(case["cdr_motif"]).strip().upper()
-    mutable_mask, cdr_start, cdr_end = make_cdr_mutable_mask(
-        binder_sequence,
-        motif,
-    )
+    if ("cdr_motif" in case) == ("redesign_regions" in case):
+        raise ValueError(f"{case_id}: specify exactly one of cdr_motif or redesign_regions")
+    regions: tuple[tuple[int, int], ...] = ()
+    if "redesign_regions" in case:
+        motif = None
+        mutable_mask, regions = make_redesign_mutable_mask(
+            binder_sequence, case["redesign_regions"]
+        )
+        # A bounding interval would incorrectly imply the intervening framework is mutable.
+        cdr_start, cdr_end = (regions[0][0] - 1, regions[0][1]) if len(regions) == 1 else (None, None)
+    else:
+        motif = str(case["cdr_motif"]).strip().upper()
+        mutable_mask, cdr_start, cdr_end = make_cdr_mutable_mask(binder_sequence, motif)
     return ESMFold2CDRCase(
         case_id=case_id,
         fasta_path=str(fasta_path),
@@ -169,6 +236,7 @@ def prepare_esmfold2_cdr_case(
         mutable_mask=mutable_mask,
         cdr_start_0based=cdr_start,
         cdr_end_0based_exclusive=cdr_end,
+        redesign_regions_1based=regions,
     )
 
 

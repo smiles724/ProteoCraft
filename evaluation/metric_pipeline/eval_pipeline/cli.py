@@ -1,7 +1,8 @@
-"""End-to-end orchestration: manifest → per-design ESMFold/AF3 → metrics → long CSV."""
+"""End-to-end orchestration: manifest → evaluator → metrics → long CSV."""
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import traceback
@@ -13,7 +14,7 @@ import pandas as pd
 # Allow `python -m eval_pipeline.cli` from project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from eval_pipeline import af3_runner, esmfold2_runner  # noqa: E402
+from eval_pipeline import af3_runner, atlasfold_runner, esmfold2_runner  # noqa: E402
 from eval_pipeline import metrics as M  # noqa: E402
 from eval_pipeline.esmfold_runner import (  # noqa: E402
     build_esmfold_input,
@@ -22,6 +23,7 @@ from eval_pipeline.esmfold_runner import (  # noqa: E402
     run_esmfold,
 )
 from eval_pipeline.manifest import load_manifest  # noqa: E402
+from eval_pipeline.hotspot_coverage import calculate_hotspot_coverage  # noqa: E402
 from eval_pipeline.tier_gating import compute_tier_flags  # noqa: E402
 from vendor.proteina_complexa.pdb_chain_utils import get_chain_ca_coords  # noqa: E402
 
@@ -29,6 +31,7 @@ from vendor.proteina_complexa.pdb_chain_utils import get_chain_ca_coords  # noqa
 DEFAULT_EVALUATOR = "esmfold2"
 LEGACY_ESMFOLD_EVALUATOR = "esmfold_202605"
 LEGACY_ESMFOLD_ALIAS = "esmfold"
+ATLASFOLD_EVALUATOR = atlasfold_runner.EVALUATOR_NAME
 
 CSV_COLS_BASE = [
     # metadata
@@ -64,6 +67,35 @@ CSV_COLS_NEW = [
     "af3_ptm_native",
     "af3_has_clash",
     "af3_fraction_disordered",
+    # AtlasFold-M v1.0.2 native sequence-only cross-evaluation metrics.
+    "atlasfold_ranking_score",
+    "atlasfold_pair_chain_iptm",
+    "atlasfold_scaffold_pair_chain_iptm",
+    "atlasfold_iptm",
+    "atlasfold_ptm",
+    "atlasfold_complex_plddt",
+    "atlasfold_target_plddt",
+    "atlasfold_binder_plddt",
+    "atlasfold_binder_ptm",
+    "atlasfold_avg_pde",
+    "atlasfold_fraction_disordered",
+    "atlasfold_interface_iptm_json",
+    "atlasfold_mmcif_path",
+    "atlasfold_pdb_path",
+    "atlasfold_confidence_json_path",
+    "atlasfold_raw_output_dir",
+    "atlasfold_reference_metric_status",
+    "atlasfold_reference_metric_error",
+    "atlasfold_model",
+    "atlasfold_version",
+    "atlasfold_source_commit",
+    "atlasfold_num_recycles",
+    "atlasfold_mlm_prob",
+    "atlasfold_num_samples",
+    "atlasfold_seeds",
+    "atlasfold_num_steps",
+    "atlasfold_max_tokens_per_batch",
+    "atlasfold_kernel",
     # Current ProteoCraft ESMFold2 full-verifier metrics.
     "pair_chain_iptm",
     "iptm",
@@ -133,6 +165,7 @@ def _build_argparser() -> argparse.ArgumentParser:
             LEGACY_ESMFOLD_EVALUATOR,
             LEGACY_ESMFOLD_ALIAS,
             "af3",
+            ATLASFOLD_EVALUATOR,
         ],
         default=DEFAULT_EVALUATOR,
         help=(
@@ -150,6 +183,67 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--af3-staging-root", default=None)
     ap.add_argument("--af3-output-root", default=None)
     ap.add_argument("--af3-timeout-per-sub-run", type=int, default=43200)
+    ap.add_argument(
+        "--atlasfold-python",
+        default=os.environ.get("ATLASFOLD_PYTHON"),
+        help="Python executable in the isolated AtlasFold environment",
+    )
+    ap.add_argument(
+        "--atlasfold-source-root",
+        default=os.environ.get("ATLASFOLD_SOURCE_ROOT"),
+        help="Pinned full AtlasFold v1.0.2 source checkout",
+    )
+    ap.add_argument(
+        "--atlasfold-cache-dir",
+        default=os.environ.get("ATLASFOLD_CACHE_DIR"),
+    )
+    ap.add_argument(
+        "--atlasfold-model-path", default=os.environ.get("ATLASFOLD_MODEL_PATH")
+    )
+    ap.add_argument("--atlasfold-lm-path", default=os.environ.get("ATLASFOLD_LM_PATH"))
+    ap.add_argument(
+        "--atlasfold-weights-receipt",
+        default=os.environ.get("ATLASFOLD_WEIGHTS_RECEIPT"),
+    )
+    ap.add_argument("--atlasfold-staging-root", default=None)
+    ap.add_argument("--atlasfold-output-root", default=None)
+    ap.add_argument("--atlasfold-timeout-per-sub-run", type=int, default=86400)
+    ap.add_argument(
+        "--atlasfold-num-recycles",
+        type=int,
+        default=atlasfold_runner.DEFAULT_NUM_RECYCLES,
+    )
+    ap.add_argument(
+        "--atlasfold-mlm-prob",
+        type=float,
+        default=atlasfold_runner.DEFAULT_MLM_PROB,
+    )
+    ap.add_argument(
+        "--atlasfold-num-samples",
+        type=int,
+        default=atlasfold_runner.DEFAULT_NUM_SAMPLES,
+    )
+    ap.add_argument(
+        "--atlasfold-seed",
+        type=int,
+        nargs="+",
+        default=list(atlasfold_runner.DEFAULT_SEEDS),
+    )
+    ap.add_argument(
+        "--atlasfold-num-steps",
+        type=int,
+        default=atlasfold_runner.DEFAULT_NUM_STEPS,
+    )
+    ap.add_argument(
+        "--atlasfold-max-tokens-per-batch",
+        type=int,
+        default=atlasfold_runner.DEFAULT_MAX_TOKENS_PER_BATCH,
+    )
+    ap.add_argument(
+        "--atlasfold-kernel",
+        choices=["auto", "torch", "cuequiv"],
+        default=atlasfold_runner.DEFAULT_KERNEL,
+    )
     ap.add_argument(
         "--esmfold2-model",
         default=esmfold2_runner.DEFAULT_MODEL_NAME,
@@ -232,6 +326,8 @@ def _compute_eval_n_successes(out: dict) -> int:
         return 0
     if out.get("evaluator") == DEFAULT_EVALUATOR:
         key_cols = ["pair_chain_iptm", "esmfold2_total_loss"]
+    elif out.get("evaluator") == ATLASFOLD_EVALUATOR:
+        key_cols = ["pair_chain_iptm", "atlasfold_ranking_score"]
     else:
         key_cols = ["binder_pLDDT", "ipAE", "binder_scRMSD"]
     return int(all(pd.notna(out.get(c)) for c in key_cols))
@@ -245,6 +341,7 @@ def evaluate_one(
     device: str = "cuda:0",
     *,
     af3_result: af3_runner.AF3Result | None = None,
+    atlasfold_result: atlasfold_runner.AtlasFoldResult | None = None,
     evaluator: str = LEGACY_ESMFOLD_EVALUATOR,
 ) -> dict:
     out: dict = _empty_row()
@@ -269,7 +366,9 @@ def evaluate_one(
     design_dir = _design_dir_for_row(out_root, row)
 
     try:
-        if af3_result is None:
+        if af3_result is not None and atlasfold_result is not None:
+            raise ValueError("only one external evaluator result may be supplied")
+        if af3_result is None and atlasfold_result is None:
             # 1. Build input
             esm_seq, segs = build_esmfold_input(row["target_seq"], row["binder_seq"])
             # 2. ESMFold inference
@@ -284,7 +383,7 @@ def evaluate_one(
             plddt_clean = np.load(design_dir / "plddt.npy")
             pae_clean = np.load(design_dir / "pae.npy")
             clean_segs = meta["clean_segments"]
-        else:
+        elif af3_result is not None:
             out["esmfold_pdb_path"] = af3_result.pdb_path
             out["eval_runtime_s"] = af3_result.runtime_s
             plddt_clean = af3_result.plddt
@@ -299,6 +398,58 @@ def evaluate_one(
                     "fraction_disordered", float("nan")
                 ),
             })
+        else:
+            assert atlasfold_result is not None
+            native = atlasfold_result.native
+            out["esmfold_pdb_path"] = atlasfold_result.pdb_path
+            out["eval_runtime_s"] = atlasfold_result.runtime_s
+            plddt_clean = atlasfold_result.plddt
+            pae_clean = atlasfold_result.pae
+            clean_segs = atlasfold_result.clean_segments
+            out.update({
+                "pair_chain_iptm": native.get("pair_chain_iptm", float("nan")),
+                "iptm": native.get("iptm", float("nan")),
+                "ptm": native.get("ptm", float("nan")),
+                "atlasfold_ranking_score": native.get(
+                    "ranking_score", float("nan")
+                ),
+                "atlasfold_pair_chain_iptm": native.get(
+                    "pair_chain_iptm", float("nan")
+                ),
+                "atlasfold_scaffold_pair_chain_iptm": native.get(
+                    "scaffold_pair_chain_iptm", float("nan")
+                ),
+                "atlasfold_iptm": native.get("iptm", float("nan")),
+                "atlasfold_ptm": native.get("ptm", float("nan")),
+                "atlasfold_complex_plddt": native.get(
+                    "complex_plddt", float("nan")
+                ),
+                "atlasfold_target_plddt": native.get(
+                    "target_plddt", float("nan")
+                ),
+                "atlasfold_binder_plddt": native.get(
+                    "binder_plddt", float("nan")
+                ),
+                "atlasfold_binder_ptm": native.get(
+                    "binder_ptm", float("nan")
+                ),
+                "atlasfold_avg_pde": native.get("avg_pde", float("nan")),
+                "atlasfold_fraction_disordered": native.get(
+                    "fraction_disordered", float("nan")
+                ),
+                "atlasfold_interface_iptm_json": json.dumps(
+                    native.get("interface_iptm", {}), sort_keys=True
+                ),
+                "atlasfold_mmcif_path": atlasfold_result.mmcif_path,
+                "atlasfold_pdb_path": atlasfold_result.pdb_path,
+                "atlasfold_confidence_json_path": (
+                    atlasfold_result.confidence_json_path
+                ),
+                "atlasfold_raw_output_dir": atlasfold_result.raw_output_dir,
+                "atlasfold_model": atlasfold_runner.MODEL_NAME,
+                "atlasfold_version": atlasfold_runner.UPSTREAM_VERSION,
+                "atlasfold_source_commit": atlasfold_runner.UPSTREAM_COMMIT,
+            })
 
         # 4. Tier 0 metrics
         out["complex_pLDDT"] = M.complex_pLDDT(plddt_clean, clean_segs)
@@ -308,6 +459,10 @@ def evaluate_one(
         out["ipAE"] = M.ipAE(pae_clean, clean_segs)
         out["min_ipAE"] = M.min_ipAE(pae_clean, clean_segs)
         out["i_pTM_approx_from_PAE"] = M.i_pTM_approx_from_PAE(pae_clean, clean_segs)
+        if atlasfold_result is not None:
+            out["complex_pLDDT"] = atlasfold_result.native["complex_plddt"]
+            out["target_pLDDT"] = atlasfold_result.native["target_plddt"]
+            out["binder_pLDDT"] = atlasfold_result.native["binder_plddt"]
 
         # v1.1 reviewer P0 #1: pred chain IDs come from meta clean_segments[i]["pdb_chain_id"]
         pred_t_chains = [
@@ -332,23 +487,97 @@ def evaluate_one(
         target_atoms = _heavy_atoms_by_chain(out["esmfold_pdb_path"], pred_t_chains)
         out["inter_chain_clash_count"] = M.inter_chain_clash_count(binder_atoms, target_atoms)
 
-        # scRMSD vs designed_complex_pdb_path
-        # v1.1 reviewer P1 #6: ref target chains from manifest's target_chain_in_complex
-        ref_target_chains = str(row["target_chain_in_complex"]).split("+")
-        sc, fold = M.binder_scRMSD(
-            pred_pdb_path=out["esmfold_pdb_path"],
-            ref_pdb_path=row["designed_complex_pdb_path"],
-            target_chains_pred=pred_t_chains,
-            target_chains_ref=ref_target_chains,
-            binder_chain_pred=pred_b_chain,
-            binder_chain_ref=row["binder_chain_in_complex"],
-        )
-        out["binder_scRMSD"] = sc
-        out["binder_fold_RMSD"] = fold
+        # scRMSD is optional for AtlasFold-M because this evaluator is
+        # sequence-only and several production manifests intentionally omit a
+        # reference complex. Other evaluators retain their original contract.
+        reference_path = _row_get(row, "designed_complex_pdb_path", None)
+        if atlasfold_result is not None:
+            out["atlasfold_reference_metric_status"] = "missing"
+            if reference_path and Path(str(reference_path)).is_file():
+                try:
+                    reference_pdb = Path(str(reference_path))
+                    if reference_pdb.suffix.lower() in {".cif", ".mmcif"}:
+                        converted_reference = (
+                            design_dir
+                            / ATLASFOLD_EVALUATOR
+                            / "reference_complex.pdb"
+                        )
+                        af3_runner.mmcif_to_pdb(reference_pdb, converted_reference)
+                        reference_pdb = converted_reference
+                    ref_target_chains = str(row["target_chain_in_complex"]).split("+")
+                    sc, fold = M.binder_scRMSD(
+                        pred_pdb_path=out["esmfold_pdb_path"],
+                        ref_pdb_path=str(reference_pdb),
+                        target_chains_pred=pred_t_chains,
+                        target_chains_ref=ref_target_chains,
+                        binder_chain_pred=pred_b_chain,
+                        binder_chain_ref=row["binder_chain_in_complex"],
+                    )
+                    out["binder_scRMSD"] = sc
+                    out["binder_fold_RMSD"] = fold
+                    out["atlasfold_reference_metric_status"] = "computed"
+                except Exception as exc:
+                    out["atlasfold_reference_metric_status"] = "failed"
+                    out["atlasfold_reference_metric_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+        else:
+            # v1.1 reviewer P1 #6: ref target chains from the manifest.
+            ref_target_chains = str(row["target_chain_in_complex"]).split("+")
+            sc, fold = M.binder_scRMSD(
+                pred_pdb_path=out["esmfold_pdb_path"],
+                ref_pdb_path=row["designed_complex_pdb_path"],
+                target_chains_pred=pred_t_chains,
+                target_chains_ref=ref_target_chains,
+                binder_chain_pred=pred_b_chain,
+                binder_chain_ref=row["binder_chain_in_complex"],
+            )
+            out["binder_scRMSD"] = sc
+            out["binder_fold_RMSD"] = fold
 
-        # 5. Tier flags (overwrites the False defaults)
-        flags = compute_tier_flags(out, evaluator=evaluator)
-        out.update(flags)
+        if atlasfold_result is not None:
+            roles = tuple(segment.get("role", "target") for segment in clean_segs[:-1])
+            out["target_chain_roles"] = "+".join(roles)
+            hotspots = esmfold2_runner.parse_hotspot_indices(
+                _row_get(row, "target_hotspot_concat_indices", None)
+            )
+            if hotspots:
+                target_lengths = [
+                    int(segment["length"])
+                    for segment in clean_segs
+                    if segment["kind"].startswith("target_chain_")
+                ]
+                coverage_8a = calculate_hotspot_coverage(
+                    atlasfold_result.pdb_path,
+                    target_chain_ids=pred_t_chains,
+                    binder_chain_id=pred_b_chain,
+                    hotspot_concat_indices_0based=hotspots,
+                    expected_target_chain_lengths=target_lengths,
+                    heavy_atom_cutoff=8.0,
+                )
+                coverage_5a = calculate_hotspot_coverage(
+                    atlasfold_result.pdb_path,
+                    target_chain_ids=pred_t_chains,
+                    binder_chain_id=pred_b_chain,
+                    hotspot_concat_indices_0based=hotspots,
+                    expected_target_chain_lengths=target_lengths,
+                    heavy_atom_cutoff=5.0,
+                )
+                out.update({
+                    "hotspot_mean_min_heavy_atom_distance": coverage_8a[
+                        "mean_min_heavy_atom_distance"
+                    ],
+                    "hotspot_heavy_atom_coverage": coverage_8a[
+                        "heavy_atom_coverage"
+                    ],
+                    "hotspot_heavy_atom_coverage_5a": coverage_5a[
+                        "heavy_atom_coverage"
+                    ],
+                })
+        else:
+            # AtlasFold-M has no calibrated ProteoCraft pass thresholds yet.
+            flags = compute_tier_flags(out, evaluator=evaluator)
+            out.update(flags)
 
     except Exception as e:
         out["error_msg"] = f"{type(e).__name__}: {e}"
@@ -548,7 +777,14 @@ def _af3_preflight(args, manifest_df: pd.DataFrame) -> None:
             )
 
 
-def _build_failed_row(staged: dict, paper_case: str, sub_run: str, error: str) -> dict:
+def _build_failed_row(
+    staged: dict,
+    paper_case: str,
+    sub_run: str,
+    error: str,
+    *,
+    evaluator: str = "af3",
+) -> dict:
     out = _empty_row()
     row = staged.get("row", {}) if isinstance(staged, dict) else {}
     try:
@@ -556,7 +792,7 @@ def _build_failed_row(staged: dict, paper_case: str, sub_run: str, error: str) -
     except Exception:
         binder_length = -1
     out.update({
-        "evaluator": "af3",
+        "evaluator": evaluator,
         "method": _row_get(row, "method", "unknown"),
         "case": _row_get(row, "case", sub_run),
         "paper_case": _row_get(row, "paper_case", paper_case),
@@ -825,6 +1061,309 @@ def _run_af3_for_one_sub_run(df: pd.DataFrame, args, out_root: Path) -> None:
     print(f"wrote {output_csv}")
 
 
+def _collect_atlasfold_env(args) -> dict:
+    if os.environ.get("ATLASFOLD_MOCK") == "1":
+        return {
+            "atlasfold_python": args.atlasfold_python or "mock-python",
+            "source_root": args.atlasfold_source_root or "mock-source",
+            "source_metadata": {"mock": True},
+            "environment_metadata": {"mock": True},
+            "weights_metadata": {"mock": True},
+        }
+
+    required = {
+        "atlasfold_python": args.atlasfold_python,
+        "source_root": args.atlasfold_source_root,
+        "model_path": args.atlasfold_model_path,
+        "lm_path": args.atlasfold_lm_path,
+        "weights_receipt": args.atlasfold_weights_receipt,
+    }
+    missing = [key for key, value in required.items() if not value]
+    if missing:
+        flags = ", ".join(f"--{key.replace('_', '-')}" for key in missing)
+        raise SystemExit(
+            f"--evaluator {ATLASFOLD_EVALUATOR} requires {flags} (or env vars)"
+        )
+    # Preserve a venv entrypoint symlink. Resolving it selects the base interpreter
+    # and silently drops packages installed only in the isolated AtlasFold venv.
+    python_path = Path(args.atlasfold_python).expanduser().absolute()
+    source_root = Path(args.atlasfold_source_root)
+    if not python_path.is_file():
+        raise SystemExit(f"--atlasfold-python={python_path} is not a file")
+    if not source_root.is_dir():
+        raise SystemExit(f"--atlasfold-source-root={source_root} is not a directory")
+    for flag_name, value in (
+        ("atlasfold-model-path", args.atlasfold_model_path),
+        ("atlasfold-lm-path", args.atlasfold_lm_path),
+        ("atlasfold-weights-receipt", args.atlasfold_weights_receipt),
+    ):
+        if value and not Path(value).is_file():
+            raise SystemExit(f"--{flag_name}={value} is not a file")
+    try:
+        source_metadata = atlasfold_runner.verify_source_checkout(source_root)
+        environment_metadata = atlasfold_runner.probe_environment(
+            str(python_path), source_root
+        )
+        weights_metadata = atlasfold_runner.validate_weights_receipt(
+            Path(args.atlasfold_weights_receipt),
+            model_path=Path(args.atlasfold_model_path),
+            lm_path=Path(args.atlasfold_lm_path),
+        )
+    except Exception as exc:
+        raise SystemExit(f"AtlasFold-M provenance preflight failed: {exc}") from exc
+    return {
+        "atlasfold_python": str(python_path),
+        "source_root": str(source_root.resolve()),
+        "source_metadata": source_metadata,
+        "environment_metadata": environment_metadata,
+        "weights_metadata": weights_metadata,
+    }
+
+
+def _atlasfold_preflight(manifest_df: pd.DataFrame) -> None:
+    """Validate sequence/role inputs before spending AtlasFold GPU time."""
+
+    for _, row in manifest_df.iterrows():
+        atlasfold_runner.build_chain_layout(
+            row["target_seq"],
+            row["binder_seq"],
+            _row_get(row, "target_chain_roles", None),
+        )
+
+
+def _row_identity(row) -> tuple[str, str, str]:
+    return tuple(str(_row_get(row, key, "")) for key in ("method", "case", "design_id"))
+
+
+def _drop_existing_rows_for_rerun(
+    existing_rows: list[dict], rows_to_run: list[dict]
+) -> list[dict]:
+    rerun_keys = {_row_identity(row) for row in rows_to_run}
+    return [row for row in existing_rows if _row_identity(row) not in rerun_keys]
+
+
+def _write_or_validate_atlasfold_run_config(
+    output_dir: Path, run_config: dict, *, allow_replace: bool
+) -> None:
+    output_dir = Path(output_dir)
+    config_path = output_dir / "adapter_provenance.json"
+    done_markers = list(output_dir.glob("*/done.txt")) if output_dir.is_dir() else []
+    if config_path.is_file() and not allow_replace:
+        previous = json.loads(config_path.read_text())
+        if previous != run_config:
+            raise SystemExit(
+                "AtlasFold-M raw outputs use a different run configuration; "
+                "use --no-skip-existing to replace them"
+            )
+        return
+    if done_markers and not config_path.is_file() and not allow_replace:
+        raise SystemExit(
+            "AtlasFold-M raw outputs have completion markers but no adapter provenance; "
+            "use --no-skip-existing to replace them"
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(run_config, indent=2, sort_keys=True) + "\n")
+
+
+def _run_atlasfold_for_one_sub_run(df: pd.DataFrame, args, out_root: Path) -> None:
+    if not args.paper_case:
+        raise SystemExit(f"{ATLASFOLD_EVALUATOR} evaluator: --paper-case required")
+    if not args.sub_run:
+        raise SystemExit(
+            f"{ATLASFOLD_EVALUATOR} evaluator: --sub-run required "
+            "(one cli.py invocation per sub-run)"
+        )
+
+    paper_case = args.paper_case
+    sub_run = args.sub_run
+    output_csv = _resolve_output_csv(args, sub_run=sub_run)
+    existing_rows: list[dict] = []
+    existing_keys: set[tuple[str, str, str]] = set()
+    if args.skip_existing and output_csv.exists():
+        existing_rows = _read_existing_eval_rows(output_csv)
+        existing_keys = {_row_identity(row) for row in existing_rows}
+
+    if args.skip_existing:
+        before = len(df)
+        df = df[
+            df.apply(
+                lambda row: not (
+                    (
+                        _design_dir_for_row(out_root, row)
+                        / ATLASFOLD_EVALUATOR
+                        / "atlasfold_m.cif"
+                    ).exists()
+                    and _row_identity(row) in existing_keys
+                ),
+                axis=1,
+            )
+        ]
+        if len(df) < before:
+            print(
+                f"skip_existing: {before - len(df)} designs already have "
+                "AtlasFold-M artifacts and CSV rows"
+            )
+        if len(df) == 0:
+            print(f"all designs already evaluated; preserving existing {output_csv}")
+            return
+
+    atlas_env = _collect_atlasfold_env(args)
+    if os.environ.get("ATLASFOLD_MOCK") != "1":
+        _atlasfold_preflight(df)
+
+    staging_dir = Path(
+        args.atlasfold_staging_root or out_root / "atlasfold_staging"
+    ) / paper_case / sub_run
+    atlas_output_dir = Path(
+        args.atlasfold_output_root or out_root / "atlasfold_outputs"
+    ) / paper_case / sub_run
+    rows = df.to_dict("records")
+    for row in rows:
+        if _is_missing(row.get("paper_case")):
+            row["paper_case"] = paper_case
+    existing_rows = _drop_existing_rows_for_rerun(existing_rows, rows)
+
+    atlasfold_runner.cleanup_for_rerun(
+        staging_dir,
+        atlas_output_dir,
+        reset_outputs=not args.skip_existing,
+    )
+    try:
+        staged = atlasfold_runner.stage_inputs_for_sub_run(
+            rows=rows,
+            staging_dir=staging_dir,
+        )
+    except Exception as exc:
+        print(f"WARNING: AtlasFold-M staging failed: {type(exc).__name__}: {exc}")
+        rows_out = existing_rows + [
+            _build_failed_row(
+                {"row": row},
+                paper_case,
+                sub_run,
+                f"staging_failed: {type(exc).__name__}: {exc}",
+                evaluator=ATLASFOLD_EVALUATOR,
+            )
+            for row in rows
+        ]
+        _align_eval_csv_rows(rows_out).to_csv(output_csv, index=False)
+        print(f"wrote {output_csv} ({len(rows)} stage-failed rows)")
+        return
+
+    for staged_design in staged:
+        staged_design["out_dir"] = (
+            _design_dir_for_row(out_root, staged_design["row"])
+            / ATLASFOLD_EVALUATOR
+        )
+    if not staged:
+        _align_eval_csv_rows(existing_rows).to_csv(output_csv, index=False)
+        print(f"no AtlasFold-M designs staged; wrote {output_csv}")
+        return
+
+    run_config = {
+        "model": atlasfold_runner.MODEL_NAME,
+        "upstream_version": atlasfold_runner.UPSTREAM_VERSION,
+        "upstream_commit": atlasfold_runner.UPSTREAM_COMMIT,
+        "source_metadata": atlas_env["source_metadata"],
+        "environment_metadata": atlas_env["environment_metadata"],
+        "weights_metadata": atlas_env["weights_metadata"],
+        "weights_receipt": args.atlasfold_weights_receipt,
+        "device": args.device,
+        "num_recycles": int(args.atlasfold_num_recycles),
+        "mlm_prob": float(args.atlasfold_mlm_prob),
+        "num_samples": int(args.atlasfold_num_samples),
+        "seeds": [int(seed) for seed in args.atlasfold_seed],
+        "num_steps": int(args.atlasfold_num_steps),
+        "max_tokens_per_batch": int(args.atlasfold_max_tokens_per_batch),
+        "kernel": args.atlasfold_kernel,
+        "cache_dir": args.atlasfold_cache_dir,
+        "model_path": args.atlasfold_model_path,
+        "lm_path": args.atlasfold_lm_path,
+        "sequence_only": True,
+    }
+    _write_or_validate_atlasfold_run_config(
+        atlas_output_dir,
+        run_config,
+        allow_replace=not args.skip_existing,
+    )
+    print(f"Running AtlasFold-M batched: {len(staged)} designs in {sub_run}")
+    subp_result = atlasfold_runner.run_atlasfold_batched(
+        staging_dir=staging_dir,
+        output_dir=atlas_output_dir,
+        atlasfold_python=atlas_env["atlasfold_python"],
+        source_root=Path(atlas_env["source_root"]),
+        device=args.device,
+        timeout_s=args.atlasfold_timeout_per_sub_run,
+        num_recycles=args.atlasfold_num_recycles,
+        mlm_prob=args.atlasfold_mlm_prob,
+        num_samples=args.atlasfold_num_samples,
+        seeds=args.atlasfold_seed,
+        num_steps=args.atlasfold_num_steps,
+        max_tokens_per_batch=args.atlasfold_max_tokens_per_batch,
+        kernel=args.atlasfold_kernel,
+        cache_dir=(
+            Path(args.atlasfold_cache_dir) if args.atlasfold_cache_dir else None
+        ),
+        model_path=(
+            Path(args.atlasfold_model_path) if args.atlasfold_model_path else None
+        ),
+        lm_path=Path(args.atlasfold_lm_path) if args.atlasfold_lm_path else None,
+        overwrite=not args.skip_existing,
+    )
+    if subp_result["timed_out"]:
+        print(f"WARNING: AtlasFold-M timed out at {subp_result['wall_clock_s']:.0f}s")
+    if subp_result["exit_code"] != 0:
+        print(
+            f"WARNING: AtlasFold-M exit code {subp_result['exit_code']}; "
+            f"stderr tail: {subp_result['stderr_tail'][-500:]}"
+        )
+
+    amortized_s = subp_result["wall_clock_s"] / max(len(staged), 1)
+    rows_out = list(existing_rows)
+    for staged_design in staged:
+        try:
+            atlas_result = atlasfold_runner.parse_one_atlasfold_design(
+                atlasfold_output_dir=atlas_output_dir,
+                staged_design=staged_design,
+                amortized_runtime_s=amortized_s,
+                out_dir=staged_design["out_dir"],
+                run_config=run_config,
+            )
+            row_out = evaluate_one(
+                staged_design["row"],
+                out_root,
+                atlasfold_result=atlas_result,
+                evaluator=ATLASFOLD_EVALUATOR,
+            )
+            row_out.update({
+                "atlasfold_num_recycles": args.atlasfold_num_recycles,
+                "atlasfold_mlm_prob": args.atlasfold_mlm_prob,
+                "atlasfold_num_samples": args.atlasfold_num_samples,
+                "atlasfold_seeds": ",".join(map(str, args.atlasfold_seed)),
+                "atlasfold_num_steps": args.atlasfold_num_steps,
+                "atlasfold_max_tokens_per_batch": args.atlasfold_max_tokens_per_batch,
+                "atlasfold_kernel": args.atlasfold_kernel,
+            })
+        except FileNotFoundError as exc:
+            row_out = _build_failed_row(
+                staged_design,
+                paper_case,
+                sub_run,
+                f"atlasfold_output_missing: {exc}",
+                evaluator=ATLASFOLD_EVALUATOR,
+            )
+        except Exception as exc:
+            row_out = _build_failed_row(
+                staged_design,
+                paper_case,
+                sub_run,
+                f"parse/metrics: {type(exc).__name__}: {exc}",
+                evaluator=ATLASFOLD_EVALUATOR,
+            )
+        rows_out.append(row_out)
+        _align_eval_csv_rows(rows_out).to_csv(output_csv, index=False)
+    print(f"wrote {output_csv}")
+
+
 def main():
     args = _build_argparser().parse_args()
     if args.evaluator == LEGACY_ESMFOLD_ALIAS:
@@ -861,8 +1400,12 @@ def main():
         _run_esmfold2_loop(df, args, out_root)
     elif args.evaluator in {LEGACY_ESMFOLD_EVALUATOR, LEGACY_ESMFOLD_ALIAS}:
         _run_esmfold_loop(df, args, out_root)
-    else:
+    elif args.evaluator == "af3":
         _run_af3_for_one_sub_run(df, args, out_root)
+    elif args.evaluator == ATLASFOLD_EVALUATOR:
+        _run_atlasfold_for_one_sub_run(df, args, out_root)
+    else:
+        raise SystemExit(f"unsupported evaluator: {args.evaluator}")
 
 
 if __name__ == "__main__":
