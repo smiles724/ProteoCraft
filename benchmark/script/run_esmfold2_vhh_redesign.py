@@ -38,6 +38,8 @@ PASSTHROUGH_OPTIONS = (
     "esmfold2_stagea_soft_steps",
     "esmfold2_stagea_mutation_fraction",
     "esmfold2_stagea_candidate_strategy",
+    "esmfold2_stagea_dominance_gap",
+    "esmfold2_stagea_protected_mutation_candidates",
     "esmfold2_stagea_include_argmax_candidate",
     "esmfold2_stageb_soft_steps",
     "esmfold2_stageb_verifier_candidates",

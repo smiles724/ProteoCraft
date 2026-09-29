@@ -206,7 +206,9 @@ def test_formal_cdr_configs_inherit_recommended_two_stage_profile(
     assert args.mcts_bootstrap_max_steps == 70
     assert args.mcts_prior_mode == "no_group"
     assert args.seed == 43
-    assert args.esmfold2_stagea_candidate_strategy == "positive_score"
+    assert args.esmfold2_stagea_candidate_strategy == "positive_score_guarded"
+    assert args.esmfold2_stagea_dominance_gap == pytest.approx(0.5)
+    assert args.esmfold2_stagea_protected_mutation_candidates == 2
     assert args.esmfold2_stagea_mutation_fraction == pytest.approx(0.5)
     assert args.esmfold2_stagea_include_argmax_candidate is True
     assert args.esmfold2_one_step_diffusion_mode == "truncated_trajectory"

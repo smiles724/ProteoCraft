@@ -1111,13 +1111,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--esmfold2_stagea_candidate_strategy",
         type=str,
-        choices=["legacy", "positive_score"],
+        choices=["legacy", "positive_score", "positive_score_guarded"],
         default="positive_score",
         help=(
             "StageA 离散候选策略；positive_score 仅使用正 logit-delta "
             "突变，并要求设置 mutation fraction（默认：positive_score）"
         ),
     )
+    parser.add_argument("--esmfold2_stagea_dominance_gap", type=float, default=0.5,
+                        help="Guarded mode: minimum raw logit gap before and after update")
+    parser.add_argument("--esmfold2_stagea_protected_mutation_candidates", type=int, default=2,
+                        help="Guarded mode: number of final weighted candidates to protect")
     parser.add_argument(
         "--esmfold2_stagea_include_argmax_candidate",
         type=lambda x: x.lower() == "true",
@@ -1244,6 +1248,14 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
         raise ValueError(message)
     if getattr(args, "mcts_strategy", None) is None:
         args.mcts_strategy = "two_stage"
+    if getattr(args, "esmfold2_stagea_candidate_strategy", None) == "positive_score_guarded":
+        if backend != "esmfold2" or args.mcts_strategy not in {
+            "legacy", "strict", "stage_a_only", "two_stage",
+        }:
+            message = "positive_score_guarded requires ESMFold2 Stage-A candidate branching"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
     if getattr(args, "seed", None) is None:
         args.seed = 43 if backend == "esmfold2" else 42
     if getattr(args, "n_steps", None) is None:
@@ -1348,7 +1360,7 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
                 parser.error(message)
             raise ValueError(message)
         if (
-            args.esmfold2_stagea_candidate_strategy == "positive_score"
+            args.esmfold2_stagea_candidate_strategy in {"positive_score", "positive_score_guarded"}
             and args.esmfold2_stagea_mutation_fraction is None
         ):
             message = (
@@ -1358,6 +1370,17 @@ def resolve_model_backend(args, parser: argparse.ArgumentParser = None) -> str:
             if parser is not None:
                 parser.error(message)
             raise ValueError(message)
+        if args.esmfold2_stagea_candidate_strategy == "positive_score_guarded":
+            from bindcraft.hallucination.esmfold2_backend import validate_dominance_guard
+            try:
+                validate_dominance_guard(
+                    args.esmfold2_stagea_dominance_gap,
+                    args.esmfold2_stagea_protected_mutation_candidates,
+                )
+            except ValueError as exc:
+                if parser is not None:
+                    parser.error(str(exc))
+                raise
         if getattr(args, "mcts_handoff_top_k", None) is None:
             args.mcts_handoff_top_k = 2
         if args.esmfold2_stageb_rerank_pool_size <= 0:
@@ -1909,6 +1932,10 @@ def main(argv=None):
                 esmfold2_stagea_candidate_strategy=(
                     args.esmfold2_stagea_candidate_strategy
                 ),
+                esmfold2_stagea_dominance_gap=args.esmfold2_stagea_dominance_gap,
+                esmfold2_stagea_protected_mutation_candidates=(
+                    args.esmfold2_stagea_protected_mutation_candidates
+                ),
                 esmfold2_stagea_include_argmax_candidate=(
                     args.esmfold2_stagea_include_argmax_candidate
                 ),
@@ -2175,6 +2202,12 @@ def main(argv=None):
                 "ESMFold2 StageA Candidate Strategy: "
                 f"{args.esmfold2_stagea_candidate_strategy}\n"
             )
+            if args.esmfold2_stagea_candidate_strategy == "positive_score_guarded":
+                f.write(f"ESMFold2 StageA Dominance Gap: {args.esmfold2_stagea_dominance_gap}\n")
+                f.write(
+                    "ESMFold2 StageA Protected Mutation Candidates: "
+                    f"{args.esmfold2_stagea_protected_mutation_candidates}\n"
+                )
             f.write(
                 "ESMFold2 StageA Include Argmax Candidate: "
                 f"{args.esmfold2_stagea_include_argmax_candidate}\n"

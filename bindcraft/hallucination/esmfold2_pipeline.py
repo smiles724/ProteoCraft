@@ -960,10 +960,21 @@ def _call_backend_propose(
     preserve_proposal_logits: bool = False,
     mutation_fraction: Optional[float] = None,
     candidate_strategy: Optional[str] = None,
+    dominance_gap: float = 0.5,
+    protected_mutation_candidates: int = 2,
     include_argmax_candidate: Optional[bool] = None,
     **kwargs: Any,
 ) -> ESMFold2ProposalBatch:
     propose_kwargs = dict(kwargs)
+    if candidate_strategy == "positive_score_guarded":
+        for name, value in (
+            ("candidate_strategy", candidate_strategy),
+            ("dominance_gap", dominance_gap),
+            ("protected_mutation_candidates", protected_mutation_candidates),
+        ):
+            if not _callable_accepts_argument(backend.propose, name):
+                raise ValueError(f"guarded candidate mode requires backend.propose argument {name}")
+            propose_kwargs[name] = value
     if (
         mutation_fraction is not None
         and _callable_accepts_argument(backend.propose, "mutation_fraction")
@@ -4015,6 +4026,8 @@ def run_esmfold2_mcts_hallucination(
     stagea_max_mutations_per_seq: Optional[int] = None,
     esmfold2_stagea_mutation_fraction: Optional[float] = 0.5,
     esmfold2_stagea_candidate_strategy: str = "positive_score",
+    esmfold2_stagea_dominance_gap: float = 0.5,
+    esmfold2_stagea_protected_mutation_candidates: int = 2,
     esmfold2_stagea_include_argmax_candidate: bool = True,
     stageb_max_mutations_per_seq: Optional[int] = None,
     num_beams: int = 8,
@@ -4107,13 +4120,18 @@ def run_esmfold2_mcts_hallucination(
     stagea_candidate_strategy = str(
         esmfold2_stagea_candidate_strategy or "legacy"
     ).strip().lower()
-    if stagea_candidate_strategy not in {"legacy", "positive_score"}:
+    if stagea_candidate_strategy == "positive_score_guarded":
+        from bindcraft.hallucination.esmfold2_backend import validate_dominance_guard
+        validate_dominance_guard(
+            esmfold2_stagea_dominance_gap, esmfold2_stagea_protected_mutation_candidates,
+        )
+    if stagea_candidate_strategy not in {"legacy", "positive_score", "positive_score_guarded"}:
         raise ValueError(
             "esmfold2_stagea_candidate_strategy must be 'legacy' or "
-            "'positive_score'"
+            "'positive_score' or 'positive_score_guarded'"
         )
     if (
-        stagea_candidate_strategy == "positive_score"
+        stagea_candidate_strategy in {"positive_score", "positive_score_guarded"}
         and stagea_mutation_fraction is None
     ):
         raise ValueError(
@@ -4133,6 +4151,10 @@ def run_esmfold2_mcts_hallucination(
         strategy = "two_stage"
     if strategy == "legacy":
         strategy = "stage_a_only"
+    if stagea_candidate_strategy == "positive_score_guarded" and strategy not in {
+        "stage_a_only", "two_stage",
+    }:
+        raise ValueError("positive_score_guarded requires Stage-A candidate branching")
     if strategy not in {
         "stage_a_only",
         "two_stage",
@@ -4650,6 +4672,10 @@ def run_esmfold2_mcts_hallucination(
                 "stagea_max_mutations_per_seq": stagea_max_mutations,
                 "stagea_mutation_fraction": stagea_mutation_fraction,
                 "stagea_candidate_strategy": stagea_candidate_strategy,
+                **({
+                    "stagea_dominance_gap": float(esmfold2_stagea_dominance_gap),
+                    "stagea_protected_mutation_candidates": esmfold2_stagea_protected_mutation_candidates,
+                } if stagea_candidate_strategy == "positive_score_guarded" else {}),
                 "stagea_include_argmax_candidate": (
                     stagea_include_argmax_candidate
                 ),
@@ -5200,6 +5226,8 @@ def run_esmfold2_mcts_hallucination(
             max_mutations_per_seq=stagea_max_mutations,
             mutation_fraction=stagea_mutation_fraction,
             candidate_strategy=stagea_candidate_strategy,
+            dominance_gap=esmfold2_stagea_dominance_gap,
+            protected_mutation_candidates=esmfold2_stagea_protected_mutation_candidates,
             include_argmax_candidate=stagea_include_argmax_candidate,
             seed=proposal_seed,
             action_group=None,

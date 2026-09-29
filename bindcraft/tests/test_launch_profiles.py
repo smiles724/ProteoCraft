@@ -78,7 +78,9 @@ def test_esmfold2_d_profile_matches_formal_method_defaults():
     assert args.esmfold2_stagea_preserve_soft_state is True
     assert args.esmfold2_stagea_cumulative_annealing is False
     assert args.esmfold2_stagea_mutation_fraction == pytest.approx(0.5)
-    assert args.esmfold2_stagea_candidate_strategy == "positive_score"
+    assert args.esmfold2_stagea_candidate_strategy == "positive_score_guarded"
+    assert args.esmfold2_stagea_dominance_gap == pytest.approx(0.5)
+    assert args.esmfold2_stagea_protected_mutation_candidates == 2
     assert args.esmfold2_stagea_include_argmax_candidate is True
     assert args.stagea_max_mutations_per_seq is None
     assert args.stageb_max_mutations_per_seq == 1
@@ -113,6 +115,15 @@ def test_explicit_cli_value_overrides_launch_profile():
 
     assert args.n_steps == 5
     assert args.esmfold2_one_step_diffusion_weight == pytest.approx(0.5)
+
+
+def test_legacy_candidate_strategy_can_override_guarded_profile():
+    args = _parse_profile(
+        "esmfold2_d",
+        "--esmfold2_stagea_candidate_strategy",
+        "positive_score",
+    )
+    assert args.esmfold2_stagea_candidate_strategy == "positive_score"
 
 
 def test_dense_truncated_schedule_is_an_explicit_profile_override():
@@ -181,7 +192,7 @@ def test_esmfold2_profile_covers_all_formal_task_modes(
     assert args.mcts_prior_mode == "no_group"
     assert args.seed == 43
     assert args.b_candidates == 8
-    assert args.esmfold2_stagea_candidate_strategy == "positive_score"
+    assert args.esmfold2_stagea_candidate_strategy == "positive_score_guarded"
     assert args.esmfold2_stagea_mutation_fraction == pytest.approx(0.5)
     assert args.esmfold2_stagea_include_argmax_candidate is True
     assert args.esmfold2_one_step_diffusion_mode == "truncated_trajectory"

@@ -1204,6 +1204,110 @@ def _candidate_metadata_from_sequence(
     }
 
 
+def validate_dominance_guard(gap: float, count: int) -> None:
+    if not math.isfinite(float(gap)) or float(gap) <= 0:
+        raise ValueError("dominance_gap must be finite and positive")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError("protected_mutation_candidates must be a positive integer")
+
+
+def dominant_current_residue_mask(
+    logits_before: torch.Tensor,
+    logits_after: torch.Tensor,
+    *,
+    current_seq: str,
+    mutable_mask: Optional[Sequence[bool]] = None,
+    dominance_gap: float = 0.5,
+) -> torch.Tensor:
+    """Protect a current residue only if it leads before and after the update."""
+    validate_dominance_guard(dominance_gap, 1)
+    protected = _as_bool_mask(mutable_mask, len(current_seq)).cpu().clone()
+    indices = _sequence_indices(current_seq).cpu()
+    rows = torch.arange(len(current_seq))
+    for logits in (logits_before, logits_after):
+        values = logits.detach().cpu()
+        if values.ndim == 3 and values.shape[0] == 1:
+            values = values[0]
+        if values.shape != (len(current_seq), len(ESM_AA_ORDER)):
+            raise ValueError("guard logits must have shape [L, 20] or [1, L, 20]")
+        current = values[rows, indices]
+        competitors = values.clone()
+        competitors[:, CYS_INDEX] = float("-inf")
+        competitors[rows, indices] = float("-inf")
+        # -inf denotes a disabled option; NaN/+inf must not imply dominance.
+        valid = ~(torch.isnan(competitors) | torch.isposinf(competitors)).any(dim=-1)
+        best = competitors.max(dim=-1).values
+        protected &= valid & torch.isfinite(current) & (indices != CYS_INDEX)
+        protected &= (current - best) >= float(dominance_gap)
+    return protected
+
+
+def _guard_weighted_candidates(
+    batch: ESMFold2DiscreteCandidateBatch,
+    *,
+    logits_before: torch.Tensor,
+    logits_after: torch.Tensor,
+    current_seq: str,
+    mutable_mask: Optional[Sequence[bool]],
+    dominance_gap: float,
+    protected_mutation_candidates: int,
+) -> ESMFold2DiscreteCandidateBatch:
+    protected = dominant_current_residue_mask(
+        logits_before, logits_after, current_seq=current_seq,
+        mutable_mask=mutable_mask, dominance_gap=dominance_gap,
+    ).tolist()
+    scores = logit_delta_mutation_scores(
+        logits_before, logits_after, current_seq=current_seq, mutable_mask=mutable_mask,
+    ).detach().cpu()
+    sequences = list(batch.sequences)
+    metadata = [dict(item) for item in batch.candidate_metadata]
+    slots = [i for i, item in enumerate(metadata)
+             if item["source"] == "positive_score_weighted"][-protected_mutation_candidates:]
+    changed_count = 0
+    fallback_count = 0
+    for slot in slots:
+        original = sequences[slot]
+        restored = [i for i, (old, new) in enumerate(zip(current_seq, original))
+                    if protected[i] and old != new]
+        candidate = "".join(old if protected[i] else new
+                            for i, (old, new) in enumerate(zip(current_seq, original)))
+        reason = None
+        if candidate == current_seq:
+            reason = "parent_sequence"
+        elif any(candidate == other for i, other in enumerate(sequences) if i != slot):
+            reason = "duplicate_candidate"
+        if reason is not None:
+            fallback_count += 1
+        elif candidate != original:
+            sequences[slot] = candidate
+            metadata[slot] = _candidate_metadata_from_sequence(
+                current_seq=current_seq, sequence=candidate, scores=scores,
+                source="positive_score_weighted_guarded",
+            )
+            changed_count += 1
+        metadata[slot]["dominance_guard"] = {
+            "original_sequence": original,
+            "attempted_restore_positions": restored,
+            "restored_positions": [] if reason else restored,
+            "fallback_reason": reason,
+            "status": "fallback" if reason else ("applied" if restored else "unchanged"),
+        }
+    diagnostics = dict(batch.diagnostics)
+    diagnostics.update(
+        candidate_strategy="positive_score_guarded",
+        dominance_gap=float(dominance_gap),
+        protected_mutation_candidates=protected_mutation_candidates,
+        protected_positions=[i for i, value in enumerate(protected) if value],
+        guard_selected_slots=slots,
+        guard_changed_candidate_count=changed_count,
+        guard_fallback_count=fallback_count,
+        mutation_count_contract="unprotected_exact_protected_at_most",
+    )
+    return ESMFold2DiscreteCandidateBatch(
+        sequences=sequences, candidate_metadata=metadata, diagnostics=diagnostics,
+    )
+
+
 def build_logit_delta_candidate_batch(
     logits_before: torch.Tensor,
     logits_after: torch.Tensor,
@@ -1217,6 +1321,8 @@ def build_logit_delta_candidate_batch(
     mutation_fraction: Optional[float] = None,
     include_logit_candidates: bool = False,
     candidate_strategy: str = "legacy",
+    dominance_gap: float = 0.5,
+    protected_mutation_candidates: int = 2,
 ) -> ESMFold2DiscreteCandidateBatch:
     """Generate discrete candidates and proposal diagnostics.
 
@@ -1224,6 +1330,8 @@ def build_logit_delta_candidate_batch(
     keeps only beneficial per-position logit-delta edits, uses one deterministic
     top-K candidate, then samples the remaining candidates with exactly the same
     number of distinct positions.
+    ``positive_score_guarded`` restores dominant residues in the final weighted
+    slots after sampling, without extra random draws or replacement mutations.
     """
 
     from bindcraft.hallucination.mutation_proposer import (
@@ -1234,6 +1342,22 @@ def build_logit_delta_candidate_batch(
     )
 
     strategy = str(candidate_strategy or "legacy").strip().lower()
+    if strategy == "positive_score_guarded":
+        validate_dominance_guard(dominance_gap, protected_mutation_candidates)
+        # Reuse the original sampler without extra random draws or budget changes.
+        batch = build_logit_delta_candidate_batch(
+            logits_before, logits_after, current_seq=current_seq,
+            mutable_mask=mutable_mask, K_top=K_top, B_candidates=B_candidates,
+            T_sample=T_sample, max_mutations_per_seq=max_mutations_per_seq,
+            mutation_fraction=mutation_fraction, include_logit_candidates=include_logit_candidates,
+            candidate_strategy="positive_score",
+        )
+        return _guard_weighted_candidates(
+            batch, logits_before=logits_before, logits_after=logits_after,
+            current_seq=current_seq, mutable_mask=mutable_mask,
+            dominance_gap=dominance_gap,
+            protected_mutation_candidates=protected_mutation_candidates,
+        )
     if strategy not in {"legacy", "positive_score"}:
         raise ValueError(
             "candidate_strategy must be 'legacy' or 'positive_score'"
@@ -1542,6 +1666,8 @@ def propose_sequences_from_logit_delta(
     mutation_fraction: Optional[float] = None,
     include_logit_candidates: bool = False,
     candidate_strategy: str = "legacy",
+    dominance_gap: float = 0.5,
+    protected_mutation_candidates: int = 2,
 ) -> list[str]:
     """Return only sequence strings for the legacy public helper contract."""
 
@@ -1557,5 +1683,7 @@ def propose_sequences_from_logit_delta(
         mutation_fraction=mutation_fraction,
         include_logit_candidates=include_logit_candidates,
         candidate_strategy=candidate_strategy,
+        dominance_gap=dominance_gap,
+        protected_mutation_candidates=protected_mutation_candidates,
     )
     return list(batch.sequences)

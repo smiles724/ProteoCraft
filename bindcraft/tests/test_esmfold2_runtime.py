@@ -738,8 +738,9 @@ def test_runtime_propose_candidate_sampling_is_reproducible_for_fixed_seed():
     assert first == second
 
 
+@pytest.mark.parametrize("strategy", ["positive_score", "positive_score_guarded"])
 def test_positive_score_runtime_excludes_unbounded_confidence_candidates(
-    monkeypatch,
+    monkeypatch, strategy,
 ):
     backend = ESMFold2RuntimeBackend(
         config=ESMFold2ProposalConfig(),
@@ -773,7 +774,7 @@ def test_positive_score_runtime_excludes_unbounded_confidence_candidates(
         T_sample=1.0,
         max_mutations_per_seq=3,
         mutation_fraction=0.25,
-        candidate_strategy="positive_score",
+        candidate_strategy=strategy,
         include_argmax_candidate=False,
         seed=17,
     )

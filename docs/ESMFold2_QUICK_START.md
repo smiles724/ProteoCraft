@@ -210,6 +210,44 @@ result = backend.verify_scaffold_consistency(
 
 输出保留正常的 `pair_chain_iptm` 等完整 verifier 字段，并另外记录 `scaffold_consistency_*` 指标、template mapping report 与 `scaffold_consistency_final_fixed_atom_rmsd`。该分数用于回答“在 template scaffold 下该 redesigned CDR 是否仍保持高置信度”，不能替代 sequence-only 的独立复评。
 
+### 4.3 Dominant-residue protection
+
+The `esmfold2_d` launch profile now defaults to the following Stage-A settings,
+including when used by the CDR/VHH launcher:
+
+```yaml
+esmfold2_stagea_candidate_strategy: positive_score_guarded
+esmfold2_stagea_dominance_gap: 0.5
+esmfold2_stagea_protected_mutation_candidates: 2
+```
+
+The original candidate pool is sampled first, with no extra random draws.
+Only the last two available `positive_score_weighted` slots are processed;
+raw argmax, deterministic top-k and other slots are unchanged. A mutable
+position is protected if the current residue leads all other allowed residues
+by at least the raw logit gap both before and after the soft update. Cys is
+excluded from the competitor set. NaN or positive-infinite allowed competitors
+disable protection for that position. The gap is not a calibrated probability.
+
+Protected substitutions are restored to the current sequence, without filling
+the freed mutation budget. If the result equals the parent or another current
+candidate, the original slot is retained and the fallback reason is recorded.
+Thus a fallback slot is not guaranteed to preserve dominant residues.
+Diagnostics record selected slots, protected positions, applied restorations,
+original sequences and fallback reasons; positions are zero-based. Actual
+candidate counts may be smaller than the requested pool size.
+
+This mode supports ESMFold2 Stage-A branching (`stage_a_only`/`two_stage`,
+including their legacy aliases), across de novo, TCR, VHH and local redesign
+inputs. It does not change Stage B, logits anchoring, diffusion or verifiers.
+Other search strategies and the Protenix backend reject this option.
+To reproduce the old strategy, explicitly set
+`esmfold2_stagea_candidate_strategy: positive_score` (or the corresponding CLI
+flag). Unprofiled CLI and low-level API defaults remain unchanged for backward
+compatibility. Changing the mainline default is an operational choice, not
+evidence of universal improvement; matched-budget, multi-seed GPU experiments
+are still needed to assess benefit on each task.
+
 ## 5. VHH All-CDR Redesign
 
 该模式保留已有 VHH 的 framework sequence，只允许 IMGT 定义的 CDR1、CDR2 和 CDR3 位点发生替换。IMGT 是抗体/VHH 可变区的标准编号体系；适配器使用其编号结果定位三段 CDR，再将对应的 VHH sequence indices 转成 mutable mask。IMGT 编号不参与模型损失计算。

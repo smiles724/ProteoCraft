@@ -151,6 +151,8 @@ def build_hallucination_command(
             ]
         )
     option_map = {
+        "esmfold2_stagea_dominance_gap": "esmfold2_stagea_dominance_gap",
+        "esmfold2_stagea_protected_mutation_candidates": "esmfold2_stagea_protected_mutation_candidates",
         "device": "device",
         "n_steps": "n_steps",
         "learning_rate": "learning_rate",

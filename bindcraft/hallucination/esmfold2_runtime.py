@@ -1313,6 +1313,8 @@ class ESMFold2RuntimeBackend:
         max_mutations_per_seq: int,
         mutation_fraction: Optional[float] = None,
         candidate_strategy: str = "legacy",
+        dominance_gap: float = 0.5,
+        protected_mutation_candidates: int = 2,
         include_argmax_candidate: Optional[bool] = None,
         seed: Optional[int] = None,
         mutable_mask: Optional[Sequence[bool]] = None,
@@ -1365,12 +1367,14 @@ class ESMFold2RuntimeBackend:
                 mutation_fraction=mutation_fraction,
                 include_logit_candidates=include_logit_candidates,
                 candidate_strategy=candidate_strategy,
+                dominance_gap=dominance_gap,
+                protected_mutation_candidates=protected_mutation_candidates,
             )
         # The positive-score experiment requires every returned sequence to
         # obey the same mutation-count contract. Confidence snapshots are
         # retained for diagnostics, but cannot enter this candidate pool.
         returned_confidence_sequences = (
-            [] if str(candidate_strategy).strip().lower() == "positive_score"
+            [] if str(candidate_strategy).strip().lower() in {"positive_score", "positive_score_guarded"}
             else confidence_sequences
         )
         candidates = list(
