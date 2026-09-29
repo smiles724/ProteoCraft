@@ -67,5 +67,24 @@ python environment/esmfold2/check_environment.py \
 `flash-attn` 或 `transformer-engine` 可以提速，但会改变部分 bf16 reduction 的数值
 顺序；需要严格复现实验时不要自行增加。
 
+## 4. Claude 优化版隔离环境
+
+`uplifting-biomolecular-modeling` 的 ESMFold2、gradient-design 和 ESMC 优化需要
+另一组严格固定的源码。不要改动上面的基线环境，另建一个环境：
+
+```bash
+export PROTEOCRAFT_UPLIFT_ROOT=/absolute/path/to/uplifting-biomolecular-modeling
+bash environment/esmfold2/install_optimization.sh /absolute/path/to/proteocraft_esmopt_py312
+```
+
+脚本安装 ef2inv 固定的 PyTorch `2.11.0+cu128`、Triton `3.6.0`、优化包要求的
+Biohub Transformers fork，并从完整的
+Biohub `esm` checkout 安装固定 commit `d0207ea3`。注意
+`ef2inv/stock/esm-d0207ea3.tar.gz` 只是用于审计的局部源码档案，不能作为完整 Python
+包安装。模型权重仍使用第 2 节固定的 Hugging Face revisions。
+
+集成开关、microbenchmark、成对搜索和盲复评分法见
+[`docs/ESM_OPTIMIZATION_EXPERIMENTS.md`](../../docs/ESM_OPTIMIZATION_EXPERIMENTS.md)。
+
 算法默认配置及四种任务的启动命令见
 [`docs/ESMFold2_QUICK_START.md`](../../docs/ESMFold2_QUICK_START.md)。

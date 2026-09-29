@@ -26,7 +26,7 @@ On top of the 1st-order gradient, BindCraft v2 adds a **0th-order verification l
 
 ### ESMFold2 Four-Mode Workflow
 
-The current recommended ESMFold2 workflow supports de novo binder design, TCR binder design, TCR CDR redesign, and IMGT all-CDR VHH redesign through the shared `esmfold2_d` launch profile. Create its separate, commit-pinned environment with **[environment/esmfold2](environment/esmfold2/README.md)**, then see the Chinese **[ESMFold2 quick-start guide](docs/ESMFold2_QUICK_START.md)** for runnable examples. The portable **[59-case benchmark](benchmark/datasets/proteocraft_59_v1/README.md)** remains the fixed 14 de novo + 41 TCR binder-design + 4 CDR-redesign benchmark; VHH cases are launched separately.
+The current recommended ESMFold2 workflow supports de novo binder design, TCR binder design, TCR CDR redesign, and IMGT all-CDR VHH redesign through the shared `esmfold2_d` launch profile. Create its separate, commit-pinned environment with **[environment/esmfold2](environment/esmfold2/README.md)**, then see the Chinese **[ESMFold2 quick-start guide](docs/ESMFold2_QUICK_START.md)** for runnable examples. The portable **[59-case benchmark](benchmark/datasets/proteocraft_59_v1/README.md)** remains the fixed 14 de novo + 41 TCR binder-design + 4 CDR-redesign benchmark; VHH cases are launched separately. To deploy the optimized `fast` composition on another machine, follow **[ProteoCraft Fast deployment and run guide](FAST_README.md)**. The optimization implementation, paired speed/quality protocol, and experiment results are documented in **[ESM optimization experiments](docs/ESM_OPTIMIZATION_EXPERIMENTS.md)**.
 
 ### Installation
 

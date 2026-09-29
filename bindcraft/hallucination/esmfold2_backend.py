@@ -60,6 +60,12 @@ class ESMFold2ProposalConfig:
 
     experimental_model_name: str = "biohub/ESMFold2-Experimental-Fast"
     verifier_model_name: str = "biohub/ESMFold2"
+    optimization_root: Optional[str] = None
+    proposal_optimization: str = "off"
+    verifier_optimization: str = "off"
+    esmc_optimization: str = "off"
+    optimization_report_path: Optional[str] = None
+    optimization_timing: bool = False
     verifier_num_loops: int = 20
     verifier_num_sampling_steps: int = 200
     verifier_structure_mode: str = "sequence_only"
@@ -114,6 +120,11 @@ class ESMFold2ProposalConfig:
     binder_structure_regeneration_mask: Optional[Tuple[bool, ...]] = None
 
     def __post_init__(self) -> None:
+        for name in ("proposal_optimization", "verifier_optimization"):
+            if getattr(self, name) not in {"off", "exact", "fast", "big"}:
+                raise ValueError(f"{name} must be off, exact, fast or big")
+        if self.esmc_optimization not in {"off", "exact"}:
+            raise ValueError("esmc_optimization must be off or exact")
         if int(self.verifier_num_loops) <= 0:
             raise ValueError("verifier_num_loops must be positive")
         if int(self.verifier_num_sampling_steps) <= 0:

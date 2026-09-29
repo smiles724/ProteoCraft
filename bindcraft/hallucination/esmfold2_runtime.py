@@ -53,6 +53,7 @@ from bindcraft.hallucination.esmfold2_one_step import (
     run_esmfold2_truncated_diffusion,
 )
 from bindcraft.hallucination.esmfold2_template import build_template_clamp
+from bindcraft.hallucination.esmfold2_optimizations import OptimizationManager, measured
 
 
 logger = logging.getLogger(__name__)
@@ -865,6 +866,7 @@ class ESMFold2RuntimeBackend:
         self.task_type = task_type
         self.verifier_num_loops = int(config.verifier_num_loops)
         self.verifier_num_sampling_steps = int(config.verifier_num_sampling_steps)
+        self.optimizations = OptimizationManager(config, self.device)
 
     def _fold_verifier_with_raw_output(
         self,
@@ -1206,6 +1208,7 @@ class ESMFold2RuntimeBackend:
             aligned_loss_dict=aligned_loss_dict,
         )
 
+    @measured("verifier")
     def verify(
         self,
         *,
@@ -1554,7 +1557,12 @@ class ESMFold2RuntimeBackend:
             self.verifier_model = ESMFold2Model.from_pretrained(
                 self.config.verifier_model_name,
                 esmc_precision="bf16",
-            ).to(self.device).eval()
+            ).to(self.device).eval().requires_grad_(False)
+        self.optimizations.verifier(self.verifier_model, self.input_builder)
+        if self.config.esmc_optimization != "off":
+            internal = getattr(self.verifier_model, "_esmc", None)
+            if internal is not None:
+                self.optimizations.esmc(internal, "verifier_esmc")
 
     def _ensure_proposal_models_loaded(self) -> None:
         if self.experimental_model is None:
@@ -1602,6 +1610,12 @@ class ESMFold2RuntimeBackend:
                     logger.warning("Could not set ESMFold2 kernel backend fallback: %s", exc)
             self.experimental_model = experimental_model.to(self.device).eval().requires_grad_(False)
 
+        self.optimizations.proposal(self.experimental_model)
+        if self.config.esmc_optimization != "off":
+            internal = getattr(self.experimental_model, "_esmc", None)
+            if internal is not None:
+                self.optimizations.esmc(internal, "proposal_esmc")
+
         lambda_esmc = resolve_lambda_esmc(self.config.lambda_esmc, task_type=self.task_type)
         if lambda_esmc != 0.0 and self.esmc_model is None:
             from transformers.models.esmc.modeling_esmc import ESMCForMaskedLM
@@ -1612,6 +1626,8 @@ class ESMFold2RuntimeBackend:
                 model_name,
                 torch_dtype=torch.float32,
             ).to(self.device).eval().requires_grad_(False)
+        if self.esmc_model is not None:
+            self.optimizations.esmc(self.esmc_model, "prior_esmc")
 
     def _build_structure_input(self, targets: Sequence[str], binder_seq: str) -> Any:
         if len(targets) + 1 > len(CHAIN_IDS):
@@ -1946,6 +1962,7 @@ class ESMFold2RuntimeBackend:
             result["template_fixed_rmsd"] = coordinate_rmsd
         return result
 
+    @measured("proposal_update")
     def _run_soft_update_impl(
         self,
         *,
@@ -2734,6 +2751,7 @@ class ESMFold2RuntimeBackend:
             num_classes=len(ESM_AA_ORDER),
         ).unsqueeze(0).float()
 
+    @measured("proposal_forward")
     def _fold_distogram(
         self,
         *,
@@ -2858,6 +2876,7 @@ class ESMFold2RuntimeBackend:
         )
         return one_hot.unsqueeze(0).float()
 
+    @measured("esmc_prior_forward")
     def _compute_esmc_pseudoperplexity(
         self,
         binder_design: torch.Tensor,
