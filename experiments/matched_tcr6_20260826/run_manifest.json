@@ -1,0 +1,28 @@
+{
+  "seed": 43,
+  "n_steps": 110,
+  "verifier": "4x50",
+  "stagea_soft": 30,
+  "stageb_soft": 20,
+  "arms": [
+    "A",
+    "B",
+    "C",
+    "D"
+  ],
+  "cases": [
+    "ALGRRIPPV_alpha",
+    "ALGRRIPPV_beta",
+    "YLNPRVARI_alpha",
+    "YLNPRVARI_beta",
+    "KLNPRIPRI_alpha",
+    "KLNPRIPRI_beta"
+  ],
+  "gpus": [
+    "1",
+    "2",
+    "5",
+    "7"
+  ],
+  "started": "2026-09-04 04:44:45"
+}

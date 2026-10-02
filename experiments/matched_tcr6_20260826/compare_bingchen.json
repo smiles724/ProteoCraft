@@ -1,0 +1,105 @@
+{
+  "ALGRRIPPV_alpha": {
+    "BC_rescored": {
+      "cdr3": "AVEDTSREIDY",
+      "esm_verify_loss": 0.46316110442584485,
+      "pair_chain_iptm_loss": 0.402569055557251,
+      "raw_common_iptm": 0.402569055557251,
+      "raw_common_plddt": 0.11235702037811279,
+      "cdr3_peptide_contact_nll": 10.478644371032715,
+      "framework_pmhc_contact_nll": 13.468278884887695,
+      "r_pep": 0.005671980790793896,
+      "framework_unchanged": true
+    },
+    "BC_search": {
+      "cdr3": "AVEDTGREIPY",
+      "esm_verify_loss": 0.4227226198151742,
+      "pair_chain_iptm_loss": 0.3624016046524048,
+      "raw_common_iptm": 0.3624016046524048,
+      "raw_common_plddt": 0.14209312200546265,
+      "cdr3_peptide_contact_nll": 10.0317964553833,
+      "framework_pmhc_contact_nll": 13.562506675720215,
+      "r_pep": 0.012367567978799343,
+      "framework_unchanged": true
+    },
+    "natural_A6": {
+      "cdr3": "AVTTDSWGKLQ",
+      "esm_verify_loss": 0.7954943530166452,
+      "pair_chain_iptm_loss": 0.7200682163238525,
+      "raw_common_iptm": 0.7200682163238525,
+      "raw_common_plddt": 0.2817956805229187,
+      "cdr3_peptide_contact_nll": 8.173163414001465,
+      "framework_pmhc_contact_nll": 11.198485374450684,
+      "r_pep": 0.13419444859027863,
+      "framework_unchanged": true
+    },
+    "ours_B": {
+      "cdr3": "ARLLPDRDIQF",
+      "esm_verify_loss": 0.38175893518451953,
+      "pair_chain_iptm_loss": 0.32080376148223877,
+      "raw_common_iptm": 0.32080376148223877,
+      "raw_common_plddt": 0.11059081554412842,
+      "cdr3_peptide_contact_nll": 9.516473770141602,
+      "framework_pmhc_contact_nll": 13.68694019317627,
+      "r_pep": 0.3221374750137329,
+      "framework_unchanged": true
+    },
+    "ours_D": {
+      "cdr3": "ALDTGDDWFMF",
+      "esm_verify_loss": 0.42633838200944246,
+      "pair_chain_iptm_loss": 0.3683047890663147,
+      "raw_common_iptm": 0.3683047890663147,
+      "raw_common_plddt": 0.13080871105194092,
+      "cdr3_peptide_contact_nll": 9.29895305633545,
+      "framework_pmhc_contact_nll": 13.764546394348145,
+      "r_pep": 0.17426280677318573,
+      "framework_unchanged": true
+    }
+  },
+  "ALGRRIPPV_beta": {
+    "BC_rescored": {
+      "cdr3": "MTRDTYADGEGSQL",
+      "esm_verify_loss": 0.6370245680718515,
+      "pair_chain_iptm_loss": 0.5797620713710785,
+      "raw_common_iptm": 0.5797621011734009,
+      "raw_common_plddt": 0.3207945227622986,
+      "cdr3_peptide_contact_nll": 7.984732627868652,
+      "framework_pmhc_contact_nll": 11.884199142456055,
+      "r_pep": 0.3047601878643036,
+      "framework_unchanged": true
+    },
+    "BC_search": {
+      "cdr3": "YTRDTYADGEGSQL",
+      "esm_verify_loss": 0.6202301110414061,
+      "pair_chain_iptm_loss": 0.564076840877533,
+      "raw_common_iptm": 0.564076840877533,
+      "raw_common_plddt": 0.307899534702301,
+      "cdr3_peptide_contact_nll": 7.937442779541016,
+      "framework_pmhc_contact_nll": 11.960460662841797,
+      "r_pep": 0.3203805387020111,
+      "framework_unchanged": true
+    },
+    "natural_A6": {
+      "cdr3": "ASRPGLAGGRPEQY",
+      "esm_verify_loss": 0.7838106335300649,
+      "pair_chain_iptm_loss": 0.7210211455821991,
+      "raw_common_iptm": 0.7210211753845215,
+      "raw_common_plddt": 0.2812875509262085,
+      "cdr3_peptide_contact_nll": 7.945608615875244,
+      "framework_pmhc_contact_nll": 11.197866439819336,
+      "r_pep": 0.2601289451122284,
+      "framework_unchanged": true
+    },
+    "ours_A": {
+      "cdr3": "LTRDTFSSFTDAMI",
+      "esm_verify_loss": 0.44548124407506345,
+      "pair_chain_iptm_loss": 0.39817214012145996,
+      "raw_common_iptm": 0.39817214012145996,
+      "raw_common_plddt": 0.1748868227005005,
+      "cdr3_peptide_contact_nll": 9.097847938537598,
+      "framework_pmhc_contact_nll": 13.250295639038086,
+      "r_pep": 0.10772594064474106,
+      "framework_unchanged": true
+    }
+  }
+}
