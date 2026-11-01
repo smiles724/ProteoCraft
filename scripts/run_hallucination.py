@@ -427,6 +427,11 @@ def load_esmfold2_backend(
         esmc_optimization=args.esmfold2_esmc_optimization,
         optimization_timing=args.esmfold2_optimization_timing,
         optimization_graph_max_tokens=args.esmfold2_optimization_graph_max_tokens,
+        memory_mode=args.esmfold2_memory_mode,
+        memory_token_threshold=args.esmfold2_memory_token_threshold,
+        memory_min_free_gib=args.esmfold2_memory_min_free_gib,
+        memory_saved_tensor_pin_memory=args.esmfold2_memory_saved_tensor_pin_memory,
+        memory_prior_residency=args.esmfold2_memory_prior_residency,
         optimization_report_path=os.path.join(args.output_dir, "optimization_report.json"),
         verifier_num_loops=args.esmfold2_verifier_num_loops,
         verifier_num_sampling_steps=args.esmfold2_verifier_num_sampling_steps,
@@ -561,16 +566,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2Experimental proposal 模型名（默认：biohub/ESMFold2-Experimental-Fast；仅 --model_backend esmfold2 使用）")
     parser.add_argument("--esmfold2_optimization_root", default=None,
                        help="uplifting-biomolecular-modeling checkout; also PROTEOCRAFT_UPLIFT_ROOT")
-    parser.add_argument("--esmfold2_proposal_optimization", choices=["off", "exact", "fast", "big"], default="off",
+    parser.add_argument("--esmfold2_proposal_optimization", choices=["off", "exact", "fast", "big"], default="fast",
                        help="ProteoCraft-adapted ef2inv composition (not the full upstream cookbook mode)")
-    parser.add_argument("--esmfold2_verifier_optimization", choices=["off", "exact", "fast", "big"], default="off",
+    parser.add_argument("--esmfold2_verifier_optimization", choices=["off", "exact", "fast", "big"], default="fast",
                        help="ProteoCraft-adapted esmfold2 composition")
-    parser.add_argument("--esmfold2_esmc_optimization", choices=["off", "exact"], default="off",
+    parser.add_argument("--esmfold2_esmc_optimization", choices=["off", "exact"], default="exact",
                        help="Adapt esmc inference QK kernels and ef2inv differentiable rotary")
     parser.add_argument("--esmfold2_optimization_timing", action="store_true",
                         help="Synchronize CUDA and write per-phase timing records (use on every benchmark arm)")
     parser.add_argument("--esmfold2_optimization_graph_max_tokens", type=int, default=None,
                        help="Override verifier graph token budgets; omit to retain kit defaults, 0 is uncapped")
+    parser.add_argument("--esmfold2_memory_mode", choices=["resident", "auto", "phase_offload"], default="resident",
+                       help="GPU model residency: keep all models, auto-select at phase boundaries, or always offload inactive models")
+    parser.add_argument("--esmfold2_memory_token_threshold", type=int, default=1024,
+                       help="Auto offload trigger: total complex residues across all target and binder chains")
+    parser.add_argument("--esmfold2_memory_min_free_gib", type=float, default=None,
+                       help="Optional auto trigger: available GiB, including reusable allocator cache")
+    parser.add_argument("--esmfold2_memory_saved_tensor_pin_memory", action=argparse.BooleanOptionalAction,
+                       default=True, help="Pin offloaded backward tensors; disable to avoid a persistent large host-pinned pool")
+    parser.add_argument("--esmfold2_memory_prior_residency",
+                       choices=["per_step", "proposal", "between_diffusion"], default="per_step",
+                       help="Independent ESMC prior placement: historical per-step offload, keep during proposal, or offload before diffusion")
     parser.add_argument("--esmfold2_soft_steps", type=int, default=None,
                        help="兼容旧脚本：同时设置 ESMFold2 Stage A / Stage B 的 soft gradient update 步数")
     parser.add_argument("--esmfold2_stagea_soft_steps", type=int, default=None,

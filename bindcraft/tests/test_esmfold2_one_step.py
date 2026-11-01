@@ -447,6 +447,264 @@ def test_common_losses_reject_bad_mutable_mask():
         )
 
 
+def _contacted_trimer_case() -> dict:
+    """Three six-residue protomers and a five-residue binder.
+
+    The first two protomers have confident distogram contacts. The third is
+    uncontacted and uncertain in PAE, so averaging the whole trimer is harmful.
+    """
+    n_tokens = 23
+    distogram = torch.full((1, n_tokens, n_tokens, 64), -12.0)
+    distogram[..., -1] = 12.0
+    for target_index in range(12):
+        for binder_index in range(18, 23):
+            for row, col in ((target_index, binder_index), (binder_index, target_index)):
+                distogram[0, row, col, :] = -12.0
+                distogram[0, row, col, 0] = 12.0
+    pae = torch.full((1, n_tokens, n_tokens, 64), -12.0)
+    pae[..., 0] = 12.0
+    for target_index in range(12, 18):
+        for binder_index in range(18, 23):
+            for row, col in ((target_index, binder_index), (binder_index, target_index)):
+                pae[0, row, col, :] = -12.0
+                pae[0, row, col, -1] = 12.0
+    x = torch.tensor(
+        list(range(100, 106))
+        + list(range(150, 156))
+        + list(range(200, 206))
+        + [0, 10, 20, 30, 40],
+        dtype=torch.float32,
+    )
+    coords = torch.stack((x, torch.zeros_like(x), torch.zeros_like(x)), dim=-1)
+    features = {
+        "token_attention_mask": torch.ones(1, n_tokens, dtype=torch.bool),
+        "asym_id": torch.tensor([[0] * 6 + [1] * 6 + [2] * 6 + [3] * 5]),
+        "atom_attention_mask": torch.ones(1, n_tokens, dtype=torch.bool),
+        "atom_to_token": torch.arange(n_tokens).unsqueeze(0),
+        "distogram_atom_idx": torch.arange(n_tokens).unsqueeze(0),
+        "residue_index": torch.tensor([list(range(6)) * 3 + list(range(5))]),
+    }
+    weights = {name: 0.0 for name in ESMFOLD2_COMMON_LOSS_WEIGHTS}
+    weights.update({"i_pae": 1.0, "iptm": 1.0})
+    return {
+        "coordinates": coords.unsqueeze(0),
+        "plddt_logits": torch.zeros(1, n_tokens, 50),
+        "pae_logits": pae,
+        "distogram_logits": distogram,
+        "features": features,
+        "binder_length": 5,
+        "target_chain_roles": ("target", "target", "target"),
+        "weights": weights,
+    }
+
+
+def test_contacted_confidence_ignores_uncontacted_third_protomer():
+    case = _contacted_trimer_case()
+    _, original = compute_esmfold2_common_losses(
+        **case, target_interface_mode="contacted"
+    )
+    changed = {**case, "pae_logits": case["pae_logits"].clone()}
+    changed["pae_logits"][:, 12:18, :, :] = 0.0
+    changed["pae_logits"][:, :, 12:18, :] = 0.0
+    _, altered = compute_esmfold2_common_losses(
+        **changed, target_interface_mode="contacted"
+    )
+    assert original["interface_selected_chain_count"].item() == 2
+    assert original["interface_selection_fallback"].item() == 0
+    assert original["i_pae"].item() == pytest.approx(altered["i_pae"].item())
+    assert original["iptm"].item() == pytest.approx(altered["iptm"].item())
+    _, legacy = compute_esmfold2_common_losses(**case)
+    assert legacy["i_pae"] > original["i_pae"]
+
+
+def test_contacted_iptm_normalization_uses_selected_chain_pair_only():
+    case = _contacted_trimer_case()
+    _, trimer = compute_esmfold2_common_losses(
+        **case, target_interface_mode="contacted"
+    )
+    keep = torch.tensor(list(range(12)) + list(range(18, 23)))
+    reduced = {
+        **case,
+        "coordinates": case["coordinates"][:, keep],
+        "plddt_logits": case["plddt_logits"][:, keep],
+        "pae_logits": case["pae_logits"][:, keep][:, :, keep],
+        "distogram_logits": case["distogram_logits"][:, keep][:, :, keep],
+        "target_chain_roles": ("target", "target"),
+        "features": {
+            "token_attention_mask": torch.ones(1, 17, dtype=torch.bool),
+            "asym_id": torch.tensor([[0] * 6 + [1] * 6 + [2] * 5]),
+            "atom_attention_mask": torch.ones(1, 17, dtype=torch.bool),
+            "atom_to_token": torch.arange(17).unsqueeze(0),
+            "distogram_atom_idx": torch.arange(17).unsqueeze(0),
+            "residue_index": torch.tensor([list(range(6)) * 2 + list(range(5))]),
+        },
+    }
+    _, dimer = compute_esmfold2_common_losses(
+        **reduced, target_interface_mode="contacted"
+    )
+    assert trimer["iptm"].item() == pytest.approx(dimer["iptm"].item())
+
+
+def test_contacted_iptm_uses_weaker_pae_direction():
+    case = _contacted_trimer_case()
+    _, symmetric = compute_esmfold2_common_losses(
+        **case, target_interface_mode="contacted"
+    )
+    asymmetric = {**case, "pae_logits": case["pae_logits"].clone()}
+    asymmetric["pae_logits"][:, 18:23, :12, :] = -12.0
+    asymmetric["pae_logits"][:, 18:23, :12, -1] = 12.0
+    _, weaker = compute_esmfold2_common_losses(
+        **asymmetric, target_interface_mode="contacted"
+    )
+    assert weaker["iptm"] > symmetric["iptm"] + 0.1
+
+
+def test_contacted_interface_keeps_clash_checks_against_full_trimer():
+    case = _contacted_trimer_case()
+    _, far = compute_esmfold2_common_losses(
+        **case, target_interface_mode="contacted"
+    )
+    case["coordinates"] = case["coordinates"].clone()
+    case["coordinates"][0, 12] = torch.tensor([0.5, 0.0, 0.0])
+    _, colliding = compute_esmfold2_common_losses(
+        **case, target_interface_mode="contacted"
+    )
+    _, full_target = compute_esmfold2_common_losses(**case)
+    assert colliding["interface_selected_chain_count"].item() == 2
+    assert colliding["i_clash"] > far["i_clash"]
+    assert colliding["i_clash"].item() == pytest.approx(full_target["i_clash"].item())
+
+
+def test_contacted_interface_is_invariant_to_target_chain_permutation():
+    case = _contacted_trimer_case()
+    original_total, original = compute_esmfold2_common_losses(
+        **case, target_interface_mode="contacted"
+    )
+    permutation = torch.tensor(list(range(12, 18)) + list(range(6, 12)) + list(range(6)) + list(range(18, 23)))
+    permuted = {
+        **case,
+        "coordinates": case["coordinates"][:, permutation],
+        "plddt_logits": case["plddt_logits"][:, permutation],
+        "pae_logits": case["pae_logits"][:, permutation][:, :, permutation],
+        "distogram_logits": case["distogram_logits"][:, permutation][:, :, permutation],
+    }
+    permuted_total, permuted_losses = compute_esmfold2_common_losses(
+        **permuted, target_interface_mode="contacted"
+    )
+    assert permuted_total.item() == pytest.approx(original_total.item())
+    assert permuted_losses["i_pae"].item() == pytest.approx(original["i_pae"].item())
+    assert permuted_losses["iptm"].item() == pytest.approx(original["iptm"].item())
+
+
+def test_contacted_fallback_retains_finite_confidence_gradients():
+    case = _contacted_trimer_case()
+    logits = torch.full_like(case["distogram_logits"], -12.0)
+    logits[..., -1] = 12.0
+    logits[0, 0, 18, :] = -12.0
+    logits[0, 18, 0, :] = -12.0
+    logits[0, 0, 18, 0] = 12.0
+    logits[0, 18, 0, 0] = 12.0
+    case["distogram_logits"] = logits.requires_grad_(True)
+    case["pae_logits"] = case["pae_logits"].clone().requires_grad_(True)
+    total, losses = compute_esmfold2_common_losses(
+        **case, target_interface_mode="contacted"
+    )
+    assert losses["interface_selection_fallback"].item() == 1
+    assert losses["interface_selected_chain_count"].item() == 1
+    total.backward()
+    assert torch.isfinite(total)
+    assert torch.isfinite(case["pae_logits"].grad).all()
+    assert case["pae_logits"].grad.abs().sum() > 0
+
+
+def test_contacted_selection_uses_immutable_binder_regions_as_well():
+    case = _contacted_trimer_case()
+    # The mutable residue has no contacts; the immutable framework does. It
+    # must still identify the same interface rather than enter the fallback.
+    case["distogram_logits"][:, 18, :18, :] = -12.0
+    case["distogram_logits"][:, :18, 18, :] = -12.0
+    case["distogram_logits"][:, 18, :18, -1] = 12.0
+    case["distogram_logits"][:, :18, 18, -1] = 12.0
+    _, full_binder = compute_esmfold2_common_losses(
+        **case, target_interface_mode="contacted"
+    )
+    _, masked_binder = compute_esmfold2_common_losses(
+        **case,
+        target_interface_mode="contacted",
+        binder_mutable_mask=[True, False, False, False, False],
+    )
+    assert masked_binder["interface_selected_chain_count"].item() == 2
+    assert masked_binder["interface_selection_fallback"].item() == 0
+    assert masked_binder["iptm"].item() == pytest.approx(full_binder["iptm"].item())
+
+
+def test_contacted_interface_preserves_full_target_hotspot_indexing():
+    case = _contacted_trimer_case()
+    _, losses = compute_esmfold2_common_losses(
+        **case,
+        target_interface_mode="contacted",
+        hotspot_params={"target_hotspot_concat_indices": [12]},
+        hotspot_weight=1.0,
+    )
+    assert losses["interface_selected_chain_count"].item() == 2
+    assert losses["i_pae_hotspot"] > losses["i_pae_global"]
+    assert losses["i_pae"].item() == pytest.approx(losses["i_pae_hotspot"].item())
+
+
+def test_explicit_all_interface_mode_preserves_all_legacy_losses():
+    case = _contacted_trimer_case()
+    default_total, default_losses = compute_esmfold2_common_losses(**case)
+    explicit_total, explicit_losses = compute_esmfold2_common_losses(
+        **case, target_interface_mode="all"
+    )
+    assert torch.equal(default_total, explicit_total)
+    assert set(default_losses) == set(explicit_losses)
+    assert all(torch.equal(value, explicit_losses[name]) for name, value in default_losses.items())
+
+
+def test_contacted_helix_uses_release_distogram_bin_distances():
+    case = _contacted_trimer_case()
+    # Released head bin 11 is 5.59375 A and therefore a helix contact; the
+    # historical 2--52 A interpretation would put it beyond the 6 A cutoff.
+    case["distogram_logits"].fill_(-12.)
+    case["distogram_logits"][..., 11] = 12.
+    _, contacted = compute_esmfold2_common_losses(
+        **case, target_interface_mode="contacted"
+    )
+    _, legacy = compute_esmfold2_common_losses(**case)
+    assert contacted["helix"].item() < 1e-4
+    assert legacy["helix"].item() > 10.
+
+
+def test_contacted_helix_preserves_experimental_distogram_bin_distances():
+    case = _contacted_trimer_case()
+    logits = torch.full((1, 23, 23, 128), -12.)
+    logits[..., 8] = 12.
+    case["distogram_logits"] = logits
+    _, contacted = compute_esmfold2_common_losses(
+        **case, target_interface_mode="contacted"
+    )
+    _, legacy = compute_esmfold2_common_losses(**case)
+    assert torch.equal(contacted["helix"], legacy["helix"])
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"target_interface_mode": "typo"}, "target_interface_mode"),
+        ({"target_interface_contact_cutoff": float("nan")}, "finite and positive"),
+        ({"target_interface_contact_cutoff": 0.0}, "finite and positive"),
+        ({"target_interface_min_contacts": 0}, "positive integer"),
+        ({"target_interface_min_contacts": True}, "positive integer"),
+        ({"target_interface_min_contacts": 2.5}, "positive integer"),
+    ],
+)
+def test_common_contacted_interface_rejects_invalid_policy(overrides, message):
+    options = {"target_interface_mode": "contacted", **overrides}
+    with pytest.raises(ValueError, match=message):
+        compute_esmfold2_common_losses(**_contacted_trimer_case(), **options)
+
+
 def test_scatter_reference_coordinates_handles_valid_atom_layout():
     atom_mask = torch.tensor([[True, True, False, True, False]])
     source = torch.tensor(

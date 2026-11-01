@@ -6,12 +6,16 @@ The adapted composition is `proteocraft-uplifting-v2`; it uses selected kernels
 from Anthropic's `uplifting-biomolecular-modeling`, not the complete upstream
 cookbook. Source: https://github.com/anthropics/uplifting-biomolecular-modeling
 
-All optimization switches default to `off`. The existing `esmfold2_d` profile
-continues to use `positive_score_guarded`; CDR/VHH masks, one-step diffusion,
-scaffold consistency and AtlasFold cross-evaluation remain separate features.
-No Fast profile is recommended until matched GPU and end-to-end validation is
-complete. CPU tests do not establish kernel parity, speed or design quality.
-The other branch's reported benchmark numbers are not validation of this version.
+The search CLI and `esmfold2_d` profile default to proposal `fast`, verifier
+`fast`, and ESMC `exact`, including the CDR/VHH launchers. They require the pinned
+optimization environment and `PROTEOCRAFT_UPLIFT_ROOT` (or the explicit root flag).
+Missing dependencies raise an error; there is no silent stock fallback.
+The low-level `ESMFold2ProposalConfig` remains stock by default for direct library
+callers; the search CLI passes its selected modes explicitly. Independent official
+rescoring explicitly fixes all three switches to `off`, and experiment arms retain
+their explicit settings. The profile continues to use `positive_score_guarded`.
+CPU tests do not establish kernel parity, speed or design quality, and the other
+branch's benchmark numbers are not validation of this version.
 
 ## Installation
 
@@ -55,13 +59,22 @@ Execution binds the requested CUDA device, including graph capture and replay.
 Use one optimization device per process: an existing PyTorch capture stream on
 another GPU is rejected rather than reused.
 
-Add the following to an existing `scripts/run_hallucination.py` command:
+The following search modes are now the defaults for `scripts/run_hallucination.py`:
 
 ```text
 --esmfold2_optimization_root /absolute/path/to/uplifting-biomolecular-modeling
 --esmfold2_proposal_optimization fast
 --esmfold2_verifier_optimization fast
 --esmfold2_esmc_optimization exact
+```
+
+To reproduce the stock search in the baseline environment, explicitly override
+all three switches (also when using `--profile esmfold2_d`):
+
+```text
+--esmfold2_proposal_optimization off
+--esmfold2_verifier_optimization off
+--esmfold2_esmc_optimization off
 ```
 
 The CDR/VHH YAML launchers also forward these optimization settings; use the YAML

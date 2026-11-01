@@ -24,6 +24,8 @@ from types import MethodType
 
 import torch
 
+from .esmfold2_memory import ModelResidencyManager
+
 
 COMPOSITION = "proteocraft-uplifting-v2"
 # Adapter derived from smiles724/ProteoCraft commit 98aacad9c421718c1925b18d71aa3975969c26ab.
@@ -39,7 +41,11 @@ def measured(phase):
         @wraps(fn)
         def wrapped(self, *args, **kwargs):
             with self.optimizations.execution_context(), self.optimizations.measure(phase):
-                return fn(self, *args, **kwargs)
+                context = (self.optimizations.memory.saved_tensors_context()
+                           if phase in {"proposal_forward", "esmc_prior_forward", "proposal_diffusion_gradient"}
+                           else nullcontext())
+                with context:
+                    return fn(self, *args, **kwargs)
         return wrapped
     return decorate
 
@@ -62,6 +68,7 @@ class OptimizationManager:
         # that work on network filesystems.
         self._resolved_source_paths = {}
         self._source_files_scanned = set()
+        self.memory = ModelResidencyManager(config, self.device, self.release_model_caches)
         # An autoloaded kit can contaminate even the nominal off arm.
         for key in ("ESMFOLD2_OPT", "ESMC_OPT", "EF2_FAST_KIT", "ESMC_KIT"):
             if os.environ.get(key, "").lower() not in ("", "off", "0"):
@@ -237,9 +244,42 @@ class OptimizationManager:
         self.records["proposal"] = {"mode": mode, "source": "ef2inv", "levers": levers}
         self.write_report()
 
+    def release_model_caches(self, model):
+        """Invalidate address-dependent caches at a model-placement boundary."""
+        if "ef2_opt" in self.modules:
+            # The kit shares graph pools: release the whole generation, not
+            # individual graphs whose addresses can still be referenced.
+            self.modules["ef2_opt"].clear_graphs(reason="phase_offload")
+        seen = set()
+        for module in model.modules():
+            for name in ("_agk_cfg", "_ef2_trimul_handle"):
+                state = getattr(module, name, None)
+                if state is not None and id(state.cache) not in seen:
+                    state.cache.clear()
+                    seen.add(id(state.cache))
+            cache = getattr(module, "_ef2_trimul_cache", None)
+            if cache is not None:
+                cache.clear()
+        self.events["memory.cache_releases"] += 1
+
     def verifier(self, model, builder):
         mode = self.config.verifier_optimization
-        if "verifier" in self.records or mode == "off":
+        if mode == "off":
+            return
+        cap = self.config.optimization_graph_max_tokens
+        if self.memory.active:
+            limit = self.config.memory_token_threshold
+            cap = min(cap, limit) if cap is not None and cap > 0 else limit
+        if "verifier" in self.records:
+            if self.memory.active and self.records["verifier"]["graph_budget_tokens"] != cap:
+                opt = self.modules["ef2_opt"]
+                opt.clear_graphs(reason="memory_policy")
+                self._set_graph_budget(opt, cap)
+                self.records["verifier"].update(
+                    graph_budget_tokens=cap, memory_graph_cap_applied=True,
+                    graph_site_budgets={site: getattr(opt.CFG, f"graph_budget_tokens_{site}", None)
+                                       for site in ("trunk", "encoder", "sampler")})
+                self.write_report()
             return
         self._require_cuda(model)
         self._check_fork("transformers.models.esmfold2.modeling_esmfold2_common",
@@ -254,13 +294,8 @@ class OptimizationManager:
             model.set_chunk_size(32 if mode == "big" else None)
         # Preserve upstream graph budgets unless the caller explicitly overrides
         # them. Zero means uncapped and can increase long-complex memory usage.
-        cap = self.config.optimization_graph_max_tokens
         if cap is not None:
-            opt.CFG.graph_budget_tokens = cap
-            for site in ("trunk", "encoder", "sampler"):
-                attribute = f"graph_budget_tokens_{site}"
-                if hasattr(opt.CFG, attribute):
-                    setattr(opt.CFG, attribute, cap)
+            self._set_graph_budget(opt, cap)
         installed = opt.install(
             model, trunk_graphs=mode != "big", sampler_graphs=mode != "big",
             fuse_msa_trimul=mode in ("fast", "big"), swa_mask_cache=True,
@@ -270,12 +305,21 @@ class OptimizationManager:
             "mode": mode, "source": "esmfold2", "levers": installed,
             "opt_core": core,
             "kernel_backend": "fused" if mode in ("fast", "big") else "unchanged",
-            "graph_max_tokens_requested": cap,
+            "graph_max_tokens_requested": self.config.optimization_graph_max_tokens,
+            "memory_graph_cap_applied": self.memory.active,
             "graph_budget_tokens": opt.CFG.graph_budget_tokens,
             "graph_site_budgets": {site: getattr(opt.CFG, f"graph_budget_tokens_{site}", None)
                                    for site in ("trunk", "encoder", "sampler")},
         }
         self.write_report()
+
+    @staticmethod
+    def _set_graph_budget(opt, cap):
+        opt.CFG.graph_budget_tokens = cap
+        for site in ("trunk", "encoder", "sampler"):
+            attribute = f"graph_budget_tokens_{site}"
+            if hasattr(opt.CFG, attribute):
+                setattr(opt.CFG, attribute, cap)
 
     def esmc(self, model, label):
         if self.config.esmc_optimization == "off" or label in self.records:
@@ -372,7 +416,8 @@ class OptimizationManager:
                               "esmc": self.config.esmc_optimization},
                 "source_root": str(self.root) if self.root else None, "source_revision": self.source_revision,
                 "versions": versions, "source_hashes": self.source_hashes,
-                "applied": self.records, "counters": counters}
+                "applied": self.records, "counters": counters,
+                "memory": self.memory.report()}
 
     def write_report(self, *, refresh_sources=False):
         if self.report_path is None:

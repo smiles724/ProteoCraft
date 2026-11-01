@@ -67,6 +67,11 @@ class ESMFold2ProposalConfig:
     optimization_report_path: Optional[str] = None
     optimization_timing: bool = False
     optimization_graph_max_tokens: Optional[int] = None
+    memory_mode: str = "resident"
+    memory_token_threshold: int = 1024
+    memory_min_free_gib: Optional[float] = None
+    memory_saved_tensor_pin_memory: bool = True
+    memory_prior_residency: str = "per_step"
     verifier_num_loops: int = 20
     verifier_num_sampling_steps: int = 200
     verifier_structure_mode: str = "sequence_only"
@@ -114,6 +119,11 @@ class ESMFold2ProposalConfig:
     proposal_confidence_max_candidates: int = 8
     proposal_confidence_tail_steps: int = 0
     target_chain_roles: Optional[Tuple[str, ...]] = None
+    # Explicit opt-in: legacy single-/multi-chain modes retain their scoring.
+    target_assembly: str = "monomer"
+    target_interface_mode: str = "all"
+    target_interface_contact_cutoff: float = 5.0
+    target_interface_min_contacts: int = 5
     binder_mutable_mask: Optional[Tuple[bool, ...]] = None
     template_structure_path: Optional[str] = None
     template_chain_ids: Optional[Tuple[str, ...]] = None
@@ -121,7 +131,40 @@ class ESMFold2ProposalConfig:
     binder_structure_regeneration_mask: Optional[Tuple[bool, ...]] = None
 
     def __post_init__(self) -> None:
+        if self.target_assembly not in {"monomer", "homotrimer"}:
+            raise ValueError("target_assembly must be monomer or homotrimer")
+        if self.target_interface_mode not in {"all", "contacted"}:
+            raise ValueError("target_interface_mode must be all or contacted")
+        if not math.isfinite(float(self.target_interface_contact_cutoff)) or float(self.target_interface_contact_cutoff) <= 0:
+            raise ValueError("target_interface_contact_cutoff must be finite and positive")
+        if (isinstance(self.target_interface_min_contacts, bool)
+                or not isinstance(self.target_interface_min_contacts, int)
+                or self.target_interface_min_contacts < 1):
+            raise ValueError("target_interface_min_contacts must be a positive integer")
+        if self.target_interface_mode == "contacted" or self.target_assembly == "homotrimer":
+            if self.target_assembly != "homotrimer" or self.target_interface_mode != "contacted":
+                raise ValueError("homotrimer and contacted interface scoring must be enabled together")
+            if self.verifier_loss_mode != "aligned_common":
+                raise ValueError("contacted interface scoring requires aligned_common verifier raw output")
+            if self.target_chain_roles is not None and tuple(self.target_chain_roles) != ("target",) * 3:
+                raise ValueError("homotrimer requires three target chain roles")
         cap = self.optimization_graph_max_tokens
+        if self.memory_mode not in {"resident", "auto", "phase_offload"}:
+            raise ValueError("memory_mode must be resident, auto or phase_offload")
+        if not isinstance(self.memory_saved_tensor_pin_memory, bool):
+            raise ValueError("memory_saved_tensor_pin_memory must be a boolean")
+        if self.memory_prior_residency not in ("per_step", "proposal", "between_diffusion"):
+            raise ValueError("memory_prior_residency must be per_step, proposal or between_diffusion")
+        if (isinstance(self.memory_token_threshold, bool)
+                or not isinstance(self.memory_token_threshold, int)
+                or self.memory_token_threshold < 1):
+            raise ValueError("memory_token_threshold must be a positive integer")
+        if self.memory_min_free_gib is not None and (
+                isinstance(self.memory_min_free_gib, bool)
+                or not isinstance(self.memory_min_free_gib, (int, float))
+                or not math.isfinite(float(self.memory_min_free_gib))
+                or float(self.memory_min_free_gib) <= 0):
+            raise ValueError("memory_min_free_gib must be finite and positive or None")
         if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or cap < 0):
             raise ValueError("optimization_graph_max_tokens must be a nonnegative integer or None")
         for name in ("proposal_optimization", "verifier_optimization"):

@@ -293,8 +293,15 @@ def _differentiable_pair_chain_iptm(
     pae_logits: torch.Tensor,
     *,
     masks: Mapping[str, torch.Tensor],
+    conservative_bidirectional: bool = False,
 ) -> torch.Tensor:
-    """Recompute target-binder pair-chain iPTM without detached summaries."""
+    """Compute the differentiable PAE-based target-binder iPTM surrogate.
+
+    The historical path retains its all-token normalization and one direction.
+    Contacted-interface mode uses each selected chain pair's own normalization
+    and the weaker directional mean.  Neither path substitutes for the model's
+    native pair-chain iPTM values used by the full verifier.
+    """
 
     logits = pae_logits
     if logits.ndim == 3:
@@ -313,6 +320,32 @@ def _differentiable_pair_chain_iptm(
         device=logits.device,
         dtype=logits.dtype,
     )
+    if conservative_bidirectional:
+        scores = []
+        for chain_id in torch.unique(asym_id[target], sorted=True):
+            chain_mask = target & (asym_id == chain_id)
+            # Normalize by this chain pair and evaluate only its two PAE
+            # blocks, avoiding extra full-trimer softmax tensors per chain.
+            pair_n_res = (chain_mask.sum() + binder.sum()).clamp(min=19).to(
+                logits.dtype
+            )
+            pair_d0 = 1.24 * (pair_n_res - 15.0).pow(1.0 / 3.0) - 1.8
+            pair_tm_per_bin = 1.0 / (
+                1.0 + (bin_centers / pair_d0) ** 2
+            )
+            forward_logits = logits[:, chain_mask, :, :][:, :, binder, :]
+            reverse_logits = logits[:, binder, :, :][:, :, chain_mask, :]
+            forward = (
+                torch.softmax(forward_logits, dim=-1) * pair_tm_per_bin
+            ).sum(dim=-1).mean(dim=(-1, -2))
+            reverse = (
+                torch.softmax(reverse_logits, dim=-1) * pair_tm_per_bin
+            ).sum(dim=-1).mean(dim=(-1, -2))
+            scores.append(torch.minimum(forward, reverse))
+        if not scores:
+            raise ValueError("No target-binder chain pair is available for iPTM")
+        return torch.stack(scores, dim=0).mean()
+
     n_res = valid.sum().clamp(min=19).to(logits.dtype)
     d0 = 1.24 * (n_res - 15.0).pow(1.0 / 3.0) - 1.8
     tm_per_bin = 1.0 / (1.0 + (bin_centers / d0) ** 2)
@@ -340,23 +373,31 @@ def _helix_loss(
     *,
     design_mask: torch.Tensor,
     residue_index: torch.Tensor,
+    target_interface_mode: str = "all",
 ) -> torch.Tensor:
     logits = distogram_logits[0] if distogram_logits.ndim == 4 else distogram_logits
-    boundaries = torch.linspace(
-        2.0,
-        52.0,
-        logits.shape[-1] - 1,
-        device=logits.device,
-        dtype=logits.dtype,
-    )
-    expanded = torch.cat(
-        (
-            torch.tensor([1.0], device=logits.device, dtype=logits.dtype),
-            boundaries,
-            torch.tensor([57.0], device=logits.device, dtype=logits.dtype),
+    if target_interface_mode == "contacted":
+        from bindcraft.hallucination.esmfold2_interface import interface_distogram_bins
+
+        bin_centers = interface_distogram_bins(
+            logits.shape[-1], device=logits.device, dtype=logits.dtype
         )
-    )
-    bin_centers = (expanded[:-1] + expanded[1:]) / 2.0
+    else:
+        boundaries = torch.linspace(
+            2.0,
+            52.0,
+            logits.shape[-1] - 1,
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        expanded = torch.cat(
+            (
+                torch.tensor([1.0], device=logits.device, dtype=logits.dtype),
+                boundaries,
+                torch.tensor([57.0], device=logits.device, dtype=logits.dtype),
+            )
+        )
+        bin_centers = (expanded[:-1] + expanded[1:]) / 2.0
     contact_probability = (
         torch.softmax(logits, dim=-1)
         * (bin_centers < 6.0).to(logits.dtype)
@@ -384,6 +425,9 @@ def compute_esmfold2_common_losses(
     binder_length: int,
     task_type: Optional[str] = None,
     target_chain_roles: Optional[Sequence[str]] = None,
+    target_interface_mode: str = "all",
+    target_interface_contact_cutoff: float = 5.0,
+    target_interface_min_contacts: int = 5,
     binder_mutable_mask: Optional[Sequence[bool]] = None,
     distogram_losses: Optional[Mapping[str, torch.Tensor]] = None,
     weights: Optional[Mapping[str, float]] = None,
@@ -405,6 +449,35 @@ def compute_esmfold2_common_losses(
     )
     device = coordinates.device
     masks = {key: value.to(device) for key, value in masks.items()}
+    resolved_interface_mode = str(target_interface_mode).strip().lower()
+    if resolved_interface_mode not in {"all", "contacted"}:
+        raise ValueError("target_interface_mode must be 'all' or 'contacted'")
+    interface_target_mask = masks["target"]
+    interface_selection = None
+    if resolved_interface_mode == "contacted":
+        from bindcraft.hallucination.esmfold2_interface import (
+            select_distogram_interface,
+        )
+
+        chain_ids = torch.unique(
+            masks["asym_id"][masks["target"]], sorted=True
+        )
+        chain_masks = [
+            masks["target"] & (masks["asym_id"] == chain_id)
+            for chain_id in chain_ids
+        ]
+        interface_selection = select_distogram_interface(
+            distogram_logits,
+            chain_masks=chain_masks,
+            binder_mask=masks["binder"],
+            cutoff=target_interface_contact_cutoff,
+            min_contacts=target_interface_min_contacts,
+        )
+        interface_target_mask = torch.zeros_like(masks["target"])
+        for index in interface_selection["selected_indices"]:
+            interface_target_mask |= chain_masks[index]
+    # Preserve the original masks for hotspot indexing and clash checks. Only
+    # interface-confidence objectives omit non-contacting target protomers.
     hotspot_mask = _hotspot_token_mask(
         masks,
         hotspot_params,
@@ -440,6 +513,13 @@ def compute_esmfold2_common_losses(
     has_scaffold = bool(masks["scaffold"].any().item())
 
     losses: Dict[str, torch.Tensor] = {}
+    if interface_selection is not None:
+        losses["interface_selected_chain_count"] = coords.new_tensor(
+            len(interface_selection["selected_indices"])
+        )
+        losses["interface_selection_fallback"] = coords.new_tensor(
+            float(interface_selection["fallback"])
+        )
     plddt = _categorical_mean(plddt_logits, start=0.0, end=1.0)
     plddt0 = _batch0(plddt)
     plddt_indices = rep_idx[masks["design"] if local_redesign else masks["binder"]]
@@ -461,7 +541,7 @@ def compute_esmfold2_common_losses(
         (design.unsqueeze(-1) & design.unsqueeze(-2))
         | (design.unsqueeze(-1) & pae_scaffold_mask.unsqueeze(-2))
     )
-    inter_pair_mask = design.unsqueeze(-1) & masks["target"].unsqueeze(-2)
+    inter_pair_mask = design.unsqueeze(-1) & interface_target_mask.unsqueeze(-2)
 
     def masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         mask_f = mask.unsqueeze(0).to(value.dtype)
@@ -489,7 +569,8 @@ def compute_esmfold2_common_losses(
             )
     losses["iptm"] = 1.0 - _differentiable_pair_chain_iptm(
         pae_logits,
-        masks=masks,
+        masks={**masks, "target": interface_target_mask},
+        conservative_bidirectional=resolved_interface_mode == "contacted",
     )
 
     if distogram_losses is not None:
@@ -508,6 +589,7 @@ def compute_esmfold2_common_losses(
         distogram_logits,
         design_mask=design if local_redesign else binder,
         residue_index=residue_index,
+        target_interface_mode=resolved_interface_mode,
     )
 
     if _is_tcr_task(task_type):

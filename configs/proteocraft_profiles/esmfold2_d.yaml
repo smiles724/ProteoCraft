@@ -8,6 +8,9 @@ defaults:
   esmfold2_task_type: denovo
   esmfold2_verifier_model: biohub/ESMFold2
   esmfold2_experimental_model: biohub/ESMFold2-Experimental-Fast
+  esmfold2_proposal_optimization: fast
+  esmfold2_verifier_optimization: fast
+  esmfold2_esmc_optimization: exact
   binder_length: 120
   n_steps: 110
   learning_rate: 0.05

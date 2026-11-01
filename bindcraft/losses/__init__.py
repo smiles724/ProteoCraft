@@ -15,7 +15,14 @@ from .confidence import (
     compute_pde_loss,
     run_confidence_heads,
 )
-from .total_loss import compute_all_losses
+
+def __getattr__(name):
+    # ESMFold2 uses geometry losses without the optional Protenix backend.
+    if name == "compute_all_losses":
+        from .total_loss import compute_all_losses
+
+        return compute_all_losses
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "compute_rg_loss",

@@ -4,6 +4,12 @@
 Protenix 使用 `fair-esm`，而 ESMFold2 路径使用 Biohub `esm`；两者提供相同的
 Python `esm` namespace，不应安装在同一个环境中。
 
+日常搜索 CLI 和 `esmfold2_d` profile 现默认启用 `fast / fast / exact`，需要使用
+第 4 节的优化版隔离环境并设置 `PROTEOCRAFT_UPLIFT_ROOT`。下述基线环境仍用于
+stock 搜索和官方复评；在基线环境执行搜索时，请显式传入
+`--esmfold2_proposal_optimization off --esmfold2_verifier_optimization off --esmfold2_esmc_optimization off`。
+独立官方复评入口会自行固定三个开关为 `off`。
+
 ## 已验证环境
 
 | 项目 | 当前实验环境 |

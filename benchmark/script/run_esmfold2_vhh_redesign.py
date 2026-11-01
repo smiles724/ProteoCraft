@@ -24,12 +24,31 @@ from bindcraft.hallucination.esmfold2_vhh import (  # noqa: E402
 )
 
 
-PASSTHROUGH_OPTIONS = (
+HOTSPOT_OPTIONS = (
+    "esmfold2_hotspot_weight",
+    "esmfold2_hotspot_cutoff",
+    "esmfold2_hotspot_satisfied_proposal_weight",
+    "esmfold2_hotspot_interface_mode",
+    "esmfold2_hotspot_verify_weight",
+    "esmfold2_hotspot_verify_near_cutoff",
+    "esmfold2_hotspot_verify_far_cutoff",
+    "esmfold2_hotspot_verify_min_distance",
+    "esmfold2_hotspot_verify_too_close_weight",
+    "esmfold2_distogram_hotspot",
+    "esmfold2_one_step_diffusion_hotspot",
+)
+
+
+PASSTHROUGH_OPTIONS = HOTSPOT_OPTIONS + (
     "esmfold2_optimization_root",
     "esmfold2_proposal_optimization",
     "esmfold2_verifier_optimization",
     "esmfold2_esmc_optimization",
     "esmfold2_optimization_graph_max_tokens",
+    "esmfold2_memory_mode",
+    "esmfold2_memory_token_threshold",
+    "esmfold2_memory_min_free_gib",
+    "esmfold2_memory_prior_residency",
     "device",
     "seed",
     "n_steps",
@@ -189,6 +208,28 @@ def parse_hallucination_result(path: Path) -> Dict[str, str]:
     return values
 
 
+def effective_hotspot_settings(command: Iterable[str]) -> Dict[str, Any]:
+    """Resolve the same profile/CLI/default precedence as the actual runner."""
+    from scripts.run_hallucination import (
+        _build_hotspot_params,
+        parse_args_with_profile,
+        resolve_esmfold2_hotspot_defaults,
+    )
+
+    args, parser = parse_args_with_profile(list(command)[2:])
+    params = _build_hotspot_params(args, parser)
+    resolve_esmfold2_hotspot_defaults(
+        args, model_backend="esmfold2", hotspot_params=params
+    )
+    return {
+        "target_hotspots_1based": [] if params is None else params["target_hotspot_residues_1based"],
+        "target_hotspot_concat_indices_0based": [] if params is None else params["target_hotspot_concat_indices"],
+        "numbering": "1-based positions in concatenated input target chains, not PDB or UniProt numbering",
+        "binder_contact_scope": "vhh_cdr_mutable_mask",
+        "effective_options": {name: getattr(args, name) for name in HOTSPOT_OPTIONS},
+    }
+
+
 def write_case_record(
     case: ESMFold2VHHCase,
     config: Mapping[str, Any],
@@ -196,6 +237,8 @@ def write_case_record(
     case_dir: Path,
     command: Iterable[str],
 ) -> None:
+    command = list(command)
+    hotspot_settings = effective_hotspot_settings(command)
     case_dir.mkdir(parents=True, exist_ok=True)
     (case_dir / "case_spec.json").write_text(
         json.dumps(case.to_dict(), indent=2, ensure_ascii=False),
@@ -223,6 +266,7 @@ def write_case_record(
         "config_path": config["config_path"],
         "target_chain_roles": list(case.target_chain_roles),
         "mutable_residue_count": sum(case.mutable_mask),
+        "hotspot": hotspot_settings,
     }
     (case_dir / "provenance.json").write_text(
         json.dumps(provenance, indent=2, ensure_ascii=False),

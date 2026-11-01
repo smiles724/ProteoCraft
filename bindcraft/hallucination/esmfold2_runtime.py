@@ -53,6 +53,10 @@ from bindcraft.hallucination.esmfold2_one_step import (
     run_esmfold2_truncated_diffusion,
 )
 from bindcraft.hallucination.esmfold2_template import build_template_clamp
+from bindcraft.hallucination.esmfold2_interface import (
+    interface_distogram_bins, native_interface_summary,
+    select_coordinate_interface, select_distogram_interface,
+)
 from bindcraft.hallucination.esmfold2_optimizations import OptimizationManager, measured
 
 
@@ -447,8 +451,9 @@ def _hotspot_structure_metrics(
     near_cutoff: float,
     far_cutoff: float,
     min_safe_distance: float = 0.0,
+    binder_contact_mask: Optional[Sequence[bool]] = None,
 ) -> dict[str, Any]:
-    """Measure hotspot-to-binder distances from an ESMFold2 full structure."""
+    """Measure hotspot distances to all binder residues or an explicit subset."""
 
     if float(near_cutoff) < 0.0:
         raise ValueError("hotspot verifier near cutoff must be non-negative")
@@ -473,6 +478,19 @@ def _hotspot_structure_metrics(
         raise ValueError(
             "hotspot-aware verifier requires target_hotspot_concat_indices"
         )
+
+    def selected_binder_indices(start: int, end: int) -> list[int]:
+        if binder_contact_mask is None:
+            return list(range(start, end))
+        mask = torch.as_tensor(binder_contact_mask)
+        if mask.ndim != 1 or mask.numel() != end - start:
+            raise ValueError("binder_contact_mask length must match the decoded binder chain")
+        if not torch.all((mask == 0) | (mask == 1)):
+            raise ValueError("binder_contact_mask must contain only boolean or 0/1 values")
+        indices = [start + i for i, selected in enumerate(mask.tolist()) if selected]
+        if not indices:
+            raise ValueError("binder_contact_mask must select at least one residue")
+        return indices
 
     molecular_fields = (
         "atom_positions",
@@ -530,9 +548,10 @@ def _hotspot_structure_metrics(
             for residue_index in range(*boundaries[chain_index])
         ]
         binder_start, binder_end = boundaries[n_target_chains]
+        contact_indices = selected_binder_indices(binder_start, binder_end)
         binder_atom_groups = [
             token_heavy_atoms(token_index)
-            for token_index in range(binder_start, binder_end)
+            for token_index in contact_indices
         ]
         nonempty_binder_atoms = [
             atoms for atoms in binder_atom_groups if atoms.numel() > 0
@@ -569,8 +588,9 @@ def _hotspot_structure_metrics(
         positions = torch.as_tensor(complex_obj.atom37_positions, dtype=torch.float32)
         atom_mask = torch.as_tensor(complex_obj.atom37_mask, dtype=torch.bool)
         binder_start, binder_end = boundaries[n_target_chains]
-        binder_positions = positions[binder_start:binder_end]
-        binder_mask = atom_mask[binder_start:binder_end]
+        contact_indices = selected_binder_indices(binder_start, binder_end)
+        binder_positions = positions[contact_indices]
+        binder_mask = atom_mask[contact_indices]
         binder_atoms = binder_positions[binder_mask]
 
         def hotspot_atoms(hotspot_index: int) -> torch.Tensor:
@@ -622,6 +642,8 @@ def _hotspot_structure_metrics(
         "hotspot_heavy_atom_coverage_5a": strict_covered_count / hotspot_count,
         "hotspot_heavy_atom_covered_count_5a": strict_covered_count,
         "hotspot_count": hotspot_count,
+        "hotspot_binder_contact_residue_count": len(contact_indices),
+        "hotspot_binder_contact_positions_1based": [i - binder_start + 1 for i in contact_indices],
         "hotspot_verify_near_cutoff": float(near_cutoff),
         "hotspot_verify_far_cutoff": float(far_cutoff),
         "hotspot_verify_min_distance": float(min_safe_distance),
@@ -635,17 +657,26 @@ def _structure_losses(
     *,
     target_chain_lengths: Optional[Sequence[int]] = None,
     target_chain_roles: Optional[Sequence[str]] = None,
+    target_interface_mode: str = "all",
+    target_interface_contact_cutoff: float = 5.0,
+    target_interface_min_contacts: int = 5,
     binder_mutable_mask: Optional[Sequence[bool]] = None,
     hotspot_params: Optional[Dict[str, Any]] = None,
     hotspot_weight: float = 0.0,
     hotspot_cutoff: float = 8.0,
     hotspot_interface_mode: str = "additive",
-) -> dict[str, torch.Tensor]:
-    bin_distance = _midpoint_bins(
-        distogram_logits.device,
-        num_bins=distogram_logits.shape[-1],
-        dtype=distogram_logits.dtype,
-    )
+) -> dict[str, Any]:
+    if target_interface_mode == "contacted":
+        bin_distance = interface_distogram_bins(
+            distogram_logits.shape[-1], device=distogram_logits.device,
+            dtype=distogram_logits.dtype,
+        )
+    else:
+        bin_distance = _midpoint_bins(
+            distogram_logits.device,
+            num_bins=distogram_logits.shape[-1],
+            dtype=distogram_logits.dtype,
+        )
     full_len = distogram_logits.shape[1]
     target_length = int(full_len) - int(binder_length)
     if target_length <= 0:
@@ -699,11 +730,29 @@ def _structure_losses(
         is_design[-binder_length:] = mutable.to(dtype=is_design.dtype)
 
     is_true_target = torch.zeros(full_len, device=distogram_logits.device)
+    target_masks = []
     offset = 0
     for chain_length, role in zip(chain_lengths, roles):
         if role == "target":
             is_true_target[offset : offset + chain_length] = 1.0
+            mask = torch.zeros(full_len, device=distogram_logits.device, dtype=torch.bool)
+            mask[offset : offset + chain_length] = True
+            target_masks.append(mask)
         offset += chain_length
+    interface_target = is_true_target
+    selection = None
+    if target_interface_mode == "contacted":
+        selection = select_distogram_interface(
+            distogram_logits, chain_masks=target_masks, binder_mask=is_binder.bool(),
+            cutoff=target_interface_contact_cutoff, min_contacts=target_interface_min_contacts,
+        )
+        interface_target = torch.zeros_like(is_true_target)
+        for index in selection["selected_indices"]:
+            interface_target[target_masks[index]] = 1.0
+    elif target_interface_mode != "all":
+        raise ValueError("target_interface_mode must be all or contacted")
+
+    compact_mask = is_binder
 
     intra = _contact_loss(
         distogram_logits,
@@ -711,8 +760,8 @@ def _structure_losses(
         num_contacts=2,
         min_sep=9,
         cutoff=14.0,
-        chain_mask=is_binder,
-        binder_mask=is_binder,
+        chain_mask=compact_mask,
+        binder_mask=compact_mask,
     )
     inter = _contact_loss(
         distogram_logits,
@@ -720,7 +769,7 @@ def _structure_losses(
         num_contacts=1,
         min_sep=0,
         cutoff=22.0,
-        chain_mask=is_true_target,
+        chain_mask=interface_target,
         binder_mask=is_design,
     )
 
@@ -741,6 +790,10 @@ def _structure_losses(
         "glob_loss": glob,
         "total_loss": base_total,
     }
+    if selection is not None:
+        losses["_interface_selection"] = selection
+        losses["interface_selected_chain_count"] = inter.new_tensor(len(selection["selected_indices"]))
+        losses["interface_selection_fallback"] = inter.new_tensor(float(selection["fallback"]))
     hotspot_indices = _normalize_target_hotspot_indices(
         hotspot_params,
         target_length=target_length,
@@ -840,6 +893,77 @@ def _stageb_structure_loss(
 class ESMFold2RuntimeBackend:
     """ESMFold2 verifier + short proposal-gradient adapter."""
 
+    def _prepare_memory_phase(self, phase, targets, binder_length):
+        self.optimizations.memory.prepare(
+            phase, sum(map(len, targets)) + binder_length,
+            {"verifier": self.verifier_model, "proposal": self.experimental_model,
+             "prior": self.esmc_model},
+        )
+
+    def _record_memory_ready(self):
+        self.optimizations.memory.ready()
+        if self.config.memory_mode != "resident":
+            self.optimizations.write_report()
+
+    def _interface_options(self) -> dict[str, Any]:
+        return {
+            "target_interface_mode": self.config.target_interface_mode,
+            "target_interface_contact_cutoff": self.config.target_interface_contact_cutoff,
+            "target_interface_min_contacts": self.config.target_interface_min_contacts,
+        }
+
+    def _validate_target_assembly(self, targets: Sequence[str]) -> None:
+        if self.config.target_assembly == "homotrimer":
+            if len(targets) != 3 or len(set(targets)) != 1:
+                raise ValueError("homotrimer requires exactly three identical target sequences")
+            if any(not sequence or set(sequence) - set(ESM_AA_ORDER) for sequence in targets):
+                raise ValueError("homotrimer requires nonempty canonical amino-acid sequences")
+
+    def _contacted_summary_from_raw(self, output: Mapping[str, Any],
+            features: Mapping[str, torch.Tensor], targets: Sequence[str],
+            binder_length: int) -> dict[str, Any]:
+        """Use raw feature identities, never cumulated decoded atom positions."""
+        self._validate_target_assembly(targets)
+        def vector(name):
+            value = features[name].detach()
+            if value.ndim == 2 and value.shape[0] == 1:
+                value = value[0]
+            if value.ndim != 1:
+                raise ValueError(f"Contacted interface expects a single feature vector: {name}")
+            return value
+        valid = vector("token_attention_mask").bool()
+        asym = vector("asym_id").long()
+        if valid.shape != asym.shape:
+            raise ValueError("Contacted interface token/asym layout mismatch")
+        # Native chain confidence axes are model asym_id, not arbitrary labels.
+        ids = torch.unique_consecutive(asym[valid]).tolist()
+        expected_ids = list(range(len(targets) + 1))
+        if ids != expected_ids:
+            raise ValueError(f"Contacted interface requires contiguous native chain axes {expected_ids}, got {ids}")
+        masks = [valid & (asym == i) for i in expected_ids]
+        observed = [int(mask.sum()) for mask in masks]
+        expected = [len(sequence) for sequence in targets] + [binder_length]
+        if observed != expected:
+            raise ValueError(f"Contacted interface chain token lengths mismatch: {observed} != {expected}")
+        atom_mask = vector("atom_attention_mask").bool().clone()
+        # Canonical ESMFold2 features contain heavy atoms. Apply atomic number
+        # when supplied by the input builder so future hydrogen padding is safe.
+        if "ref_element" in features:
+            atom_mask &= vector("ref_element") > 1
+        selection = select_coordinate_interface(
+            output["sample_atom_coords"], atom_to_token=vector("atom_to_token"),
+            atom_mask=atom_mask, chain_masks=masks[:-1], binder_mask=masks[-1],
+            cutoff=self.config.target_interface_contact_cutoff,
+            min_contacts=self.config.target_interface_min_contacts,
+        )
+        summary = native_interface_summary(output.get("pair_chains_iptm"), selection,
+                                           n_target_chains=len(targets))
+        summary["pair_chain_iptm_axis_order"] = list(CHAIN_IDS[:len(targets) + 1])
+        summary["target_interface_contact_cutoff"] = self.config.target_interface_contact_cutoff
+        summary["target_interface_min_contacts"] = self.config.target_interface_min_contacts
+        summary["target_interface_chain_token_lengths"] = observed
+        return summary
+
     def __init__(
         self,
         *,
@@ -915,8 +1039,9 @@ class ESMFold2RuntimeBackend:
     ) -> dict[str, torch.Tensor]:
         """Build the atom identity layout paired with verifier coordinates."""
 
-        self._ensure_verifier_loaded()
         targets = _target_sequences(target_seq)
+        self._prepare_memory_phase("verifier", targets, len(binder_seq))
+        self._ensure_verifier_loaded()
         input_spec = self._build_structure_input(targets, binder_seq)
         features, _ = self.input_builder.prepare_input(
             input_spec,
@@ -1085,6 +1210,11 @@ class ESMFold2RuntimeBackend:
             n_target_chains=len(targets),
             target_chain_roles=target_chain_roles,
         )
+        if self.config.target_interface_mode == "contacted":
+            if raw_features is None or raw_output is None:
+                raise ValueError("Contacted interface verification requires raw model features and output")
+            summary["pair_chain_iptm_legacy_all_target_mean"] = summary.get("pair_chain_iptm")
+            summary.update(self._contacted_summary_from_raw(raw_output, raw_features, targets, len(binder_seq)))
         summary.update(
             _binder_structure_metrics(
                 fold_result,
@@ -1127,6 +1257,11 @@ class ESMFold2RuntimeBackend:
             or hotspot_verify_weight > 0.0
             or hotspot_too_close_weight > 0.0
         ):
+            binder_contact_mask = None
+            if self.task_type == "vhh_redesign":
+                binder_contact_mask = self.config.binder_mutable_mask
+                if binder_contact_mask is None:
+                    raise ValueError("VHH hotspot verification requires the configured CDR mutable mask")
             hotspot_metrics = _hotspot_structure_metrics(
                 fold_result.complex,
                 target_sequences=targets,
@@ -1134,8 +1269,12 @@ class ESMFold2RuntimeBackend:
                 near_cutoff=float(self.config.hotspot_verify_near_cutoff),
                 far_cutoff=float(self.config.hotspot_verify_far_cutoff),
                 min_safe_distance=float(self.config.hotspot_verify_min_distance),
+                binder_contact_mask=binder_contact_mask,
             )
             summary.update(hotspot_metrics)
+            summary["hotspot_binder_contact_scope"] = (
+                "vhh_cdr" if binder_contact_mask is not None else "all_binder"
+            )
 
         coordinate = _fold_result_coordinates(fold_result)
         aligned_loss_dict = None
@@ -1150,6 +1289,7 @@ class ESMFold2RuntimeBackend:
             distogram_losses = _structure_losses(
                 raw_output["distogram_logits"],
                 len(binder_seq),
+                **self._interface_options(),
                 target_chain_lengths=[len(sequence) for sequence in targets],
                 target_chain_roles=target_chain_roles,
                 binder_mutable_mask=self.config.binder_mutable_mask,
@@ -1159,6 +1299,7 @@ class ESMFold2RuntimeBackend:
                 hotspot_interface_mode="additive",
             )
             _, raw_common_losses = compute_esmfold2_common_losses(
+                **self._interface_options(),
                 coordinates=raw_output["sample_atom_coords"],
                 plddt_logits=raw_output["plddt_logits"],
                 pae_logits=raw_output["pae_logits"],
@@ -1172,12 +1313,15 @@ class ESMFold2RuntimeBackend:
                 weights=ESMFOLD2_LEGACY_VERIFIER_LOSS_WEIGHTS,
             )
             raw_common_loss_dict = _tensor_loss_dict_to_float(raw_common_losses)
+            scoring_summary = dict(summary)
             _, aligned_loss_dict = compute_esmfold2_bounded_verifier_losses(
-                summary,
+                scoring_summary,
                 weights=ESMFOLD2_VERIFIER_LOSS_WEIGHTS,
             )
             summary["esm_verify_loss_weights"] = dict(ESMFOLD2_VERIFIER_LOSS_WEIGHTS)
             summary["esm_verify_score_version"] = "bounded_pair_v1"
+            if self.config.target_interface_mode == "contacted":
+                summary["esm_verify_score_version"] = "bounded_contacted_bidirectional_min_mean_v1"
             summary["esm_verify_raw_common_loss"] = raw_common_loss_dict["total"]
             summary["esm_verify_raw_common_loss_weights"] = dict(
                 ESMFOLD2_LEGACY_VERIFIER_LOSS_WEIGHTS
@@ -1217,8 +1361,9 @@ class ESMFold2RuntimeBackend:
         seed: Optional[int] = None,
         hotspot_params: Optional[Dict[str, Any]] = None,
     ):
-        self._ensure_verifier_loaded()
         targets = _target_sequences(target_seq)
+        self._prepare_memory_phase("verifier", targets, len(binder_seq))
+        self._ensure_verifier_loaded()
         target_chain_roles = _normalize_target_chain_roles(
             self.config.target_chain_roles,
             n_target_chains=len(targets),
@@ -1279,8 +1424,9 @@ class ESMFold2RuntimeBackend:
                 "verify_scaffold_consistency requires "
                 "verifier_structure_mode='scaffold_consistency'"
             )
-        self._ensure_verifier_loaded()
         targets = _target_sequences(target_seq)
+        self._prepare_memory_phase("verifier", targets, len(binder_seq))
+        self._ensure_verifier_loaded()
         target_chain_roles = _normalize_target_chain_roles(
             self.config.target_chain_roles,
             n_target_chains=len(targets),
@@ -1495,8 +1641,9 @@ class ESMFold2RuntimeBackend:
         available for explicit diagnostics and does not mutate verifier state.
         """
 
-        self._ensure_proposal_models_loaded()
         targets = _target_sequences(target_seq)
+        self._prepare_memory_phase("proposal", targets, len(binder_seq))
+        self._ensure_proposal_models_loaded()
         explicit_target_chain_roles = self.config.target_chain_roles
         design = self._sequence_to_design_one_hot(binder_seq)
         fold_result = self._fold_distogram(
@@ -1507,15 +1654,16 @@ class ESMFold2RuntimeBackend:
         losses = _structure_losses(
             fold_result["distogram_logits"],
             len(binder_seq),
+            **self._interface_options(),
             target_chain_lengths=(
                 [len(sequence) for sequence in targets]
-                if explicit_target_chain_roles is not None
+                if explicit_target_chain_roles is not None or self.config.target_interface_mode == "contacted"
                 else None
             ),
             target_chain_roles=explicit_target_chain_roles,
             binder_mutable_mask=(
                 self.config.binder_mutable_mask
-                if explicit_target_chain_roles is not None
+                if explicit_target_chain_roles is not None or self.config.target_interface_mode == "contacted"
                 else None
             ),
             hotspot_params=hotspot_params,
@@ -1563,11 +1711,13 @@ class ESMFold2RuntimeBackend:
                 self.config.verifier_model_name,
                 esmc_precision="bf16",
             ).to(self.device).eval().requires_grad_(False)
+        self.optimizations.memory.place("verifier", self.verifier_model)
         self.optimizations.verifier(self.verifier_model, self.input_builder)
         if self.config.esmc_optimization != "off":
             internal = getattr(self.verifier_model, "_esmc", None)
             if internal is not None:
                 self.optimizations.esmc(internal, "verifier_esmc")
+        self._record_memory_ready()
 
     def _ensure_proposal_models_loaded(self) -> None:
         if self.experimental_model is None:
@@ -1615,6 +1765,7 @@ class ESMFold2RuntimeBackend:
                     logger.warning("Could not set ESMFold2 kernel backend fallback: %s", exc)
             self.experimental_model = experimental_model.to(self.device).eval().requires_grad_(False)
 
+        self.optimizations.memory.place("proposal", self.experimental_model)
         self.optimizations.proposal(self.experimental_model)
         if self.config.esmc_optimization != "off":
             internal = getattr(self.experimental_model, "_esmc", None)
@@ -1632,9 +1783,17 @@ class ESMFold2RuntimeBackend:
                 torch_dtype=torch.float32,
             ).to(self.device).eval().requires_grad_(False)
         if self.esmc_model is not None:
+            if not self.optimizations.memory.active:
+                self.optimizations.memory.place("prior", self.esmc_model)
             self.optimizations.esmc(self.esmc_model, "prior_esmc")
+            if self.config.memory_prior_residency == "per_step":
+                self.optimizations.memory.offload_model("prior", self.esmc_model)
+        self._record_memory_ready()
 
     def _build_structure_input(self, targets: Sequence[str], binder_seq: str) -> Any:
+        self._validate_target_assembly(targets)
+        if self.config.target_assembly == "homotrimer" and (not binder_seq or set(binder_seq) - set(ESM_AA_ORDER)):
+            raise ValueError("homotrimer requires one nonempty canonical binder sequence")
         if len(targets) + 1 > len(CHAIN_IDS):
             raise ValueError("Too many chains for first ESMFold2 backend")
         proteins = []
@@ -1786,6 +1945,7 @@ class ESMFold2RuntimeBackend:
             preserve_proposal_logits=preserve_proposal_logits,
         )
 
+    @measured("proposal_diffusion_gradient")
     def _one_step_diffusion_gradient(
         self,
         *,
@@ -1801,6 +1961,10 @@ class ESMFold2RuntimeBackend:
         hotspot_params: Optional[Dict[str, Any]],
         effective_hotspot_weight: float,
     ) -> Dict[str, Any]:
+        if self.config.memory_prior_residency == "between_diffusion":
+            # The prior's own backward has completed. Keep the proposal model
+            # and its live graph; move only the independent sequence prior.
+            self._prepare_memory_phase("diffusion", targets, len(current_seq))
         one_step_mode = str(self.config.one_step_diffusion_mode).strip().lower()
         template_report: Optional[Mapping[str, Any]] = None
         if one_step_mode == "truncated_trajectory":
@@ -1880,6 +2044,7 @@ class ESMFold2RuntimeBackend:
         else:
             raise ValueError(f"Unsupported one-step diffusion mode: {one_step_mode}")
         diffusion_total, diffusion_losses = compute_esmfold2_common_losses(
+            **self._interface_options(),
             coordinates=one_step["coordinates"],
             plddt_logits=one_step["plddt_logits"],
             pae_logits=one_step["pae_logits"],
@@ -2043,6 +2208,7 @@ class ESMFold2RuntimeBackend:
                 raise ValueError(
                     "runtime mutable_mask does not match configured binder_mutable_mask"
                 )
+        self._prepare_memory_phase("proposal", targets, len(current_seq))
         self._ensure_proposal_models_loaded()
         effective_hotspot_weight = (
             float(self.config.hotspot_weight)
@@ -2179,15 +2345,16 @@ class ESMFold2RuntimeBackend:
             losses = _structure_losses(
                 fold_result["distogram_logits"],
                 len(current_seq),
+                **self._interface_options(),
                 target_chain_lengths=(
                     [len(sequence) for sequence in targets]
-                    if explicit_target_chain_roles is not None
+                    if explicit_target_chain_roles is not None or self.config.target_interface_mode == "contacted"
                     else None
                 ),
                 target_chain_roles=explicit_target_chain_roles,
                 binder_mutable_mask=(
                     mutable_mask
-                    if explicit_target_chain_roles is not None
+                    if explicit_target_chain_roles is not None or self.config.target_interface_mode == "contacted"
                     else None
                 ),
                 hotspot_params=hotspot_params,
@@ -2217,6 +2384,7 @@ class ESMFold2RuntimeBackend:
                         score_mask=score_mask,
                     )
                 esmc_grad = torch.autograd.grad(esmc_loss.mean(), logits)[0]
+                self._prepare_memory_phase("proposal", targets, len(current_seq))
 
             combined_grad = combine_normalized_gradients(
                 structure_grad,
@@ -2439,6 +2607,8 @@ class ESMFold2RuntimeBackend:
                 or (local_step + 1) % 10 == 0
             ):
                 metrics["logits_snapshot"] = logits.detach().clone()[0].cpu()
+            if "_interface_selection" in losses:
+                metrics["target_interface_selection"] = dict(losses["_interface_selection"])
             soft_step_metrics.append(metrics)
 
         if one_step_enabled and one_step_interval == 0:
@@ -2470,14 +2640,15 @@ class ESMFold2RuntimeBackend:
             losses = _structure_losses(
                 fold_result["distogram_logits"],
                 len(current_seq),
+                **self._interface_options(),
                 target_chain_lengths=(
                     [len(sequence) for sequence in targets]
-                    if explicit_target_chain_roles is not None
+                    if explicit_target_chain_roles is not None or self.config.target_interface_mode == "contacted"
                     else None
                 ),
                 target_chain_roles=explicit_target_chain_roles,
                 binder_mutable_mask=(
-                    mutable_mask if explicit_target_chain_roles is not None else None
+                    mutable_mask if (explicit_target_chain_roles is not None or self.config.target_interface_mode == "contacted") else None
                 ),
                 hotspot_params=hotspot_params,
                 hotspot_weight=effective_distogram_hotspot_weight,
@@ -2507,6 +2678,7 @@ class ESMFold2RuntimeBackend:
                     )
                 esmc_grad = torch.autograd.grad(esmc_loss.mean(), logits)[0]
 
+            self._prepare_memory_phase("proposal", targets, len(current_seq))
             one_step = self._one_step_diffusion_gradient(
                 logits=logits,
                 fold_result=fold_result,
@@ -2623,6 +2795,8 @@ class ESMFold2RuntimeBackend:
                     diffusion_losses["rg"]
                     * float(self.config.one_step_diffusion_rg_weight)
                 )
+            if "_interface_selection" in losses:
+                one_step_metrics["target_interface_selection"] = dict(losses["_interface_selection"])
             soft_step_metrics.append(one_step_metrics)
 
         return (
@@ -2852,6 +3026,9 @@ class ESMFold2RuntimeBackend:
             )
             if scaffold_pair_chain is not None:
                 result["scaffold_binder_pair_chain_iptm"] = scaffold_pair_chain
+        if self.config.target_interface_mode == "contacted" and calculate_confidence:
+            result["pair_chain_iptm_legacy_all_target_mean"] = result.get("pair_chain_iptm")
+            result.update(self._contacted_summary_from_raw(output, inputs, targets, design.shape[1]))
         return result
 
     @lru_cache(maxsize=1)
@@ -2890,6 +3067,11 @@ class ESMFold2RuntimeBackend:
     ) -> torch.Tensor:
         if self.esmc_model is None:
             raise RuntimeError("ESMC model is required when lambda_esmc is non-zero")
+        if self.optimizations.memory.active:
+            self.optimizations.memory.prepare(
+                "prior", self.optimizations.memory.total_tokens,
+                {"verifier": self.verifier_model, "proposal": self.experimental_model,
+                 "prior": self.esmc_model})
         from transformers.models.esmc.tokenization_esmc import ESMCTokenizer
 
         device = binder_design.device

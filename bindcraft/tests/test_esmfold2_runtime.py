@@ -518,6 +518,66 @@ def test_hotspot_structure_metrics_penalize_unsafe_heavy_atom_distance():
     assert metrics["hotspot_verify_min_distance"] == pytest.approx(2.5)
 
 
+@pytest.mark.parametrize("complex_class", [FakeGeometryComplex, FakeMolecularComplex])
+def test_hotspot_cdr_mask_rejects_close_non_cdr_decoys(complex_class):
+    complex_obj = complex_class()
+    # Only the middle binder residue is a CDR: distant, despite close fixed residues.
+    if complex_class is FakeGeometryComplex:
+        complex_obj.atom37_positions[6, 0, 0] = 20.0
+    else:
+        complex_obj.atom_positions[5, 0] = 20.0
+    kwargs = dict(target_sequences=["AAAA"], hotspot_params={"target_hotspot_concat_indices": [0]},
+                  near_cutoff=5.0, far_cutoff=20.0)
+    unmasked = _hotspot_structure_metrics(complex_obj, **kwargs)
+    masked = _hotspot_structure_metrics(complex_obj, binder_contact_mask=[False, True, False], **kwargs)
+    assert unmasked["hotspot_heavy_atom_coverage_5a"] == 1.0
+    assert masked["hotspot_heavy_atom_coverage_5a"] == 0.0
+    assert masked["hotspot_verify_distance_loss"] == pytest.approx(1.0)
+    assert masked["hotspot_min_heavy_atom_distances"] == pytest.approx([20.0])
+    assert masked["hotspot_binder_contact_positions_1based"] == [2]
+
+
+@pytest.mark.parametrize("mask", [[True], [False, False, False], [0, 0.5, 0]])
+def test_hotspot_structure_metrics_rejects_invalid_cdr_mask(mask):
+    with pytest.raises(ValueError, match="binder_contact_mask"):
+        _hotspot_structure_metrics(FakeGeometryComplex(), target_sequences=["AAAA"],
+            hotspot_params={"target_hotspot_concat_indices": [0]}, near_cutoff=5.0,
+            far_cutoff=20.0, binder_contact_mask=mask)
+
+
+@pytest.mark.parametrize("builder_class", [FakeGeometryInputBuilder, FakeMolecularInputBuilder])
+def test_vhh_runtime_passes_cdr_mask_into_verifier(builder_class):
+    class DistantCdrInputBuilder(builder_class):
+        def fold(self, *args, **kwargs):
+            result = super().fold(*args, **kwargs)
+            if isinstance(result.complex, FakeMolecularComplex):
+                result.complex.atom_positions[5, 0] = 20.0
+            else:
+                result.complex.atom37_positions[6, 0, 0] = 20.0
+            return result
+
+    backend = ESMFold2RuntimeBackend(
+        config=ESMFold2ProposalConfig(binder_mutable_mask=(False, True, False),
+            hotspot_verify_weight=0.2, hotspot_verify_near_cutoff=5.0, hotspot_verify_far_cutoff=20.0),
+        device="cpu", task_type="vhh_redesign", verifier_model=object(),
+        input_builder=DistantCdrInputBuilder(), protein_input_cls=FakeProteinInput,
+        structure_prediction_input_cls=FakeStructurePredictionInput)
+    result = backend.verify(binder_seq="YYY", target_seq="AAAA", seed=7,
+                            hotspot_params={"target_hotspot_concat_indices": [0]})
+    assert result.summary_confidence["hotspot_binder_contact_scope"] == "vhh_cdr"
+    assert result.summary_confidence["hotspot_heavy_atom_coverage_5a"] == 0.0
+    assert result.total_loss == pytest.approx(0.37)
+
+
+def test_vhh_hotspot_verification_requires_explicit_cdr_mask():
+    backend = ESMFold2RuntimeBackend(config=ESMFold2ProposalConfig(), device="cpu",
+        task_type="vhh_redesign", verifier_model=object(), input_builder=FakeGeometryInputBuilder(),
+        protein_input_cls=FakeProteinInput, structure_prediction_input_cls=FakeStructurePredictionInput)
+    with pytest.raises(ValueError, match="CDR mutable mask"):
+        backend.verify(binder_seq="YYY", target_seq="AAAA", seed=7,
+                       hotspot_params={"target_hotspot_concat_indices": [0]})
+
+
 def test_runtime_preserves_matching_free_proposal_logits_without_hard_anchor():
     generator = torch.Generator().manual_seed(11)
     proposal_logits = init_binder_logits(

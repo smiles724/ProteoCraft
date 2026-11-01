@@ -36,7 +36,10 @@ def test_cluster_bootstrap_does_not_overweight_hotspot_variants():
     assert result == experiment.clustered_interval({"target1": [1] * 100, "target2": [3]})
 
 
-def test_prepare_uses_disjoint_outputs_and_common_seeds(tmp_path):
+def test_prepare_uses_disjoint_outputs_and_common_seeds(tmp_path, monkeypatch):
+    from scripts.run_hallucination import parse_args_with_profile
+    # Command generation should not depend on the checkout's live Git state.
+    monkeypatch.setattr(experiment, "git_state", lambda path: {"revision": "test", "dirty": False})
     args = experiment.parser().parse_args([
         "prepare", "--output", str(tmp_path), "--kit-root", str(tmp_path / "kit"),
         "--cases", "denovo_PD1", "--arms", "baseline", "exact", "--seeds", "43", "44",
@@ -51,6 +54,9 @@ def test_prepare_uses_disjoint_outputs_and_common_seeds(tmp_path):
         assert command[command.index("--seed") + 1] == str(row["seed"])
         assert command[command.index("--esmfold2_save_verified_candidate_cif") + 1] == "true"
         assert "--esmfold2_optimization_timing" in command
+        parsed, _ = parse_args_with_profile(command[2:])
+        assert (parsed.esmfold2_proposal_optimization, parsed.esmfold2_verifier_optimization,
+                parsed.esmfold2_esmc_optimization) == experiment.ARMS[row["arm"]]
     experiment.prepare(args)
     assert json.loads((tmp_path / "campaign.json").read_text()) == manifest
 

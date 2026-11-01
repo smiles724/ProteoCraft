@@ -208,11 +208,13 @@ def _normalize_hotspots(raw_hotspots: Any, *, target_length: int) -> tuple[int, 
         raise ValueError("target_hotspots_1based must be a list of integers")
     hotspots: list[int] = []
     for raw_position in raw_hotspots:
-        if isinstance(raw_position, bool):
+        if isinstance(raw_position, bool) or (
+            isinstance(raw_position, float) and not raw_position.is_integer()
+        ):
             raise ValueError("target_hotspots_1based must contain integers")
         try:
             position = int(raw_position)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(
                 "target_hotspots_1based must contain integers"
             ) from exc
@@ -303,6 +305,10 @@ def prepare_esmfold2_vhh_case(
         case.get("target_hotspots_1based"),
         target_length=sum(len(sequence) for sequence in target_sequences),
     )
+    position_roles = [role for sequence, role in zip(target_sequences, target_chain_roles)
+                      for _ in sequence]
+    if any(position_roles[position - 1] != "target" for position in target_hotspots):
+        raise ValueError(f"{case_id}: target hotspots must belong to a chain with role=target")
     reference_path = _resolve_path(
         case.get("reference_structure_path"),
         base_dir=input_dir,

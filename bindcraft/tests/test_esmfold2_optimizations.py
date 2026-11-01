@@ -312,25 +312,71 @@ def test_cli_finalizes_without_masking_search_failure(monkeypatch, fail_finalize
     assert finalized == [True]
 
 
-def test_cli_optimization_defaults_and_graph_override():
+def _search_backend(args):
+    from scripts import run_hallucination as cli
+    cli.resolve_model_backend(args)
+    cli.resolve_esmfold2_verifier_precision_defaults(args)
+    cli.resolve_esmfold2_hotspot_defaults(args, model_backend="esmfold2", hotspot_params=None)
+    return cli.load_esmfold2_backend(args, device="cpu")
+
+
+@pytest.mark.parametrize("profile", [[], ["--profile", "esmfold2_d"]])
+def test_cli_optimization_defaults_and_graph_override(profile):
     from scripts.run_hallucination import parse_args_with_profile
-    args, _ = parse_args_with_profile(["--target", "AAAA", "--profile", "esmfold2_d"])
+    args, _ = parse_args_with_profile(["--target", "AAAA", "--model_backend", "esmfold2", "--mode", "mcts", *profile])
     assert (args.esmfold2_proposal_optimization, args.esmfold2_verifier_optimization,
-            args.esmfold2_esmc_optimization) == ("off", "off", "off")
-    assert args.esmfold2_stagea_candidate_strategy == "positive_score_guarded"
+            args.esmfold2_esmc_optimization) == ("fast", "fast", "exact")
+    backend = _search_backend(args)
+    assert (backend.config.proposal_optimization, backend.config.verifier_optimization,
+            backend.config.esmc_optimization) == ("fast", "fast", "exact")
+    if profile:
+        assert args.esmfold2_stagea_candidate_strategy == "positive_score_guarded"
     assert args.esmfold2_optimization_graph_max_tokens is None
     args, _ = parse_args_with_profile(["--target", "AAAA",
                                       "--esmfold2_optimization_graph_max_tokens", "256"])
     assert args.esmfold2_optimization_graph_max_tokens == 256
 
 
+@pytest.mark.parametrize("profile", [[], ["--profile", "esmfold2_d"]])
+def test_search_stock_override_does_not_require_optimization_sources(profile, monkeypatch):
+    from scripts.run_hallucination import parse_args_with_profile
+    monkeypatch.delenv("PROTEOCRAFT_UPLIFT_ROOT", raising=False)
+    args, _ = parse_args_with_profile([
+        "--target", "AAAA", "--model_backend", "esmfold2", "--mode", "mcts", *profile,
+        "--esmfold2_proposal_optimization", "off", "--esmfold2_verifier_optimization", "off",
+        "--esmfold2_esmc_optimization", "off",
+    ])
+    backend = _search_backend(args)
+    monkeypatch.setattr(backend.optimizations, "_source", lambda: pytest.fail("stock imported kit"))
+    backend.optimizations.proposal(object())
+    backend.optimizations.verifier(object(), None)
+    backend.optimizations.esmc(object(), "prior")
+    assert backend.optimizations.records == {}
+
+
+@pytest.mark.parametrize("kind", ["denovo", "tcr"])
+def test_panel_search_launchers_default_to_fast(kind, tmp_path):
+    from benchmark.script.run_esmfold2_59 import PreparedCase, build_hallucination_command
+    from scripts.run_hallucination import parse_args_with_profile
+    case = PreparedCase(case_id="example", task_type=kind, target_name="target",
+                        source_run_id="source", target_sequence="AAAA", binder_length=4)
+    command = build_hallucination_command(case, profile="esmfold2_d", device="cpu", case_dir=tmp_path)
+    args, _ = parse_args_with_profile(command[2:])
+    backend = _search_backend(args)
+    assert (backend.config.proposal_optimization, backend.config.verifier_optimization,
+            backend.config.esmc_optimization) == ("fast", "fast", "exact")
+
+
 @pytest.mark.parametrize("kind", ["cdr", "vhh"])
-def test_task_launchers_forward_optimization_settings(kind, tmp_path):
+@pytest.mark.parametrize("explicit", [False, True])
+def test_task_launchers_forward_optimization_settings(kind, tmp_path, explicit):
     from scripts.run_hallucination import parse_args_with_profile
     config = {"launch_profile": "esmfold2_d", "esmfold2_optimization_root": "/kit",
               "esmfold2_proposal_optimization": "fast", "esmfold2_verifier_optimization": "exact",
               "esmfold2_esmc_optimization": "off", "esmfold2_optimization_graph_max_tokens": 256,
               "esmfold2_optimization_timing": True}
+    if not explicit:
+        config = {"launch_profile": "esmfold2_d"}
     if kind == "vhh":
         from bindcraft.tests.test_esmfold2_vhh import _vhh_case
         from bindcraft.hallucination.esmfold2_vhh import prepare_esmfold2_vhh_case
@@ -349,3 +395,6 @@ def test_task_launchers_forward_optimization_settings(kind, tmp_path):
         if name != "launch_profile":
             assert getattr(args, name) == value
     assert args.esmfold2_stagea_candidate_strategy == "positive_score_guarded"
+    if not explicit:
+        assert (args.esmfold2_proposal_optimization, args.esmfold2_verifier_optimization,
+                args.esmfold2_esmc_optimization) == ("fast", "fast", "exact")

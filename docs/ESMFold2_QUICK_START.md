@@ -1,5 +1,8 @@
 # ProteoCraft ESMFold2 运行指南
 
+长复合物或显存不足时，可启用通用的[分阶段显存管理模式](ESMFold2_MEMORY.md)。
+默认驻留方式保持不变；单靶标、双靶标和 VHH 启动器均可显式配置。
+
 本文档说明当前推荐的 ESMFold2 默认配置，以及 De novo binder design、TCR binder design、TCR CDR redesign 和 VHH all-CDR redesign 四种任务的启动方式。以下命令均需在仓库根目录执行。
 
 运行前先使用 [`environment/esmfold2/`](../environment/esmfold2/README.md)
@@ -9,14 +12,18 @@
 namespace，混装可能加载错误实现。
 
 ```bash
-bash environment/esmfold2/install.sh
-conda activate proteocraft_esmfold2_py312
+# 先按 ESM_OPTIMIZATION_EXPERIMENTS.md 获取并固定优化源码版本。
+export PROTEOCRAFT_UPLIFT_ROOT=/absolute/path/to/uplifting-biomolecular-modeling
+bash environment/esmfold2/install_optimization.sh /absolute/path/to/proteocraft_esmopt_py312
+source /absolute/path/to/proteocraft_esmopt_py312/bin/activate
 python environment/esmfold2/download_models.py \
   --cache-dir /path/to/proteocraft_hf_cache
 ```
 
 模型下载脚本会打印 `HF_HOME`、`HF_HUB_OFFLINE`、`TRANSFORMERS_OFFLINE` 和
-`ESMCFOLD_CCD_PATH` 的设置。导出这些变量后，可执行以下自检：
+`ESMCFOLD_CCD_PATH` 的设置。优化环境由安装脚本固定依赖，优化适配器会在运行时
+校验源码版本。下面的 `check_environment.py` 仅检查旧基线环境；如果使用该环境
+并显式关闭搜索加速，可执行：
 
 ```bash
 python environment/esmfold2/check_environment.py \
@@ -43,6 +50,7 @@ configs/proteocraft_profiles/esmfold2_d.yaml
 | 项目 | 默认值 |
 |---|---|
 | Model backend | ESMFold2 |
+| Search optimization: proposal / verifier / ESMC | `fast / fast / exact` |
 | Search | Two-stage MCTS |
 | Stage A / Stage B | 70 / 40 outer steps |
 | Initial roots | 8 |
@@ -54,6 +62,19 @@ configs/proteocraft_profiles/esmfold2_d.yaml
 | Search-time verifier | 4 loops x 50 sampling steps |
 
 命令行中显式提供的参数会覆盖 profile。例如，如果希望整次搜索使用更高精度的 full verifier，可以显式使用 `--esmfold2_verifier_num_loops 20 --esmfold2_verifier_num_sampling_steps 200`。只对最终候选进行高精度复评时，应在搜索结束后单独运行统一的 20 x 200 rescoring，而不是修改搜索期默认值。
+
+默认加速需要上述优化环境及源码路径；依赖缺失时会报错，不会静默回退。
+使用旧基线环境复现 stock 搜索时，可显式追加以下参数覆盖默认值：
+
+```bash
+--esmfold2_proposal_optimization off \
+--esmfold2_verifier_optimization off \
+--esmfold2_esmc_optimization off
+```
+
+独立官方复评的 `configs/evaluation/esmfold2_official_rescore.yaml` 仍固定为
+`off / off / off`，不受搜索默认值影响。优化环境安装细节见
+[`ESM_OPTIMIZATION_EXPERIMENTS.md`](ESM_OPTIMIZATION_EXPERIMENTS.md)。
 
 加密的 truncated diffusion schedule 是一个可选项，不改变默认 profile：
 

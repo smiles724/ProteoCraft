@@ -6,6 +6,7 @@ import yaml
 
 from benchmark.script.run_esmfold2_vhh_redesign import (
     build_hallucination_command,
+    effective_hotspot_settings,
     write_case_record,
 )
 from bindcraft.hallucination.esmfold2_vhh import prepare_esmfold2_vhh_case
@@ -199,3 +200,72 @@ def test_vhh_case_record_marks_reference_coordinates_as_record_only(tmp_path):
     assert provenance["reference_structure_usage"] == (
         "recorded_only_not_model_input"
     )
+
+
+def test_vhh_hotspot_launcher_preserves_explicit_overrides_and_records_numbering(tmp_path):
+    raw = _vhh_case()
+    raw["target_hotspots_1based"] = [1, 9]
+    case = prepare_esmfold2_vhh_case(raw, input_dir=tmp_path)
+    config = {
+        "launch_profile": "esmfold2_d",
+        "config_path": str(tmp_path / "config.yaml"),
+        "esmfold2_hotspot_weight": 0.7,
+        "esmfold2_hotspot_cutoff": 7.0,
+        "esmfold2_hotspot_satisfied_proposal_weight": 0.1,
+        "esmfold2_hotspot_interface_mode": "localized",
+        "esmfold2_hotspot_verify_weight": 0.25,
+        "esmfold2_hotspot_verify_near_cutoff": 5.0,
+        "esmfold2_hotspot_verify_far_cutoff": 18.0,
+        "esmfold2_hotspot_verify_min_distance": 2.0,
+        "esmfold2_hotspot_verify_too_close_weight": 0.0,
+        "esmfold2_distogram_hotspot": False,
+        "esmfold2_one_step_diffusion_hotspot": True,
+    }
+    command = build_hallucination_command(case, config, case_dir=tmp_path / "out")
+    write_case_record(case, config, case_dir=tmp_path / "out", command=command)
+    record = json.loads((tmp_path / "out/provenance.json").read_text())["hotspot"]
+    assert record["target_hotspots_1based"] == [1, 9]
+    assert record["target_hotspot_concat_indices_0based"] == [0, 8]
+    for key, value in record["effective_options"].items():
+        assert value == config[key]
+    assert record["binder_contact_scope"] == "vhh_cdr_mutable_mask"
+
+
+def test_vhh_hotspot_profile_zero_is_not_silently_reenabled(tmp_path):
+    raw = _vhh_case()
+    raw["target_hotspots_1based"] = [2]
+    case = prepare_esmfold2_vhh_case(raw, input_dir=tmp_path)
+    command = build_hallucination_command(case, {"launch_profile": "esmfold2_d"}, case_dir=tmp_path)
+    effective = effective_hotspot_settings(command)["effective_options"]
+    assert effective["esmfold2_hotspot_weight"] == pytest.approx(0.5)
+    assert effective["esmfold2_hotspot_verify_weight"] == 0.0
+    assert effective["esmfold2_hotspot_verify_too_close_weight"] == 0.0
+    assert effective["esmfold2_distogram_hotspot"] is True
+
+
+@pytest.mark.parametrize("position", [0, 10, True, 1.5, float("nan"), float("inf")])
+def test_vhh_hotspot_rejects_invalid_input_numbering(tmp_path, position):
+    raw = _vhh_case()
+    raw["target_hotspots_1based"] = [position]
+    with pytest.raises(ValueError):
+        prepare_esmfold2_vhh_case(raw, input_dir=tmp_path)
+
+
+def test_vhh_hotspot_multichain_mapping_excludes_scaffold_chains(tmp_path):
+    raw = _vhh_case()
+    raw["target_sequences"] = ["ACD", "EFG", "HIK"]
+    raw["target_chain_roles"] = ["target", "scaffold", "target"]
+    raw["target_hotspots_1based"] = [3, 7]
+    case = prepare_esmfold2_vhh_case(raw, input_dir=tmp_path)
+    command = build_hallucination_command(case, {}, case_dir=tmp_path)
+    assert effective_hotspot_settings(command)["target_hotspot_concat_indices_0based"] == [2, 6]
+    raw["target_hotspots_1based"] = [4]
+    with pytest.raises(ValueError, match="role=target"):
+        prepare_esmfold2_vhh_case(raw, input_dir=tmp_path)
+
+
+def test_vhh_hotspot_rejects_duplicate_positions(tmp_path):
+    raw = _vhh_case()
+    raw["target_hotspots_1based"] = [1, 1]
+    with pytest.raises(ValueError, match="duplicate"):
+        prepare_esmfold2_vhh_case(raw, input_dir=tmp_path)
