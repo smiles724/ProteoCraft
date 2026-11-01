@@ -1,5 +1,94 @@
 # ProteoCraft ESMFold2/AF3/AtlasFold-M Evaluator
 
+## Independent stock ESMFold2 rescoring
+
+From the repository root, `evaluation/metric_pipeline/run_esmfold2_rescore.py`
+provides a standalone `prepare → run → report` workflow. It does not require an
+optimization campaign. Use the Python 3.12 ProteoCraft ESMFold2 environment for
+inference; preparation/reporting require only Python and PyYAML.
+
+The versioned recipe is `configs/evaluation/esmfold2_official_rescore.yaml`:
+all three optimization switches are explicitly **off**, both ESMFold2 and its
+internal ESMC snapshots are pinned, and inference uses 20 loops / 200 sampling
+steps with seeds 1043, 1044 and 1045. The evaluator uses official model weights
+through the existing ProteoCraft adapter, not the separate Biohub SDK CLI.
+`run` launches a fresh child process, rejects optimization autoload variables,
+and requires the pinned models/CCD to exist in the Hugging Face cache. It never
+downloads missing checkpoints. Search defaults and search outputs are untouched.
+
+Input is JSONL, with one explicit candidate per line. Chain order, chain roles
+and **zero-based indices into concatenated target sequences** are required:
+
+```json
+{"case_id":"example","candidate_id":"seed43-rank001","binder_seq":"ACDE","target_sequences":["AAAA","CCCC"],"target_chain_roles":["target","scaffold"],"target_hotspot_concat_indices":[0,3],"search_seed":43,"search_loss":0.4}
+```
+
+The short sequences above illustrate the schema, not a scientific test case.
+Use `[]` explicitly for absent hotspots. Supply the entire binder sequence for
+CDR/VHH designs. Extra JSON metadata, such as mutable masks or source identifiers,
+is retained in the frozen manifest; it does not impose structural constraints.
+This recipe performs **sequence-only refolding**, including for CDR/VHH. Template
+or scaffold-constrained evaluation remains a separate protocol and is rejected
+as a `structure_mode` here. Within one case ID, target sequences, roles and
+hotspots must agree. Evaluation seeds may not equal a supplied search seed.
+
+```bash
+python evaluation/metric_pipeline/run_esmfold2_rescore.py prepare \
+  --manifest candidates.jsonl --out-dir outputs/my_run/evaluation
+python evaluation/metric_pipeline/run_esmfold2_rescore.py run \
+  --out-dir outputs/my_run/evaluation --device cuda:0
+python evaluation/metric_pipeline/run_esmfold2_rescore.py report \
+  --out-dir outputs/my_run/evaluation
+```
+
+To select Top 5 unique sequences by lowest search `total_loss` from each completed
+search, use `prepare --from-search --manifest completed_runs.jsonl`. Each input
+row supplies `run_dir`, `candidate_prefix`, `case_id`, the same explicit target
+context and optional `search_seed`; omit `binder_seq` and `candidate_id`:
+
+```json
+{"case_id":"example","candidate_prefix":"seed43","run_dir":"search/seed43","target_sequences":["AAAA"],"target_chain_roles":["target"],"target_hotspot_concat_indices":[],"search_seed":43}
+```
+
+Relative run paths resolve against the input manifest directory. A completed
+`esmfold2_artifacts/run_summary.json` is required; when `experiment_run.json`
+exists it must also report return code 0. Candidate deduplication is within each
+run. Fewer than five unique candidates are retained as such, without padding.
+For an explicit candidate manifest, all supplied candidates are evaluated;
+Top K selection only applies with `--from-search`.
+
+Outputs:
+
+- `candidates.jsonl` and `evaluation_contract.json`: frozen sequences, contexts,
+  protocol, selection provenance and hashes. Changed inputs/settings require a
+  new output directory; the inference phase consumes only this frozen snapshot.
+- `runtime_environment.json` and `optimization_report.json`: actual software,
+  GPU, relevant source/config/CCD hashes, optimization settings and call counts.
+  The source hashes cover the bounded scorer and geometry losses; the effective
+  bounded and raw-common scoring weights are also recorded explicitly.
+- `structures/<case>/<candidate>/seed_<seed>/esmfold2.cif` and `score.json`:
+  structure and metrics per candidate/seed, or an explicit failure record.
+- `scores.csv`: every expected candidate/seed, including failed or missing rows.
+- `summary.csv`: mean/min/max/population SD; ranking within each case uses mean
+  pair-chain iPTM and includes only candidates successful on **all** seeds.
+  Hotspot coverage (8 Å and 5 Å), binder pLDDT (0–1), compactness and clash losses
+  remain separate columns; ranking is not an experimental binding claim.
+- `evaluation_status.json`: expected, successful, failed and missing counts.
+
+Re-running resumes missing work and validates saved score identities and CIF
+hashes. Failed attempts require `run --retry-failed`; their original records are
+archived. Runtime/source changes cannot be mixed into an unfinished evaluation.
+Receipts from before scorer hashes/weights were recorded cannot be resumed with
+this version; use a new output directory, preserving the previous evaluation.
+Incomplete candidates remain visible but receive no quality aggregate or rank.
+The worker exits nonzero if any candidate/seed fails. A process lock prevents
+concurrent writers to the same output directory.
+
+For fast-vs-stock numerical comparisons at the search budget, copy the recipe
+and set 4 loops / 50 sampling steps in a separate output directory. The default
+20×200 final evaluation is a different protocol, not a direct numerical parity
+test. Freeze the selection before comparing fast and stock searches.
+
 BCv2  evaluation 代码目标：
 
 - 将 method 产出的 binder design 统一整理成 manifest。

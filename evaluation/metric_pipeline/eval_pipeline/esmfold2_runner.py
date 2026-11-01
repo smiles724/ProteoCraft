@@ -120,6 +120,14 @@ def build_backend(
         verifier_num_loops=int(num_loops),
         verifier_num_sampling_steps=int(num_sampling_steps),
         verifier_loss_mode=str(loss_mode),
+        # Evaluation must remain stock even if search defaults change to fast.
+        proposal_optimization="off",
+        verifier_optimization="off",
+        esmc_optimization="off",
+        verifier_structure_mode="sequence_only",
+        hotspot_cutoff=8.0,
+        hotspot_verify_weight=0.0,
+        hotspot_verify_too_close_weight=0.0,
     )
     return ESMFold2RuntimeBackend(config=config, device=device, task_type="evaluation")
 

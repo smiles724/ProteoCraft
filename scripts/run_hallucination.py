@@ -421,6 +421,13 @@ def load_esmfold2_backend(
     config = ESMFold2ProposalConfig(
         experimental_model_name=args.esmfold2_experimental_model,
         verifier_model_name=args.esmfold2_verifier_model,
+        optimization_root=args.esmfold2_optimization_root,
+        proposal_optimization=args.esmfold2_proposal_optimization,
+        verifier_optimization=args.esmfold2_verifier_optimization,
+        esmc_optimization=args.esmfold2_esmc_optimization,
+        optimization_timing=args.esmfold2_optimization_timing,
+        optimization_graph_max_tokens=args.esmfold2_optimization_graph_max_tokens,
+        optimization_report_path=os.path.join(args.output_dir, "optimization_report.json"),
         verifier_num_loops=args.esmfold2_verifier_num_loops,
         verifier_num_sampling_steps=args.esmfold2_verifier_num_sampling_steps,
         soft_steps=stagea_soft_steps,
@@ -552,6 +559,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="ESMFold2 verifier 模型名（仅 --model_backend esmfold2 使用）")
     parser.add_argument("--esmfold2_experimental_model", type=str, default="biohub/ESMFold2-Experimental-Fast",
                        help="ESMFold2Experimental proposal 模型名（默认：biohub/ESMFold2-Experimental-Fast；仅 --model_backend esmfold2 使用）")
+    parser.add_argument("--esmfold2_optimization_root", default=None,
+                       help="uplifting-biomolecular-modeling checkout; also PROTEOCRAFT_UPLIFT_ROOT")
+    parser.add_argument("--esmfold2_proposal_optimization", choices=["off", "exact", "fast", "big"], default="off",
+                       help="ProteoCraft-adapted ef2inv composition (not the full upstream cookbook mode)")
+    parser.add_argument("--esmfold2_verifier_optimization", choices=["off", "exact", "fast", "big"], default="off",
+                       help="ProteoCraft-adapted esmfold2 composition")
+    parser.add_argument("--esmfold2_esmc_optimization", choices=["off", "exact"], default="off",
+                       help="Adapt esmc inference QK kernels and ef2inv differentiable rotary")
+    parser.add_argument("--esmfold2_optimization_timing", action="store_true",
+                        help="Synchronize CUDA and write per-phase timing records (use on every benchmark arm)")
+    parser.add_argument("--esmfold2_optimization_graph_max_tokens", type=int, default=None,
+                       help="Override verifier graph token budgets; omit to retain kit defaults, 0 is uncapped")
     parser.add_argument("--esmfold2_soft_steps", type=int, default=None,
                        help="兼容旧脚本：同时设置 ESMFold2 Stage A / Stage B 的 soft gradient update 步数")
     parser.add_argument("--esmfold2_stagea_soft_steps", type=int, default=None,
@@ -1493,7 +1512,7 @@ def parse_args_with_profile(argv=None):
     return args, parser
 
 
-def main(argv=None):
+def _main(argv=None, *, optimization_managers):
     args, parser = parse_args_with_profile(argv)
     model_backend = resolve_model_backend(args, parser)
 
@@ -1821,6 +1840,9 @@ def main(argv=None):
             template_chain_ids=esmfold2_template_chain_ids,
             template_chain_sequences=esmfold2_template_chain_sequences,
         )
+        manager = getattr(esmfold2_backend, "optimizations", None)
+        if manager is not None:
+            optimization_managers.append(manager)
 
     # 组装 loss_weights: default 不覆盖；非 default preset 覆盖整套权重。
     # 单独的 --w_* 参数始终具有最高优先级。
@@ -2370,6 +2392,22 @@ def main(argv=None):
     print(f" 最佳序列: {best_seq}")
     print(f" 结果文件: {output_file}")
     print("=" * 70)
+
+
+def main(argv=None):
+    managers = []
+    try:
+        return _main(argv, optimization_managers=managers)
+    finally:
+        # Preserve the original search exception if writing diagnostics also fails.
+        failed = sys.exc_info()[0] is not None
+        for manager in managers:
+            try:
+                manager.finalize()
+            except Exception:
+                if not failed:
+                    raise
+                logging.exception("Could not finalize optimization diagnostics")
 
 
 if __name__ == "__main__":

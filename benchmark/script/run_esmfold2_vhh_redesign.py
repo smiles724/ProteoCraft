@@ -25,6 +25,11 @@ from bindcraft.hallucination.esmfold2_vhh import (  # noqa: E402
 
 
 PASSTHROUGH_OPTIONS = (
+    "esmfold2_optimization_root",
+    "esmfold2_proposal_optimization",
+    "esmfold2_verifier_optimization",
+    "esmfold2_esmc_optimization",
+    "esmfold2_optimization_graph_max_tokens",
     "device",
     "seed",
     "n_steps",
@@ -170,6 +175,8 @@ def build_hallucination_command(
         command.extend(("--target_hotspots", case.target_hotspots_argument))
     for option_name in PASSTHROUGH_OPTIONS:
         _append_cli_argument(command, option_name, config.get(option_name))
+    if config.get("esmfold2_optimization_timing") is True:
+        command.append("--esmfold2_optimization_timing")
     return command
 
 

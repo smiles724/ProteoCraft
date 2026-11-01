@@ -151,6 +151,11 @@ def build_hallucination_command(
             ]
         )
     option_map = {
+        "esmfold2_optimization_root": "esmfold2_optimization_root",
+        "esmfold2_proposal_optimization": "esmfold2_proposal_optimization",
+        "esmfold2_verifier_optimization": "esmfold2_verifier_optimization",
+        "esmfold2_esmc_optimization": "esmfold2_esmc_optimization",
+        "esmfold2_optimization_graph_max_tokens": "esmfold2_optimization_graph_max_tokens",
         "esmfold2_stagea_dominance_gap": "esmfold2_stagea_dominance_gap",
         "esmfold2_stagea_protected_mutation_candidates": "esmfold2_stagea_protected_mutation_candidates",
         "device": "device",
@@ -273,6 +278,8 @@ def build_hallucination_command(
     }
     for config_key, cli_name in option_map.items():
         _append_cli_argument(command, cli_name, config.get(config_key))
+    if config.get("esmfold2_optimization_timing") is True:
+        command.append("--esmfold2_optimization_timing")
     return command
 
 
